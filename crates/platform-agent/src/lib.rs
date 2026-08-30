@@ -5,6 +5,7 @@
 //! game pack describes and what a node's operator decides.
 
 pub mod agent;
+pub mod api;
 pub mod config;
 pub mod docker;
 pub mod instance;

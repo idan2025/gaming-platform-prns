@@ -16,6 +16,7 @@
 //! pack, and it is what keeps a hostile pack from becoming a hostile container.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,21 @@ pub struct AgentConfig {
     /// Refuse to start more than this many instances on this node.
     #[serde(default = "default_max_instances")]
     pub max_instances: usize,
+    /// Where the local API listens.
+    ///
+    /// **Loopback only, enforced.** This API creates and destroys containers and
+    /// has no authentication whatsoever, so anyone who can reach it can run any
+    /// image the operator configured, on this machine. Binding it to a routable
+    /// address would hand that to the network. Identity challenge/response
+    /// arrives with the optional index in phase 4 (`PLAN.md` §8); until it does,
+    /// the honest boundary is "you must already be on this host", and the config
+    /// enforces it rather than documenting it and hoping.
+    #[serde(default = "default_api_bind")]
+    pub api_bind: SocketAddr,
+}
+
+fn default_api_bind() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 4750))
 }
 
 fn default_max_instances() -> usize {
@@ -120,6 +136,8 @@ pub enum ConfigError {
     RelativeDataRoot(PathBuf),
     EmptyImage(String),
     RelativeContentRoot { game: String, path: PathBuf },
+    /// The local API was pointed at something other than loopback.
+    NonLoopbackApiBind(SocketAddr),
 }
 
 impl core::fmt::Display for ConfigError {
@@ -141,6 +159,12 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "game {game:?} content_root {} must be absolute inside the container",
                 path.display()
+            ),
+            Self::NonLoopbackApiBind(addr) => write!(
+                f,
+                "api_bind {addr} is not a loopback address. This API creates containers \
+                 and has no authentication, so it must not be reachable from the network. \
+                 Put a reverse proxy in front of it if you need remote access"
             ),
         }
     }
@@ -174,6 +198,9 @@ impl AgentConfig {
                 end,
                 why: "reaches into privileged ports, which a game server must not need",
             });
+        }
+        if !self.api_bind.ip().is_loopback() {
+            return Err(ConfigError::NonLoopbackApiBind(self.api_bind));
         }
         for (game, runtime) in &self.games {
             if runtime.image.trim().is_empty() {
@@ -213,6 +240,12 @@ content_version = "5.26"
 memory_limit_bytes = 2147483648
 cpus = 1.5
 "#;
+
+    /// TOML appends land inside the last table, so a key meant for the top
+    /// level has to go before the first one.
+    fn with_top_level(line: &str) -> String {
+        SAMPLE.replacen("max_instances = 4", &format!("max_instances = 4\n{line}"), 1)
+    }
 
     #[test]
     fn a_sample_config_parses() {
@@ -266,6 +299,27 @@ cpus = 1.5
     fn a_relative_container_content_root_is_refused() {
         let src = SAMPLE.replace("content_root = \"/game\"", "content_root = \"game\"");
         assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::RelativeContentRoot { .. })));
+    }
+
+    /// An unauthenticated container-creating API on a routable address is a
+    /// remote code execution service. The config refuses rather than warns.
+    #[test]
+    fn a_routable_api_bind_is_refused() {
+        for addr in ["0.0.0.0:4750", "192.168.1.10:4750", "[::]:4750"] {
+            let src = with_top_level(&format!("api_bind = \"{addr}\""));
+            assert!(
+                matches!(AgentConfig::parse(&src), Err(ConfigError::NonLoopbackApiBind(_))),
+                "api_bind {addr} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_api_defaults_to_loopback() {
+        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        assert!(cfg.api_bind.ip().is_loopback());
+        let src = with_top_level("api_bind = \"127.0.0.1:9999\"");
+        assert_eq!(AgentConfig::parse(&src).unwrap().api_bind.port(), 9999);
     }
 
     #[test]

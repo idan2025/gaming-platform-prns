@@ -12,6 +12,13 @@ data_root = "/var/lib/gaming-platform-prns"
 # Refuse to run more than this many instances on this node.
 max_instances = 8
 
+# Where the local API listens. Loopback only, and the agent refuses to start
+# otherwise: every route creates or destroys containers and there is no
+# authentication of any kind, so the boundary is "you are already on this host".
+# Identity challenge/response arrives with phase 4; until then, put an
+# authenticating proxy in front if you need remote access.
+api_bind = "127.0.0.1:4750"
+
 # Stop an instance with no players for this long. Leave unset on a node whose
 # instances are all deliberate; set it on anything public, or free compute is
 # exactly what you are offering (DESIGN.md §4).

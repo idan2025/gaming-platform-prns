@@ -440,6 +440,38 @@ bridge.
   shared read-only content store plus per-instance writable overlay (a 2.74 GB
   copy per instance does not scale), port allocation. Agent has a local API; still
   no central service.
+
+  **Built 2026-08-30**, with one correction and one finding.
+
+  *The overlay is not an overlay.* Mounting overlayfs inside a container needs
+  `CAP_SYS_ADMIN`, and a game server is the last process that should have it. So
+  it is a read-only bind of the shared content plus one writable bind per path
+  the pack declares, nested inside it. That is why `writable_paths` exists on a
+  pack at all.
+
+  *And nesting a writable bind inside a read-only one only works if the
+  mountpoint already exists in the read-only source.* Found by an integration
+  test against a real daemon, not by reasoning: runc reports it as
+  `mkdirat ... read-only file system`, which says nothing about game content.
+  `InstancePlan::required_content_dirs` and `Agent::plan_and_check` turn it into
+  the name of the directory the install is missing.
+
+  Two boundaries the code is built around, both worth keeping in later phases:
+
+  - **A pack cannot say what runs.** It could already not name a command; it also
+    cannot name a container image, since an image name selects the code a node
+    executes. Images, limits, ports and the data root are agent config, written
+    by the node's operator. An unconfigured game cannot start, and no default
+    image is invented for it. This keeps §10's "are community packs allowed"
+    genuinely open.
+  - **The agent only touches containers it created**, by inspected label, never
+    by name prefix. A node that runs game servers is a node someone uses for
+    other things.
+
+  The local API is **loopback-only and the config refuses otherwise**: every
+  route creates or destroys containers and there is no authentication at all.
+  Identity challenge/response is phase 4's job (`DESIGN.md` §2.4); until it
+  exists the honest boundary is "you are already on this host".
 - **Phase 4 — index + optional hosting.** Announce indexer served over **both** a
   Reticulum destination and HTTPS, identity challenge/response auth, hosted-deploy
   API, agent uplink over Reticulum, multi-node. Per-account quotas and idle reaping

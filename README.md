@@ -15,7 +15,9 @@ account, no port forwarding, no central service, and no internet required.
 > index, no account, no internet, proven end to end in
 > `tests/browse_discovery.rs`. Phase 2 is complete: the §3.4 detail probe over a
 > Link, and a Tauri launcher (`launcher/`) over `crates/launcher-core`.
-> Everything past that is still plan. The working single-host implementation this generalizes is
+> Phase 3 is complete too: `crates/platform-agent` runs many game servers on one
+> host off a single shared copy of the content, with a loopback-only local API
+> and no central service. Everything past that is still plan. The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
 
 ## The idea

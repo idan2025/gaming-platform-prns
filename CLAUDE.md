@@ -24,6 +24,17 @@ because JavaScript reads a missing property as `undefined`. Tests pin the keys.
 `launcher/src-tauri` is excluded from the workspace, so `cargo test` at the root
 does not build it; build it from its own directory.
 
+**Phase 3 is done**: `crates/platform-agent` runs many servers on one host off
+one shared copy of the content. Two rules there are load-bearing rather than
+stylistic, and both have tests against a real Docker daemon:
+- **A pack cannot name a container image.** An image selects the code a node
+  executes, so it is agent config, chosen by the node's operator.
+- **The agent only touches containers carrying its own label**, never a name
+  prefix. This machine already runs unrelated containers; so will any real node.
+
+The agent's Docker tests skip themselves where there is no daemon, and they
+build a tiny local image from busybox rather than pulling anything.
+
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:
 `profile::tests::destination_hash_matches_deployed_sven` freezes the destination
