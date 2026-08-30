@@ -244,7 +244,53 @@ spawn with `process_group(0)` and stop via direct `libc::kill(-pid, SIGKILL)` �
 never a shelled-out `kill`, which does not exist in the slim image. It broke
 three releases in a row.
 
-## 7. Ordering
+## 7. Engine dependency — fork Prns, depend on the fork
+
+Decided 2026-08-30. Prns is **not published on crates.io**.
+
+**We already patch the engine, and that decides this.** The field the entire
+server browser rests on — `Diagnostic::AnnounceHeard.app_data`
+(`prns-runtime/core/src/runtime/event.rs:97`) — is a *local addition* made in
+`svencoop-prns` commit `c9ec90b`, not upstream. `tracing_events.rs` carries a
+matching line. Any option that assumes we consume upstream unmodified is
+therefore wrong on arrival.
+
+Upstream: `https://github.com/KenAKAFrosty/Prns`, dual MIT / Apache-2.0. The
+vendored copy in `svencoop-prns` is version **0.3.7** — 2876 tracked files, ~13 MB
+in git, ~53 MB on disk, copied rather than submoduled and with no `.git` of its
+own, so its local edits are invisible as history.
+
+**Decision: fork to `idan2025/prns`, land our patches there as real commits, and
+depend on the fork by pinned rev.**
+
+Why this over the alternatives:
+
+- **vs. vendoring another copy.** Vendoring works and is hermetic, but the
+  patches stay invisible edits inside a blob, upgrading means a manual re-copy
+  plus re-applying changes nobody wrote down, and once the platform exists there
+  are two copies to patch. The fork turns each engine change into a reviewable
+  commit that can be rebased onto a new Prns release, with conflicts shown rather
+  than silently lost.
+- **vs. submodule or a git dep on upstream.** Both point at somebody else's repo,
+  so neither has anywhere to put our patches — each needs a fork underneath
+  anyway. Submodules additionally cost `--recursive` clones and detached HEADs.
+
+**This does not violate §5.** Both repos depending on the same third-party fork
+is not `svencoop-prns` depending on the platform. `svencoop-prns` may keep its
+`vendor/` copy indefinitely; migrating it to the fork is optional and its own
+decision.
+
+**Consequences to handle:**
+
+- A pinned rev needs the network on a first build. That is awkward for a project
+  selling offline mesh operation — plan a vendored or cached build for releases,
+  and keep `cargo vendor` output reproducible.
+- Every patch we carry is a merge cost against upstream forever. Keep them
+  minimal and upstream them where they are generally useful — the `app_data`
+  field plausibly is.
+- Record which rev of the fork this repo pins, and why, next to the dependency.
+
+## 8. Ordering
 
 Refines `DESIGN.md` §5 by folding the four roles in. The Relay role is **not** a
 separate early phase: it would have to be built inside `svencoop-prns` to ship
@@ -259,12 +305,8 @@ bridge.
   no code changes anywhere.
 - **Phase 1 — stand up the platform bridge.** The first code in this repo, in
   order:
-  1. **Decide how this repo gets Prns.** It is not on crates.io;
-     `svencoop-prns` uses `personal-rns = { path = "vendor/personal-rns" }` against
-     a full checked-in copy of the Prns monorepo (~30 crates under `vendor/`).
-     Options: vendor a copy again, a git submodule, or a git dependency pinned to
-     a rev. Nothing else in this phase can start first, and the choice sets how
-     engine upgrades land forever.
+  1. **Fork Prns and depend on the fork** (§7). Nothing else in this phase
+     compiles first.
   2. **Copy `relay.rs` + `framing.rs` into `crates/game-bridge/`** and parametrize
      the Sven-specific parts: aspect (`SC_ASPECT_SERVER`/`SC_ASPECT_CLIENT` are
      hardcoded at `src/relay.rs:189,207,397,434`), app name, port.
@@ -297,7 +339,7 @@ bridge.
   it changes the installer, the signing story, and the support burden
   (`MODES.md`).
 
-## 8. Launcher stack — stay on Tauri v2
+## 9. Launcher stack — stay on Tauri v2
 
 Decided 2026-08-30. The launcher generalizes from `svencoop-prns-clone/gui/`,
 which is Tauri v2 with a vanilla-JS frontend (1489 lines across
@@ -342,7 +384,7 @@ the network dependency at install time.
 system runtime — then egui, paying a frontend rewrite and the loss of mobile. Do
 not pre-emptively switch; wait for WebView2 to actually bite in testing.
 
-## 9. Decisions this plan does not make
+## 10. Decisions this plan does not make
 
 Carried from `DESIGN.md` §7, still open, listed here so they are not lost:
 node supply (user-contributed is the default under the decentralization rule, so
