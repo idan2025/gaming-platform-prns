@@ -476,6 +476,24 @@ bridge.
   Reticulum destination and HTTPS, identity challenge/response auth, hosted-deploy
   API, agent uplink over Reticulum, multi-node. Per-account quotas and idle reaping
   from day one — public deploy plus anonymous identities is free compute.
+  **Hosted deploy is built (2026-08-30), and the legal question is answered by
+  not answering it.** The platform ships **no list of hostable games**. Which
+  titles an operator may run for other people varies by jurisdiction and by
+  agreements this project cannot see (§10, `GAMES.md` §5), so
+  `HostingConfig.games` is empty until an operator writes it and an empty list
+  means hosting is off — the same shape as the agent making the container image
+  an operator's choice.
+
+  Ownership lives on the container as a label; the index reconstructs who owns
+  what by asking the node, so there is no index-side instance table to drift out
+  of step with reality. "Not found" and "not yours" are the same answer, so the
+  API cannot be used to enumerate other people's servers.
+
+  **Multi-node is still not built, and the reason matters.** An agent's API is
+  loopback-only and refuses to bind anything else, because it creates containers
+  with no authentication. An index can therefore only drive agents on its own
+  host. The fix is the agent uplink over Reticulum — not exposing the agent.
+
 - **Phase 5 — more games.** The ladder in `GAMES.md` §7: GoldSrc sibling (app 90)
   → Source/TF2 → Minetest → Minecraft Java. Each step exercises exactly one new
   axis. Never let the second game be the hard game.
