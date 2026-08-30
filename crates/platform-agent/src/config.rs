@@ -71,6 +71,44 @@ pub struct AgentConfig {
     /// enforces it rather than documenting it and hoping.
     #[serde(default = "default_api_bind")]
     pub api_bind: SocketAddr,
+    /// The Reticulum control uplink. `None` = local-only, today's behavior. When
+    /// present, the agent also announces a `platform-agent.control` destination
+    /// and answers authenticated create/stop/remove/list requests over a Link,
+    /// so an index can drive this node without an inbound port or public IP
+    /// (`DESIGN.md` §2.3, `PLAN.md` §8 phase 4). The loopback API above keeps
+    /// working either way.
+    #[serde(default)]
+    pub uplink: Option<UplinkConfig>,
+}
+
+/// The agent's Reticulum control uplink, as the operator writes it.
+///
+/// **`trusted_indexes` is the whole authorization.** The agent authenticates a
+/// caller by challenge/response (`platform_auth`), derives the caller's identity
+/// from the signing key, and admits the session only if that identity is in this
+/// list. An empty list refuses every caller — hosting off, the same shape as
+/// `HostingConfig.games` empty meaning hosting off. Putting an index here is the
+/// operator saying "I trust that index to deploy on this node and to enforce its
+/// own quotas"; from the user's side agents stay untrusted (`DESIGN.md` §5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UplinkConfig {
+    /// Reticulum identity secret this agent announces under. Absolute path to a
+    /// 64-byte file (X25519 secret ‖ Ed25519 secret); loaded at start, not here.
+    pub identity_secret_path: PathBuf,
+    /// Attach a `TcpServerInterface` on `host:port` (`0.0.0.0` for a public
+    /// relay) — `None` means auto-discovered interfaces only. Same shape as
+    /// `game_bridge::relay::attach_interfaces`.
+    #[serde(default)]
+    pub tcp: Option<String>,
+    /// Auto-attach interfaces. Defaults false to match the bridge's explicit
+    /// default; an operator opts in.
+    #[serde(default)]
+    pub auto: bool,
+    /// Hex identity hashes of indexes this node will let deploy. 16 bytes each,
+    /// 32 hex characters. **Empty refuses everyone.**
+    #[serde(default)]
+    pub trusted_indexes: Vec<String>,
 }
 
 fn default_api_bind() -> SocketAddr {
@@ -143,6 +181,10 @@ pub enum ConfigError {
     RelativeContentRoot { game: String, path: PathBuf },
     /// The local API was pointed at something other than loopback.
     NonLoopbackApiBind(SocketAddr),
+    /// A `trusted_indexes` entry was not a 32-char hex identity hash.
+    BadTrustedIndex(String),
+    /// The uplink identity secret path was relative, not absolute.
+    RelativeUplinkIdentityPath(PathBuf),
 }
 
 impl core::fmt::Display for ConfigError {
@@ -170,6 +212,16 @@ impl core::fmt::Display for ConfigError {
                 "api_bind {addr} is not a loopback address. This API creates containers \
                  and has no authentication, so it must not be reachable from the network. \
                  Put a reverse proxy in front of it if you need remote access"
+            ),
+            Self::BadTrustedIndex(s) => write!(
+                f,
+                "trusted_indexes entry {s:?} is not a 32-character hex identity hash"
+            ),
+            Self::RelativeUplinkIdentityPath(p) => write!(
+                f,
+                "uplink.identity_secret_path {} must be absolute: a relative path would \
+                 resolve against whatever directory the agent started in",
+                p.display()
             ),
         }
     }
@@ -207,6 +259,18 @@ impl AgentConfig {
         if !self.api_bind.ip().is_loopback() {
             return Err(ConfigError::NonLoopbackApiBind(self.api_bind));
         }
+        if let Some(uplink) = &self.uplink {
+            if !uplink.identity_secret_path.is_absolute() {
+                return Err(ConfigError::RelativeUplinkIdentityPath(
+                    uplink.identity_secret_path.clone(),
+                ));
+            }
+            for hash in &uplink.trusted_indexes {
+                if !is_identity_hash_hex(hash) {
+                    return Err(ConfigError::BadTrustedIndex(hash.clone()));
+                }
+            }
+        }
         for (game, runtime) in &self.games {
             if runtime.image.trim().is_empty() {
                 return Err(ConfigError::EmptyImage(game.clone()));
@@ -224,6 +288,14 @@ impl AgentConfig {
     pub fn runtime_for(&self, game_id: &str) -> Option<&GameRuntime> {
         self.games.get(game_id)
     }
+}
+
+/// A Reticulum identity hash is 16 bytes, written as 32 lowercase hex chars.
+/// `trusted_indexes` entries must be exactly that, or the uplink cannot match a
+/// verified identity against them. Uppercase is refused so a later lookup is a
+/// straight byte compare, not a case-fold.
+fn is_identity_hash_hex(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -325,6 +397,93 @@ cpus = 1.5
         assert!(cfg.api_bind.ip().is_loopback());
         let src = with_top_level("api_bind = \"127.0.0.1:9999\"");
         assert_eq!(AgentConfig::parse(&src).unwrap().api_bind.port(), 9999);
+    }
+
+    #[test]
+    fn an_agent_without_an_uplink_is_local_only() {
+        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        assert!(cfg.uplink.is_none());
+    }
+
+    #[test]
+    fn an_uplink_block_parses() {
+        let src = with_top_level(
+            "[uplink]\n\
+             identity_secret_path = \"/etc/gpp/agent.key\"\n\
+             tcp = \"0.0.0.0:4789\"\n\
+             auto = true\n\
+             trusted_indexes = [\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"]\n",
+        );
+        let cfg = AgentConfig::parse(&src).unwrap();
+        let uplink = cfg.uplink.expect("uplink present");
+        assert_eq!(uplink.identity_secret_path, PathBuf::from("/etc/gpp/agent.key"));
+        assert!(uplink.auto);
+        assert_eq!(uplink.tcp.as_deref(), Some("0.0.0.0:4789"));
+        assert_eq!(uplink.trusted_indexes.len(), 1);
+    }
+
+    /// Empty `trusted_indexes` is valid — it means the uplink refuses every
+    /// caller, the same shape as `HostingConfig.games` empty meaning hosting off.
+    #[test]
+    fn an_uplink_with_no_trusted_indexes_is_valid_but_off() {
+        let src = with_top_level(
+            "[uplink]\nidentity_secret_path = \"/etc/gpp/agent.key\"\ntrusted_indexes = []\n",
+        );
+        let cfg = AgentConfig::parse(&src).unwrap();
+        assert!(cfg.uplink.unwrap().trusted_indexes.is_empty());
+    }
+
+    #[test]
+    fn an_uplink_identity_hash_must_be_32_hex_chars() {
+        let src = with_top_level(
+            "[uplink]\nidentity_secret_path = \"/etc/gpp/agent.key\"\n\
+             trusted_indexes = [\"not-a-hash\"]\n",
+        );
+        assert!(matches!(
+            AgentConfig::parse(&src),
+            Err(ConfigError::BadTrustedIndex(_))
+        ));
+    }
+
+    #[test]
+    fn an_uplink_identity_hash_rejects_uppercase() {
+        let src = with_top_level(
+            "[uplink]\nidentity_secret_path = \"/etc/gpp/agent.key\"\n\
+             trusted_indexes = [\"A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6\"]\n",
+        );
+        assert!(matches!(
+            AgentConfig::parse(&src),
+            Err(ConfigError::BadTrustedIndex(_))
+        ));
+    }
+
+    #[test]
+    fn an_uplink_identity_secret_path_must_be_absolute() {
+        let src = with_top_level(
+            "[uplink]\nidentity_secret_path = \"agent.key\"\ntrusted_indexes = []\n",
+        );
+        assert!(matches!(
+            AgentConfig::parse(&src),
+            Err(ConfigError::RelativeUplinkIdentityPath(_))
+        ));
+    }
+
+    #[test]
+    fn an_uplink_block_rejects_unknown_keys() {
+        let src = with_top_level(
+            "[uplink]\nidentity_secret_path = \"/etc/gpp/agent.key\"\n\
+             run_anything = true\n",
+        );
+        assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn is_identity_hash_hex_matches_only_32_lowercase_hex() {
+        assert!(is_identity_hash_hex("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"));
+        assert!(!is_identity_hash_hex("A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6"));
+        assert!(!is_identity_hash_hex("a1b2"));
+        assert!(!is_identity_hash_hex("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6ee"));
+        assert!(!is_identity_hash_hex("z1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"));
     }
 
     #[test]
