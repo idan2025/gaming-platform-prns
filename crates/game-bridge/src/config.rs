@@ -63,6 +63,11 @@ pub struct ServerArgs {
     /// How long an accepted link may go without identifying itself before it
     /// is closed. Only consulted when `allowlist` is non-empty.
     pub identify_timeout_secs: u64,
+    /// Whether this node also carries **other people's** traffic across its
+    /// interfaces. See `RelayArgs` for what that means and why the default
+    /// differs by role. A host volunteering a game server is already
+    /// volunteering resources, so this defaults **on** for a server.
+    pub relay_transit: bool,
 }
 
 impl ServerArgs {
@@ -88,6 +93,7 @@ impl ServerArgs {
             passworded: false,
             allowlist: Vec::new(),
             identify_timeout_secs: 10,
+            relay_transit: true,
         }
     }
 }
@@ -109,6 +115,15 @@ pub struct ClientArgs {
     pub identity: PathBuf,
     pub tcp: Option<String>,
     pub auto: bool,
+    /// Whether this node also carries other people's traffic.
+    ///
+    /// **Defaults off, unlike v0.1.10.** A player who installed this to join
+    /// one server was, in v0.1.10, unconditionally forwarding strangers'
+    /// traffic across whatever connection they were on, with no prompt, no
+    /// counter and no off switch (`PLAN.md` §4). On a metered or mobile
+    /// connection that is a defect. A client that wants to donate transit can
+    /// turn it on, or run the `Relay` role.
+    pub relay_transit: bool,
 }
 
 impl ClientArgs {
@@ -121,7 +136,52 @@ impl ClientArgs {
             identity: PathBuf::from("./game-bridge-client.identity"),
             tcp: None,
             auto: false,
+            relay_transit: false,
         }
+    }
+}
+
+/// Relay role: donate transit and nothing else.
+///
+/// A node with interfaces and a transport identity, no game, no bound game
+/// port, and **no announced destination** — there is nothing to announce, since
+/// a transport node is not a service anyone links to. It is the smallest of the
+/// four roles (`PLAN.md` §1) and the only way to donate transit deliberately
+/// rather than as a side effect of running a game.
+///
+/// Two things a UI must say plainly, per `PLAN.md` §4:
+///
+/// - **A relay cannot read what it carries.** Links are end-to-end encrypted
+///   and a transport node forwards ciphertext. That is the argument for asking
+///   strangers to donate transit; say it rather than burying it.
+/// - **It costs bandwidth.** `BridgeSession::transit_stats` is there so a user
+///   can see what they are giving, because a donation they cannot see becomes
+///   "my connection broke" and gets switched off forever.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RelayArgs {
+    /// Where to persist the relay identity. Generated on first run. A
+    /// transport node's identity is stable so paths through it stay stable.
+    pub identity: PathBuf,
+    /// A public relay wants `0.0.0.0:<port>`, which binds a TCP server that
+    /// many peers can dial. Any other host dials one instead.
+    pub tcp: Option<String>,
+    pub auto: bool,
+}
+
+impl RelayArgs {
+    pub fn new() -> Self {
+        Self {
+            identity: PathBuf::from("./game-bridge-relay.identity"),
+            tcp: None,
+            auto: false,
+        }
+    }
+}
+
+impl Default for RelayArgs {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -157,6 +217,7 @@ pub enum AnnounceFormat {
 pub enum BridgeConfig {
     Server(ServerArgs),
     Client(ClientArgs),
+    Relay(RelayArgs),
 }
 
 impl BridgeConfig {
@@ -164,13 +225,26 @@ impl BridgeConfig {
         match self {
             Self::Server(_) => BridgeRole::Server,
             Self::Client(_) => BridgeRole::Client,
+            Self::Relay(_) => BridgeRole::Relay,
         }
     }
 
-    pub fn profile(&self) -> &GameProfile {
+    /// `None` for the relay role: it carries traffic for every game and knows
+    /// about none of them.
+    pub fn profile(&self) -> Option<&GameProfile> {
         match self {
-            Self::Server(a) => &a.profile,
-            Self::Client(a) => &a.profile,
+            Self::Server(a) => Some(&a.profile),
+            Self::Client(a) => Some(&a.profile),
+            Self::Relay(_) => None,
+        }
+    }
+
+    /// Whether this configuration carries other people's traffic.
+    pub fn relays_transit(&self) -> bool {
+        match self {
+            Self::Server(a) => a.relay_transit,
+            Self::Client(a) => a.relay_transit,
+            Self::Relay(_) => true,
         }
     }
 }
@@ -179,11 +253,45 @@ impl BridgeConfig {
 pub enum BridgeRole {
     Server,
     Client,
+    /// Donates transit, runs no game. `PLAN.md` §4.
+    Relay,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `PLAN.md` §4 defect, as a test. v0.1.10 forwarded strangers'
+    /// traffic from every client unconditionally. A client must now opt in; a
+    /// server, which is already volunteering resources, stays on.
+    #[test]
+    fn a_client_does_not_donate_transit_by_default() {
+        let p = GameProfile::sven_coop();
+        assert!(!ClientArgs::new(p.clone()).relay_transit, "a client must opt in");
+        assert!(ServerArgs::new(p).relay_transit, "a host is already volunteering");
+    }
+
+    #[test]
+    fn relay_role_always_relays_and_has_no_game() {
+        let cfg = BridgeConfig::Relay(RelayArgs::new());
+        assert_eq!(cfg.role(), BridgeRole::Relay);
+        assert!(cfg.relays_transit());
+        assert!(cfg.profile().is_none(), "a relay carries every game and knows none");
+    }
+
+    #[test]
+    fn relays_transit_follows_the_game_roles_switch() {
+        let p = GameProfile::sven_coop();
+        let mut client = ClientArgs::new(p.clone());
+        assert!(!BridgeConfig::Client(client.clone()).relays_transit());
+        client.relay_transit = true;
+        assert!(BridgeConfig::Client(client).relays_transit());
+
+        let mut server = ServerArgs::new(p);
+        assert!(BridgeConfig::Server(server.clone()).relays_transit());
+        server.relay_transit = false;
+        assert!(!BridgeConfig::Server(server).relays_transit());
+    }
 
     #[test]
     fn defaults_come_from_the_profile() {

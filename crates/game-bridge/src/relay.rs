@@ -58,6 +58,7 @@ use prns_core::identity::in_memory::InMemoryNodeIdentity;
 use prns_core::identity::{IdentityHash, IdentitySigner};
 use prns_core::routing::announce::emit::{AnnounceAppDataBytes, MAX_ANNOUNCE_APP_DATA_LEN};
 use prns_core::routing::delivery::Delivery;
+use prns_core::interfaces::InterfaceId;
 use prns_core::routing::links::LinkId;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -65,7 +66,7 @@ use tokio::task::LocalSet;
 use tracing::{debug, error, info, warn};
 
 use crate::announce::{self, AnnounceFlags, AnnounceInfo, AnnounceRecord};
-use crate::config::{AnnounceFormat, BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
+use crate::config::{AnnounceFormat, BridgeConfig, BridgeRole, ClientArgs, RelayArgs, ServerArgs};
 use crate::framing::{frame, Reassembler};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
 
@@ -75,6 +76,7 @@ pub async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
     let session = match cfg {
         BridgeConfig::Server(args) => BridgeSession::start_server(args).await?,
         BridgeConfig::Client(args) => BridgeSession::start_client(args).await?,
+        BridgeConfig::Relay(args) => BridgeSession::start_relay(args).await?,
     };
     session.await_completion().await
 }
@@ -87,6 +89,7 @@ pub struct BridgeSession {
     connected_clients: ConnectedClients,
     own_hash: Option<DestinationHash>,
     role: BridgeRole,
+    relay_transit: bool,
     stop_tx: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<()>>,
 }
@@ -244,11 +247,13 @@ impl BridgeSession {
             .map_err(|e| anyhow!("invalid destination name: {e:?}"))?
         };
 
-        spawn_bridge_node(BridgeRole::Server, Some(precomputed_hash), move |discovered, connected_clients| async move {
+        spawn_bridge_node(BridgeRole::Server, Some(precomputed_hash), args.relay_transit, move |discovered, connected_clients| async move {
             let identity = load_identity(&args.identity)?;
             let app_name = args.profile.app_name.clone();
             let game_id = args.profile.id.clone();
             let name_bytes = server_announce_bytes(&args);
+            let relay_transit = args.relay_transit;
+            info!(game = %args.profile.id, relay_transit, "transit relaying");
             let destination = PreConfiguredDestination::Single {
                 app_name: &app_name,
                 aspects: &[ASPECT_SERVER],
@@ -277,7 +282,10 @@ impl BridgeSession {
             let link_senders: LinkSenders = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
             let node = PrnsNode::new(PrnsNodeRecipe {
-                transport_identity: Some(identity),
+                // Config-driven, not unconditional (`PLAN.md` §4). `None`
+                // leaves the engine's TransportState::Unidentified, so nothing
+                // is forwarded for anyone else.
+                transport_identity: relay_transit.then_some(identity),
                 pre_configured_destinations: [destination],
                 app_state: (),
                 storage: GrowableHeap,
@@ -458,7 +466,7 @@ impl BridgeSession {
             .map_err(|e| anyhow!("invalid destination name: {e:?}"))?
         };
 
-        spawn_bridge_node(BridgeRole::Client, Some(precomputed_hash), move |discovered, _connected_clients| async move {
+        spawn_bridge_node(BridgeRole::Client, Some(precomputed_hash), args.relay_transit, move |discovered, _connected_clients| async move {
             let identity = load_identity(&args.identity)?;
             let app_name = args.profile.app_name.clone();
             let game_id = args.profile.id.clone();
@@ -495,7 +503,10 @@ impl BridgeSession {
             };
 
             let node = PrnsNode::new(PrnsNodeRecipe {
-                transport_identity: Some(identity),
+                // Off by default for a client (`PLAN.md` §4): a player who
+                // installed this to join one server should not be forwarding
+                // strangers' traffic on a metered connection without knowing.
+                transport_identity: args.relay_transit.then_some(identity),
                 pre_configured_destinations: [destination],
                 app_state: (),
                 storage: GrowableHeap,
@@ -716,6 +727,105 @@ impl BridgeSession {
     }
 }
 
+impl BridgeSession {
+    /// Start a node that carries other people's traffic and nothing else.
+    ///
+    /// No destination is registered and nothing is announced: a transport node
+    /// is not a service anyone links to, it is a hop on the way to one. That
+    /// is why this role has no `own_hash` and no discovered-server list of its
+    /// own worth speaking of — though it still hears announces, because every
+    /// node on the interface does.
+    pub async fn start_relay(args: RelayArgs) -> Result<Self> {
+        spawn_bridge_node(BridgeRole::Relay, None, true, move |discovered, _connected| async move {
+            let identity = load_identity(&args.identity)?;
+            let identity_hash = InMemoryNodeIdentity::from_secret_key_bytes(&identity).identity_hash();
+            info!(
+                identity = ?identity_hash.as_bytes(),
+                "relay node starting; it forwards ciphertext it cannot read"
+            );
+
+            let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+            let node = PrnsNode::new(PrnsNodeRecipe {
+                transport_identity: Some(identity),
+                // The whole point of the role: no game, no destination.
+                pre_configured_destinations: [] as [PreConfiguredDestination; 0],
+                app_state: (),
+                storage: GrowableHeap,
+                request_endpoints: request_endpoints![],
+                on_event: {
+                    let event_tx = event_tx.clone();
+                    move |event, _state| funnel_event(event, &event_tx)
+                },
+                interfaces: |node: &PrnsNodeHandle| {
+                    attach_interfaces(node, args.tcp.as_deref(), args.auto);
+                },
+                persistence: NoPersistence,
+            });
+            let handle = node.handle();
+
+            // A relay still hears announces, and keeping them costs nothing —
+            // a relay operator has as much right to a server list as anyone.
+            let router_discovered = discovered.clone();
+            let _router_task = tokio::spawn(async move {
+                let mut event_rx = event_rx;
+                while let Some(event) = event_rx.recv().await {
+                    if let BridgeEvent::AnnounceHeard { destination, info } = event {
+                        remember_server(&router_discovered, destination, info).await;
+                    }
+                }
+            });
+
+            info!("relay node running");
+            Ok((handle, async move { let _ = node.run().await; }))
+        })
+        .await
+    }
+
+    /// What this node is carrying, per interface.
+    ///
+    /// **Read the caveat before showing these numbers to a user.**
+    /// `transported_links` is honest: it counts links this node carries *for
+    /// other people*. `rx_bytes`/`tx_bytes` are not — they count everything on
+    /// the interface, this node's own game traffic included. There is no
+    /// engine-level split: `Diagnostic` has no forwarded-packet variant
+    /// (`prns-runtime/core/src/runtime/event.rs`), so bytes attributable to
+    /// transit alone cannot be reported without patching the engine. Label
+    /// them as total interface throughput, not as "bandwidth you donated".
+    pub fn transit_stats(&self) -> Vec<TransitStats> {
+        self.handle
+            .interfaces()
+            .into_iter()
+            .map(|s| TransitStats {
+                interface: s.id,
+                transported_links: s.transported_links,
+                links: s.links,
+                interface_rx_bytes: s.rx_bytes,
+                interface_tx_bytes: s.tx_bytes,
+            })
+            .collect()
+    }
+
+    /// Whether this node is forwarding for others at all.
+    pub fn relays_transit(&self) -> bool {
+        self.role == BridgeRole::Relay || self.relay_transit
+    }
+}
+
+/// Per-interface transit visibility. See `BridgeSession::transit_stats` for
+/// which of these numbers are attributable to transit and which are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitStats {
+    pub interface: InterfaceId,
+    /// Links this node carries on behalf of other nodes. Transit, exactly.
+    pub transported_links: u32,
+    /// Links terminating at this node.
+    pub links: u32,
+    /// Total bytes on the interface, own traffic included. Not transit alone.
+    pub interface_rx_bytes: u64,
+    /// Total bytes on the interface, own traffic included. Not transit alone.
+    pub interface_tx_bytes: u64,
+}
+
 /// Pump one accepted link against the local game server until either side
 /// ends. Split out of the server's `LinkEstablished` arm so the allowlist can
 /// defer the call until the peer has identified itself (`PLAN.md` §8 step 4)
@@ -826,6 +936,7 @@ fn link_payload(chunk: &[u8], link_id: LinkId) -> Option<SendToLinkPayload> {
 async fn spawn_bridge_node<B, Fut, NodeRun>(
     role: BridgeRole,
     own_hash: Option<DestinationHash>,
+    relay_transit: bool,
     build: B,
 ) -> Result<BridgeSession>
 where
@@ -891,6 +1002,7 @@ where
         connected_clients,
         own_hash,
         role,
+        relay_transit,
         stop_tx: Some(stop_tx),
         done: Some(done_rx),
     })

@@ -175,6 +175,31 @@ anything:
    user cannot tell donating transit from a broken connection.
 4. **A rate cap**, enforced and visible.
 
+**Built 2026-08-30, and 3 and 4 did not survive contact with the engine.**
+Items 1 and 2 landed as specified: `transport_identity` is now
+`Option`-driven per role (`None` leaves the engine at
+`TransportState::Unidentified`, forwarding nothing), the client defaults off,
+and `BridgeConfig::Relay` is a node with interfaces, a transport identity, no
+game and no announced destination.
+
+Item 3 is **half available**. `InterfaceSnapshot`
+(`prns-core/src/interfaces/status/mod.rs:67`) exposes `transported_links` per
+interface, which is exactly "links I carry for other people" — that part is
+honest. It also exposes `rx_bytes`/`tx_bytes`, but those count *everything* on
+the interface, this node's own game traffic included. `Diagnostic` has no
+forwarded-packet variant at all
+(`prns-runtime/core/src/runtime/event.rs`), so **bytes attributable to transit
+cannot be reported without patching the engine.** A UI must label the byte
+figures as total interface throughput, never as "bandwidth you donated".
+
+Item 4 is **not implementable as stated.** A rate cap needs an enforcement
+point in the forwarding path, and the runtime exposes none — the only lever is
+tearing down an interface, which would kill this node's own game traffic along
+with the transit. Either it becomes a third fork patch (an engine-side cap,
+which is the honest place for it) or the Relay role ships with observation and
+an off switch but no cap. That is a decision, not an oversight; it is not
+resolved here.
+
 Note the standalone role needs no destination and announces nothing — it is a
 node with interfaces and a transport identity, and that is all. It is the
 smallest of the four roles to build, but it is platform code, so it is built in
