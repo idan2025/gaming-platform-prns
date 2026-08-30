@@ -12,8 +12,17 @@ parametrized relay and framing, the §3.3 announce record, the link allowlist,
 the Relay role with a transit off switch, and game packs with Sven Co-op as
 pack #1. **Phase 2's browse core is built too**: a `Browse` role that binds no
 game port and holds no identity, and `browse.rs` filtering and sorting from
-announces alone. Remaining in phase 2: the §3.4 detail probe over a Link, and
-the launcher UI. `cargo test` is 74 tests and green, clippy clean.
+announces alone, the §3.4 detail probe over a Link, and a Tauri launcher
+(`launcher/`) over `crates/launcher-core`. `cargo test` is 93 tests and green,
+clippy clean.
+
+The launcher splits deliberately: `launcher-core` holds every shape the UI
+consumes and is tested without a webview; `launcher/src-tauri` only forwards.
+Its serde field names **are** the frontend contract — a rename is a silent break,
+because JavaScript reads a missing property as `undefined`. Tests pin the keys.
+
+`launcher/src-tauri` is excluded from the workspace, so `cargo test` at the root
+does not build it; build it from its own directory.
 
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:

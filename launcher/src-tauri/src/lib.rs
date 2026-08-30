@@ -1,0 +1,122 @@
+//! Tauri shell. Every command here forwards to `launcher-core` and does nothing
+//! else, on purpose: the logic worth testing lives in a crate that needs no
+//! webview, no display server and no platform toolchain to run its tests.
+//!
+//! Stack decision is `PLAN.md` §9 — Tauri v2, kept because the core is Rust and
+//! Tauri links it as a plain path dependency with no IPC or serialization
+//! boundary between the UI and the sessions it supervises.
+//!
+//! `tauri.conf.json` sets `webviewInstallMode: offlineInstaller` for the reason
+//! §9 gives: Tauri needs WebView2 on Windows, and a genuinely offline mesh
+//! machine that lacks it could otherwise neither start the launcher nor
+//! download the runtime — precisely the situation this platform advertises.
+
+use std::path::PathBuf;
+
+use launcher_core::{
+    BrowseOpts, BrowseQueryInput, BrowseStatus, GameSummary, JoinResult, Launcher, ServerDetailsView,
+    ServerRow,
+};
+use tauri::Manager;
+
+struct AppState {
+    launcher: Launcher,
+}
+
+#[tauri::command]
+async fn browse_status(state: tauri::State<'_, AppState>) -> Result<BrowseStatus, String> {
+    Ok(state.launcher.browse_status().await)
+}
+
+#[tauri::command]
+async fn start_browse(state: tauri::State<'_, AppState>, opts: BrowseOpts) -> Result<(), String> {
+    state.launcher.start_browse(opts).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_browse(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.launcher.stop_browse().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_servers(
+    state: tauri::State<'_, AppState>,
+    query: BrowseQueryInput,
+) -> Result<Vec<ServerRow>, String> {
+    state.launcher.list_servers(query).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_games(state: tauri::State<'_, AppState>) -> Result<Vec<GameSummary>, String> {
+    Ok(state.launcher.list_games())
+}
+
+/// Never returns `Err` for an unreachable server: a probe that did not answer is
+/// a *state* the detail pane renders, not an error banner. Mesh routing is
+/// asymmetric and an allowlisted server refuses probes on purpose, so "did not
+/// answer" must never be presented as "offline".
+#[tauri::command]
+async fn server_details(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+) -> Result<ServerDetailsView, String> {
+    Ok(state.launcher.server_details(&destination_hash).await)
+}
+
+#[tauri::command]
+async fn join_server(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+    game_id: Option<String>,
+) -> Result<JoinResult, String> {
+    state
+        .launcher
+        .join_server(&destination_hash, game_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.launcher.leave().await.map_err(|e| e.to_string())
+}
+
+/// Where game packs live: next to the executable in a shipped build, and at the
+/// repo's `packs/` when running from a checkout.
+fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(dir) = app.path().resource_dir() {
+        let candidate = dir.join("packs");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs"))
+}
+
+pub fn run() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "launcher=info,launcher_core=info,game_bridge=info".into()),
+        )
+        .try_init();
+
+    tauri::Builder::default()
+        .setup(|app| {
+            let launcher = Launcher::from_pack_dir(&pack_dir(app.handle()));
+            app.manage(AppState { launcher });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            browse_status,
+            start_browse,
+            stop_browse,
+            list_servers,
+            list_games,
+            server_details,
+            join_server,
+            leave,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running the launcher");
+}

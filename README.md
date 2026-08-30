@@ -13,8 +13,9 @@ account, no port forwarding, no central service, and no internet required.
 > pack, the §3.3 announce record, a link allowlist, the Relay role with an off
 > switch, and a Browse role that lists and filters from announces alone — no
 > index, no account, no internet, proven end to end in
-> `tests/browse_discovery.rs`. Still to come in phase 2: the detail probe over a
-> Link, and the launcher UI. Everything past that is still plan. The working single-host implementation this generalizes is
+> `tests/browse_discovery.rs`. Phase 2 is complete: the §3.4 detail probe over a
+> Link, and a Tauri launcher (`launcher/`) over `crates/launcher-core`.
+> Everything past that is still plan. The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
 
 ## The idea

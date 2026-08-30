@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mesh Game Servers</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+        <circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/>
+        <path d="M7 7 L11 16 M17 7 L13 16 M7 6 L17 6"/>
+      </svg>
+      <h1>Mesh Game Servers</h1>
+    </div>
+    <div id="status" class="status" aria-live="polite"></div>
+  </header>
+
+  <section class="filters" id="filters" aria-label="Filters">
+    <div class="field field-text">
+      <input id="f-text" type="search" placeholder="Search server name…" aria-label="Search by name">
+    </div>
+    <div class="field">
+      <select id="f-game" aria-label="Filter by game"></select>
+    </div>
+    <label class="toggle"><input type="checkbox" id="f-players"><span>Has players</span></label>
+    <label class="toggle"><input type="checkbox" id="f-notfull"><span>Not full</span></label>
+    <label class="toggle"><input type="checkbox" id="f-pw"><span>Hide passworded</span></label>
+    <label class="toggle"><input type="checkbox" id="f-dedicated"><span>Dedicated only</span></label>
+    <label class="toggle"><input type="checkbox" id="f-legacy" checked><span>Include legacy</span></label>
+    <label class="field field-num">Max hops
+      <input id="f-maxhops" type="number" min="0" step="1" placeholder="any" aria-label="Maximum hops">
+    </label>
+  </section>
+
+  <div id="legacy-notice" class="legacy-notice hidden" role="status"></div>
+
+  <main class="main">
+    <section class="list-wrap" aria-label="Server list">
+      <div class="list-head" role="row">
+        <button class="col col-name" data-sort="name" type="button">Name<span class="arrow"></span></button>
+        <div class="col col-game">Game</div>
+        <div class="col col-map">Map</div>
+        <button class="col col-players" data-sort="players" type="button">Players<span class="arrow"></span></button>
+        <button class="col col-hops" data-sort="hops" type="button">Hops<span class="arrow"></span></button>
+        <button class="col col-seen" data-sort="last_seen" type="button">Last seen<span class="arrow"></span></button>
+      </div>
+      <div class="list-body" id="list" tabindex="0" role="listbox" aria-label="Servers"></div>
+    </section>
+
+    <aside class="detail" id="detail" hidden aria-label="Server details"></aside>
+  </main>
+
+  <div id="error" class="error hidden" role="alert"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

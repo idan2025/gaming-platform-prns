@@ -1,0 +1,27 @@
+[package]
+name = "launcher"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Tauri shell for the decentralized game-server browser"
+
+[lib]
+name = "launcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+launcher-core = { path = "../../crates/launcher-core" }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Used for production builds or when no dev server is specified. Do not remove.
+custom-protocol = ["tauri/custom-protocol"]

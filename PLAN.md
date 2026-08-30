@@ -409,8 +409,28 @@ bridge.
     question, and answering it more freely leaks what the allowlist exists to
     protect. The server stays *listed* — discoverable but private.
 
-  One thing remains in this phase: **the launcher UI**, generalized from
-  `svencoop-prns-clone/gui/` (§9).
+  **The launcher is built**, and phase 2 with it. `crates/launcher-core` holds
+  the logic and the JSON shapes the UI consumes; `launcher/src-tauri` is a thin
+  Tauri v2 shell whose every command forwards to it, so the part worth testing
+  needs no webview, display server or platform toolchain to test. `§9`'s
+  `webviewInstallMode: offlineInstaller` is set from the start rather than
+  "before shipping".
+
+  Four UI rules follow from the design rather than from taste, and they are
+  enforced in the frontend rather than left to a style guide:
+  - **No ping and nothing that reads like one** — no latency figure, no
+    quality dot, no signal bars derived from hops. Hops is shown as a hop count,
+    with the interface it was heard on.
+  - **A row's player count is stale by construction**, so it is shown with when
+    it was heard, and the live number appears only in the detail pane.
+  - **A legacy row's unknowns render as unknown, never as zero.** "0/0 players"
+    for a server nobody has a count for is a lie told on that server's behalf.
+  - **When a filter hides legacy rows, the UI says so**, with a control to clear
+    it, so a user never concludes a server left the mesh when it was filtered.
+
+  Joining starts a client bridge and tells the player where to point their game.
+  It deliberately does not launch anything — a pack cannot name a command, and
+  §10 still holds open whether packs may ever be trusted with argv.
 
   Note what the browse node does *not* have: a ping. The list sorts by `hops`,
   which is free in every announce. Measuring latency would mean opening a Link
