@@ -7,12 +7,14 @@ A **decentralized server browser** for game servers over
 Find a game server on the mesh, join it, host one, or donate transit — with no
 account, no port forwarding, no central service, and no internet required.
 
-> **Status: phase 1 complete** (`PLAN.md` §8, all six steps). The engine is
-> pinned to a patched fork of Prns ([`ENGINE.md`](ENGINE.md)), and
+> **Status: phase 1 complete, phase 2's browse core with it** (`PLAN.md` §8).
+> The engine is pinned to a patched fork of Prns ([`ENGINE.md`](ENGINE.md)), and
 > `crates/game-bridge/` carries the relay and framing parametrized by a game
-> pack, the §3.3 announce record, a link allowlist, and the Relay role with an
-> off switch. Next is phase 2: the Browse role in a launcher, from announces
-> alone. Everything below phase 1 is still plan. The working single-host implementation this generalizes is
+> pack, the §3.3 announce record, a link allowlist, the Relay role with an off
+> switch, and a Browse role that lists and filters from announces alone — no
+> index, no account, no internet, proven end to end in
+> `tests/browse_discovery.rs`. Still to come in phase 2: the detail probe over a
+> Link, and the launcher UI. Everything past that is still plan. The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
 
 ## The idea

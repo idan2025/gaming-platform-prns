@@ -4,11 +4,14 @@
 //! Extraction is one-directional (`PLAN.md` §5): this crate copies from that
 //! repo and parametrizes; that repo never depends on this one.
 //!
-//! Build order is `PLAN.md` §8. Done here: step 1 (engine pinned to a patched
-//! Prns fork — `ENGINE.md`) and step 2 (relay + framing copied and
-//! parametrized by `GameProfile`). Next: step 3, the §3.3 announce record.
+//! `PLAN.md` §8 phase 1 is complete here, and phase 2's browse core with it:
+//! the engine is pinned to a patched Prns fork (`ENGINE.md`), the relay and
+//! framing are parametrized by a game pack, servers announce the §3.3 record,
+//! links can be allowlisted, transit is opt-in, and `BridgeSession::browse`
+//! lists and filters what a node has heard with no index and no internet.
 
 pub mod announce;
+pub mod browse;
 pub mod config;
 pub mod framing;
 pub mod pack;
@@ -16,8 +19,9 @@ pub mod profile;
 pub mod relay;
 
 pub use announce::{AnnounceInfo, AnnounceRecord, DecodeError, EncodeError};
+pub use browse::{browse, BrowseFilter, BrowseQuery, SortBy};
 pub use pack::{GamePack, PackError};
-pub use config::{BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
+pub use config::{BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, ServerArgs};
 pub use profile::{GameProfile, GameTransport, ASPECT_CLIENT, ASPECT_SERVER};
 pub use relay::{
     run_bridge, server_announce_app_data, server_announce_name_bytes, BridgeSession,

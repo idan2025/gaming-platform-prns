@@ -141,6 +141,42 @@ impl ClientArgs {
     }
 }
 
+/// Browse role: listen, list, and nothing else.
+///
+/// `PLAN.md` §8 phase 2's zero-infrastructure baseline. A browse node binds no
+/// game port, announces nothing, registers no destination, and — unless asked —
+/// forwards nothing. It attaches interfaces and listens. That is the whole
+/// role, and it is deliberately the cheapest thing in the crate: the list must
+/// work with no index, no account and no internet, so that a central service
+/// can never quietly become load-bearing.
+///
+/// It holds no identity, and that is also why it has **no transit switch**: a
+/// transport identity is what makes a node forward for others, and this role
+/// never holds one. Browsing a list is not consent to carry strangers' packets
+/// (`PLAN.md` §4); someone who wants to donate transit runs `RelayArgs`.
+///
+/// It does not need an identity to hear announces. The detail probe in
+/// `PLAN.md` §3.4 — opening a Link to ask a server for its player list and
+/// mods — does need one, and that is when this grows a field.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BrowserArgs {
+    pub tcp: Option<String>,
+    pub auto: bool,
+}
+
+impl BrowserArgs {
+    pub fn new() -> Self {
+        Self { tcp: None, auto: false }
+    }
+}
+
+impl Default for BrowserArgs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Relay role: donate transit and nothing else.
 ///
 /// A node with interfaces and a transport identity, no game, no bound game
@@ -218,6 +254,7 @@ pub enum BridgeConfig {
     Server(ServerArgs),
     Client(ClientArgs),
     Relay(RelayArgs),
+    Browse(BrowserArgs),
 }
 
 impl BridgeConfig {
@@ -226,6 +263,7 @@ impl BridgeConfig {
             Self::Server(_) => BridgeRole::Server,
             Self::Client(_) => BridgeRole::Client,
             Self::Relay(_) => BridgeRole::Relay,
+            Self::Browse(_) => BridgeRole::Browse,
         }
     }
 
@@ -235,7 +273,7 @@ impl BridgeConfig {
         match self {
             Self::Server(a) => Some(&a.profile),
             Self::Client(a) => Some(&a.profile),
-            Self::Relay(_) => None,
+            Self::Relay(_) | Self::Browse(_) => None,
         }
     }
 
@@ -245,6 +283,9 @@ impl BridgeConfig {
             Self::Server(a) => a.relay_transit,
             Self::Client(a) => a.relay_transit,
             Self::Relay(_) => true,
+            // A browse node holds no transport identity, so it forwards
+            // nothing. Not a policy, a structural fact.
+            Self::Browse(_) => false,
         }
     }
 }
@@ -255,6 +296,8 @@ pub enum BridgeRole {
     Client,
     /// Donates transit, runs no game. `PLAN.md` §4.
     Relay,
+    /// Listens and lists. Runs no game, announces nothing. `PLAN.md` §3.
+    Browse,
 }
 
 #[cfg(test)]
@@ -269,6 +312,16 @@ mod tests {
         let p = GameProfile::sven_coop();
         assert!(!ClientArgs::new(p.clone()).relay_transit, "a client must opt in");
         assert!(ServerArgs::new(p).relay_transit, "a host is already volunteering");
+    }
+
+    /// A browse node cannot forward for anyone, and the type says so rather
+    /// than offering a switch that would do nothing.
+    #[test]
+    fn a_browse_node_never_relays_and_has_no_game() {
+        let cfg = BridgeConfig::Browse(BrowserArgs::new());
+        assert_eq!(cfg.role(), BridgeRole::Browse);
+        assert!(!cfg.relays_transit());
+        assert!(cfg.profile().is_none(), "browsing spans every game");
     }
 
     #[test]

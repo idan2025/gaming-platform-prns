@@ -10,7 +10,10 @@ now code: `crates/game-bridge/`, with the engine pin recorded in `ENGINE.md`.
 **Phase 1 is done** — all six steps of `PLAN.md` §8: the Prns fork and pin, the
 parametrized relay and framing, the §3.3 announce record, the link allowlist,
 the Relay role with a transit off switch, and game packs with Sven Co-op as
-pack #1. Next is phase 2, the Browse role. `cargo test` is 49 tests and green.
+pack #1. **Phase 2's browse core is built too**: a `Browse` role that binds no
+game port and holds no identity, and `browse.rs` filtering and sorting from
+announces alone. Remaining in phase 2: the §3.4 detail probe over a Link, and
+the launcher UI. `cargo test` is 74 tests and green, clippy clean.
 
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:

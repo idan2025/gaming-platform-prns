@@ -66,7 +66,9 @@ use tokio::task::LocalSet;
 use tracing::{debug, error, info, warn};
 
 use crate::announce::{self, AnnounceFlags, AnnounceInfo, AnnounceRecord};
-use crate::config::{AnnounceFormat, BridgeConfig, BridgeRole, ClientArgs, RelayArgs, ServerArgs};
+use crate::config::{
+    AnnounceFormat, BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, ServerArgs,
+};
 use crate::framing::{frame, Reassembler};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
 
@@ -77,6 +79,7 @@ pub async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
         BridgeConfig::Server(args) => BridgeSession::start_server(args).await?,
         BridgeConfig::Client(args) => BridgeSession::start_client(args).await?,
         BridgeConfig::Relay(args) => BridgeSession::start_relay(args).await?,
+        BridgeConfig::Browse(args) => BridgeSession::start_browser(args).await?,
     };
     session.await_completion().await
 }
@@ -99,6 +102,18 @@ pub struct BridgeSession {
 pub struct DiscoveredServer {
     pub destination_hash: DestinationHash,
     pub last_seen: Instant,
+    /// Mesh distance, straight off the announce.
+    ///
+    /// `PLAN.md` §3.4 sorts the browser by this and shows it instead of a
+    /// ping, because it is the one distance figure that is both free and
+    /// honest. A ping would have to be measured by opening a Link to every
+    /// server in the list, which is exactly the traffic a decentralized
+    /// browser must not generate.
+    pub hops: u8,
+    /// Which of this node's interfaces heard the announce. Shown, not
+    /// filtered on by default: it is how a user tells a LAN neighbour from
+    /// something eight hops away over a TCP relay.
+    pub source_interface: InterfaceId,
     /// What the announce said about itself: a §3.3 record, or a bare display
     /// name from a deployed v0.1.x peer.
     pub info: AnnounceInfo,
@@ -339,8 +354,8 @@ impl BridgeSession {
                     std::collections::HashMap::new();
                 while let Some(event) = event_rx.recv().await {
                     match event {
-                        BridgeEvent::AnnounceHeard { destination, info } => {
-                            remember_server(&router_discovered, destination, info).await;
+                        BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } => {
+                            remember_server(&router_discovered, destination, hops, source_interface, info).await;
                         }
                         BridgeEvent::PeerIdentified { link_id, identity } => {
                             router_connected_clients.write().await.insert(link_id, identity);
@@ -563,8 +578,8 @@ impl BridgeSession {
                 let mut event_rx = event_rx;
                 while let Some(event) = event_rx.recv().await {
                     match event {
-                        BridgeEvent::AnnounceHeard { destination, info } => {
-                            remember_server(&router_discovered, destination, info).await;
+                        BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } => {
+                            remember_server(&router_discovered, destination, hops, source_interface, info).await;
                             let mut t = router_target.write().await;
                             if t.is_none() {
                                 info!(server_hash = ?destination.as_bytes(), "discovered a server announce");
@@ -769,8 +784,8 @@ impl BridgeSession {
             let _router_task = tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 while let Some(event) = event_rx.recv().await {
-                    if let BridgeEvent::AnnounceHeard { destination, info } = event {
-                        remember_server(&router_discovered, destination, info).await;
+                    if let BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } = event {
+                        remember_server(&router_discovered, destination, hops, source_interface, info).await;
                     }
                 }
             });
@@ -779,6 +794,65 @@ impl BridgeSession {
             Ok((handle, async move { let _ = node.run().await; }))
         })
         .await
+    }
+
+    /// Start a node that only listens for announces.
+    ///
+    /// The zero-infrastructure baseline of `PLAN.md` §8 phase 2: no index, no
+    /// account, no internet, no bound game port, nothing announced, nothing
+    /// forwarded unless asked. Two launchers on a shared interface find each
+    /// other with this and nothing else, which is the property the whole
+    /// design exists to protect (`DESIGN.md` §0).
+    ///
+    /// Call `browse()` for a filtered, sorted view of what it has heard.
+    pub async fn start_browser(args: BrowserArgs) -> Result<Self> {
+        spawn_bridge_node(BridgeRole::Browse, None, false, move |discovered, _connected| async move {
+            let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+            let node = PrnsNode::new(PrnsNodeRecipe {
+                // No transport identity, so this node forwards nothing for
+                // anyone. That is structural, not a setting — see BrowserArgs.
+                transport_identity: None,
+                pre_configured_destinations: [] as [PreConfiguredDestination; 0],
+                app_state: (),
+                storage: GrowableHeap,
+                request_endpoints: request_endpoints![],
+                on_event: {
+                    let event_tx = event_tx.clone();
+                    move |event, _state| funnel_event(event, &event_tx)
+                },
+                interfaces: |node: &PrnsNodeHandle| {
+                    attach_interfaces(node, args.tcp.as_deref(), args.auto);
+                },
+                persistence: NoPersistence,
+            });
+            let handle = node.handle();
+
+            let router_discovered = discovered.clone();
+            let _router_task = tokio::spawn(async move {
+                let mut event_rx = event_rx;
+                while let Some(event) = event_rx.recv().await {
+                    if let BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } = event {
+                        remember_server(&router_discovered, destination, hops, source_interface, info).await;
+                    }
+                }
+            });
+
+            info!("browse node running; listening for announces");
+            Ok((handle, async move { let _ = node.run().await; }))
+        })
+        .await
+    }
+
+    /// A filtered, sorted view of everything this node has heard.
+    ///
+    /// Takes the snapshot and runs `browse::browse` over it. `PLAN.md` §3.4's
+    /// default is ascending hops, which is what `BrowseQuery::default` gives.
+    pub async fn browse(&self, query: &crate::browse::BrowseQuery) -> Vec<DiscoveredServer> {
+        let rows = self.discovered.read().await;
+        crate::browse::browse(&rows, query, Instant::now())
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// What this node is carrying, per interface.
@@ -1014,14 +1088,27 @@ where
 async fn remember_server(
     list: &Arc<RwLock<Vec<DiscoveredServer>>>,
     destination: DestinationHash,
+    hops: u8,
+    source_interface: InterfaceId,
     info: AnnounceInfo,
 ) {
     let mut l = list.write().await;
     if let Some(s) = l.iter_mut().find(|s| s.destination_hash == destination) {
         s.last_seen = Instant::now();
+        // Every field is overwritten, not merged. A server that moved closer,
+        // changed interface, renamed itself or emptied out should read as it
+        // is now; the freshest announce is the truth about it.
+        s.hops = hops;
+        s.source_interface = source_interface;
         s.info = info;
     } else {
-        l.push(DiscoveredServer { destination_hash: destination, last_seen: Instant::now(), info });
+        l.push(DiscoveredServer {
+            destination_hash: destination,
+            last_seen: Instant::now(),
+            hops,
+            source_interface,
+            info,
+        });
     }
 }
 
@@ -1031,7 +1118,12 @@ async fn remember_server(
 
 #[derive(Debug)]
 enum BridgeEvent {
-    AnnounceHeard { destination: DestinationHash, info: AnnounceInfo },
+    AnnounceHeard {
+        destination: DestinationHash,
+        hops: u8,
+        source_interface: InterfaceId,
+        info: AnnounceInfo,
+    },
     LinkEstablished { link_id: LinkId },
     PeerIdentified { link_id: LinkId, identity: IdentityHash },
     /// Synthesized by the server's own timer, not by the engine: an accepted
@@ -1043,13 +1135,23 @@ enum BridgeEvent {
 
 fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
     match event {
-        PrnsEvent::Diagnostic(Diagnostic::AnnounceHeard { destination, app_data, .. }) => {
+        PrnsEvent::Diagnostic(Diagnostic::AnnounceHeard {
+            destination,
+            hops,
+            source_interface,
+            app_data,
+        }) => {
             // A malformed announce is dropped, not listed: it is bytes from an
             // unauthenticated stranger, and a row we cannot parse is a row we
             // cannot honestly show.
             match crate::announce::decode(&app_data) {
                 Ok(info) => {
-                    let _ = tx.send(BridgeEvent::AnnounceHeard { destination, info });
+                    let _ = tx.send(BridgeEvent::AnnounceHeard {
+                        destination,
+                        hops,
+                        source_interface,
+                        info,
+                    });
                 }
                 Err(e) => {
                     debug!(

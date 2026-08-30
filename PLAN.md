@@ -381,6 +381,28 @@ bridge.
   no index, no account, no internet. This is the zero-infrastructure baseline and
   it ships before any central service, so the central service can never quietly
   become load-bearing.
+
+  **The bridge half is built (2026-08-30).** `BridgeConfig::Browse` is a node
+  that binds no game port, registers no destination, announces nothing and holds
+  no identity — so it cannot forward for anyone even by accident — and
+  `crates/game-bridge/src/browse.rs` filters and sorts what it heard.
+  `tests/browse_discovery.rs` proves the baseline end to end on loopback: a
+  browse node lists a server with its game id, players, map and tier, and lists
+  a *legacy* announce by name with no game id, in about a second.
+
+  Two things remain in this phase, both deliberately named rather than folded in:
+  1. **The detail probe** (§3.4) — opening a Link to ask a server for the
+     expensive fields. The engine's request-endpoint mechanism
+     (`request_endpoints!`, `RequestEndpoint`) is the right vehicle, but the
+     bridge does not itself know a player *list*: that needs a game-specific
+     query (A2S for GoldSrc), which belongs with the pack work, and an
+     `app_state` the bridge currently sets to `()`.
+  2. **The launcher UI**, generalized from `svencoop-prns-clone/gui/` (§9).
+
+  Note what the browse node does *not* have: a ping. The list sorts by `hops`,
+  which is free in every announce. Measuring latency would mean opening a Link
+  to every row — precisely the traffic a browser anyone can run must not
+  generate.
 - **Phase 3 — one node, many servers.** `platform-agent`, Docker orchestration,
   shared read-only content store plus per-instance writable overlay (a 2.74 GB
   copy per instance does not scale), port allocation. Agent has a local API; still
