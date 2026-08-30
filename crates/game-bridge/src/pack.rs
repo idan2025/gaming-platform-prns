@@ -31,7 +31,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{GameProfile, GameTransport, ProfileError};
+use crate::profile::{GameProfile, GameTransport, ProfileError, QueryProtocol};
 
 /// Manifest schema version. Bumped when a field changes meaning, not when one
 /// is added — unknown fields are rejected (see `deny_unknown_fields`), but a
@@ -59,6 +59,11 @@ pub struct GamePack {
     /// Viability tier, `GAMES.md` §4: 1 low-rate UDP tick, 2 TCP or bursty,
     /// 3 modern high-bitrate.
     pub min_link_class: u8,
+    /// How to ask a running server for live stats: `"a2s"` for GoldSrc and
+    /// Source, omitted for everything else. A game with no query answers a
+    /// detail probe with its announced numbers, flagged as announced.
+    #[serde(default)]
+    pub query: Option<PackQuery>,
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
@@ -69,6 +74,20 @@ pub struct GamePack {
 pub enum PackTransport {
     Udp,
     Tcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackQuery {
+    A2s,
+}
+
+impl From<PackQuery> for QueryProtocol {
+    fn from(q: PackQuery) -> Self {
+        match q {
+            PackQuery::A2s => QueryProtocol::A2s,
+        }
+    }
 }
 
 impl From<PackTransport> for GameTransport {
@@ -124,6 +143,7 @@ impl GamePack {
             default_port: 27015,
             transport: PackTransport::Udp,
             min_link_class: 1,
+            query: Some(PackQuery::A2s),
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -182,6 +202,7 @@ impl GamePack {
             default_port: self.default_port,
             transport: self.transport.into(),
             min_link_class: self.min_link_class,
+            query: self.query.map(Into::into),
         };
         profile.validate()?;
         Ok(profile)

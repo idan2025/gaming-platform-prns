@@ -390,14 +390,27 @@ bridge.
   browse node lists a server with its game id, players, map and tier, and lists
   a *legacy* announce by name with no game id, in about a second.
 
-  Two things remain in this phase, both deliberately named rather than folded in:
-  1. **The detail probe** (§3.4) — opening a Link to ask a server for the
-     expensive fields. The engine's request-endpoint mechanism
-     (`request_endpoints!`, `RequestEndpoint`) is the right vehicle, but the
-     bridge does not itself know a player *list*: that needs a game-specific
-     query (A2S for GoldSrc), which belongs with the pack work, and an
-     `app_state` the bridge currently sets to `()`.
-  2. **The launcher UI**, generalized from `svencoop-prns-clone/gui/` (§9).
+  **The detail probe is built too.** `BridgeSession::probe_details` opens a Link
+  to one server and asks it, over the engine's request-endpoint mechanism, at
+  `/game-bridge/details/1`. Three things it settled:
+
+  - A node with **no destination and no identity** can still initiate a Link and
+    make a request, so browsing and probing stay the cheap passive role rather
+    than requiring the join machinery.
+  - The response carries a `StatsSource` flag and a `stats_age_secs`. Live
+    numbers come from a background A2S poll, not from the request handler — a
+    handler that blocked on a 2-second UDP query would stall the node's event
+    loop for every other peer. So "live" honestly means "read this recently",
+    and a game with no query protocol answers with its announced numbers,
+    flagged as announced. `GameProfile::query` / the pack's `query` field says
+    which is which; only GoldSrc and Source can be asked today.
+  - **An allowlisted server refuses a probe from an unlisted identity.** The
+    allowlist decides who may play; who may see who is playing is the same
+    question, and answering it more freely leaks what the allowlist exists to
+    protect. The server stays *listed* — discoverable but private.
+
+  One thing remains in this phase: **the launcher UI**, generalized from
+  `svencoop-prns-clone/gui/` (§9).
 
   Note what the browse node does *not* have: a ping. The list sorts by `hops`,
   which is free in every announce. Measuring latency would mean opening a Link

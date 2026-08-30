@@ -60,12 +60,14 @@ use prns_core::routing::announce::emit::{AnnounceAppDataBytes, MAX_ANNOUNCE_APP_
 use prns_core::routing::delivery::Delivery;
 use prns_core::interfaces::InterfaceId;
 use prns_core::routing::links::LinkId;
+use prns_core::routing::request_handlers::RequestPathHash;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::LocalSet;
 use tracing::{debug, error, info, warn};
 
 use crate::announce::{self, AnnounceFlags, AnnounceInfo, AnnounceRecord};
+use crate::details::{ServerDetails, StatsSource, DETAILS_ENDPOINT_ID};
 use crate::config::{
     AnnounceFormat, BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, ServerArgs,
 };
@@ -73,6 +75,164 @@ use crate::framing::{frame, Reassembler};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
 
 const UDP_READ_BUF: usize = 8192;
+
+/// How often the server re-reads live stats out of its game server.
+///
+/// Polled on a timer rather than queried inside the request handler: an A2S
+/// query takes up to two seconds, and the handler runs on the node's own
+/// single-threaded runtime, so a probe that blocked on it would stall every
+/// other peer's traffic for that long. The cost is that "live" means "read
+/// this recently", which `ServerDetails::stats_age_secs` reports rather than
+/// hides.
+const LIVE_STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Live figures read out of the game server, and when.
+struct LiveStats {
+    players: u8,
+    max_players: u8,
+    map: String,
+    player_names: Vec<String>,
+    read_at: Instant,
+}
+
+/// What the server knows about itself, shared with the detail-probe endpoint.
+///
+/// Held by the node as its `app_state`, so a request handler gets `&ServerState`
+/// and never has to reach back into the relay's tokio structures.
+#[derive(Clone)]
+pub struct ServerState {
+    inner: Arc<ServerStateInner>,
+}
+
+struct ServerStateInner {
+    game_id: String,
+    name: String,
+    /// The map as configured. A live read supersedes it when one is available.
+    announced_map: String,
+    announced_players: u8,
+    announced_max_players: u8,
+    started: Instant,
+    bridge_clients: std::sync::atomic::AtomicU16,
+    live: std::sync::Mutex<Option<LiveStats>>,
+    /// Empty means "open"; non-empty means only these identities may ask.
+    allowlist: Vec<IdentityHash>,
+}
+
+impl ServerState {
+    fn new(args: &ServerArgs, allowlist: Vec<IdentityHash>) -> Self {
+        let record = server_announce_record(args);
+        Self {
+            inner: Arc::new(ServerStateInner {
+                game_id: record.game_id,
+                name: record.name,
+                announced_map: record.map,
+                announced_players: record.players,
+                announced_max_players: record.max_players,
+                started: Instant::now(),
+                bridge_clients: std::sync::atomic::AtomicU16::new(0),
+                live: std::sync::Mutex::new(None),
+                allowlist,
+            }),
+        }
+    }
+
+    fn set_bridge_clients(&self, n: usize) {
+        self.inner
+            .bridge_clients
+            .store(n.min(u16::MAX as usize) as u16, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn store_live(&self, stats: LiveStats) {
+        if let Ok(mut slot) = self.inner.live.lock() {
+            *slot = Some(stats);
+        }
+    }
+
+    /// Whether `requester` may ask this server about itself.
+    ///
+    /// An allowlisted server does not hand its roster to strangers. The
+    /// allowlist already decides who may *play*; who may see who is playing is
+    /// the same question, and answering it more freely would leak exactly what
+    /// the allowlist exists to keep private.
+    fn may_answer(&self, requester: Option<IdentityHash>) -> bool {
+        if self.inner.allowlist.is_empty() {
+            return true;
+        }
+        match requester {
+            Some(id) => self.inner.allowlist.contains(&id),
+            None => false,
+        }
+    }
+
+    fn details(&self) -> ServerDetails {
+        let i = &self.inner;
+        let uptime_secs = i.started.elapsed().as_secs().min(u32::MAX as u64) as u32;
+        let bridge_clients = i.bridge_clients.load(std::sync::atomic::Ordering::Relaxed);
+
+        let live = i.live.lock().ok().and_then(|slot| {
+            slot.as_ref().map(|s| {
+                (
+                    s.players,
+                    s.max_players,
+                    s.map.clone(),
+                    s.player_names.clone(),
+                    s.read_at.elapsed().as_secs().min(u16::MAX as u64) as u16,
+                )
+            })
+        });
+
+        match live {
+            Some((players, max_players, map, player_names, age)) => ServerDetails {
+                game_id: i.game_id.clone(),
+                name: i.name.clone(),
+                map,
+                players,
+                max_players,
+                stats_source: StatsSource::Live,
+                uptime_secs,
+                bridge_clients,
+                stats_age_secs: age,
+                player_names,
+                roster_truncated: false,
+            },
+            None => ServerDetails {
+                game_id: i.game_id.clone(),
+                name: i.name.clone(),
+                map: i.announced_map.clone(),
+                players: i.announced_players,
+                max_players: i.announced_max_players,
+                stats_source: StatsSource::Announced,
+                uptime_secs,
+                bridge_clients,
+                stats_age_secs: 0,
+                player_names: Vec::new(),
+                roster_truncated: false,
+            },
+        }
+    }
+}
+
+/// The `PLAN.md` §3.4 detail probe, server side.
+struct DetailsEndpoint;
+
+impl RequestEndpoint<ServerState> for DetailsEndpoint {
+    const ENDPOINT_ID: &'static str = DETAILS_ENDPOINT_ID;
+    // Gating happens in the handler instead, against the configured allowlist:
+    // `POLICY` is a const and cannot see runtime config, and `AllowList` wants
+    // a `&'static [IdentityHash]` we do not have.
+    const POLICY: RequestEndpointPolicy = RequestEndpointPolicy::AllowAll;
+
+    async fn handle(mut cx: RequestContext<'_, ServerState>) -> Result<(), Decline> {
+        if !cx.state.may_answer(cx.requester) {
+            return Err(Decline::Ignore);
+        }
+        // The request body advertises the requester's newest schema. We answer
+        // in ours regardless; a requester too old to read it gets a clean
+        // `UnsupportedSchema` from its own decoder rather than a mis-parse.
+        let bytes = cx.state.details().encode();
+        cx.respond(bytes)
+    }
+}
 
 pub async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
     let session = match cfg {
@@ -256,7 +416,7 @@ impl BridgeSession {
                 ratchet: RatchetPolicy::NoRatchets,
                 resource_strategy: ResourceStrategy::AcceptNone,
                 maximum_request_bytes: Default::default(),
-                request_endpoints: ServeMyRequestEndpoints::No,
+                request_endpoints: ServeMyRequestEndpoints::Yes,
             }
             .destination_hash()
             .map_err(|e| anyhow!("invalid destination name: {e:?}"))?
@@ -269,6 +429,7 @@ impl BridgeSession {
             let name_bytes = server_announce_bytes(&args);
             let relay_transit = args.relay_transit;
             info!(game = %args.profile.id, relay_transit, "transit relaying");
+            let state = ServerState::new(&args, allowlist.clone());
             let destination = PreConfiguredDestination::Single {
                 app_name: &app_name,
                 aspects: &[ASPECT_SERVER],
@@ -279,7 +440,8 @@ impl BridgeSession {
                 ratchet: RatchetPolicy::NoRatchets,
                 resource_strategy: ResourceStrategy::AcceptNone,
                 maximum_request_bytes: Default::default(),
-                request_endpoints: ServeMyRequestEndpoints::No,
+                // Serves the §3.4 detail probe.
+                request_endpoints: ServeMyRequestEndpoints::Yes,
             };
             let server_hash = destination
                 .destination_hash()
@@ -302,9 +464,9 @@ impl BridgeSession {
                 // is forwarded for anyone else.
                 transport_identity: relay_transit.then_some(identity),
                 pre_configured_destinations: [destination],
-                app_state: (),
+                app_state: state.clone(),
                 storage: GrowableHeap,
-                request_endpoints: request_endpoints![],
+                request_endpoints: request_endpoints![DetailsEndpoint],
                 on_event: {
                     let event_tx = event_tx.clone();
                     move |event, _state| funnel_event(event, &event_tx)
@@ -315,6 +477,34 @@ impl BridgeSession {
                 persistence: NoPersistence,
             });
             let handle = node.handle();
+
+            // Live-stats poller. Only for games that answer a query at all;
+            // everything else serves announced numbers, flagged as announced.
+            if let Some(crate::profile::QueryProtocol::A2s) = args.profile.query {
+                let stats_state = state.clone();
+                let _stats_task = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(LIVE_STATS_INTERVAL);
+                    loop {
+                        ticker.tick().await;
+                        match crate::a2s::query(game_addr).await {
+                            Ok(stats) => stats_state.store_live(LiveStats {
+                                players: stats.info.players,
+                                max_players: stats.info.max_players,
+                                map: stats.info.map.clone(),
+                                player_names: stats
+                                    .players_list
+                                    .iter()
+                                    .map(|p| p.name.clone())
+                                    .collect(),
+                                read_at: Instant::now(),
+                            }),
+                            // Expected whenever the game server is not running.
+                            // The last good read stays, and its age says so.
+                            Err(e) => debug!(error = %e, "live stats query failed"),
+                        }
+                    }
+                });
+            }
 
             // Announcer.
             let announcer = handle.clone();
@@ -344,6 +534,7 @@ impl BridgeSession {
             let router_discovered = discovered.clone();
             let router_connected_clients = connected_clients.clone();
             let identify_timeout_tx = event_tx.clone();
+            let router_state = state.clone();
             let identify_timeout_secs = args.identify_timeout_secs.max(1);
             let _router_task = tokio::spawn(async move {
                 let mut event_rx = event_rx;
@@ -416,6 +607,7 @@ impl BridgeSession {
                                     router_handle.clone(),
                                     game_addr,
                                 );
+                                router_state.set_bridge_clients(router_senders.read().await.len());
                                 continue;
                             }
 
@@ -425,6 +617,7 @@ impl BridgeSession {
                             // instead of being dropped -- a peer that turns
                             // out to be allowed loses no datagram, including
                             // the first one.
+                            router_state.set_bridge_clients(router_senders.read().await.len());
                             pending_identify.insert(link_id, rx);
                             let timeout_tx = identify_timeout_tx.clone();
                             tokio::spawn(async move {
@@ -438,6 +631,7 @@ impl BridgeSession {
                                 let _ = tx.send(Vec::new()).await;
                             }
                             router_connected_clients.write().await.remove(&link_id);
+                            router_state.set_bridge_clients(router_senders.read().await.len());
                         }
                         BridgeEvent::LinkData { link_id, bytes } => {
                             if let Some(tx) = router_senders.read().await.get(&link_id).cloned() {
@@ -853,6 +1047,55 @@ impl BridgeSession {
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    /// Ask one server about itself over a Link (`PLAN.md` §3.4).
+    ///
+    /// **One server, because a person opened it.** Never call this across a
+    /// list, not even lazily and not even for the visible rows: an announce is
+    /// free to listen to, but a probe is a connection to somebody else's
+    /// machine, and a browser that opened one per row would be a scanner. The
+    /// announce record is what fills the list; this fills a detail pane.
+    ///
+    /// Returns the details and the link's measured round trip. That RTT is the
+    /// only latency figure in the whole product, and it exists precisely
+    /// because it was paid for — the list still sorts by hops.
+    pub async fn probe_details(
+        &self,
+        destination: DestinationHash,
+    ) -> Result<(ServerDetails, u32)> {
+        let link_id = match self.handle.establish_link(destination).await {
+            Ok(id) => id,
+            Err(e) => {
+                // A server may need a path resolved before a link will open —
+                // announces are not always enough between same-interface peers.
+                debug!(error = ?e, "no route for probe; requesting a path first");
+                self.handle
+                    .request_path(destination)
+                    .await
+                    .map_err(|pe| anyhow!("no path to server: {pe:?}"))?;
+                self.handle
+                    .establish_link(destination)
+                    .await
+                    .map_err(|e2| anyhow!("link to server failed: {e2:?}"))?
+            }
+        };
+
+        let outcome = self
+            .handle
+            .request(
+                link_id,
+                RequestPathHash::of(DETAILS_ENDPOINT_ID),
+                &crate::details::request_body(),
+            )
+            .await;
+        // Close the link either way: a probe is a question, not a session.
+        let _ = self.handle.close_link(link_id);
+
+        let (response, rtt) = outcome.map_err(|e| anyhow!("detail probe failed: {e:?}"))?;
+        let details = ServerDetails::decode(&response)
+            .map_err(|e| anyhow!("server sent a details response we cannot read: {e}"))?;
+        Ok((details, rtt.millis().min(u32::MAX as u64) as u32))
     }
 
     /// What this node is carrying, per interface.

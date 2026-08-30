@@ -10,9 +10,11 @@
 //! links can be allowlisted, transit is opt-in, and `BridgeSession::browse`
 //! lists and filters what a node has heard with no index and no internet.
 
+pub mod a2s;
 pub mod announce;
 pub mod browse;
 pub mod config;
+pub mod details;
 pub mod framing;
 pub mod pack;
 pub mod profile;

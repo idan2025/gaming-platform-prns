@@ -18,6 +18,22 @@ pub const ASPECT_CLIENT: &str = "client";
 /// Longest `game_id` the announce record can carry (`PLAN.md` §3.3).
 pub const MAX_GAME_ID_LEN: usize = 24;
 
+/// A protocol for asking a running game server about itself.
+///
+/// Separate from `GameTransport` because the two do not follow each other: a
+/// game can speak UDP and answer nothing (Quake-family), or answer a query on a
+/// different port than it plays on. `None` is the honest default — most games
+/// have no standard query protocol, and a detail probe against one of them
+/// reports announced numbers with `StatsSource::Announced` rather than
+/// pretending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum QueryProtocol {
+    /// Valve's A2S, on the same UDP port the game runs on. GoldSrc and Source.
+    A2s,
+}
+
 /// How the bridge moves the game's traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -50,6 +66,8 @@ pub struct GameProfile {
     /// browser can warn before a player joins something their mesh cannot
     /// carry. An ordering until phase 0 measures it.
     pub min_link_class: u8,
+    /// How to ask this game's server for live stats, if it can be asked.
+    pub query: Option<QueryProtocol>,
 }
 
 /// Why a profile cannot be used.
@@ -96,6 +114,7 @@ impl GameProfile {
             transport: GameTransport::Udp,
             // GoldSrc, `GAMES.md` §4 tier 1.
             min_link_class: 1,
+            query: Some(QueryProtocol::A2s),
         }
     }
 

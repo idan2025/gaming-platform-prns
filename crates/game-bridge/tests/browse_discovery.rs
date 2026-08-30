@@ -178,3 +178,105 @@ async fn filtering_by_game_id_finds_the_server() {
     browser.stop().await;
     server.stop().await;
 }
+
+/// The §3.4 detail probe, end to end: a browse node opens a Link to one server
+/// it heard and asks it about itself.
+///
+/// This also settles a question the design rested on: a node with **no
+/// destination and no identity** can still initiate a Link and make a request.
+/// If it could not, browsing and probing would have to be the same node as
+/// joining, and the Browse role would stop being the cheap passive thing it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browse_node_can_probe_a_server_it_heard() {
+    let tcp_port = common::free_tcp_port();
+    let dir = common::scratch_dir("probe");
+
+    let mut server_args = ServerArgs::new(GameProfile::sven_coop());
+    server_args.identity = dir.join("server.identity");
+    server_args.tcp = Some(format!("0.0.0.0:{tcp_port}"));
+    server_args.announce_interval = 1;
+    server_args.name = Some("Probe Target".to_string());
+    server_args.players = 5;
+    server_args.max_players = 16;
+    server_args.map = Some("svencoop2".to_string());
+    // Nothing is listening on this port, so the A2S poll never succeeds and the
+    // server must fall back to announced numbers — which is the case worth
+    // testing, since most games can never be queried at all.
+    server_args.game_port = 1;
+    let mut server = BridgeSession::start_server(server_args).await.expect("server starts");
+
+    let mut browser_args = BrowserArgs::new();
+    browser_args.tcp = Some(format!("127.0.0.1:{tcp_port}"));
+    let mut browser = BridgeSession::start_browser(browser_args).await.expect("browser starts");
+
+    let query = BrowseQuery::default();
+    assert!(
+        wait_for(&browser, &query, Duration::from_secs(30), |rows| {
+            rows.iter().any(|r| r.game_id() == Some("sven-coop"))
+        })
+        .await,
+        "browse node never heard the probe target"
+    );
+
+    let hash = browser.browse(&query).await[0].destination_hash;
+    let (details, rtt_ms) = browser
+        .probe_details(hash)
+        .await
+        .expect("the detail probe should settle");
+
+    assert_eq!(details.game_id, "sven-coop");
+    assert_eq!(details.name, "Probe Target");
+    assert_eq!((details.players, details.max_players), (5, 16));
+    assert_eq!(details.map, "svencoop2");
+    assert_eq!(
+        details.stats_source,
+        game_bridge::details::StatsSource::Announced,
+        "with no game server to query, the numbers must be flagged as announced"
+    );
+    assert_eq!(details.stats_age_secs, 0);
+    assert!(details.player_names.is_empty());
+    // The one latency figure in the product, and it was paid for.
+    assert!(rtt_ms < 10_000, "implausible RTT over loopback: {rtt_ms}ms");
+
+    browser.stop().await;
+    server.stop().await;
+}
+
+/// An allowlisted server must not tell a stranger who is playing on it.
+///
+/// The allowlist already decides who may join; who may see the roster is the
+/// same question, and answering it more freely leaks exactly what the allowlist
+/// exists to keep private.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_allowlisted_server_refuses_a_probe_from_a_stranger() {
+    let tcp_port = common::free_tcp_port();
+    let dir = common::scratch_dir("probe-allowlist");
+
+    let mut server_args = ServerArgs::new(GameProfile::sven_coop());
+    server_args.identity = dir.join("server.identity");
+    server_args.tcp = Some(format!("0.0.0.0:{tcp_port}"));
+    server_args.announce_interval = 1;
+    server_args.game_port = 1;
+    // Somebody else entirely.
+    server_args.allowlist = vec!["0102030405060708090a0b0c0d0e0f10".to_string()];
+    let mut server = BridgeSession::start_server(server_args).await.expect("server starts");
+
+    let mut browser_args = BrowserArgs::new();
+    browser_args.tcp = Some(format!("127.0.0.1:{tcp_port}"));
+    let mut browser = BridgeSession::start_browser(browser_args).await.expect("browser starts");
+
+    let query = BrowseQuery::default();
+    assert!(
+        wait_for(&browser, &query, Duration::from_secs(30), |rows| !rows.is_empty()).await,
+        "the allowlisted server should still be listed — it is discoverable, just private"
+    );
+
+    let hash = browser.browse(&query).await[0].destination_hash;
+    assert!(
+        browser.probe_details(hash).await.is_err(),
+        "an allowlisted server answered a probe from an unlisted identity"
+    );
+
+    browser.stop().await;
+    server.stop().await;
+}
