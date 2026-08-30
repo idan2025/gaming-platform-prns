@@ -7,9 +7,10 @@ A **decentralized server browser** for game servers over Reticulum, built on
 
 **Phase 1 is underway.** The docs are still the authority on design, but there is
 now code: `crates/game-bridge/`, with the engine pin recorded in `ENGINE.md`.
-Done: step 1 (fork Prns, depend on the fork) and step 2 (`relay.rs` + `framing.rs`
-copied and parametrized by `GameProfile`). Next: step 3, the §3.3 announce record.
-Build order is `PLAN.md` §8.
+**Phase 1 is done** — all six steps of `PLAN.md` §8: the Prns fork and pin, the
+parametrized relay and framing, the §3.3 announce record, the link allowlist,
+the Relay role with a transit off switch, and game packs with Sven Co-op as
+pack #1. Next is phase 2, the Browse role. `cargo test` is 49 tests and green.
 
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:

@@ -1,0 +1,16 @@
+# Game pack #1. See crates/game-bridge/src/pack.rs for what a pack may and may
+# not contain — in particular, a pack describes a game, it never launches one.
+#
+# `app_name` is a wire contract frozen by PLAN.md §5: deployed svencoop-prns
+# v0.1.10 servers announce under it, and changing it orphans every one of them.
+
+schema_version = 1
+
+id = "sven-coop"
+display_name = "Sven Co-op"
+app_name = "sven-coop"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+
+notes = "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns v0.1.10 servers announce under it."

@@ -11,10 +11,12 @@
 pub mod announce;
 pub mod config;
 pub mod framing;
+pub mod pack;
 pub mod profile;
 pub mod relay;
 
 pub use announce::{AnnounceInfo, AnnounceRecord, DecodeError, EncodeError};
+pub use pack::{GamePack, PackError};
 pub use config::{BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
 pub use profile::{GameProfile, GameTransport, ASPECT_CLIENT, ASPECT_SERVER};
 pub use relay::{
