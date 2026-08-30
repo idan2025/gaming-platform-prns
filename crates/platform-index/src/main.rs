@@ -75,6 +75,10 @@ async fn main() -> Result<()> {
         identity = %hex::encode(identity.identity_hash().as_bytes()),
         "index identity; clients bind their signatures to this"
     );
+    // The agent-client path reuses this same key as the index's credential when
+    // it authenticates to a remote agent: one identity, presented the same way to
+    // users (who sign for it) and to agents (which trust it via trusted_indexes).
+    let agent_client_secret = personal_rns::prelude::Zeroizing::new(secret);
 
     let browser = BridgeSession::start_browser(BrowserArgs {
         tcp: tcp.clone(),
@@ -92,7 +96,7 @@ async fn main() -> Result<()> {
     // internet reaches this, and finds it by hearing its announce.
     let index_node = platform_index::node::start(
         state.clone(),
-        personal_rns::prelude::Zeroizing::new(secret),
+        agent_client_secret.clone(),
         tcp,
         auto,
     )
@@ -101,6 +105,23 @@ async fn main() -> Result<()> {
         destination = %hex::encode(index_node.destination().as_bytes()),
         "queryable over Reticulum at this destination"
     );
+
+    // If hosting is on and any node is a remote agent (`NodeConfig.agent` set),
+    // the index drives it over Reticulum with the same node + identity it serves
+    // queries from. Built once, held in the Hosting slot; HTTP-only nodes still
+    // take the `api` path, so an index with a mix of both works.
+    if state.hosting.is_some() {
+        let client = platform_index::agent_client::AgentClient::new(
+            index_node.handle(),
+            agent_client_secret.clone(),
+        );
+        if let Err(e) = client.identity_hash() {
+            tracing::warn!(error = %format!("{e:#}"), "could not derive the index identity for agent uplink; remote-agent nodes will be unreachable");
+        }
+        if let Some(h) = &state.hosting {
+            h.set_agent_client(client).await;
+        }
+    }
 
     let ingest_state = state.clone();
     tokio::spawn(async move {

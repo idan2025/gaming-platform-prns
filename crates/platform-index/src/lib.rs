@@ -3,6 +3,7 @@
 //! `DESIGN.md` §2.4. Not the authority — see `registry` for why that is a fact
 //! about the code and not just an intention.
 
+pub mod agent_client;
 pub mod client;
 pub mod hosting;
 pub mod http;

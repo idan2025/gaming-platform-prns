@@ -35,9 +35,14 @@
 //! story for a shortcut.
 
 
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
+use anyhow::{anyhow, Context, Result};
+use personal_rns::prelude::DestinationHash;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::agent_client::AgentClient;
 use crate::quota::{AccountId, InstanceRecord, QuotaPolicy, Quotas};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,8 +66,15 @@ pub struct HostingConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub name: String,
-    /// Base URL of the agent's local API, e.g. `http://127.0.0.1:4750`.
+    /// Base URL of the agent's local API, e.g. `http://127.0.0.1:4750`. Used
+    /// when `agent` is absent; ignored when `agent` is set.
     pub api: String,
+    /// Hex destination hash of the agent's `platform-agent.control`
+    /// destination, for a node on another host reached over Reticulum instead
+    /// of loopback HTTP. When present, the index drives this node through
+    /// `agent_client` (`PLAN.md` §8 phase 4); `api` is the loopback fallback.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 /// The quota knobs, as an operator writes them.
@@ -145,6 +157,11 @@ pub struct Hosting {
     config: HostingConfig,
     quotas: Quotas,
     http: reqwest::Client,
+    /// The Reticulum uplink to remote agents. `None` when this index runs no
+    /// Reticulum node, in which case nodes with `agent` set are unreachable
+    /// (and reported as such) and loopback-HTTP nodes keep working. Set after
+    /// construction once `node.rs` has produced a handle (`set_agent_client`).
+    agent_client: Mutex<Option<Arc<AgentClient>>>,
 }
 
 impl Hosting {
@@ -159,11 +176,39 @@ impl Hosting {
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_default(),
+            agent_client: Mutex::new(None),
         }
     }
 
     pub fn config(&self) -> &HostingConfig {
         &self.config
+    }
+
+    /// Attach the Reticulum uplink, once the index's node has produced a handle.
+    /// Before this is called, nodes reached via `agent` answer "no uplink";
+    /// loopback-HTTP nodes are unaffected.
+    pub async fn set_agent_client(&self, client: Arc<AgentClient>) {
+        *self.agent_client.lock().await = Some(client);
+    }
+
+    /// The configured Reticulum uplink, cloned out of the lock so a slow Link
+    /// does not serialize every other op.
+    async fn agent_client(&self) -> Option<Arc<AgentClient>> {
+        self.agent_client.lock().await.clone()
+    }
+
+    /// Parse a node's `agent` hex into a destination hash, or `None` when the
+    /// node is loopback-HTTP only.
+    fn agent_dest(node: &NodeConfig) -> Option<Result<DestinationHash>> {
+        let hex = node.agent.as_deref()?;
+        let bytes = match hex::decode(hex) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(anyhow!("node {} has a bad agent hash: {e}", node.name))),
+        };
+        Some(
+            DestinationHash::from_slice(&bytes)
+                .ok_or_else(|| anyhow!("node {} has a bad agent hash: not 16 bytes", node.name)),
+        )
     }
 
     /// Everything running across every node this index drives.
@@ -183,6 +228,32 @@ impl Hosting {
     }
 
     async fn node_instances(&self, node: &NodeConfig) -> Result<Vec<HostedInstance>> {
+        // A node with an `agent` hash is reached over Reticulum; otherwise the
+        // loopback HTTP path. The RNS path needs the uplink; without it the node
+        // is unreachable rather than silently empty.
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client = self
+                .agent_client()
+                .await
+                .ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            let rows = client.list(dest).await.with_context(|| {
+                format!("asking agent {} over Reticulum", node.name)
+            })?;
+            return Ok(rows
+                .into_iter()
+                .map(|r| HostedInstance {
+                    instance_id: r.instance_id,
+                    node: node.name.clone(),
+                    game_id: r.game_id,
+                    name: r.name,
+                    state: format!("{:?}", r.state).to_ascii_lowercase(),
+                    port: r.port,
+                    owner: r.owner,
+                })
+                .collect());
+        }
+
         let url = format!("{}/instances", node.api.trim_end_matches('/'));
         let rows: Vec<serde_json::Value> = self
             .http
@@ -267,6 +338,37 @@ impl Hosting {
 
         // The index picks the id. See DeployRequest.
         let instance_id = new_instance_id(&request.game_id)?;
+
+        // Remote agent over Reticulum, when the chosen node names one.
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client = self
+                .agent_client()
+                .await
+                .ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            let spec = platform_agent::instance::InstanceSpec {
+                instance_id: instance_id.clone(),
+                game_id: request.game_id.clone(),
+                name: request.name.clone(),
+                max_players: request.max_players,
+                port: None,
+                owner: None,
+            };
+            let created = client
+                .create(dest, spec, Some(account.0.clone()))
+                .await
+                .with_context(|| format!("asking agent {} to deploy", node.name))?;
+            return Ok(HostedInstance {
+                instance_id,
+                node: node.name.clone(),
+                game_id: request.game_id.clone(),
+                name: request.name.clone(),
+                state: format!("{:?}", created.state).to_ascii_lowercase(),
+                port: created.port,
+                owner: Some(account.0.clone()),
+            });
+        }
+
         let url = format!("{}/instances", node.api.trim_end_matches('/'));
         let body = serde_json::json!({
             "instance_id": instance_id,
@@ -323,6 +425,22 @@ impl Hosting {
             .iter()
             .find(|n| n.name == found.node)
             .ok_or_else(|| anyhow!("the node holding it is no longer configured"))?;
+
+        // Remote agent over Reticulum: ask it to remove the instance. Ownership
+        // was just checked against the label the agent itself reported, so a
+        // restarted index still enforces it correctly on either path.
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client = self
+                .agent_client()
+                .await
+                .ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            return client
+                .remove(dest, instance_id)
+                .await
+                .with_context(|| format!("asking agent {} to remove it", node.name));
+        }
+
         let url = format!(
             "{}/instances/{}",
             node.api.trim_end_matches('/'),
@@ -367,6 +485,7 @@ mod tests {
         HostingConfig {
             games: vec!["sven-coop".to_string()],
             nodes: vec![NodeConfig {
+                agent: None,
                 name: "local".to_string(),
                 api: "http://127.0.0.1:4750".to_string(),
             }],
@@ -451,7 +570,7 @@ mod tests {
     #[test]
     fn a_node_is_picked_by_load() {
         let mut c = config();
-        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into() });
+        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None });
         let h = Hosting::new(c);
         let existing = vec![HostedInstance {
             instance_id: "a".into(),

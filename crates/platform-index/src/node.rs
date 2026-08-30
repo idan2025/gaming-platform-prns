@@ -73,6 +73,7 @@ impl RequestEndpoint<Arc<IndexState>> for QueryEndpoint {
 /// A running index node. Dropping the handle stops it.
 pub struct IndexNode {
     destination: DestinationHash,
+    handle: Option<PrnsNodeHandle>,
     stop_tx: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<()>>,
 }
@@ -83,10 +84,21 @@ impl IndexNode {
         self.destination
     }
 
+    /// The node's command handle, so other parts of the index (the hosted-deploy
+    /// path driving remote agents) can open Links and issue requests on the same
+    /// Reticulum stack. `PrnsNodeHandle` is `Send`, so it can leave the node's
+    /// `!Send` runtime thread.
+    pub fn handle(&self) -> PrnsNodeHandle {
+        self.handle
+            .clone()
+            .expect("handle is present until stop() consumes it")
+    }
+
     pub async fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
+        self.handle = None;
         if let Some(rx) = self.done.take() {
             let _ = rx.await;
         }
@@ -119,7 +131,7 @@ pub async fn start(
     .destination_hash()
     .map_err(|e| anyhow!("invalid index destination: {e:?}"))?;
 
-    let (init_tx, init_rx) = oneshot::channel::<Result<oneshot::Sender<()>>>();
+    let (init_tx, init_rx) = oneshot::channel::<Result<(oneshot::Sender<()>, PrnsNodeHandle)>>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
 
     // The node future is !Send, so it gets its own thread and LocalSet — the
@@ -188,7 +200,7 @@ pub async fn start(
                 });
 
                 let (stop_tx, stop_rx) = oneshot::channel::<()>();
-                if init_tx.send(Ok(stop_tx)).is_err() {
+                if init_tx.send(Ok((stop_tx, handle.clone()))).is_err() {
                     return;
                 }
                 debug!("index node running");
@@ -202,7 +214,7 @@ pub async fn start(
         })
         .map_err(|e| anyhow!("spawning the index node thread: {e}"))?;
 
-    let stop_tx = init_rx
+    let (stop_tx, handle) = init_rx
         .await
         .map_err(|_| anyhow!("index node thread died before starting"))??;
 
@@ -212,6 +224,7 @@ pub async fn start(
     );
     Ok(IndexNode {
         destination: destination_hash,
+        handle: Some(handle),
         stop_tx: Some(stop_tx),
         done: Some(done_rx),
     })
