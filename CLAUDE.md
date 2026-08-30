@@ -136,7 +136,9 @@ Two facts that decide the browser's design, both easy to get wrong:
 | Engine dependency is a **fork** of Prns, pinned by rev | `PLAN.md` §7 |
 | Launcher stays **Tauri v2** | `PLAN.md` §9 |
 
-Open questions are listed in `PLAN.md` §10 and `DESIGN.md` §7. If you resolve
+Open questions are listed in `PLAN.md` §10 and `DESIGN.md` §7. Two are now
+decided: which games are hostable (the operator's choice, no shipped list) and
+whether community packs are allowed (yes, tiered — `PLAN.md` §11). If you resolve
 one, move it out of the open list and record the reasoning.
 
 ## The reference implementation

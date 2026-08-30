@@ -494,6 +494,12 @@ bridge.
   with no authentication. An index can therefore only drive agents on its own
   host. The fix is the agent uplink over Reticulum — not exposing the agent.
 
+- **Pack distribution — after phase 4, before it matters.** §11: `[content]`
+  drivers, signing with expiry, trust tiers. Turns "write a TOML yourself" into
+  "import one somebody curated". Note the bigger lever for breadth is
+  `StreamRelay` (TCP), without which no config file can describe Minecraft or
+  Terraria — signing a pack for a game the bridge cannot run helps nobody.
+
 - **Phase 5 — more games.** The ladder in `GAMES.md` §7: GoldSrc sibling (app 90)
   → Source/TF2 → Minetest → Minecraft Java. Each step exercises exactly one new
   axis. Never let the second game be the hard game.
@@ -550,7 +556,91 @@ not pre-emptively switch; wait for WebView2 to actually bite in testing.
 
 Carried from `DESIGN.md` §7, still open, listed here so they are not lost:
 node supply (user-contributed is the default under the decentralization rule, so
-agents are untrusted), whether Mode 3 justifies a privileged installer,
-monetization, which games are legally central-hostable (only anonymous-steamcmd
-titles — decide before phase 4), and whether community packs are allowed at all
-given a pack is argv on a node.
+agents are untrusted), whether Mode 3 justifies a privileged installer, and
+monetization.
+
+Two have since been decided:
+
+- **Which games are legally hostable** — decided 2026-08-30 by not deciding it
+  centrally. The platform ships no list; an index operator configures what their
+  nodes will host (§8 phase 4, `hosting.example.toml`).
+- **Whether community packs are allowed at all** — decided 2026-08-30: **yes,
+  tiered**, and §11 is how.
+
+## 11. Pack distribution — drivers, signing, trust tiers
+
+Decided 2026-08-30. Answers `DESIGN.md` §7's "signed packs only, or first-party
+only" as **both, tiered**, and makes a downloadable pack safe to *execute*
+rather than merely safe to read.
+
+### 11.1 The joint that makes it safe
+
+The premise everything else rests on: **Rust ships the bricks, a pack picks a
+brick and hands it bounded parameters.** Never free-form, never argv. The
+codebase already does this twice — `QueryProtocol::A2s` (the pack names an enum,
+the code implements it) and the container image (the operator chooses, the pack
+cannot). Pack distribution is the same seam extended, not a new architecture.
+
+That is what lets a stranger's file be run rather than only read. A pack has no
+field to put a command in, so a hostile one has nothing to say.
+
+### 11.2 `[content]` — the missing brick
+
+Today content provisioning is **manual**: an operator puts the game into
+`<data_root>/content/<game>/<version>/` themselves and the agent checks the
+declared `writable_paths` exist inside it before starting. That is the
+`manual` driver, implicit rather than named. Touch-and-go needs the named ones:
+
+```toml
+[content]
+driver = "steamcmd"
+app_id = 276060          # a number, not a command line
+```
+
+```toml
+[content]
+driver = "archive"
+url = "https://example.org/minetest-server-5.9.0.tar.xz"
+sha256 = "9f2c..."       # the safety is here, not in the URL
+strip_components = 1
+```
+
+Drivers to build, in order: `manual` (name what already happens), `archive`
+(fetch, **verify the digest**, extract — a hijacked mirror gets nothing),
+`steamcmd` (anonymous app ids only), `oci` (pull an image the *operator*
+allowlisted). Each takes typed fields and nothing else.
+
+Only anonymous-steamcmd titles can be fetched unattended (`GAMES.md` §5).
+Anything needing credentials stays `manual`, which is the honest answer rather
+than a worse one.
+
+### 11.3 Signing, and why expiry rather than revocation
+
+A curated repository's safety is a signing key plus **a person who reviews
+submissions and revokes bad ones**. That is an ongoing commitment, not a feature
+that ships once; say so before promising anyone a "safe" repo.
+
+Revocation is the hard part on a mesh: nothing guarantees a node ever fetches a
+revocation list. So **signed packs carry a validity window and go stale**. An
+unrefreshed node fails closed instead of trusting a compromised pack forever,
+and it degrades correctly offline — which a CRL does not.
+
+### 11.4 Trust tiers, shown rather than buried
+
+1. **First-party** — signed by the project key.
+2. **Signed community** — signed by a key the operator trusts.
+3. **Unsigned local** — a file someone wrote. Refused for deploy unless the
+   operator explicitly allowed unsigned packs.
+
+The tier is surfaced at import and at deploy, in those words. A user importing a
+community pack gets told what that means at the moment they do it, not in a
+document they will not read.
+
+### 11.5 What this does not change
+
+A pack still cannot name a command, an image, or an executable, at any tier.
+Signing raises confidence in *who wrote a description*; it does not turn a
+description into code. If a future pack format ever needs to carry executable
+intent, that is a new decision and this section is the argument against it.
+
+
