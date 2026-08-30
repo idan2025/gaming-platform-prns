@@ -7,17 +7,18 @@ A **decentralized server browser** for game servers over
 Find a game server on the mesh, join it, host one, or donate transit — with no
 account, no port forwarding, no central service, and no internet required.
 
-> **Status: phase 1 complete, phase 2's browse core with it** (`PLAN.md` §8).
-> The engine is pinned to a patched fork of Prns ([`ENGINE.md`](ENGINE.md)), and
-> `crates/game-bridge/` carries the relay and framing parametrized by a game
-> pack, the §3.3 announce record, a link allowlist, the Relay role with an off
-> switch, and a Browse role that lists and filters from announces alone — no
-> index, no account, no internet, proven end to end in
-> `tests/browse_discovery.rs`. Phase 2 is complete: the §3.4 detail probe over a
-> Link, and a Tauri launcher (`launcher/`) over `crates/launcher-core`.
-> Phase 3 is complete too: `crates/platform-agent` runs many game servers on one
-> host off a single shared copy of the content, with a loopback-only local API
-> and no central service. Everything past that is still plan. The working single-host implementation this generalizes is
+> **Status** (`PLAN.md` §8 has the detail). Phases 1-3 are complete and phase 4
+> is underway.
+>
+> | Phase | | |
+> | --- | --- | --- |
+> | 1 | The bridge | done — engine pinned to a patched Prns fork ([`ENGINE.md`](ENGINE.md)); relay and framing parametrized by a game pack; the announce record; a link allowlist; a Relay role with a transit off switch |
+> | 2 | Browse | done — list and filter from announces alone, no index and no internet; a detail probe over a Link; a Tauri launcher |
+> | 3 | One node, many servers | done — `platform-agent` runs many servers off one shared copy of the content, loopback-only local API, no central service |
+> | 4 | Index + hosting | partly — identity challenge/response, and an index served over both HTTP and Reticulum, with quotas. Hosted deploy, agent uplink and multi-node are still plan |
+> | 5 | More games | plan |
+>
+> The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
 
 ## The idea

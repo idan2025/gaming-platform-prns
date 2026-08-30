@@ -35,6 +35,22 @@ stylistic, and both have tests against a real Docker daemon:
 The agent's Docker tests skip themselves where there is no daemon, and they
 build a tiny local image from busybox rather than pulling anything.
 
+**Phase 4 is underway**: `crates/platform-auth` (challenge/response against a
+Reticulum identity) and `crates/platform-index` (registry, HTTP front door,
+quota engine, and the index served over a Reticulum destination). Hosted deploy,
+the agent uplink and multi-node are not built.
+
+Two rules there that a later change could quietly break:
+- **An auth signature is bound to the verifier's identity.** Anyone can run an
+  index, so a hostile one could otherwise relay a challenge to a second index
+  and replay the user's signature there. Removing the audience from the signed
+  material would not fail any obvious test — the one that catches it is
+  `a_signature_for_one_index_is_worthless_at_another`.
+- **The index is a cache in the code, not just the prose.** Its registry is fed
+  by a Browse session and its queries run the launcher's own `browse` filter. Do
+  not give it a privileged source or its own query semantics; that is how a
+  cache becomes a second source of truth.
+
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:
 `profile::tests::destination_hash_matches_deployed_sven` freezes the destination
