@@ -37,7 +37,7 @@ a convenience, never a dependency.
 | **Play** | join a server, game launches | built — `connect_and_launch()` |
 | **Host** | run a server others find | built for Sven (Mode 1/2) |
 | **Browse** | list/filter every server on the mesh | partial — announces heard, no structure |
-| **Relay** | donate transit, carry others' traffic | **engine yes, app no** |
+| **Relay** | donate transit, carry others' traffic | **already on, unconditionally — see §4** |
 
 ## 2. Measured budgets (read out of the vendored engine, not the README)
 
@@ -130,28 +130,57 @@ Rules:
 
 ## 4. Role: Relay
 
-The engine supports transport nodes; the app does not expose it.
+**Every node already relays, unconditionally.** This is the opposite of what an
+early reading of the code suggested, and it changes what the work is.
 
-- `set_transport_identity()` (`prns-core/src/engine/registration.rs:124`) flips
-  `TransportState` to `NetworkTransport::Enabled`.
+- `src/relay.rs:231` (server) and `src/relay.rs:446` (client) both pass
+  `transport_identity: Some(identity)` into `PrnsNodeRecipe`.
+- `configure_assembled_node` takes that secret, holds the identity, and calls
+  `set_transport_identity` on it
+  (`prns-runtime/core/src/runtime/node/assembly.rs:256-262`).
+- `set_transport_identity` (`prns-core/src/engine/registration.rs:124`) sets
+  `TransportState::Identified { network: NetworkTransport::Enabled }`.
 - Path requests then forward recursively
-  (`routing/ingress/path_requests.rs:225`); relayed packets carry
+  (`routing/ingress/path_requests.rs:225`) and relayed packets carry
   `PropagationType::Transport`.
-- `src/config.rs` has **no transport knob**. Today's deployment leans on an
-  external upstream `rnsd` reached over a private network (which must stay a
-  `TCPServerInterface`, never a point-to-point `UDPInterface`).
 
-Work: expose the knob plus interface configuration in the launcher. Small and
-self-contained — which is why it lands early (see §6).
+So a player who installs this to join one server is, today, also forwarding
+strangers' traffic across whatever connection they are on — with no consent
+prompt, no visibility, no rate cap, and no off switch. On a metered or mobile
+connection that is a defect, not a feature.
+
+The Relay work is therefore about **control and consent**, not about enabling
+anything:
+
+1. **An off switch.** `transport_identity` becomes `Option`-driven by config
+   rather than always `Some`. Default for the *client* role should be off, or at
+   minimum a first-run prompt. Default for a *server* role node can stay on — it
+   is already a host volunteering resources.
+2. **A standalone Relay role.** A third `Role` variant beside `Server` and
+   `Client` in `src/config.rs`, so a person can donate transit **without** running
+   a game server or binding a game port. Today the only way to relay is to run one
+   of the two game roles, which is why nobody does it deliberately.
+3. **Visibility.** Bytes forwarded, peers seen, paths held. Without a counter the
+   user cannot tell donating transit from a broken connection.
+4. **A rate cap**, enforced and visible.
+
+Note the standalone role needs no destination and announces nothing — it is a
+node with interfaces and a transport identity, and that is all. That makes it the
+smallest of the four roles to build, which is why it lands early (§6).
 
 Two things the UI must say plainly:
 
 - **A relay cannot read what it carries.** Links are end-to-end encrypted; a
-  transport node forwards ciphertext. This is a genuine selling point for asking
-  strangers to donate transit — say it, do not bury it.
-- **It costs bandwidth.** Opt-in, with a rate cap and a visible byte counter.
-  Otherwise "supporting relay" becomes "my connection died" and the user turns it
-  off forever.
+  transport node forwards ciphertext. This is the argument for asking strangers
+  to donate transit — say it, do not bury it.
+- **It costs bandwidth.** Opt-in, capped, counted. Otherwise "supporting relay"
+  becomes "my connection died" and the user disables it permanently.
+
+Interfaces are attached by `attach_interfaces` (`src/relay.rs:832`), which today
+takes only `--tcp <host:port>` and `--auto`. A `0.0.0.0` host binds a
+`TcpServer`; any other host attaches a `TcpClientInterface`. A public relay wants
+the former. The upstream `rnsd` the current deployment leans on must stay a
+`TCPServerInterface` (many peers), never a point-to-point `UDPInterface`.
 
 ## 5. Roles Play and Host — carry forward, do not rewrite
 
@@ -181,9 +210,11 @@ LAN does not demonstrate anything.
   instances over Reticulum on one node with today's binaries. Every promise about
   player counts is conditional on this. Measure tier 1 for real; each new tier
   needs its own measurement before it ships.
-- **Phase 0.5 — Relay role.** Expose `set_transport_identity` + interface config
-  in the launcher, with rate cap, byte counter, and the "cannot read your traffic"
-  copy. Independent of everything else; ship it whenever.
+- **Phase 0.5 — Relay role.** Not "enable transport" — it is already on for every
+  node (§4). Add the off switch, the standalone Relay role, interface config, a
+  rate cap, a byte counter, and the "cannot read your traffic" copy. Independent
+  of everything else; ship it whenever. Treat the current always-on relaying as a
+  defect to fix, not a feature to keep.
 - **Phase 1 — generalize the bridge.** Parametrized aspect, the §3.3 announce
   record with fallback decode, link allowlist, `game-pack` manifests. Sven becomes
   pack #1 and the existing app must still work.
@@ -206,7 +237,52 @@ LAN does not demonstrate anything.
   it changes the installer, the signing story, and the support burden
   (`MODES.md`).
 
-## 7. Decisions this plan does not make
+## 7. Launcher stack — stay on Tauri v2
+
+Decided 2026-08-30. The launcher generalizes from `svencoop-prns-clone/gui/`,
+which is Tauri v2 with a vanilla-JS frontend (1489 lines across
+`dist/{index.html,app.js,style.css}`, no framework).
+
+**Stay.** Three reasons, in order of weight:
+
+1. **The core is Rust and Tauri links it directly.** `gui/src-tauri/Cargo.toml`
+   depends on `sc-rns-controller` and `sc-rns-bridge` as plain path deps — no IPC,
+   no FFI, no serialization boundary between the UI and the relay it supervises.
+   An Electron-class shell would have to drive a Rust sidecar process instead,
+   which is strictly worse for an app whose entire job is process supervision.
+2. **Tauri v2 ships mobile.** `MODES.md` identifies Android `VpnService` and iOS
+   `NetworkExtension` as the *cleanest* Mode 3 virtual-LAN path — cleaner than
+   desktop, which needs a Wintun driver, admin install, and code signing. egui,
+   iced, and Slint have a weak-to-absent mobile story. Leaving Tauri forecloses
+   the best version of Mode 3.
+3. **There is nothing to escape.** The frontend is vanilla JS with no framework
+   lock-in, and the server browser is a filterable list. The Windows gotchas
+   (WebView2Loader.dll, `inline-assets.py`) are already solved and recorded.
+
+**The one real weakness, fixable in config.** Tauri needs WebView2 on Windows. A
+genuinely offline mesh machine that lacks it cannot start the launcher and cannot
+download the runtime — precisely the scenario this platform advertises. WebView2
+ships with Windows 11 and evergreen Windows 10, so it is an edge case, but it is
+*our* edge case. `gui/src-tauri/tauri.conf.json` has no `windows` bundle block
+today; add one before shipping to non-technical users:
+
+```json
+"bundle": {
+  "windows": {
+    "webviewInstallMode": { "type": "offlineInstaller" }
+  }
+}
+```
+
+`offlineInstaller` embeds the bootstrapper (a ~130 MB installer);
+`fixedRuntime` pins an exact runtime shipped alongside the binary. Either removes
+the network dependency at install time.
+
+**Revisit only if** the launcher must become a single static binary with zero
+system runtime — then egui, paying a frontend rewrite and the loss of mobile. Do
+not pre-emptively switch; wait for WebView2 to actually bite in testing.
+
+## 8. Decisions this plan does not make
 
 Carried from `DESIGN.md` §7, still open, listed here so they are not lost:
 node supply (user-contributed is the default under the decentralization rule, so
