@@ -7,10 +7,11 @@ A **decentralized server browser** for game servers over
 Find a game server on the mesh, join it, host one, or donate transit — with no
 account, no port forwarding, no central service, and no internet required.
 
-> **Status: phase 1, step 1 of 6 done** (`PLAN.md` §8). The engine dependency is
-> pinned to a patched fork of Prns — see [`ENGINE.md`](ENGINE.md) — and
-> `crates/game-bridge/` builds against it. Everything else in the documents below
-> is still plan. The working single-host implementation this generalizes is
+> **Status: phase 1, steps 1-2 of 6 done** (`PLAN.md` §8). The engine dependency
+> is pinned to a patched fork of Prns — see [`ENGINE.md`](ENGINE.md) — and
+> `crates/game-bridge/` carries the relay and framing, parametrized by a
+> `GameProfile` rather than hardcoded to Sven Co-op. Next is the announce record
+> (§3.3) that makes the browser possible. Everything else below is still plan. The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
 
 ## The idea

@@ -5,10 +5,19 @@
 A **decentralized server browser** for game servers over Reticulum, built on
 [Prns](https://github.com/KenAKAFrosty/Prns).
 
-**Phase 1 has started.** The docs are still the authority on design, but there is
-now code: `crates/game-bridge/` and an engine pin recorded in `ENGINE.md`. Phase 1
-step 1 (fork Prns, depend on the fork) is done; step 2 (copy and parametrize
-`relay.rs` + `framing.rs`) is next. Build order is `PLAN.md` §8.
+**Phase 1 is underway.** The docs are still the authority on design, but there is
+now code: `crates/game-bridge/`, with the engine pin recorded in `ENGINE.md`.
+Done: step 1 (fork Prns, depend on the fork) and step 2 (`relay.rs` + `framing.rs`
+copied and parametrized by `GameProfile`). Next: step 3, the §3.3 announce record.
+Build order is `PLAN.md` §8.
+
+Two tests are load-bearing rather than routine, and a change that breaks either
+is breaking `PLAN.md` §5, not just a test:
+`profile::tests::destination_hash_matches_deployed_sven` freezes the destination
+hashes a deployed v0.1.10 Sven peer derives, and
+`framing::tests::reserved_header_bits_are_ignored_not_rejected` pins the fact
+that a deployed peer *silently corrupts* rather than rejects a header carrying a
+channel id.
 
 ## Read this first
 
