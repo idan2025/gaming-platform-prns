@@ -501,6 +501,13 @@ bridge.
   (`crates/platform-index/tests/uplink_roundtrip.rs`) pins create/list/stop/remove
   end to end and the untrusted-index refusal.
 
+  Two uplink follow-ups are deliberately not built and stay on the phase-4 list:
+  **capacity push** (agent announces capacity to the index, vs the current
+  pull-only `/capacity` over an authenticated link) and **agent auto-discovery**
+  (an index learns agents from `platform-agent.control` announces, vs the current
+  static `NodeConfig.agent` hash). Both are conveniences; neither blocks
+  multi-node, and neither changes the auth model.
+
 - **Pack distribution — after phase 4, before it matters.** §11: `[content]`
   drivers, signing with expiry, trust tiers. Turns "write a TOML yourself" into
   "import one somebody curated". Note the bigger lever for breadth is
