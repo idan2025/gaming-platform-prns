@@ -1,0 +1,13 @@
+[package]
+name = "game-bridge"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Game-agnostic Reticulum bridge. Generalizes the Sven Co-op bridge in idan2025/Svencoop-Prns."
+
+[dependencies]
+personal-rns = { workspace = true, features = ["tokio-host", "tcp", "wifi-auto"] }
+prns-core = { workspace = true }

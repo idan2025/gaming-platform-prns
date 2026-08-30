@@ -43,7 +43,7 @@ a convenience, never a dependency.
 
 | Quantity | Value | Source |
 | --- | --- | --- |
-| Link plaintext cap | ~1967 B; bridge uses `MAX_CHUNK = 1900` | `src/framing.rs:24` |
+| Link plaintext cap | **1967 B — only on our fork**; upstream is 431. Bridge uses `MAX_CHUNK = 1900` | `src/framing.rs:24`, `ENGINE.md` |
 | Group plaintext cap | **383 B, fire-and-forget** | `MAX_SEND_GROUP_PLAINTEXT_LEN` |
 | **Announce `app_data` cap** | **316 B** (284 if ratcheted) | derived below |
 
@@ -246,7 +246,13 @@ three releases in a row.
 
 ## 7. Engine dependency — fork Prns, depend on the fork
 
-Decided 2026-08-30. Prns is **not published on crates.io**.
+Decided 2026-08-30, **done** — pinned rev, patch inventory and rebase procedure
+are in `ENGINE.md`.
+
+Corrected 2026-08-30: this section originally opened "Prns is not published on
+crates.io". That is false — `personal-rns`, `prns-core` and `prns-runtime` are on
+crates.io, `0.3.7` included. The decision is unchanged, because it never rested
+on that premise:
 
 **We already patch the engine, and that decides this.** The field the entire
 server browser rests on — `Diagnostic::AnnounceHeard.app_data`
@@ -289,6 +295,7 @@ decision.
   minimal and upstream them where they are generally useful — the `app_data`
   field plausibly is.
 - Record which rev of the fork this repo pins, and why, next to the dependency.
+  Done: `ENGINE.md`, pointed at from `Cargo.toml`.
 
 ## 8. Ordering
 

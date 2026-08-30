@@ -7,9 +7,11 @@ A **decentralized server browser** for game servers over
 Find a game server on the mesh, join it, host one, or donate transit — with no
 account, no port forwarding, no central service, and no internet required.
 
-> **Status: design phase. There is no code in this repo yet.**
-> The documents below are the plan. The working single-host implementation it
-> generalizes is [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
+> **Status: phase 1, step 1 of 6 done** (`PLAN.md` §8). The engine dependency is
+> pinned to a patched fork of Prns — see [`ENGINE.md`](ENGINE.md) — and
+> `crates/game-bridge/` builds against it. Everything else in the documents below
+> is still plan. The working single-host implementation this generalizes is
+> [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
 
 ## The idea
 
@@ -53,6 +55,7 @@ Pick one, or several:
 | [DESIGN.md](DESIGN.md) | Architecture, components, hard problems and positions on them. |
 | [GAMES.md](GAMES.md) | Nine axes of per-game variation, viability tiers, the game ladder. |
 | [MODES.md](MODES.md) | Dedicated, listen-server, virtual-LAN, and the unsupported case. |
+| [ENGINE.md](ENGINE.md) | The pinned Prns fork: what it patches, why, and how to move the pin. |
 | [CLAUDE.md](CLAUDE.md) | Instructions for agents working in this repo. |
 
 ## Which games

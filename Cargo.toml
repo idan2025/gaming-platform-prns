@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/game-bridge"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/idan2025/gaming-platform-prns"
+
+# Engine dependency. See PLAN.md §7 for the decision and ENGINE.md for what the
+# pinned rev contains and how to move it. Do not switch these to crates.io: the
+# published personal-rns 0.3.7 does not carry the two patches the platform needs
+# (ENGINE.md "What the fork adds").
+[workspace.dependencies]
+personal-rns = { git = "https://github.com/idan2025/Prns.git", rev = "33f0a8391bd0a07888e44207ec87f07fbe2b132b" }
+prns-core = { git = "https://github.com/idan2025/Prns.git", rev = "33f0a8391bd0a07888e44207ec87f07fbe2b132b" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"

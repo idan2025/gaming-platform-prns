@@ -13,7 +13,7 @@ Measured from the vendored engine, not from the README (which is stale here):
 
 | Primitive | Plaintext cap | Delivery | Use for |
 | --- | --- | --- | --- |
-| **Link** (`MAX_SEND_TO_LINK_PLAINTEXT_LEN`, `link_mdu(2048)`) | ~1967 B; bridge uses `MAX_CHUNK = 1900` | reliable, ordered, retransmitted | all unicast game traffic |
+| **Link** (`MAX_SEND_TO_LINK_PLAINTEXT_LEN`, `link_mdu(2048)` — our patch; upstream `link_mdu(500)` = 431, `ENGINE.md`) | 1967 B; bridge uses `MAX_CHUNK = 1900` | reliable, ordered, retransmitted | all unicast game traffic |
 | **Group** (`MAX_SEND_GROUP_PLAINTEXT_LEN`) | **383 B** | **fire-and-forget, cannot prove** | LAN broadcast/multicast emulation |
 
 383 B derives from `BROADCAST_MTU = 500` → `BROADCAST_MDU = 464` → minus the

@@ -3,14 +3,20 @@
 ## What this is
 
 A **decentralized server browser** for game servers over Reticulum, built on
-[Prns](https://github.com/KenAKAFrosty/Prns). Design phase — **this repo is
-documentation only, there is no code yet.**
+[Prns](https://github.com/KenAKAFrosty/Prns).
+
+**Phase 1 has started.** The docs are still the authority on design, but there is
+now code: `crates/game-bridge/` and an engine pin recorded in `ENGINE.md`. Phase 1
+step 1 (fork Prns, depend on the fork) is done; step 2 (copy and parametrize
+`relay.rs` + `framing.rs`) is next. Build order is `PLAN.md` §8.
 
 ## Read this first
 
 **`PLAN.md` is the entry point.** It carries the decided design, the measured
 wire budgets, and the build order. `DESIGN.md` is the architecture, `GAMES.md`
 the per-game variation and viability tiers, `MODES.md` the four transport modes.
+`ENGINE.md` records the pinned Prns fork — read it before touching the engine
+dependency or quoting a payload size.
 
 When those disagree with each other, `PLAN.md` wins — it is the newest and it
 records why. When any of them disagrees with the source, **the source wins**; fix
@@ -40,15 +46,22 @@ the doc and say so in the commit.
 
 ## Measure the engine, never quote its README
 
-Prns facts in this repo were read out of the vendored engine at
-`/home/pi/svencoop-prns-clone/vendor/prns-core` and `.../prns-runtime`. **The
-Prns and Sven READMEs are stale on payload sizes** — the "384 bytes" figure in
-the Sven README refers to the broadcast packet class, not to links. Verify
+Prns facts in this repo are read out of the pinned fork, checked out at
+`/home/pi/prns-fork` (branch `platform/0.3.7`, `ENGINE.md`). That tree is
+byte-identical to the engine vendored in `svencoop-prns` at
+`/home/pi/svencoop-prns-clone/vendor`, so either reads the same — but the fork is
+the one with history, and it is what this repo compiles.
+
+**The Prns and Sven READMEs are stale on payload sizes** — the "384 bytes" figure
+in the Sven README refers to the broadcast packet class, not to links. Verify
 against source and cite `file:line`.
 
 The numbers that matter (`PLAN.md` §2):
 
-- Link plaintext ~1967 B; the bridge uses `MAX_CHUNK = 1900` (`src/framing.rs:24`).
+- Link plaintext **1967 B on our fork, 431 B on upstream Prns** — the size comes
+  from a patch we carry, not from the engine as published. The bridge uses
+  `MAX_CHUNK = 1900` (`src/framing.rs:24`). Never quote 1967 as a Prns fact;
+  see `ENGINE.md`.
 - Group plaintext **383 B, fire-and-forget** — a GROUP cannot prove delivery.
   Never build reassembly or retransmit on top of it.
 - Announce `app_data` **316 B** (284 ratcheted). That is the entire
