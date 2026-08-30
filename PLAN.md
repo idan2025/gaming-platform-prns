@@ -165,8 +165,10 @@ anything:
 4. **A rate cap**, enforced and visible.
 
 Note the standalone role needs no destination and announces nothing — it is a
-node with interfaces and a transport identity, and that is all. That makes it the
-smallest of the four roles to build, which is why it lands early (§6).
+node with interfaces and a transport identity, and that is all. It is the
+smallest of the four roles to build, but it is platform code, so it is built in
+this repo as part of Phase 1 rather than bolted onto `svencoop-prns` first
+(§5, §7).
 
 Two things the UI must say plainly:
 
@@ -182,7 +184,50 @@ takes only `--tcp <host:port>` and `--auto`. A `0.0.0.0` host binds a
 the former. The upstream `rnsd` the current deployment leans on must stay a
 `TCPServerInterface` (many peers), never a point-to-point `UDPInterface`.
 
-## 5. Roles Play and Host — carry forward, do not rewrite
+## 5. Relationship to `svencoop-prns` — extract, never couple
+
+Decided 2026-08-30, and it constrains everything below.
+
+**`svencoop-prns` stays a standalone product.** It keeps its own repo, its own
+releases, and its own users. It is not being migrated, deprecated, or turned into
+a subdirectory of the platform. Sven Co-op becomes *one game option* in the
+platform, and the platform is not a prerequisite for running the standalone app.
+
+**Extraction is one-directional: platform copies from Sven, never the reverse.**
+
+- The platform's `game-bridge` starts as a copy of `src/relay.rs` + `src/framing.rs`
+  with the Sven-specific parts parametrized. It does **not** become a crate that
+  `svencoop-prns` then depends on.
+- A reverse dependency would couple a shipped, working app to an unreleased
+  platform's churn. That is exactly how "don't break the standalone" gets
+  violated by accident.
+- The cost is real and accepted: **a fix in shared logic must be applied twice.**
+  Anything landing in one repo's relay or framing code gets a deliberate decision
+  about porting it to the other. Cheaper than the coupling.
+
+**Never break the standalone.** No platform requirement justifies a change to
+`svencoop-prns` that regresses it on its own. Its `AGENTS.md` gotchas
+(process-group kill, settings.json interface dedup, WebView2Loader.dll) stay
+authoritative for that repo.
+
+**Therefore wire compatibility is a hard requirement, not a nicety.** A platform
+launcher must be able to join a standalone `svencoop-prns` server at v0.1.10, and
+a standalone client must keep joining its own servers. Two rules follow, both
+already in this plan and now non-negotiable:
+
+- The §3.3 announce record **must** keep the bare-UTF-8 fallback decode, or
+  deployed Sven servers vanish from the platform browser.
+- Framing channel ids **must** stay gated behind announce-advertised version
+  negotiation with channel 0 frozen as today's format. `Reassembler::push` masks
+  only `FLAG_FINAL` and ignores the other header bits, so an ungated change
+  silently corrupts streams for every deployed peer.
+
+**One defect is shared and should be fixed in both**, separately: the
+unconditional relaying in §4. It affects installed v0.1.10 clients today, and
+only a change in `svencoop-prns` reaches them. Small, independent of the
+platform, and its own release decision.
+
+## 6. Roles Play and Host — carry forward, do not rewrite
 
 Already built for Sven. What generalizing them needs is in `DESIGN.md` §2.1/§2.2:
 parametrized aspect (`SC_ASPECT_SERVER` is hardcoded at `src/relay.rs:189,207`),
@@ -199,25 +244,40 @@ spawn with `process_group(0)` and stop via direct `libc::kill(-pid, SIGKILL)` �
 never a shelled-out `kill`, which does not exist in the slim image. It broke
 three releases in a row.
 
-## 6. Ordering
+## 7. Ordering
 
-Refines `DESIGN.md` §5 by folding the four roles in. Rationale for the one
-change: **Relay moves early** because it is the smallest new work of the four and
-it is what makes the mesh actually reach — a browser listing three servers on one
-LAN does not demonstrate anything.
+Refines `DESIGN.md` §5 by folding the four roles in. The Relay role is **not** a
+separate early phase: it would have to be built inside `svencoop-prns` to ship
+before Phase 1, and §5 forbids putting platform code there. It folds into Phase 1
+instead, where it is written once, in the right repo, against a parametrized
+bridge.
 
 - **Phase 0 — prove the ceiling.** Benchmark concurrent players and concurrent
   instances over Reticulum on one node with today's binaries. Every promise about
   player counts is conditional on this. Measure tier 1 for real; each new tier
-  needs its own measurement before it ships.
-- **Phase 0.5 — Relay role.** Not "enable transport" — it is already on for every
-  node (§4). Add the off switch, the standalone Relay role, interface config, a
-  rate cap, a byte counter, and the "cannot read your traffic" copy. Independent
-  of everything else; ship it whenever. Treat the current always-on relaying as a
-  defect to fix, not a feature to keep.
-- **Phase 1 — generalize the bridge.** Parametrized aspect, the §3.3 announce
-  record with fallback decode, link allowlist, `game-pack` manifests. Sven becomes
-  pack #1 and the existing app must still work.
+  needs its own measurement before it ships. Runs against `svencoop-prns` as-is —
+  no code changes anywhere.
+- **Phase 1 — stand up the platform bridge.** The first code in this repo, in
+  order:
+  1. **Decide how this repo gets Prns.** It is not on crates.io;
+     `svencoop-prns` uses `personal-rns = { path = "vendor/personal-rns" }` against
+     a full checked-in copy of the Prns monorepo (~30 crates under `vendor/`).
+     Options: vendor a copy again, a git submodule, or a git dependency pinned to
+     a rev. Nothing else in this phase can start first, and the choice sets how
+     engine upgrades land forever.
+  2. **Copy `relay.rs` + `framing.rs` into `crates/game-bridge/`** and parametrize
+     the Sven-specific parts: aspect (`SC_ASPECT_SERVER`/`SC_ASPECT_CLIENT` are
+     hardcoded at `src/relay.rs:189,207,397,434`), app name, port.
+  3. **The §3.3 announce record**, with the bare-UTF-8 fallback decode that keeps
+     deployed Sven servers listable.
+  4. **Link allowlist** at accept time — cheap now, see §6.
+  5. **The Relay role** (§4): `transport_identity` becomes config-driven with the
+     client defaulting off, plus a standalone `Relay` variant that donates transit
+     with no game and no announced destination, a rate cap, and byte counters.
+  6. **`game-pack` manifests**, with Sven Co-op as pack #1.
+
+  `svencoop-prns` is untouched by all of this and keeps working exactly as it does
+  today.
 - **Phase 2 — Browse role.** Launcher lists and filters from **announces alone** —
   no index, no account, no internet. This is the zero-infrastructure baseline and
   it ships before any central service, so the central service can never quietly
@@ -237,7 +297,7 @@ LAN does not demonstrate anything.
   it changes the installer, the signing story, and the support burden
   (`MODES.md`).
 
-## 7. Launcher stack — stay on Tauri v2
+## 8. Launcher stack — stay on Tauri v2
 
 Decided 2026-08-30. The launcher generalizes from `svencoop-prns-clone/gui/`,
 which is Tauri v2 with a vanilla-JS frontend (1489 lines across
@@ -282,7 +342,7 @@ the network dependency at install time.
 system runtime — then egui, paying a frontend rewrite and the loss of mobile. Do
 not pre-emptively switch; wait for WebView2 to actually bite in testing.
 
-## 8. Decisions this plan does not make
+## 9. Decisions this plan does not make
 
 Carried from `DESIGN.md` §7, still open, listed here so they are not lost:
 node supply (user-contributed is the default under the decentralization rule, so
