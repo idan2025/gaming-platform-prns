@@ -50,11 +50,30 @@ async fn main() -> Result<()> {
         "index identity; clients bind their signatures to this"
     );
 
-    let browser = BridgeSession::start_browser(BrowserArgs { tcp, auto }).await?;
+    let browser = BridgeSession::start_browser(BrowserArgs {
+        tcp: tcp.clone(),
+        auto,
+    })
+    .await?;
     let state = Arc::new(IndexState {
         registry: Mutex::new(Registry::new()),
         auth: Mutex::new(Authenticator::new(identity.identity_hash())),
     });
+
+    // The Reticulum half. This is the one that has to exist for an index to be
+    // a convenience rather than a dependency: a client on a mesh with no
+    // internet reaches this, and finds it by hearing its announce.
+    let index_node = platform_index::node::start(
+        state.clone(),
+        personal_rns::prelude::Zeroizing::new(secret),
+        tcp,
+        auto,
+    )
+    .await?;
+    tracing::info!(
+        destination = %hex::encode(index_node.destination().as_bytes()),
+        "queryable over Reticulum at this destination"
+    );
 
     let ingest_state = state.clone();
     tokio::spawn(async move {
