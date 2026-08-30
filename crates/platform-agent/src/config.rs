@@ -37,6 +37,11 @@ pub const MANAGED_LABEL: &str = "org.idan2025.gaming-platform-prns.managed";
 /// Label carrying the instance id.
 pub const INSTANCE_LABEL: &str = "org.idan2025.gaming-platform-prns.instance";
 
+/// Label carrying the identity that asked for this instance, when something is
+/// deploying on a user's behalf. The container is the ownership record, so an
+/// index needs no database of its own.
+pub const OWNER_LABEL: &str = "org.idan2025.gaming-platform-prns.owner";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {

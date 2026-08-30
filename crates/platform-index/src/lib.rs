@@ -4,6 +4,7 @@
 //! about the code and not just an intention.
 
 pub mod client;
+pub mod hosting;
 pub mod http;
 pub mod node;
 pub mod quota;

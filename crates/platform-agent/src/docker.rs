@@ -27,7 +27,7 @@ use bollard::container::{
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
 
-use crate::config::{GameRuntime, INSTANCE_LABEL, MANAGED_LABEL};
+use crate::config::{GameRuntime, INSTANCE_LABEL, MANAGED_LABEL, OWNER_LABEL};
 use crate::instance::{InstanceSpec, InstanceState};
 use crate::store::Mount;
 
@@ -48,6 +48,8 @@ pub struct ManagedContainer {
     pub container_id: String,
     pub state: InstanceState,
     pub port: Option<u16>,
+    pub owner: Option<String>,
+    pub game_id: Option<String>,
 }
 
 impl DockerRuntime {
@@ -97,6 +99,10 @@ impl DockerRuntime {
                     container_id: c.id.unwrap_or_default(),
                     state,
                     port,
+                    owner: labels.get(OWNER_LABEL).cloned(),
+                    game_id: labels
+                        .get("org.idan2025.gaming-platform-prns.game")
+                        .cloned(),
                 })
             })
             .collect())
@@ -144,6 +150,9 @@ impl DockerRuntime {
         labels.insert(MANAGED_LABEL.to_string(), "1".to_string());
         labels.insert(INSTANCE_LABEL.to_string(), spec.instance_id.clone());
         labels.insert("org.idan2025.gaming-platform-prns.game".to_string(), spec.game_id.clone());
+        if let Some(owner) = &spec.owner {
+            labels.insert(OWNER_LABEL.to_string(), owner.clone());
+        }
 
         // Order matters: the read-only content mount comes first and the
         // writable ones are nested inside it. See the store planner.

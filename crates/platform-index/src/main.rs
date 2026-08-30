@@ -28,15 +28,41 @@ async fn main() -> Result<()> {
     let mut bind = "127.0.0.1:4760".to_string();
     let mut tcp = None;
     let mut auto = false;
+    let mut hosting_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => bind = args.next().context("--bind needs an address")?,
             "--tcp" => tcp = Some(args.next().context("--tcp needs host:port")?),
             "--auto" => auto = true,
+            "--hosting" => hosting_path = Some(args.next().context("--hosting needs a path")?),
             other => anyhow::bail!("unknown argument {other:?}"),
         }
     }
+
+    // Hosting is opt-in twice over: an operator has to pass a config file, and
+    // that file has to list games. An index with neither is a directory, which
+    // is what most of them should be.
+    let hosting = match &hosting_path {
+        None => {
+            tracing::info!("no --hosting config; this index is a directory only");
+            None
+        }
+        Some(path) => {
+            let src = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {path}"))?;
+            let config: platform_index::hosting::HostingConfig =
+                toml::from_str(&src).with_context(|| format!("parsing {path}"))?;
+            if config.enabled() {
+                tracing::info!(games = ?config.games, nodes = config.nodes.len(), "hosting enabled");
+            } else {
+                tracing::warn!(
+                    "{path} does not enable hosting: it needs both a games list and a node"
+                );
+            }
+            Some(platform_index::hosting::Hosting::new(config))
+        }
+    };
 
     // The index's own identity, which is also the audience clients bind their
     // signatures to. Ephemeral for now: a restart invalidates outstanding
@@ -58,6 +84,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(IndexState {
         registry: Mutex::new(Registry::new()),
         auth: Mutex::new(Authenticator::new(identity.identity_hash())),
+        hosting,
     });
 
     // The Reticulum half. This is the one that has to exist for an index to be

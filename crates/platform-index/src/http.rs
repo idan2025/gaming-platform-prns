@@ -31,6 +31,9 @@ use crate::registry::Registry;
 pub struct IndexState {
     pub registry: Mutex<Registry>,
     pub auth: Mutex<Authenticator>,
+    /// `None` when this index does not offer hosting, which is the default and
+    /// the common case: most indexes are just directories.
+    pub hosting: Option<crate::hosting::Hosting>,
 }
 
 #[derive(Serialize)]
@@ -51,6 +54,10 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/auth/challenge", post(challenge))
         .route("/auth/verify", post(verify))
         .route("/me", get(me))
+        // Hosting. Everything above works with these switched off.
+        .route("/hosting", get(hosting_info))
+        .route("/instances", get(my_instances).post(deploy))
+        .route("/instances/:id", axum::routing::delete(destroy))
         .with_state(state)
 }
 
@@ -207,6 +214,86 @@ async fn me(
         .authenticate(&token, std::time::SystemTime::now())
         .map_err(|e| fail(StatusCode::UNAUTHORIZED, e))?;
     Ok(Json(json!({ "identity": hex::encode(identity.as_bytes()) })))
+}
+
+/// What this index will host, if anything. **Unauthenticated on purpose**: a
+/// launcher has to be able to decide whether signing in is even worth it, and
+/// an operator's list of hosted games is not a secret.
+async fn hosting_info(State(state): State<Arc<IndexState>>) -> Json<serde_json::Value> {
+    match &state.hosting {
+        None => Json(json!({ "enabled": false, "games": [] })),
+        Some(h) => Json(json!({
+            "enabled": h.config().enabled(),
+            "games": h.config().games,
+            "nodes": h.config().nodes.len(),
+            "max_instances_per_account": h.config().quota.max_instances_per_account,
+        })),
+    }
+}
+
+/// Resolve a bearer token to the account it proves, or fail with 401.
+async fn account_of(
+    state: &IndexState,
+    headers: &HeaderMap,
+) -> Result<crate::quota::AccountId, (StatusCode, Json<ApiError>)> {
+    let token = bearer(headers).ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "no bearer token"))?;
+    let auth = state.auth.lock().await;
+    let identity = auth
+        .authenticate(&token, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::UNAUTHORIZED, e))?;
+    Ok(crate::quota::AccountId(hex::encode(identity.as_bytes())))
+}
+
+fn hosting_of(state: &IndexState) -> Result<&crate::hosting::Hosting, (StatusCode, Json<ApiError>)> {
+    state
+        .hosting
+        .as_ref()
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "this index does not offer hosting"))
+}
+
+async fn my_instances(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::hosting::HostedInstance>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .instances_for(&account)
+        .await
+        .map(Json)
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
+}
+
+async fn deploy(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    Json(request): Json<crate::hosting::DeployRequest>,
+) -> ApiResult<crate::hosting::HostedInstance> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .deploy(&account, &request, std::time::SystemTime::now())
+        .await
+        .map(Json)
+        // A quota denial, an unhosted game and a node that will not take it are
+        // all things the caller can act on, so they carry their sentence.
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+async fn destroy(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .destroy(&account, &id)
+        .await
+        .map(|()| Json(json!({ "removed": id })))
+        // "no such instance" covers both missing and not-yours, so this cannot
+        // be used to enumerate other people's instances.
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {

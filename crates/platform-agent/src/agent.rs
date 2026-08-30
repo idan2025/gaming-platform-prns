@@ -195,6 +195,7 @@ impl Agent {
             port: Some(port),
             container_id: Some(container_id),
             uptime_secs: None,
+            owner: spec.owner,
         })
     }
 
@@ -231,7 +232,14 @@ impl Agent {
             .map(|c| {
                 let spec = specs.get(&c.instance_id);
                 InstanceStatus {
-                    game_id: spec.map(|s| s.game_id.clone()).unwrap_or_default(),
+                    // Read off the container rather than this run's memory: an
+                    // index restarts, and the label is what survives.
+                    owner: c.owner.clone(),
+                    game_id: c
+                        .game_id
+                        .clone()
+                        .or_else(|| spec.map(|s| s.game_id.clone()))
+                        .unwrap_or_default(),
                     // An instance the agent did not start this run still shows
                     // up — it is running on this node, and hiding it would make
                     // the list a lie about the machine.

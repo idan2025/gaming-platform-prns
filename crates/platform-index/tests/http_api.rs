@@ -18,10 +18,17 @@ fn key(seed: u8) -> PrivateIdentityMaterial {
 }
 
 async fn serve() -> (std::net::SocketAddr, PrivateIdentityMaterial) {
+    serve_with(None).await
+}
+
+async fn serve_with(
+    hosting: Option<platform_index::hosting::Hosting>,
+) -> (std::net::SocketAddr, PrivateIdentityMaterial) {
     let index_key = key(200);
     let state = Arc::new(IndexState {
         registry: Mutex::new(Registry::new()),
         auth: Mutex::new(Authenticator::new(index_key.identity_hash())),
+        hosting,
     });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -173,4 +180,145 @@ async fn the_listing_limit_is_capped_regardless_of_what_is_asked_for() {
     assert!(res.status().is_success(), "an absurd limit is clamped, not an error");
     let rows: serde_json::Value = res.json().await.unwrap();
     assert!(rows.as_array().unwrap().len() <= 500);
+}
+
+/// Sign in and return a bearer token, the way a launcher would.
+async fn token_for(
+    addr: std::net::SocketAddr,
+    index_key: &PrivateIdentityMaterial,
+    user: &PrivateIdentityMaterial,
+) -> String {
+    let client = reqwest::Client::new();
+    let challenge: Challenge = client
+        .post(format!("http://{addr}/auth/challenge"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let response = answer_challenge(&challenge, &index_key.identity_hash(), user).unwrap();
+    let session: platform_auth::Session = client
+        .post(format!("http://{addr}/auth/verify"))
+        .json(&response)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    session.token
+}
+
+fn hosting_config() -> platform_index::hosting::HostingConfig {
+    platform_index::hosting::HostingConfig {
+        games: vec!["sven-coop".to_string()],
+        nodes: vec![platform_index::hosting::NodeConfig {
+            name: "local".to_string(),
+            // Nothing is listening here. Every test below either fails before
+            // reaching a node, or is asserting how an unreachable node is
+            // reported — which is itself worth pinning.
+            api: "http://127.0.0.1:1".to_string(),
+        }],
+        quota: Default::default(),
+    }
+}
+
+/// An index that does not host says so, unauthenticated, so a launcher can tell
+/// before bothering anyone to sign in.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_without_hosting_advertises_that_plainly() {
+    let (addr, _) = serve().await;
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/hosting"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(false));
+    assert_eq!(body["games"], serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosting_index_advertises_what_it_will_run() {
+    let (addr, _) =
+        serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/hosting"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    assert_eq!(body["games"], serde_json::json!(["sven-coop"]));
+}
+
+/// Deploying is the one thing here that costs somebody resources, so it is the
+/// one thing that requires proving who you are.
+#[tokio::test(flavor = "multi_thread")]
+async fn deploying_without_a_session_is_refused() {
+    let (addr, _) =
+        serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{addr}/instances"))
+        .json(&serde_json::json!({ "game_id": "sven-coop", "name": "mine" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+}
+
+/// The operator's list is the whole access-control story for *what* may run, and
+/// a caller gets told what it is rather than a bare refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn deploying_an_unhosted_game_names_what_is_hosted() {
+    let (addr, index_key) =
+        serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let token = token_for(addr, &index_key, &key(1)).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("http://{addr}/instances"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "game_id": "minecraft", "name": "nope" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("does not host"), "{msg}");
+    assert!(msg.contains("sven-coop"), "the caller should see the list: {msg}");
+}
+
+/// An index with no hosting configured must not pretend the routes exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn deploy_routes_are_absent_when_hosting_is_off() {
+    let (addr, index_key) = serve().await;
+    let token = token_for(addr, &index_key, &key(1)).await;
+    let res = reqwest::Client::new()
+        .post(format!("http://{addr}/instances"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "game_id": "sven-coop", "name": "mine" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+/// Not-found and not-yours are the same answer, so nobody can enumerate other
+/// people's instances by watching which ids come back differently.
+#[tokio::test(flavor = "multi_thread")]
+async fn destroying_someone_elses_instance_is_indistinguishable_from_a_missing_one() {
+    let (addr, index_key) =
+        serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let token = token_for(addr, &index_key, &key(1)).await;
+    let client = reqwest::Client::new();
+
+    let missing = client
+        .delete(format!("http://{addr}/instances/does-not-exist"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
 }

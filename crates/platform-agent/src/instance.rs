@@ -28,6 +28,17 @@ pub struct InstanceSpec {
     /// had across a restart.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Who asked for this, when something else is deploying on a user's behalf.
+    /// An identity hash in hex; opaque to the agent.
+    ///
+    /// The agent does no access control with it — a caller that reached the
+    /// loopback API is already trusted here. It exists so an **index** can
+    /// reconstruct who owns what by listing the node, instead of keeping its own
+    /// database that would drift from reality the first time someone stopped a
+    /// container by hand. Same reasoning as the agent keeping no instance
+    /// database of its own: the containers are the record.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Where an instance is in its life.
@@ -58,6 +69,9 @@ pub struct InstanceStatus {
     /// Seconds since the container started, when it is running.
     #[serde(default)]
     pub uptime_secs: Option<u64>,
+    /// Who this was deployed for, if anyone. Read back off the container label.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +159,7 @@ mod tests {
             name: "Test".to_string(),
             max_players: 8,
             port: None,
+        owner: None,
         }
     }
 

@@ -68,6 +68,7 @@ async fn a_launcher_queries_an_index_over_the_mesh_with_no_internet() {
     let state = Arc::new(IndexState {
         registry: Mutex::new(registry),
         auth: Mutex::new(Authenticator::new(index_key.identity_hash())),
+        hosting: None,
     });
 
     let secret = personal_rns::prelude::Zeroizing::new([77u8; 64]);

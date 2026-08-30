@@ -78,6 +78,7 @@ fn spec(id: &str) -> InstanceSpec {
         name: "Test".to_string(),
         max_players: 8,
         port: None,
+        owner: None,
     }
 }
 

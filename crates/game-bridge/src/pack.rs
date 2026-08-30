@@ -315,13 +315,27 @@ mod tests {
         assert!(loaded.packs.iter().any(|p| p.id == "sven-coop"));
     }
 
+    /// The manifest understands `tcp`; the relay does not yet. So the pack
+    /// *parses* the field and `parse` — which validates — refuses it, rather
+    /// than a TCP game being silently bridged as UDP at run time.
     #[test]
-    fn tcp_transport_parses() {
+    fn a_tcp_pack_parses_its_field_but_is_refused_until_the_relay_can_run_it() {
         let src = SVEN_TOML
             .replace("transport = \"udp\"", "transport = \"tcp\"")
             .replace("min_link_class = 1", "min_link_class = 2");
-        let pack = GamePack::parse(&src).unwrap();
-        assert_eq!(pack.transport, PackTransport::Tcp);
-        assert_eq!(pack.to_profile().unwrap().transport, GameTransport::Tcp);
+        assert!(
+            matches!(
+                GamePack::parse(&src),
+                Err(PackError::Invalid(ProfileError::TransportNotImplemented(
+                    GameTransport::Tcp
+                )))
+            ),
+            "a TCP pack must be refused with a reason, not accepted and mis-run"
+        );
+
+        // The field itself still deserializes, so the manifest format is ready
+        // for the day StreamRelay lands.
+        let raw: GamePack = toml::from_str(&src).unwrap();
+        assert_eq!(raw.transport, PackTransport::Tcp);
     }
 }

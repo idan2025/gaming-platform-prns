@@ -1,0 +1,27 @@
+# Hosted deploy, for an index operator who wants to run servers on other
+# people's behalf. Entirely optional: an index with no such file is a directory,
+# which is what most of them should be.
+#
+# THE PLATFORM SHIPS NO LIST OF HOSTABLE GAMES. Which titles you may legally run
+# for other people depends on your jurisdiction and on agreements this project
+# cannot see (GAMES.md §5, PLAN.md §10). You decide, here — the same way
+# platform-agent makes the container image your choice.
+#
+# An empty `games` list means hosting is off.
+games = ["sven-coop"]
+
+# Reach, honestly: an agent's API is loopback-only and refuses to bind anything
+# else, because it creates containers and has no authentication. So an index can
+# only drive agents on its own host today. Multi-node needs the agent uplink
+# over Reticulum, which is not built — do NOT work around it by exposing an
+# agent to the network.
+[[nodes]]
+name = "local"
+api = "http://127.0.0.1:4750"
+
+[quota]
+max_instances_per_account = 3
+max_total_instances = 20
+idle_timeout_secs = 1800
+min_lifetime_secs = 300
+create_cooldown_secs = 30
