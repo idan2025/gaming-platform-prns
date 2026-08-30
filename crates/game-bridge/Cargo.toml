@@ -11,3 +11,15 @@ description = "Game-agnostic Reticulum bridge. Generalizes the Sven Co-op bridge
 [dependencies]
 personal-rns = { workspace = true, features = ["tokio-host", "tcp", "wifi-auto"] }
 prns-core = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+anyhow = "1"
+hex = "0.4"
+tracing = "0.1"
+# Optional so a launcher can persist profiles/args without the CLI paying for it.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }

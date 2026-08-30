@@ -1,9 +1,24 @@
 //! Game-agnostic Reticulum bridge.
 //!
-//! Phase 1 step 1 (`PLAN.md` §8): this crate exists so far only to pin the
-//! engine and to fail the build if the pinned fork ever loses a patch the
-//! platform depends on. Steps 2-6 fill it in with the parametrized copy of
-//! `relay.rs` + `framing.rs` from `idan2025/Svencoop-Prns`.
+//! Generalizes the single-game bridge in `idan2025/Svencoop-Prns` v0.1.10.
+//! Extraction is one-directional (`PLAN.md` §5): this crate copies from that
+//! repo and parametrizes; that repo never depends on this one.
+//!
+//! Build order is `PLAN.md` §8. Done here: step 1 (engine pinned to a patched
+//! Prns fork — `ENGINE.md`) and step 2 (relay + framing copied and
+//! parametrized by `GameProfile`). Next: step 3, the §3.3 announce record.
+
+pub mod config;
+pub mod framing;
+pub mod profile;
+pub mod relay;
+
+pub use config::{BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
+pub use profile::{GameProfile, GameTransport, ASPECT_CLIENT, ASPECT_SERVER};
+pub use relay::{
+    run_bridge, server_announce_app_data, server_announce_name_bytes, BridgeSession,
+    ConnectedClient, DiscoveredServer,
+};
 
 use prns_core::engine::MAX_SEND_TO_LINK_PLAINTEXT_LEN;
 
@@ -15,12 +30,12 @@ use prns_core::engine::MAX_SEND_TO_LINK_PLAINTEXT_LEN;
 ///
 /// **This is a fact about the fork, not about Prns.** Unpatched upstream sizes
 /// the same constant off `BROADCAST_MTU = 500`, giving 431 — below a single
-/// GoldSrc datagram. See ENGINE.md.
+/// GoldSrc datagram. See `ENGINE.md`.
 pub const LINK_PLAINTEXT_CAP: usize = 1967;
 
 // If the pin ever moves to a rev without the link-MTU patch, every chunk-size
-// assumption downstream (`MAX_CHUNK = 1900`) silently becomes a per-datagram
-// fragmentation storm. Fail at compile time instead.
+// assumption downstream (`framing::MAX_CHUNK = 1900`) silently becomes a
+// per-datagram fragmentation storm. Fail at compile time instead.
 const _: () = assert!(
     MAX_SEND_TO_LINK_PLAINTEXT_LEN == LINK_PLAINTEXT_CAP,
     "pinned engine lost the link-MTU patch: MAX_SEND_TO_LINK_PLAINTEXT_LEN is not 1967 (upstream default is 431). See ENGINE.md."
