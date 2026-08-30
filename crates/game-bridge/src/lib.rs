@@ -8,11 +8,13 @@
 //! Prns fork — `ENGINE.md`) and step 2 (relay + framing copied and
 //! parametrized by `GameProfile`). Next: step 3, the §3.3 announce record.
 
+pub mod announce;
 pub mod config;
 pub mod framing;
 pub mod profile;
 pub mod relay;
 
+pub use announce::{AnnounceInfo, AnnounceRecord, DecodeError, EncodeError};
 pub use config::{BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
 pub use profile::{GameProfile, GameTransport, ASPECT_CLIENT, ASPECT_SERVER};
 pub use relay::{

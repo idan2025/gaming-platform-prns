@@ -119,6 +119,17 @@ Rules:
 - Player counts in an announce are stale by up to one announce interval. Label
   them as such in the UI; the live number comes from the probe over a Link.
 
+**One consequence this section did not state, settled 2026-08-30 when the record
+was built.** The fallback is only specified in one direction — a platform
+browser reading a deployed peer. In the other direction a deployed v0.1.10
+*client* decodes `app_data` as a bare UTF-8 name, so a platform server
+announcing a record appears in that client's list under a garbled name. It still
+**joins**: the destination hash is unaffected, and joining is what §5 requires.
+The trade is accepted, because without the game id in `app_data` there is no
+browser at all (§3.1). `ServerArgs::announce_format` carries a `Legacy` escape
+hatch for a server that would rather look right to deployed Sven clients than be
+filterable, at the cost of being an unattributed row in the platform browser.
+
 ### 3.4 Browser UI
 
 - Filter by: game id, tier, has-players, not-full, not-passworded, mode.

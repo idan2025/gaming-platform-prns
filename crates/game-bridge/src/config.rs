@@ -37,6 +37,21 @@ pub struct ServerArgs {
     pub announce_interval: u64,
     /// Display name broadcast in this server's announces.
     pub name: Option<String>,
+    /// Which shape this server's announces take.
+    pub announce_format: AnnounceFormat,
+    /// Current and maximum player counts to advertise. Stale by up to one
+    /// announce interval by construction; the live number comes from a probe
+    /// over a Link (`PLAN.md` §3.4). Ignored by `AnnounceFormat::Legacy`.
+    pub players: u8,
+    pub max_players: u8,
+    /// Current map, if the game has one. Ignored by `AnnounceFormat::Legacy`.
+    pub map: Option<String>,
+    /// Whether this is a dedicated server rather than a listen server.
+    pub dedicated: bool,
+    /// Transport mode 1-3 (`MODES.md`).
+    pub transport_mode: u8,
+    /// Whether joining needs a password.
+    pub passworded: bool,
     /// Identity hashes (hex, 32 chars) permitted to link. Empty means open to
     /// anyone, which is v0.1.10's only behaviour.
     ///
@@ -64,6 +79,13 @@ impl ServerArgs {
             auto: false,
             announce_interval: 15,
             name: None,
+            announce_format: AnnounceFormat::Record,
+            players: 0,
+            max_players: 0,
+            map: None,
+            dedicated: true,
+            transport_mode: 1,
+            passworded: false,
             allowlist: Vec::new(),
             identify_timeout_secs: 10,
         }
@@ -101,6 +123,34 @@ impl ClientArgs {
             auto: false,
         }
     }
+}
+
+/// What a server puts in its announce `app_data`.
+///
+/// **The trade this encodes.** A `Record` is what makes the browser possible at
+/// all: `Diagnostic::AnnounceHeard` exposes no aspect and no identity, and the
+/// destination hash is one-way, so the game id can only reach a listener inside
+/// `app_data` (`PLAN.md` §3.1). Filtering by game, tier, or player count needs
+/// it.
+///
+/// The cost is one-directional and cosmetic: a deployed `svencoop-prns` v0.1.10
+/// *client* decodes `app_data` as a bare UTF-8 display name, so a platform
+/// server announcing a record shows up in that client's list under a garbled
+/// name. It still **joins** — the destination hash is unaffected, and that is
+/// what `PLAN.md` §5 actually requires. Nothing in the other direction changes:
+/// a platform browser reading a deployed server's bare name is exactly the
+/// mandatory fallback in `announce::decode`.
+///
+/// `Legacy` exists for a server that would rather look right to deployed Sven
+/// clients than be filterable in the platform browser. It cannot advertise a
+/// game id, so a platform browser can only show it as an unattributed row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AnnounceFormat {
+    /// The `PLAN.md` §3.3 record. The default.
+    Record,
+    /// A bare UTF-8 display name, byte-identical to what v0.1.10 announces.
+    Legacy,
 }
 
 #[derive(Debug, Clone)]

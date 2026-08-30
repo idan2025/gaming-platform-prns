@@ -64,7 +64,8 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::LocalSet;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
+use crate::announce::{self, AnnounceFlags, AnnounceInfo, AnnounceRecord};
+use crate::config::{AnnounceFormat, BridgeConfig, BridgeRole, ClientArgs, ServerArgs};
 use crate::framing::{frame, Reassembler};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
 
@@ -95,14 +96,39 @@ pub struct BridgeSession {
 pub struct DiscoveredServer {
     pub destination_hash: DestinationHash,
     pub last_seen: Instant,
-    /// The server's self-chosen display name, decoded from its announce
-    /// app_data (valid UTF-8 only). `None` if the announcer didn't send a
-    /// name-shaped payload.
+    /// What the announce said about itself: a §3.3 record, or a bare display
+    /// name from a deployed v0.1.x peer.
+    pub info: AnnounceInfo,
+}
+
+impl DiscoveredServer {
+    /// Display name, whichever announce shape it came in.
+    pub fn name(&self) -> Option<&str> {
+        match &self.info {
+            AnnounceInfo::Record(r) if !r.name.is_empty() => Some(&r.name),
+            AnnounceInfo::Record(_) => None,
+            AnnounceInfo::Legacy { name } => name.as_deref(),
+        }
+    }
+
+    /// Which game this server runs, when it says.
     ///
-    /// Step 3 (`PLAN.md` §3.3) replaces this single field with the decoded
-    /// announce record, keeping this bare-UTF-8 path as the mandatory fallback
-    /// for deployed v0.1.x peers.
-    pub name: Option<String>,
+    /// A legacy announce carries no game id and the destination hash is
+    /// one-way (`PLAN.md` §3.1), so this is `None` for every deployed v0.1.x
+    /// peer. A browser must show those as unattributed rather than guess.
+    pub fn game_id(&self) -> Option<&str> {
+        match &self.info {
+            AnnounceInfo::Record(r) => Some(&r.game_id),
+            AnnounceInfo::Legacy { .. } => None,
+        }
+    }
+
+    pub fn record(&self) -> Option<&AnnounceRecord> {
+        match &self.info {
+            AnnounceInfo::Record(r) => Some(r),
+            AnnounceInfo::Legacy { .. } => None,
+        }
+    }
 }
 
 /// A client identity learned by the server via `identify()` on link
@@ -222,7 +248,7 @@ impl BridgeSession {
             let identity = load_identity(&args.identity)?;
             let app_name = args.profile.app_name.clone();
             let game_id = args.profile.id.clone();
-            let name_bytes = server_announce_name_bytes(&args.name);
+            let name_bytes = server_announce_bytes(&args);
             let destination = PreConfiguredDestination::Single {
                 app_name: &app_name,
                 aspects: &[ASPECT_SERVER],
@@ -270,7 +296,7 @@ impl BridgeSession {
             // Announcer.
             let announcer = handle.clone();
             let interval = args.announce_interval;
-            let announce_app_data = server_announce_app_data(&args.name);
+            let announce_app_data = server_announce_app_data(&args);
             let _announce_task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval.max(1)));
                 ticker.tick().await;
@@ -305,15 +331,15 @@ impl BridgeSession {
                     std::collections::HashMap::new();
                 while let Some(event) = event_rx.recv().await {
                     match event {
-                        BridgeEvent::AnnounceHeard { destination, name } => {
-                            remember_server(&router_discovered, destination, name).await;
+                        BridgeEvent::AnnounceHeard { destination, info } => {
+                            remember_server(&router_discovered, destination, info).await;
                         }
                         BridgeEvent::PeerIdentified { link_id, identity } => {
                             router_connected_clients.write().await.insert(link_id, identity);
                             if allowlist.is_empty() {
                                 continue;
                             }
-                            if allowlist.iter().any(|allowed| *allowed == identity) {
+                            if allowlist.contains(&identity) {
                                 if let Some(rx) = pending_identify.remove(&link_id) {
                                     info!(
                                         link = ?link_id,
@@ -526,8 +552,8 @@ impl BridgeSession {
                 let mut event_rx = event_rx;
                 while let Some(event) = event_rx.recv().await {
                     match event {
-                        BridgeEvent::AnnounceHeard { destination, name } => {
-                            remember_server(&router_discovered, destination, name).await;
+                        BridgeEvent::AnnounceHeard { destination, info } => {
+                            remember_server(&router_discovered, destination, info).await;
                             let mut t = router_target.write().await;
                             if t.is_none() {
                                 info!(server_hash = ?destination.as_bytes(), "discovered a server announce");
@@ -876,14 +902,14 @@ where
 async fn remember_server(
     list: &Arc<RwLock<Vec<DiscoveredServer>>>,
     destination: DestinationHash,
-    name: Option<String>,
+    info: AnnounceInfo,
 ) {
     let mut l = list.write().await;
     if let Some(s) = l.iter_mut().find(|s| s.destination_hash == destination) {
         s.last_seen = Instant::now();
-        s.name = name;
+        s.info = info;
     } else {
-        l.push(DiscoveredServer { destination_hash: destination, last_seen: Instant::now(), name });
+        l.push(DiscoveredServer { destination_hash: destination, last_seen: Instant::now(), info });
     }
 }
 
@@ -893,7 +919,7 @@ async fn remember_server(
 
 #[derive(Debug)]
 enum BridgeEvent {
-    AnnounceHeard { destination: DestinationHash, name: Option<String> },
+    AnnounceHeard { destination: DestinationHash, info: AnnounceInfo },
     LinkEstablished { link_id: LinkId },
     PeerIdentified { link_id: LinkId, identity: IdentityHash },
     /// Synthesized by the server's own timer, not by the engine: an accepted
@@ -906,8 +932,21 @@ enum BridgeEvent {
 fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
     match event {
         PrnsEvent::Diagnostic(Diagnostic::AnnounceHeard { destination, app_data, .. }) => {
-            let name = announce_app_data_to_name(&app_data);
-            let _ = tx.send(BridgeEvent::AnnounceHeard { destination, name });
+            // A malformed announce is dropped, not listed: it is bytes from an
+            // unauthenticated stranger, and a row we cannot parse is a row we
+            // cannot honestly show.
+            match crate::announce::decode(&app_data) {
+                Ok(info) => {
+                    let _ = tx.send(BridgeEvent::AnnounceHeard { destination, info });
+                }
+                Err(e) => {
+                    debug!(
+                        destination = ?destination.as_bytes(),
+                        error = %e,
+                        "ignoring an announce whose app_data did not decode"
+                    );
+                }
+            }
         }
         PrnsEvent::Diagnostic(Diagnostic::LinkEstablished(established)) => {
             let _ = tx.send(BridgeEvent::LinkEstablished {
@@ -930,20 +969,6 @@ fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
     }
 }
 
-/// Decode an announce's app_data as a display name: valid, non-empty UTF-8
-/// only — anything else yields `None` rather than mojibake.
-///
-/// This is the **fallback path** that `PLAN.md` §3.3/§5 make mandatory: it is
-/// how deployed v0.1.x servers, which announce a bare UTF-8 name and nothing
-/// else, stay listable. Step 3 puts the structured record in front of it; this
-/// function does not go away.
-fn announce_app_data_to_name(app_data: &AnnounceAppDataBytes) -> Option<String> {
-    if app_data.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(app_data).ok().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
-}
-
 type LinkSenders = Arc<RwLock<std::collections::HashMap<LinkId, mpsc::Sender<Vec<u8>>>>>;
 type ConnectedClients = Arc<RwLock<std::collections::HashMap<LinkId, IdentityHash>>>;
 
@@ -952,19 +977,83 @@ type ConnectedClients = Arc<RwLock<std::collections::HashMap<LinkId, IdentityHas
 /// Frozen: deployed v0.1.10 peers announce exactly these bytes, and the
 /// launcher's browser recognises them. Do not "improve" it.
 const DEFAULT_SERVER_ANNOUNCE_NAME: &[u8] = b"sc-rns-bridge";
+const DEFAULT_SERVER_ANNOUNCE_NAME_STR: &str = "sc-rns-bridge";
 
-/// Build the bytes a server announces as its app_data: the configured name
-/// (trimmed, UTF-8, truncated to the wire budget), or the fixed default.
+/// The framing generation this build speaks, advertised in the record so a
+/// future channel-id format can be negotiated instead of assumed. Generation 1
+/// is `framing.rs` as frozen by `PLAN.md` §5.
+const FRAMING_GENERATION: u8 = 1;
+
+/// The legacy announce payload: the configured name (trimmed, UTF-8, truncated
+/// to the wire budget), or the fixed default. Byte-identical to v0.1.10.
 pub fn server_announce_name_bytes(name: &Option<String>) -> Vec<u8> {
     let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let bytes = trimmed.map(str::as_bytes).unwrap_or(DEFAULT_SERVER_ANNOUNCE_NAME);
     bytes[..bytes.len().min(MAX_ANNOUNCE_APP_DATA_LEN)].to_vec()
 }
 
+/// Build the §3.3 record this server advertises.
+///
+/// Over-long fields are truncated rather than refused: a server should still
+/// appear in the browser under a shortened name, and refusing to announce over
+/// a 49th character would make the server invisible instead.
+pub fn server_announce_record(args: &ServerArgs) -> AnnounceRecord {
+    fn truncate(s: &str, max: usize) -> String {
+        // Truncate on a char boundary so the field stays valid UTF-8.
+        let mut end = s.len().min(max);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    }
+
+    let name = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SERVER_ANNOUNCE_NAME_STR);
+
+    AnnounceRecord {
+        protocol_version: FRAMING_GENERATION,
+        flags: AnnounceFlags {
+            passworded: args.passworded,
+            allowlisted: !args.allowlist.is_empty(),
+            dedicated: args.dedicated,
+            transport_mode: args.transport_mode,
+        },
+        min_link_class: args.profile.min_link_class,
+        players: args.players,
+        max_players: args.max_players,
+        game_id: truncate(&args.profile.id, announce::MAX_GAME_ID_LEN),
+        name: truncate(name, announce::MAX_NAME_LEN),
+        map: truncate(args.map.as_deref().unwrap_or(""), announce::MAX_MAP_LEN),
+        tlvs: Vec::new(),
+    }
+}
+
+/// The bytes this server puts in `app_data`, honouring `announce_format`.
+///
+/// A record that fails to encode falls back to the legacy name rather than
+/// announcing nothing: an unlistable server is worse than an unfilterable one.
+/// `ServerArgs` validation should make that unreachable, so it is logged.
+pub fn server_announce_bytes(args: &ServerArgs) -> Vec<u8> {
+    match args.announce_format {
+        AnnounceFormat::Legacy => server_announce_name_bytes(&args.name),
+        AnnounceFormat::Record => match server_announce_record(args).encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "announce record did not encode; falling back to a bare name");
+                server_announce_name_bytes(&args.name)
+            }
+        },
+    }
+}
+
 /// The `AnnounceAppData` for an `AnnounceNow` command, built from the same
-/// name bytes as the destination's registered app_data.
-pub fn server_announce_app_data(name: &Option<String>) -> AnnounceAppData {
-    let bytes = server_announce_name_bytes(name);
+/// bytes as the destination's registered app_data.
+pub fn server_announce_app_data(args: &ServerArgs) -> AnnounceAppData {
+    let bytes = server_announce_bytes(args);
     AnnounceAppData::Data(AnnounceAppDataBytes::from_slice(&bytes).unwrap_or_default())
 }
 
@@ -1089,20 +1178,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn server_announce_app_data_round_trips_through_announce_app_data_to_name() {
-        let name = Some("Idan's Server".to_string());
-        let AnnounceAppData::Data(bytes) = server_announce_app_data(&name) else {
-            panic!("expected AnnounceAppData::Data");
-        };
-        assert_eq!(announce_app_data_to_name(&bytes), Some("Idan's Server".to_string()));
+    fn sven_server_args() -> ServerArgs {
+        let mut args = ServerArgs::new(crate::profile::GameProfile::sven_coop());
+        args.name = Some("Idan's Server".to_string());
+        args.players = 4;
+        args.max_players = 32;
+        args.map = Some("svencoop1".to_string());
+        args
     }
 
+    /// What the server announces must be what a browser reads back.
     #[test]
-    fn announce_app_data_to_name_rejects_empty_and_non_utf8() {
-        assert_eq!(announce_app_data_to_name(&AnnounceAppDataBytes::new()), None);
-        let invalid_utf8 = AnnounceAppDataBytes::from_slice(&[0xff, 0xfe]).unwrap();
-        assert_eq!(announce_app_data_to_name(&invalid_utf8), None);
+    fn announced_record_round_trips_through_decode() {
+        let args = sven_server_args();
+        let AnnounceAppData::Data(bytes) = server_announce_app_data(&args) else {
+            panic!("expected AnnounceAppData::Data");
+        };
+        let AnnounceInfo::Record(r) = crate::announce::decode(&bytes).unwrap() else {
+            panic!("expected a record");
+        };
+        assert_eq!(r.game_id, "sven-coop");
+        assert_eq!(r.name, "Idan's Server");
+        assert_eq!(r.map, "svencoop1");
+        assert_eq!((r.players, r.max_players), (4, 32));
+        assert_eq!(r.min_link_class, 1);
+        assert_eq!(r.protocol_version, FRAMING_GENERATION);
+    }
+
+    /// The legacy format must stay byte-identical to v0.1.10, or deployed Sven
+    /// clients stop showing the server's name (`PLAN.md` §5).
+    #[test]
+    fn legacy_format_is_byte_identical_to_v0_1_10() {
+        let mut args = sven_server_args();
+        args.announce_format = AnnounceFormat::Legacy;
+        assert_eq!(server_announce_bytes(&args), b"Idan's Server");
+
+        args.name = None;
+        assert_eq!(server_announce_bytes(&args), DEFAULT_SERVER_ANNOUNCE_NAME);
+    }
+
+    /// An allowlisted server must say so, so a browser can show the padlock
+    /// rather than letting a player discover it on a failed join.
+    #[test]
+    fn allowlist_is_advertised_in_the_record() {
+        let mut args = sven_server_args();
+        assert!(!server_announce_record(&args).flags.allowlisted);
+        args.allowlist = vec!["0102030405060708090a0b0c0d0e0f10".to_string()];
+        assert!(server_announce_record(&args).flags.allowlisted);
+    }
+
+    /// An over-long name shortens the row; it never suppresses the announce.
+    #[test]
+    fn over_long_fields_truncate_rather_than_refuse() {
+        let mut args = sven_server_args();
+        args.name = Some("q".repeat(200));
+        let record = server_announce_record(&args);
+        assert_eq!(record.name.len(), crate::announce::MAX_NAME_LEN);
+        record.encode().expect("a truncated record still encodes");
+    }
+
+    /// Truncation must not split a multi-byte character.
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let mut args = sven_server_args();
+        // 'é' is two bytes, so a 48-byte cut lands mid-character at 24 of them.
+        args.name = Some("é".repeat(40));
+        let record = server_announce_record(&args);
+        assert!(record.name.len() <= crate::announce::MAX_NAME_LEN);
+        assert_eq!(record.name.chars().count(), 24);
     }
 
     #[test]

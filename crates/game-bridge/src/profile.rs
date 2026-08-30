@@ -45,6 +45,11 @@ pub struct GameProfile {
     /// Port the game server listens on when nothing overrides it.
     pub default_port: u16,
     pub transport: GameTransport,
+    /// Viability tier from `GAMES.md` §4: 1 low-rate UDP tick, 2 TCP or
+    /// bursty, 3 modern high-bitrate. Travels in the announce record so a
+    /// browser can warn before a player joins something their mesh cannot
+    /// carry. An ordering until phase 0 measures it.
+    pub min_link_class: u8,
 }
 
 /// Why a profile cannot be used.
@@ -54,6 +59,7 @@ pub enum ProfileError {
     IdTooLong(usize),
     IdNotAscii,
     EmptyAppName,
+    UnknownLinkClass(u8),
 }
 
 impl core::fmt::Display for ProfileError {
@@ -65,6 +71,9 @@ impl core::fmt::Display for ProfileError {
             }
             Self::IdNotAscii => write!(f, "game id must be ASCII"),
             Self::EmptyAppName => write!(f, "app name is empty"),
+            Self::UnknownLinkClass(n) => {
+                write!(f, "min_link_class {n} is not a GAMES.md §4 tier (1-3)")
+            }
         }
     }
 }
@@ -85,6 +94,8 @@ impl GameProfile {
             display_name: "Sven Co-op".to_string(),
             default_port: 27015,
             transport: GameTransport::Udp,
+            // GoldSrc, `GAMES.md` §4 tier 1.
+            min_link_class: 1,
         }
     }
 
@@ -100,6 +111,9 @@ impl GameProfile {
         }
         if self.app_name.is_empty() {
             return Err(ProfileError::EmptyAppName);
+        }
+        if !(1..=3).contains(&self.min_link_class) {
+            return Err(ProfileError::UnknownLinkClass(self.min_link_class));
         }
         Ok(())
     }
