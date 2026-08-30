@@ -234,10 +234,24 @@ parametrized aspect (`SC_ASPECT_SERVER` is hardcoded at `src/relay.rs:189,207`),
 `StreamRelay` for TCP games, framing v2 channel ids for multi-port games, and
 `game-pack` manifests.
 
-One item got cheaper since `DESIGN.md` was written: the **link allowlist**.
-v0.1.9 (`c9ec90b`) already captures the peer identity at accept —
-`src/relay.rs:282` inserts `(link_id, identity)` into `ConnectedClients`, `:366`
-removes it on close. Gating is a rejection before that insert, not new plumbing.
+**The link allowlist — corrected 2026-08-30, it is not free.** This section
+claimed v0.1.9 (`c9ec90b`) already captured the peer identity at accept, so
+gating would be "a rejection before that insert, not new plumbing". Wrong, and
+the source says so: `LinkRequestPolicy`
+(`prns-core/src/routing/upstream_app_destinations/core.rs:24`) has exactly two
+values, `AcceptAll` and `AcceptNone`. There is no per-request callback and no
+identity at accept time. The identity appears only if the peer *volunteers* it
+via `identify()` **after** the link is established, arriving as
+`Diagnostic::PeerIdentified` — which is what `src/relay.rs:282` actually
+handles.
+
+So enforcement is: accept the link, start no relay, and buffer the peer's data
+in its channel until it identifies. Allowed peers then get the relay started
+having lost no datagram; peers identifying as someone else are closed; and
+**peers that never identify must be closed on a timer**, or the allowlist is
+bypassed by staying silent. That timeout is the part that was invisible in the
+original estimate, and it is not optional. Implemented in
+`crates/game-bridge/src/relay.rs` (`parse_allowlist` carries the reasoning).
 
 Carry forward verbatim from the reference repo, per its `AGENTS.md`: process-group
 spawn with `process_group(0)` and stop via direct `libc::kill(-pid, SIGKILL)` —

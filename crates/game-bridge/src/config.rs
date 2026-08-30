@@ -37,6 +37,17 @@ pub struct ServerArgs {
     pub announce_interval: u64,
     /// Display name broadcast in this server's announces.
     pub name: Option<String>,
+    /// Identity hashes (hex, 32 chars) permitted to link. Empty means open to
+    /// anyone, which is v0.1.10's only behaviour.
+    ///
+    /// Enforcement is necessarily *after* link establishment, not before it —
+    /// the engine offers no per-request hook and no identity until the peer
+    /// identifies itself. `relay.rs`'s `parse_allowlist` documents why, and
+    /// why `identify_timeout_secs` is not optional.
+    pub allowlist: Vec<String>,
+    /// How long an accepted link may go without identifying itself before it
+    /// is closed. Only consulted when `allowlist` is non-empty.
+    pub identify_timeout_secs: u64,
 }
 
 impl ServerArgs {
@@ -53,6 +64,8 @@ impl ServerArgs {
             auto: false,
             announce_interval: 15,
             name: None,
+            allowlist: Vec::new(),
+            identify_timeout_secs: 10,
         }
     }
 }

@@ -190,6 +190,12 @@ impl BridgeSession {
         args.profile
             .validate()
             .map_err(|e| anyhow!("invalid game profile: {e}"))?;
+        // Parsed here rather than in the node thread so a typo'd hash is a
+        // startup error the caller sees, not a warning in a log nobody reads.
+        let allowlist = parse_allowlist(&args.allowlist)?;
+        if !allowlist.is_empty() {
+            info!(entries = allowlist.len(), "link allowlist active");
+        }
 
         // Computed up front, with identical inputs to the destination built
         // again inside the node thread, so the server's own hash is available
@@ -288,8 +294,15 @@ impl BridgeSession {
             let router_senders = link_senders.clone();
             let router_discovered = discovered.clone();
             let router_connected_clients = connected_clients.clone();
+            let identify_timeout_tx = event_tx.clone();
+            let identify_timeout_secs = args.identify_timeout_secs.max(1);
             let _router_task = tokio::spawn(async move {
                 let mut event_rx = event_rx;
+                // Links accepted but not yet identified, held with their
+                // buffered data. Only ever non-empty when an allowlist is
+                // configured. Local to this task, which is the only owner.
+                let mut pending_identify: std::collections::HashMap<LinkId, mpsc::Receiver<Vec<u8>>> =
+                    std::collections::HashMap::new();
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         BridgeEvent::AnnounceHeard { destination, name } => {
@@ -297,87 +310,81 @@ impl BridgeSession {
                         }
                         BridgeEvent::PeerIdentified { link_id, identity } => {
                             router_connected_clients.write().await.insert(link_id, identity);
+                            if allowlist.is_empty() {
+                                continue;
+                            }
+                            if allowlist.iter().any(|allowed| *allowed == identity) {
+                                if let Some(rx) = pending_identify.remove(&link_id) {
+                                    info!(
+                                        link = ?link_id,
+                                        identity = ?identity.as_bytes(),
+                                        "peer is on the allowlist; starting relay"
+                                    );
+                                    spawn_server_link_relay(
+                                        link_id,
+                                        rx,
+                                        router_senders.clone(),
+                                        router_handle.clone(),
+                                        game_addr,
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    link = ?link_id,
+                                    identity = ?identity.as_bytes(),
+                                    "peer is not on the allowlist; closing link"
+                                );
+                                pending_identify.remove(&link_id);
+                                router_senders.write().await.remove(&link_id);
+                                router_connected_clients.write().await.remove(&link_id);
+                                let _ = router_handle.close_link(link_id);
+                            }
+                        }
+                        BridgeEvent::IdentifyTimeout { link_id } => {
+                            // Only fires for a link still waiting: an allowed
+                            // peer's entry was removed when its relay started.
+                            if pending_identify.remove(&link_id).is_some() {
+                                warn!(
+                                    link = ?link_id,
+                                    "link did not identify within the allowlist timeout; closing"
+                                );
+                                router_senders.write().await.remove(&link_id);
+                                let _ = router_handle.close_link(link_id);
+                            }
                         }
                         BridgeEvent::LinkEstablished { link_id } => {
                             if router_senders.read().await.contains_key(&link_id) {
                                 continue;
                             }
-                            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+                            let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
                             router_senders.write().await.insert(link_id, tx);
 
-                            let senders = router_senders.clone();
-                            let handle = router_handle.clone();
+                            if allowlist.is_empty() {
+                                spawn_server_link_relay(
+                                    link_id,
+                                    rx,
+                                    router_senders.clone(),
+                                    router_handle.clone(),
+                                    game_addr,
+                                );
+                                continue;
+                            }
+
+                            // Allowlisted: hold the link until it identifies.
+                            // The sender is already in the map, so anything
+                            // the peer sends meanwhile buffers in the channel
+                            // instead of being dropped -- a peer that turns
+                            // out to be allowed loses no datagram, including
+                            // the first one.
+                            pending_identify.insert(link_id, rx);
+                            let timeout_tx = identify_timeout_tx.clone();
                             tokio::spawn(async move {
-                                debug!(link = ?link_id, game_addr = %game_addr, "server relay started");
-                                let sock = match UdpSocket::bind("0.0.0.0:0").await {
-                                    Ok(s) => Arc::new(s),
-                                    Err(e) => {
-                                        error!(link = ?link_id, error = %e, "failed to bind relay UDP socket");
-                                        senders.write().await.remove(&link_id);
-                                        let _ = handle.close_link(link_id);
-                                        return;
-                                    }
-                                };
-                                if let Err(e) = sock.connect(game_addr).await {
-                                    error!(link = ?link_id, error = %e, "failed to connect relay UDP socket to game server");
-                                    senders.write().await.remove(&link_id);
-                                    let _ = handle.close_link(link_id);
-                                    return;
-                                }
-                                let sock_send = sock.clone();
-                                let to_game = tokio::spawn(async move {
-                                    let mut reassembler = Reassembler::default();
-                                    while let Some(chunk) = rx.recv().await {
-                                        if chunk.is_empty() {
-                                            break;
-                                        }
-                                        if let Some(datagram) = reassembler.push(&chunk) {
-                                            if sock_send.send(&datagram).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                });
-                                let sock_recv = sock.clone();
-                                let from_game = {
-                                    let handle = handle.clone();
-                                    tokio::spawn(async move {
-                                        let mut buf = vec![0u8; UDP_READ_BUF];
-                                        loop {
-                                            match sock_recv.recv(&mut buf).await {
-                                                Ok(n) if n > 0 => {
-                                                    let datagram = &buf[..n];
-                                                    for chunk in frame(datagram) {
-                                                        let Some(payload) = link_payload(&chunk, link_id) else {
-                                                            return;
-                                                        };
-                                                        if handle
-                                                            .issue(PrnsCommand::SendToLink(SendToLink {
-                                                                link_id,
-                                                                payload,
-                                                            }))
-                                                            .is_none()
-                                                        {
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                                Ok(_) => continue,
-                                                Err(e) => {
-                                                    debug!(link = ?link_id, error = ?e, "UDP recv from game server ended");
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    })
-                                };
-                                let _ = tokio::join!(to_game, from_game);
-                                senders.write().await.remove(&link_id);
-                                let _ = handle.close_link(link_id);
-                                debug!(link = ?link_id, "server relay ended");
+                                tokio::time::sleep(Duration::from_secs(identify_timeout_secs)).await;
+                                let _ = timeout_tx.send(BridgeEvent::IdentifyTimeout { link_id });
                             });
                         }
                         BridgeEvent::LinkClosed { link_id } => {
+                            pending_identify.remove(&link_id);
                             if let Some(tx) = router_senders.write().await.remove(&link_id) {
                                 let _ = tx.send(Vec::new()).await;
                             }
@@ -529,8 +536,10 @@ impl BridgeSession {
                         }
                         BridgeEvent::LinkEstablished { .. } => {}
                         // The client is always the link initiator, so it never
-                        // becomes the identified peer of a link it accepted.
+                        // becomes the identified peer of a link it accepted,
+                        // and it never allowlists anyone.
                         BridgeEvent::PeerIdentified { .. } => {}
+                        BridgeEvent::IdentifyTimeout { .. } => {}
                         BridgeEvent::LinkClosed { link_id } => {
                             router_link_data.write().await.remove(&link_id);
                         }
@@ -681,6 +690,88 @@ impl BridgeSession {
     }
 }
 
+/// Pump one accepted link against the local game server until either side
+/// ends. Split out of the server's `LinkEstablished` arm so the allowlist can
+/// defer the call until the peer has identified itself (`PLAN.md` §8 step 4)
+/// without duplicating the relay.
+fn spawn_server_link_relay(
+    link_id: LinkId,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    senders: LinkSenders,
+    handle: PrnsNodeHandle,
+    game_addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        debug!(link = ?link_id, game_addr = %game_addr, "server relay started");
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                error!(link = ?link_id, error = %e, "failed to bind relay UDP socket");
+                senders.write().await.remove(&link_id);
+                let _ = handle.close_link(link_id);
+                return;
+            }
+        };
+        if let Err(e) = sock.connect(game_addr).await {
+            error!(link = ?link_id, error = %e, "failed to connect relay UDP socket to game server");
+            senders.write().await.remove(&link_id);
+            let _ = handle.close_link(link_id);
+            return;
+        }
+        let sock_send = sock.clone();
+        let to_game = tokio::spawn(async move {
+            let mut reassembler = Reassembler::default();
+            while let Some(chunk) = rx.recv().await {
+                if chunk.is_empty() {
+                    break;
+                }
+                if let Some(datagram) = reassembler.push(&chunk) {
+                    if sock_send.send(&datagram).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let sock_recv = sock.clone();
+        let from_game = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; UDP_READ_BUF];
+                loop {
+                    match sock_recv.recv(&mut buf).await {
+                        Ok(n) if n > 0 => {
+                            let datagram = &buf[..n];
+                            for chunk in frame(datagram) {
+                                let Some(payload) = link_payload(&chunk, link_id) else {
+                                    return;
+                                };
+                                if handle
+                                    .issue(PrnsCommand::SendToLink(SendToLink {
+                                        link_id,
+                                        payload,
+                                    }))
+                                    .is_none()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            debug!(link = ?link_id, error = ?e, "UDP recv from game server ended");
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        let _ = tokio::join!(to_game, from_game);
+        senders.write().await.remove(&link_id);
+        let _ = handle.close_link(link_id);
+        debug!(link = ?link_id, "server relay ended");
+    });
+}
+
 /// Wrap a framed chunk for `SendToLink`.
 ///
 /// `frame` never emits more than `MAX_CHUNK + 1` bytes and the pinned engine's
@@ -805,6 +896,9 @@ enum BridgeEvent {
     AnnounceHeard { destination: DestinationHash, name: Option<String> },
     LinkEstablished { link_id: LinkId },
     PeerIdentified { link_id: LinkId, identity: IdentityHash },
+    /// Synthesized by the server's own timer, not by the engine: an accepted
+    /// link never identified itself while an allowlist was in force.
+    IdentifyTimeout { link_id: LinkId },
     LinkClosed { link_id: LinkId },
     LinkData { link_id: LinkId, bytes: Vec<u8> },
 }
@@ -912,6 +1006,44 @@ pub fn attach_interfaces(node: &PrnsNodeHandle, tcp: Option<&str>, auto: bool) {
     }
 }
 
+/// Parse hex identity hashes into the allowlist.
+///
+/// # Why the allowlist cannot be enforced at accept time
+///
+/// `PLAN.md` §6 assumed gating was "a rejection before that insert, not new
+/// plumbing", on the strength of v0.1.9 capturing the peer identity at accept.
+/// The engine does not support that. `LinkRequestPolicy`
+/// (`prns-core/src/routing/upstream_app_destinations/core.rs:24`) has exactly
+/// two values, `AcceptAll` and `AcceptNone` — there is no per-request callback,
+/// and no identity is available when the link request arrives. The identity
+/// only becomes known if the peer *volunteers* it by calling `identify()`
+/// after the link is already up, which surfaces as
+/// `Diagnostic::PeerIdentified`.
+///
+/// So enforcement is: accept the link, relay nothing, and hold the peer's data
+/// in its channel until it identifies. Allowed peers get the relay started and
+/// lose no datagram; peers that identify as someone else are closed; and peers
+/// that never identify at all are closed on a timer — without that last case
+/// an allowlist would be bypassed by simply staying silent, which is the
+/// obvious attack and the reason a timeout is not optional.
+fn parse_allowlist(entries: &[String]) -> Result<Vec<IdentityHash>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let hex_str = entry.trim();
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| anyhow!("invalid hex in allowlist entry {hex_str:?}: {e}"))?;
+            let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "allowlist entry {hex_str:?} is {} bytes; an identity hash is 16 (32 hex chars)",
+                    bytes.len()
+                )
+            })?;
+            Ok(IdentityHash::new(arr))
+        })
+        .collect()
+}
+
 fn parse_destination_hash(hex: &str) -> Result<DestinationHash> {
     let hex = hex.trim();
     let bytes = hex::decode(hex).map_err(|e| anyhow!("invalid hex in server hash: {e}"))?;
@@ -971,6 +1103,20 @@ mod tests {
         assert_eq!(announce_app_data_to_name(&AnnounceAppDataBytes::new()), None);
         let invalid_utf8 = AnnounceAppDataBytes::from_slice(&[0xff, 0xfe]).unwrap();
         assert_eq!(announce_app_data_to_name(&invalid_utf8), None);
+    }
+
+    #[test]
+    fn parse_allowlist_accepts_valid_hashes_and_rejects_junk() {
+        assert!(parse_allowlist(&[]).unwrap().is_empty());
+
+        let hex = "0102030405060708090a0b0c0d0e0f10";
+        let parsed = parse_allowlist(&[format!("  {hex}  ")]).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], IdentityHash::new([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]));
+
+        assert!(parse_allowlist(&["nothex".to_string()]).is_err());
+        // 15 bytes: right alphabet, wrong length.
+        assert!(parse_allowlist(&["0102030405060708090a0b0c0d0e0f".to_string()]).is_err());
     }
 
     /// `frame` must never produce a chunk the engine refuses. If `MAX_CHUNK`
