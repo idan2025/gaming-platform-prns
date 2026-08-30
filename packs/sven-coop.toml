@@ -14,4 +14,10 @@ transport = "udp"
 min_link_class = 1
 query = "a2s"
 
+# Paths Sven Co-op writes to, relative to its install directory. A node shares
+# one read-only copy of the 2.74 GB content across every instance and gives each
+# one writable space only here. Validated as relative paths before they become
+# mounts — a pack cannot point these at the host.
+writable_paths = ["svencoop/maps", "svencoop/logs", "svencoop/scripts"]
+
 notes = "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns v0.1.10 servers announce under it."

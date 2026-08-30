@@ -68,6 +68,10 @@ pub struct GameProfile {
     pub min_link_class: u8,
     /// How to ask this game's server for live stats, if it can be asked.
     pub query: Option<QueryProtocol>,
+    /// Paths this game writes to, relative to its install directory. Used by
+    /// `platform-agent` to give each instance writable space over a shared
+    /// read-only copy of the content. Validated before use, never trusted.
+    pub writable_paths: Vec<String>,
 }
 
 /// Why a profile cannot be used.
@@ -115,6 +119,11 @@ impl GameProfile {
             // GoldSrc, `GAMES.md` §4 tier 1.
             min_link_class: 1,
             query: Some(QueryProtocol::A2s),
+            writable_paths: vec![
+                "svencoop/maps".to_string(),
+                "svencoop/logs".to_string(),
+                "svencoop/scripts".to_string(),
+            ],
         }
     }
 

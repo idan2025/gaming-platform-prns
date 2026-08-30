@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/game-bridge", "crates/launcher-core"]
+members = ["crates/game-bridge", "crates/launcher-core", "crates/platform-agent"]
 # The Tauri shell is its own workspace: `launcher/src-tauri` needs a build
 # script and platform toolchains that have no business gating `cargo test` here.
 exclude = ["launcher/src-tauri"]

@@ -6,8 +6,19 @@
 //!
 //! # What a pack deliberately cannot do
 //!
-//! **It cannot run anything.** No command, no argv, no path to an executable,
-//! no install script. `PLAN.md` §10 lists "whether community packs are allowed
+//! **It cannot run anything, and it cannot name what runs.** No command, no
+//! argv, no path to an executable, no install script — and, since phase 3, no
+//! container image either. An image name is argv with extra steps: it selects
+//! the code a node executes. So the image a game runs in is **agent
+//! configuration**, chosen by whoever owns the node, keyed by game id
+//! (`platform-agent`'s `config.rs`). A pack describes a game; an operator
+//! decides what runs on their hardware.
+//!
+//! `writable_paths` is the boundary case that proves the rule: it is a game
+//! fact a planner cannot guess, so the pack supplies it — but every entry is
+//! validated as a relative path that cannot escape the install directory before
+//! it is turned into a mount. Data the node checks, never an instruction the
+//! node obeys. `PLAN.md` §10 lists "whether community packs are allowed
 //! at all, given a pack is argv on a node" as an *open* question, and the
 //! honest way to hold a question open is to not build the thing that settles
 //! it. A pack that could name a command would make every shared pack a remote
@@ -64,6 +75,19 @@ pub struct GamePack {
     /// detail probe with its announced numbers, flagged as announced.
     #[serde(default)]
     pub query: Option<PackQuery>,
+    /// Paths this game writes to, relative to wherever its install lives.
+    ///
+    /// A node runs many instances off **one** read-only copy of the content
+    /// (`PLAN.md` §8 phase 3 — a 2.74 GB copy per instance does not scale), so
+    /// each instance gets writable space only where the game actually needs it.
+    /// The planner cannot guess those paths, so the pack declares them.
+    ///
+    /// This is game *data*, not an instruction: every entry is validated as a
+    /// relative path that cannot escape the install directory before it becomes
+    /// a mount. Compare the image a container runs, which is deliberately **not**
+    /// a pack field — see the module docs.
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
@@ -144,6 +168,11 @@ impl GamePack {
             transport: PackTransport::Udp,
             min_link_class: 1,
             query: Some(PackQuery::A2s),
+            writable_paths: vec![
+                "svencoop/maps".to_string(),
+                "svencoop/logs".to_string(),
+                "svencoop/scripts".to_string(),
+            ],
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -203,6 +232,7 @@ impl GamePack {
             transport: self.transport.into(),
             min_link_class: self.min_link_class,
             query: self.query.map(Into::into),
+            writable_paths: self.writable_paths.clone(),
         };
         profile.validate()?;
         Ok(profile)

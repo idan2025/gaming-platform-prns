@@ -1,0 +1,34 @@
+# Example agent configuration.
+#
+# Everything here is the NODE OPERATOR's decision. A game pack describes what a
+# game is; this file decides what actually runs on your hardware. In particular
+# the image is here and not in the pack, because an image name selects the code
+# this machine executes — see crates/game-bridge/src/pack.rs.
+
+# Absolute. Holds `content/<game>/<version>/` (shared, read-only) and
+# `instances/<id>/` (per instance, writable).
+data_root = "/var/lib/gaming-platform-prns"
+
+# Refuse to run more than this many instances on this node.
+max_instances = 8
+
+# Stop an instance with no players for this long. Leave unset on a node whose
+# instances are all deliberate; set it on anything public, or free compute is
+# exactly what you are offering (DESIGN.md §4).
+# idle_timeout_secs = 1800
+
+# UDP ports the agent may allocate. Must not reach below 1024.
+[port_range]
+start = 27100
+end = 27199
+
+[games.sven-coop]
+image = "ghcr.io/idan2025/svencoop-prns:0.1.10"
+# Where the install lives inside that image.
+content_root = "/game"
+# Directory under <data_root>/content/sven-coop/ holding the game files. The
+# pack's `writable_paths` must already exist inside it: a writable bind mount
+# nested in a read-only one cannot create its own mountpoint.
+content_version = "5.26"
+memory_limit_bytes = 2147483648
+cpus = 1.5
