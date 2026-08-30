@@ -37,8 +37,13 @@ build a tiny local image from busybox rather than pulling anything.
 
 **Phase 4 is underway**: `crates/platform-auth` (challenge/response against a
 Reticulum identity) and `crates/platform-index` (registry, HTTP front door,
-quota engine, and the index served over a Reticulum destination). Hosted deploy,
-the agent uplink and multi-node are not built.
+quota engine, and the index served over a Reticulum destination). Hosted deploy
+is built, and **multi-node is built**: the agent's control surface runs over
+Reticulum as a `platform-agent.control` destination (`crates/platform-agent/src/uplink.rs`),
+so an agent needs no inbound port; the index drives it over a Link with
+challenge/response auth and the operator's `trusted_indexes` allowlist
+(`crates/platform-index/src/agent_client.rs`). The loopback HTTP API stays for
+local use. A Docker-gated two-node round-trip test pins it end to end.
 
 Two rules there that a later change could quietly break:
 - **An auth signature is bound to the verifier's identity.** Anyone can run an
@@ -50,6 +55,18 @@ Two rules there that a later change could quietly break:
   by a Browse session and its queries run the launcher's own `browse` filter. Do
   not give it a privileged source or its own query semantics; that is how a
   cache becomes a second source of truth.
+- **The agent's `trusted_indexes` allowlist is re-checked on every op, not just
+  at verify.** A session token alone is never enough, so an index removed from
+  the list is refused on its next request, not its next login. Caching the
+  trust decision at verify time would not fail any obvious test — the one that
+  catches it is `a_token_stops_authorizing_when_the_identity_leaves_the_allowlist`
+  and the live-wire `an_untrusted_index_cannot_even_list_over_the_uplink`.
+- **The owner stamped over the uplink is the end-user's identity, not the
+  index's.** The create request carries the user's identity hash; the agent sets
+  `spec.owner` from it and stamps `OWNER_LABEL` unchanged. The authenticated
+  index is trusted to assert it; the agent does not overwrite it with the
+  caller's identity. Pinned by
+  `an_index_creates_lists_stops_and_removes_on_a_remote_agent`.
 
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:

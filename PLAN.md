@@ -489,10 +489,17 @@ bridge.
   of step with reality. "Not found" and "not yours" are the same answer, so the
   API cannot be used to enumerate other people's servers.
 
-  **Multi-node is still not built, and the reason matters.** An agent's API is
-  loopback-only and refuses to bind anything else, because it creates containers
-  with no authentication. An index can therefore only drive agents on its own
-  host. The fix is the agent uplink over Reticulum — not exposing the agent.
+  **Multi-node is built (2026-08-30).** The agent's control surface now runs over
+  Reticulum as a `platform-agent.control` destination, so an agent needs no
+  inbound port and no public IP — the same property the platform sells to its
+  users. The index, already a Reticulum node, becomes a client of the agent over
+  a Link: challenge/response auth (`platform_auth`, audience = the agent's
+  identity), then create/stop/remove/list. Authorization is the operator's
+  `trusted_indexes` allowlist, re-checked on every op, so an index removed from
+  the list is refused on its next request, not its next login. The loopback HTTP
+  API stays unchanged for local use. A Docker-gated two-node round-trip test
+  (`crates/platform-index/tests/uplink_roundtrip.rs`) pins create/list/stop/remove
+  end to end and the untrusted-index refusal.
 
 - **Pack distribution — after phase 4, before it matters.** §11: `[content]`
   drivers, signing with expiry, trust tiers. Turns "write a TOML yourself" into
