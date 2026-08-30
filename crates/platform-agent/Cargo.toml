@@ -10,6 +10,9 @@ description = "Per-node daemon: runs many game-server instances on one host, sha
 
 [dependencies]
 game-bridge = { path = "../game-bridge" }
+platform-auth = { path = "../platform-auth" }
+personal-rns = { workspace = true, features = ["tokio-host", "tcp", "wifi-auto"] }
+prns-core = { workspace = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
@@ -19,6 +22,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bollard = "0.17"
 axum = "0.7"
 serde_json = "1"
+hex = "0.4"
+getrandom = "0.2"
 
 [[bin]]
 name = "platform-agent"

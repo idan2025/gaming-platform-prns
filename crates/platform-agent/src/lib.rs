@@ -11,4 +11,5 @@ pub mod docker;
 pub mod instance;
 pub mod ports;
 pub mod store;
+pub mod uplink;
 pub mod uplink_wire;

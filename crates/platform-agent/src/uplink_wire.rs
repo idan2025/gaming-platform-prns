@@ -88,15 +88,15 @@ impl std::error::Error for WireError {}
 
 /// `OP_CREATE`: run an instance on behalf of a user.
 ///
-/// `owner` is the end-user's identity hash in hex — opaque to the agent, stamped
-/// onto the container as `OWNER_LABEL` via `InstanceSpec::owner`. The agent
+/// The end-user's identity hash rides in `spec.owner` — the same field the
+/// loopback HTTP path uses, so there is one owner field, not two. The agent
 /// trusts the *authenticated* index's claim about who the owner is; the index
 /// proved its own identity by `OP_VERIFY`, and the node's operator put that
-/// index in `trusted_indexes`.
+/// index in `trusted_indexes`. `OWNER_LABEL` is stamped from `spec.owner`
+/// unchanged (`agent.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateReq {
     pub token: String,
-    pub owner: Option<String>,
     pub spec: InstanceSpec,
 }
 
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn a_create_request_payload_round_trips() {
-        let req = CreateReq { token: "t".into(), owner: Some("a1b2".into()), spec: spec("i-1") };
+        let req = CreateReq { token: "t".into(), spec: spec("i-1") };
         let body = payload_bytes(&req).unwrap();
         let back: CreateReq = parse_payload(&body).unwrap();
         assert_eq!(back, req);

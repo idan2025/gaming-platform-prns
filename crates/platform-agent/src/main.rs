@@ -14,6 +14,7 @@ use game_bridge::GamePack;
 use platform_agent::agent::Agent;
 use platform_agent::api;
 use platform_agent::config::AgentConfig;
+use platform_agent::uplink;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,7 +39,19 @@ async fn main() -> Result<()> {
     tracing::info!(packs = loaded.packs.len(), "game packs loaded");
 
     let bind = config.api_bind;
+    let uplink_config = config.uplink.clone();
     let agent = Arc::new(Agent::new(config, loaded.packs).await?);
+
+    // The Reticulum control uplink is opt-in via `[uplink]` in the config. When
+    // present, the agent also announces a `platform-agent.control` destination
+    // and answers authenticated create/stop/remove/list requests over a Link, so
+    // an index can drive this node with no inbound port and no public IP. The
+    // loopback API below keeps working either way.
+    let _uplink_node = if let Some(cfg) = uplink_config {
+        Some(uplink::start(agent.clone(), cfg).await?)
+    } else {
+        None
+    };
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
