@@ -219,11 +219,10 @@ impl GameProfile {
             // GoldSrc, `GAMES.md` §4 tier 1.
             min_link_class: 1,
             query: Some(QueryProtocol::A2s),
-            writable_paths: vec![
-                "svencoop/maps".to_string(),
-                "svencoop/logs".to_string(),
-                "svencoop/scripts".to_string(),
-            ],
+            // Only what a server writes. A writable path is an empty
+            // directory mounted *over* the content, so listing `svencoop/maps`
+            // hid all 108 shipped maps — see `pack.rs`.
+            writable_paths: vec!["svencoop/logs".to_string()],
             // GoldSrc plays and answers A2S on one port. Nothing to multiplex,
             // so it announces framing generation 1 like every deployed peer.
             extra_ports: Vec::new(),

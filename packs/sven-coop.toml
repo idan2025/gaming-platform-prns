@@ -18,7 +18,18 @@ query = "a2s"
 # one read-only copy of the 2.74 GB content across every instance and gives each
 # one writable space only here. Validated as relative paths before they become
 # mounts — a pack cannot point these at the host.
-writable_paths = ["svencoop/maps", "svencoop/logs", "svencoop/scripts"]
+#
+# **A writable path HIDES whatever the install shipped at that path.** It is an
+# empty per-instance directory bind-mounted over the content, so listing one
+# that already has files in it does not add write access to them — it makes them
+# vanish. This pack listed `svencoop/maps` and `svencoop/scripts` until
+# 2026-08-31, which mounted empty directories over 108 shipped maps and the
+# game's own scripts: the server started, then answered `map change failed:
+# 'svencoop1' not found on server` for a map sitting on disk the whole time.
+#
+# So list only what the server genuinely writes and the install does not ship.
+# A dedicated server writes its log; it reads maps and scripts.
+writable_paths = ["svencoop/logs"]
 
 notes = "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns v0.1.10 servers announce under it."
 

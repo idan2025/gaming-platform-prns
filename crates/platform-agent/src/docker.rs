@@ -327,11 +327,41 @@ impl DockerRuntime {
             exposed.insert(container_port, HashMap::new());
         }
 
-        let env: Vec<String> = runtime
+        // What the platform tells a game image about this instance.
+        //
+        // A bare game image — one whose job is to run a dedicated server and
+        // nothing else — has no other way to learn its port, its name or how
+        // many players to allow. Without these the agent can only run images
+        // that already know what to do, which in practice means images that
+        // carry their own controller and ignore the agent entirely.
+        //
+        // The set is fixed and comes from the *validated spec*, never from the
+        // pack: a pack still cannot reach a container's environment, so this
+        // does not weaken "a pack cannot name what runs". The container-side
+        // port is the pack's own number, which is what the game binds inside
+        // its own namespace; the host port it appears on outside is the node's
+        // business and is deliberately not told to the game.
+        let mut env: Vec<String> = runtime
             .env
             .iter()
+            // The operator's own env is applied first so the platform's values
+            // below win. An operator who set GPP_PORT would otherwise silently
+            // point the game at a port the node did not publish.
+            .filter(|(k, _)| !k.starts_with("GPP_"))
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
+        let game_port = ports
+            .iter()
+            .find(|p| p.channel == game_bridge::framing::CHANNEL_GAME)
+            .map(|p| p.container_port);
+        env.push(format!("GPP_INSTANCE_ID={}", spec.instance_id));
+        env.push(format!("GPP_GAME_ID={}", spec.game_id));
+        env.push(format!("GPP_SERVER_NAME={}", spec.name));
+        env.push(format!("GPP_MAX_PLAYERS={}", spec.max_players));
+        env.push(format!("GPP_CONTENT_ROOT={}", runtime.content_root.display()));
+        if let Some(port) = game_port {
+            env.push(format!("GPP_PORT={port}"));
+        }
 
         let host_config = HostConfig {
             binds: Some(binds),

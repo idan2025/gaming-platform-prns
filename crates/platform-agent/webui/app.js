@@ -270,6 +270,16 @@ function renderGames() {
   // We rebuild cards only when the game set changes (by id + runnable). This keeps
   // any open start form's typed values intact because the form state is held in
   // state.openForms, and we re-apply it after rebuild.
+  // A rebuild replaces the DOM nodes an open form lives in, and putting focus
+  // back afterwards is not the same as never having taken it: the caret jumps,
+  // an IME composition is dropped, and a half-typed name can be lost. So while
+  // any form is open the grid is never rebuilt — only its dynamic bits are
+  // refreshed. The card set is stable in practice (games change when a pack is
+  // imported, not on a timer), so this costs nothing real.
+  if (state.openForms.size > 0) {
+    for (const g of state.games) refreshCardDynamic(g);
+    return;
+  }
   const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "")).join(";");
   if (grid.dataset.sig === sig) {
     // Just refresh dynamic bits (install state) on existing cards.
@@ -366,6 +376,8 @@ function onOpenStartForm(gameId) {
   if (!state.openForms.has(gameId)) {
     state.openForms.set(gameId, { name: "", maxPlayers: 16, advanced: false, fixedPort: "" });
   }
+  const opening = state.openForms.get(gameId);
+  if (opening) opening._opened = true;
   renderStartForm(gameId);
 }
 
@@ -429,13 +441,13 @@ function renderStartForm(gameId) {
   });
 
   holder.append(form);
-  // Restore focus if it was inside this form before re-render.
-  if (f._focusedField) {
-    const f2 = form.querySelector("#" + f._focusedField);
-    if (f2) {
-      try { f2.focus(); if (f2.setSelectionRange && f2.type !== "number") f2.setSelectionRange(f._selStart || 0, f._selEnd || 0); } catch (_) {}
-    }
-  } else {
+  // Focus **only** when a person just opened this form, never on a re-render.
+  // Restoring focus on every render is what made the page feel like it was
+  // grabbing the cursor: a render the user did not cause would pull the caret
+  // back into a field they had deliberately left. `_opened` is set once, by the
+  // click that created the form, and cleared here.
+  if (f._opened) {
+    f._opened = false;
     nameInput.focus();
   }
 }

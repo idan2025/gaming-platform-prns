@@ -234,11 +234,12 @@ impl GamePack {
             transport: PackTransport::Udp,
             min_link_class: 1,
             query: Some(PackQuery::A2s),
-            writable_paths: vec![
-                "svencoop/maps".to_string(),
-                "svencoop/logs".to_string(),
-                "svencoop/scripts".to_string(),
-            ],
+            // Only what a *server* writes. A writable path is an empty
+            // directory bind-mounted over the content, so listing one that the
+            // install ships files at hides them — `svencoop/maps` used to be
+            // here and masked all 108 shipped maps. Kept in step with
+            // `packs/sven-coop.toml`.
+            writable_paths: vec!["svencoop/logs".to_string()],
             // App 276060 is the Sven Co-op Dedicated Server and it fetches
             // anonymously, which is what `steamcmd` requires. Kept in step with
             // `packs/sven-coop.toml`, which
