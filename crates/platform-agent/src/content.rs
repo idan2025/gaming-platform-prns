@@ -105,7 +105,8 @@ impl core::fmt::Display for ProvisionError {
             Self::FetchNotPermitted { url } => write!(
                 f,
                 "this pack wants to download {url}, and this node has not enabled content \
-                 fetching. Set allow_content_fetch = true in [store] once you trust the pack"
+                 fetching. Set allow_content_fetch = true in the agent config once you trust \
+                 this pack"
             ),
             Self::BadSpec(e) => write!(f, "unusable [content] block: {e}"),
             Self::BadContentRef(e) => write!(f, "unusable content reference: {e}"),

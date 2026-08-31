@@ -21,10 +21,12 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Context, Result};
+use game_bridge::content::PackContent;
 use game_bridge::GamePack;
 use tokio::sync::Mutex;
 
 use crate::config::AgentConfig;
+use crate::content::{ProvisionError, Provisioned, Provisioner};
 use crate::docker::DockerRuntime;
 use crate::instance::{InstanceSpec, InstanceState, InstanceStatus};
 use crate::ports::PortAllocator;
@@ -33,6 +35,7 @@ use crate::store::{ContentRef, InstancePlan, StoreLayout};
 pub struct Agent {
     config: AgentConfig,
     layout: StoreLayout,
+    content: Provisioner,
     docker: DockerRuntime,
     ports: Mutex<PortAllocator>,
     packs: BTreeMap<String, GamePack>,
@@ -55,11 +58,13 @@ impl Agent {
         let ports = PortAllocator::with_reserved(config.port_range, &reserved);
 
         let layout = StoreLayout::new(config.data_root.clone());
+        let content = Provisioner::new(layout.clone(), config.allow_content_fetch);
         let packs = packs.into_iter().map(|p| (p.id.clone(), p)).collect();
 
         Ok(Self {
             config,
             layout,
+            content,
             docker,
             ports: Mutex::new(ports),
             packs,
@@ -115,10 +120,11 @@ impl Agent {
             .map_err(|e| anyhow!("{e}"))?;
         if !content_dir.is_dir() {
             return Err(anyhow!(
-                "game content for {} version {} is not installed at {}",
+                "game content for {} version {} is not installed at {}. {}",
                 content.game_id,
                 content.version,
-                content_dir.display()
+                content_dir.display(),
+                self.how_to_install(&spec.game_id, &pack.content)
             ));
         }
 
@@ -132,6 +138,53 @@ impl Agent {
             ));
         }
         Ok(plan)
+    }
+
+    /// What an operator should do about content that is not there.
+    ///
+    /// The sentence differs by driver, because the action differs: a `manual`
+    /// pack needs a human with the game files, an `archive` pack needs one API
+    /// call, and an `archive` pack on a node that has not opted in needs a
+    /// decision about the pack first.
+    fn how_to_install(&self, game_id: &str, content: &PackContent) -> String {
+        match (content.is_automatic(), self.config.allow_content_fetch) {
+            (true, true) => format!(
+                "This pack's \"{}\" driver can fetch it: POST /content/{game_id}",
+                content.driver_name()
+            ),
+            (true, false) => format!(
+                "This pack's \"{}\" driver could fetch it, but this node has                  allow_content_fetch off — install it by hand or turn fetching on once you                  trust the pack",
+                content.driver_name()
+            ),
+            (false, _) => "This pack's content driver is \"manual\": install the game there                            yourself"
+                .to_string(),
+        }
+    }
+
+    /// Install a game's content if it is not already there.
+    ///
+    /// Deliberately **not** part of `create`. Fetching a game is gigabytes over
+    /// somebody's home uplink; a create request that silently turned into a
+    /// half-hour download would time out, and the second attempt would find a
+    /// staging directory it could not explain. So provisioning is its own
+    /// explicit step, run once per game and version, and `create` keeps failing
+    /// fast with a sentence naming this one.
+    pub async fn ensure_content(&self, game_id: &str) -> Result<Provisioned, ProvisionError> {
+        let pack = self.packs.get(game_id).ok_or_else(|| {
+            ProvisionError::Io(std::io::Error::other(format!(
+                "no game pack installed for {game_id:?}"
+            )))
+        })?;
+        let runtime = self.config.runtime_for(game_id).ok_or_else(|| {
+            ProvisionError::Io(std::io::Error::other(format!(
+                "this node has no runtime configured for {game_id:?}, so there is no                  content_version to install into"
+            )))
+        })?;
+        let content = ContentRef {
+            game_id: game_id.to_string(),
+            version: runtime.content_version.clone(),
+        };
+        self.content.ensure(&content, &pack.content).await
     }
 
     /// Create and start an instance.

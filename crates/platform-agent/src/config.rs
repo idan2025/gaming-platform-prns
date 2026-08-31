@@ -60,6 +60,18 @@ pub struct AgentConfig {
     /// Refuse to start more than this many instances on this node.
     #[serde(default = "default_max_instances")]
     pub max_instances: usize,
+    /// Whether this node may download game content a pack's `[content]` block
+    /// names (`PLAN.md` §11.2).
+    ///
+    /// **Off by default.** A pack is a file somebody wrote, and an `archive`
+    /// driver points a node at a URL that pack author chose. The digest keeps
+    /// the *bytes* honest, but nothing yet says the operator wanted those bytes
+    /// at all — §11.3's signing and §11.4's trust tiers are the eventual answer,
+    /// and until they exist this switch is the operator saying "yes, fetch what
+    /// my installed packs name". Off, an `archive` pack behaves like `manual`:
+    /// it says what is missing and leaves the disk alone.
+    #[serde(default)]
+    pub allow_content_fetch: bool,
     /// Where the local API listens.
     ///
     /// **Loopback only, enforced.** This API creates and destroys containers and

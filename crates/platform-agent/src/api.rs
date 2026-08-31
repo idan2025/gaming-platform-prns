@@ -53,6 +53,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
+        .route("/content/:game", post(install_content))
         .with_state(agent)
 }
 
@@ -109,6 +110,35 @@ async fn remove(
         .await
         .map(|()| Json(json!({ "removed": id })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// Install a game's content from its pack's `[content]` driver.
+///
+/// Separate from create on purpose (`Agent::ensure_content`): this call can run
+/// for a long time and moves gigabytes, and an operator asking for that should
+/// be the one who asked for it. Idempotent — content that is already installed
+/// is reported, never re-fetched.
+async fn install_content(
+    State(agent): State<Arc<Agent>>,
+    Path(game): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    match agent.ensure_content(&game).await {
+        Ok(crate::content::Provisioned::AlreadyInstalled(dir)) => Ok(Json(json!({
+            "game": game,
+            "installed": false,
+            "dir": dir.display().to_string(),
+        }))),
+        Ok(crate::content::Provisioned::Installed { dir, bytes }) => Ok(Json(json!({
+            "game": game,
+            "installed": true,
+            "dir": dir.display().to_string(),
+            "bytes": bytes,
+        }))),
+        // A manual pack, a node that has not opted in, a digest that did not
+        // match: all things the caller has to act on, all carrying the sentence
+        // that says what to do.
+        Err(e) => Err(fail(StatusCode::BAD_REQUEST, e)),
+    }
 }
 
 /// Instance directories with no container. Reported, never deleted — that is a
