@@ -40,6 +40,7 @@ cargo clippy --workspace --all-targets
 # The launcher shell (its own workspace, excluded from `cargo test` at the root)
 cd launcher/src-tauri && cargo build --release
 cargo tauri build                   # bundles; needs `cargo install tauri-cli`
+cargo tauri build --bundles deb     # one target, when the others are not wanted
 
 # The frontend, headless
 cd launcher/uicheck && npm install && node render.mjs
@@ -47,6 +48,34 @@ cd launcher/uicheck && npm install && node render.mjs
 
 `CARGO_INCREMENTAL=0` is worth setting on a build machine: incremental artifacts
 regrow tens of gigabytes over a few days here.
+
+### Linux bundles, as actually observed
+
+`cargo tauri build` on Debian produces `.deb` and `.rpm` from
+`launcher/src-tauri/target/release/bundle/`. Both were built and inspected at
+0.1.0: the deb installs `usr/bin/mesh-game-servers`, a desktop entry and icons,
+and declares `libwebkit2gtk-4.1-0, libgtk-3-0`.
+
+`mainBinaryName` in `tauri.conf.json` is what makes the installed binary
+`mesh-game-servers` rather than `launcher`. It is worth keeping: `/usr/bin/launcher`
+is a name any project could claim, and this repo already refuses to manage
+containers by name prefix for the same reason.
+
+**AppImage needs two things this host did not have**, and it is the only target
+that fails without them:
+
+- `librsvg2-dev` on the build machine. Without it the run ends in
+  `there is no 'libdir' variable for 'librsvg-2.0' library` from
+  `linuxdeploy-plugin-gtk`, after the deb and rpm have already succeeded.
+- The network *at bundle time*: AppImage bundling downloads `linuxdeploy`, its
+  GTK and GStreamer plugins and `AppRun` into `~/.cache/tauri`. So an AppImage
+  cannot be produced on the same air-gapped machine that `cargo vendor` was
+  meant to serve. Build it somewhere with a network and ship the artifact.
+
+Windows and macOS bundles have not been produced or tested from this repo.
+`webviewInstallMode: offlineInstaller` is set for the Windows case
+(`PLAN.md` §9): a genuinely offline machine that lacks WebView2 could otherwise
+neither start the launcher nor download the runtime.
 
 ## Building without the internet
 
@@ -73,6 +102,8 @@ double every engine-pin bump in review.
       ones that cover multi-node.
 - [ ] `cargo clippy --workspace --all-targets` clean.
 - [ ] `launcher/uicheck` passes.
+- [ ] `cargo tauri build` produces a bundle, and the installed binary is
+      `mesh-game-servers`.
 - [ ] The launcher opens, lists a server, and joins it against a real server on
       a second machine. Loopback tests do not prove the mesh path.
 - [ ] A deployed `svencoop-prns` v0.1.10 peer still appears in the launcher's

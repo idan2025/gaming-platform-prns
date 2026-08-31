@@ -3,6 +3,7 @@
   "productName": "Mesh Game Servers",
   "version": "0.1.0",
   "identifier": "org.idan2025.gamingplatformprns.launcher",
+  "mainBinaryName": "mesh-game-servers",
   "build": {
     "frontendDist": "../dist",
     "beforeDevCommand": "",
@@ -28,6 +29,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "shortDescription": "Decentralized game-server browser over Reticulum",
+    "longDescription": "Find and join game servers over a Reticulum mesh with no account, no port forwarding, no central service and no internet required. The launcher browses announces directly; an index, if one exists at all, is only a cache.",
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
