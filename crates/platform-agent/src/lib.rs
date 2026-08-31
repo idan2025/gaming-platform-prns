@@ -9,6 +9,7 @@ pub mod api;
 pub mod config;
 pub mod content;
 pub mod docker;
+pub mod install;
 pub mod instance;
 pub mod pack_import;
 pub mod packs;

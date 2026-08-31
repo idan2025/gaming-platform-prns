@@ -159,6 +159,10 @@ impl From<io::Error> for ProvisionError {
 /// Materializes a pack's content into a node's store.
 /// Where the shared content is mounted inside a provisioning container. An
 /// agent-internal path: nothing in a pack names it, and no game ever sees it.
+/// Where a provisioning task's own scratch state lives inside its container.
+/// Backed by the staging directory, so it is discarded with the run.
+const TASK_HOME_DIR: &str = "/task-home";
+
 const TASK_INSTALL_DIR: &str = "/content";
 
 /// A provisioning container gets a memory cap for the same reason an instance
@@ -256,11 +260,28 @@ impl Provisioner {
                 let staging = self.staging_root()?;
                 let installed = staging.join("unpacked");
                 fs::create_dir_all(&installed)?;
-                let mount = Mount {
-                    host_path: installed.clone(),
-                    container_path: TASK_INSTALL_DIR.into(),
-                    read_only: false,
-                };
+                // steamcmd keeps its own state — a Steam runtime, a login cache,
+                // logs — under `$HOME`, and it is run as the agent's user rather
+                // than root so the install it produces is one the agent can work
+                // in afterwards. That user has no home inside the image, and
+                // steamcmd's first act is then `mkdir: Permission denied`. So
+                // give it one in the staging directory, which is discarded when
+                // the run ends: only `unpacked` is promoted into the content
+                // tree, so none of steamcmd's own state becomes game content.
+                let steam_home = staging.join("steamhome");
+                fs::create_dir_all(&steam_home)?;
+                let mounts = [
+                    Mount {
+                        host_path: installed.clone(),
+                        container_path: TASK_INSTALL_DIR.into(),
+                        read_only: false,
+                    },
+                    Mount {
+                        host_path: steam_home.clone(),
+                        container_path: TASK_HOME_DIR.into(),
+                        read_only: false,
+                    },
+                ];
                 // Every argument here is built by this code. The pack supplied
                 // one number, and `+login anonymous` is not negotiable: an app
                 // that needs credentials is a `manual` pack (GAMES.md §5).
@@ -284,8 +305,9 @@ impl Provisioner {
                         &name,
                         &image,
                         cmd,
-                        &[mount],
+                        &mounts,
                         Some(TASK_MEMORY_LIMIT_BYTES),
+                        &[format!("HOME={TASK_HOME_DIR}")],
                     )
                     .await;
                 let outcome = match outcome {

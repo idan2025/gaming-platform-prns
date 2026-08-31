@@ -389,6 +389,7 @@ impl DockerRuntime {
         cmd: Vec<String>,
         mounts: &[Mount],
         memory_limit_bytes: Option<i64>,
+        env: &[String],
     ) -> Result<TaskOutcome> {
         let binds: Vec<String> = mounts
             .iter()
@@ -409,7 +410,19 @@ impl DockerRuntime {
         let config = Config {
             image: Some(image.to_string()),
             cmd: if cmd.is_empty() { None } else { Some(cmd) },
+            env: if env.is_empty() { None } else { Some(env.to_vec()) },
             labels: Some(labels),
+            // **Run as the agent's own user.** A provisioning task writes into
+            // the shared content tree, and the agent has to work in that tree
+            // afterwards — creating the mountpoints a pack declares writable,
+            // and one day replacing a version. Left as root, steamcmd produces
+            // a root-owned 2.6 GB install that the agent then cannot touch, and
+            // the symptom is a successful download followed by
+            // `Permission denied (os error 13)` on the very next step.
+            //
+            // Not a security boundary: this drops privilege rather than
+            // granting it, and the image is the operator's choice either way.
+            user: Some(task_user()),
             host_config: Some(HostConfig {
                 binds: Some(binds),
                 memory: memory_limit_bytes,
@@ -534,6 +547,21 @@ impl DockerRuntime {
             Err(e) => Err(e).with_context(|| format!("inspecting container {name}")),
         }
     }
+}
+
+/// `uid:gid` for a provisioning task: whoever runs the agent.
+///
+/// On a platform with no such notion this is `0:0`, which is what Docker would
+/// have used anyway.
+#[cfg(unix)]
+fn task_user() -> String {
+    // Safety: `getuid`/`getgid` cannot fail and touch no memory.
+    unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
+}
+
+#[cfg(not(unix))]
+fn task_user() -> String {
+    "0:0".to_string()
 }
 
 /// This container's id, as the daemon knows it.

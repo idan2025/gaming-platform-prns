@@ -154,7 +154,7 @@ fn validate_id(id: &str) -> Result<(), PlanError> {
     })
 }
 
-fn validate_writable_path(p: &str) -> Result<(), PlanError> {
+pub fn validate_writable_path(p: &str) -> Result<(), PlanError> {
     if p.is_empty() {
         return Err(PlanError::EmptyWritablePath);
     }

@@ -304,33 +304,37 @@ async fn listing_instances_on_a_fresh_node_is_an_empty_list() {
 /// reading "500" learns nothing; the missing content directory is the whole
 /// answer to "why will my server not start".
 #[tokio::test(flavor = "multi_thread")]
-async fn a_create_with_no_installed_content_explains_itself() {
+/// Pressing Start on a game whose files are not here yet begins the download
+/// instead of refusing. "Install it first" is a step the machine can take on
+/// its own, and making a person take it is making them learn the difference
+/// between a pack and an install in order to do the obvious thing.
+///
+/// It answers 202, not 200: the download cannot happen inside this request —
+/// 2.7 GB takes longer than a browser will hold a connection — so the honest
+/// answer is "accepted, and here is what is happening".
+async fn starting_a_server_with_no_content_begins_the_download() {
     let Some((addr, _dir)) = serve().await else {
         eprintln!("skipping: no Docker daemon");
         return;
     };
-    let res = reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .post(format!("http://{addr}/instances"))
         .json(&serde_json::json!({
-            "instance_id": "apitest",
+            "instance_id": "sven-1",
             "game_id": "sven-coop",
-            "name": "API Test",
+            "name": "Test",
             "max_players": 8
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 400, "a caller-fixable failure must not be a 500");
-    let body: serde_json::Value = res.json().await.unwrap();
-    let msg = body["error"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("not installed"),
-        "the error should name the missing content, got: {msg}"
-    );
+    assert_eq!(resp.status(), 202);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["installing"], "sven-coop");
+    // The sentence is for a person to read, so it has to say what happens next.
+    assert!(body["message"].as_str().unwrap().contains("start once it finishes"));
 }
 
-/// An id that could escape its directory must be refused before anything is
-/// created, and the refusal must be the caller's fault, not the server's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hostile_instance_id_is_refused() {
     let Some((addr, _dir)) = serve().await else {

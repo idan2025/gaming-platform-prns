@@ -492,7 +492,25 @@ async function onStartSubmit(gameId) {
   if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "Starting…"; }
 
   try {
-    await withInFlight(api("POST", "/instances", body));
+    const result = await withInFlight(api("POST", "/instances", body));
+    // 202: this game's files are not here yet, so the agent started the
+    // download instead of refusing. The operator asked to play, not to learn
+    // the difference between a pack and an install — so wait for it and then
+    // start the server, without making them press anything else.
+    if (result && result.installing) {
+      closeStartForm(gameId);
+      clearError();
+      state.installingMsg.set(gameId, "Downloading game files… this can take a while.");
+      renderGames();
+      const ok = await watchInstall(gameId);
+      if (ok) {
+        // Same body, now that the files are there.
+        await withInFlight(api("POST", "/instances", body));
+        setActiveTab("servers");
+        poll();
+      }
+      return;
+    }
     closeStartForm(gameId);
     clearError();
     // Switch to Servers tab so the operator sees their new instance.
@@ -506,6 +524,53 @@ async function onStartSubmit(gameId) {
   }
 }
 
+// Poll one game's install until it finishes. Resolves true when the files are
+// there, false when it failed — the failure sentence is put in front of the
+// operator either way, because it names the thing they have to fix.
+//
+// Deliberately not wrapped in `withInFlight`: an install runs for tens of
+// minutes and pausing the instance list for all of it would freeze the rest of
+// the UI.
+async function watchInstall(gameId) {
+  state.installing.set(gameId, true);
+  state.installDone.delete(gameId);
+  renderGames();
+  try {
+    for (;;) {
+      await new Promise(r => setTimeout(r, 3000));
+      let body;
+      try {
+        body = await api("GET", "/content/" + encodeURIComponent(gameId));
+      } catch (e) {
+        if (e && e.__auth) return false;
+        continue; // a blip in polling is not a failed install
+      }
+      const st = (body && body.status) || {};
+      if (st.state === "running") {
+        state.installingMsg.set(gameId, "Downloading game files… " + formatUptime(st.since_secs) + " so far.");
+        renderGames();
+        continue;
+      }
+      if (st.state === "done") {
+        state.installingMsg.set(gameId, st.already_installed ? "Already installed." : "Install completed.");
+        state.installDone.set(gameId, "ok");
+        return true;
+      }
+      if (st.state === "failed") {
+        state.installingMsg.set(gameId, st.error || "Install failed.");
+        state.installDone.set(gameId, "error");
+        showError(st.error || "Install failed.");
+        return false;
+      }
+      // "idle" means the agent forgot, or never started. Not an error to loop on.
+      return false;
+    }
+  } finally {
+    state.installing.delete(gameId);
+    renderGames();
+  }
+}
+
 // ---------- install ----------
 
 async function onInstall(gameId) {
@@ -515,15 +580,16 @@ async function onInstall(gameId) {
   state.installDone.delete(gameId);
   renderGames();
   try {
+    // Returns as soon as the download has been *started*: it takes tens of
+    // minutes and no browser will hold a request open that long.
     await withInFlight(api("POST", "/content/" + encodeURIComponent(gameId)));
-    state.installingMsg.set(gameId, "Install completed.");
-    state.installDone.set(gameId, "ok");
     clearError();
+    state.installing.delete(gameId);
+    await watchInstall(gameId);
   } catch (e) {
     if (e && e.__auth) return;
     state.installingMsg.set(gameId, (e && e.error) || "Install failed.");
     state.installDone.set(gameId, "error");
-  } finally {
     state.installing.delete(gameId);
     renderGames();
   }

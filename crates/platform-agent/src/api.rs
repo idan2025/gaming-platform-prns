@@ -68,6 +68,8 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 #[derive(Clone)]
 pub struct ApiState {
     pub agent: Arc<Agent>,
+    /// Content installs running in the background.
+    pub installs: Arc<crate::install::Installs>,
     pub token: Option<Arc<String>>,
     /// Where packs live, so a pack can be imported into a running node. `None`
     /// disables the import route rather than guessing a directory: this route
@@ -90,6 +92,7 @@ pub fn router_full(
 ) -> Router {
     let state = ApiState {
         agent: agent.clone(),
+        installs: Arc::new(crate::install::Installs::new()),
         token: token.map(Arc::new),
         pack_dir: pack_dir.map(Arc::new),
     };
@@ -100,7 +103,7 @@ pub fn router_full(
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
-        .route("/content/:game", post(install_content))
+        .route("/content/:game", post(install_content).get(install_status))
         .route("/games", get(games))
         .route("/packs", post(import_pack))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
@@ -315,18 +318,62 @@ async fn list(State(state): State<ApiState>) -> ApiResult<Vec<InstanceStatus>> {
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+/// Start a server, fetching the game's files first if they are not here yet.
+///
+/// **Pressing Start on a game with no content begins the download rather than
+/// refusing.** "Install it first" is a step the machine can take on its own,
+/// and making a person take it is making them learn the difference between a
+/// pack and an install to do the obvious thing.
+///
+/// It cannot become a *synchronous* download — that is the request timeout this
+/// endpoint's sibling was just fixed for — so the honest answer is `202
+/// Accepted` with the install's state, and the caller starts the server when it
+/// finishes. `PLAN.md` §11.2 keeps installing as its own step for exactly that
+/// reason; what changes here is that nobody has to *ask* for it.
 async fn create(
     State(state): State<ApiState>,
     Json(spec): Json<InstanceSpec>,
-) -> ApiResult<InstanceStatus> {
-    state.agent
-        .create(spec)
-        .await
-        .map(Json)
-        // A rejected spec, an unconfigured game and a missing content directory
-        // are all the caller's problem to fix, so they are 400s carrying the
-        // explanation rather than 500s carrying nothing.
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiError>)> {
+    // The spec is judged before anything else, and a bad one is refused here
+    // rather than falling through to the content path below. Without this, a
+    // hostile instance id on a game whose files happen to be missing would be
+    // answered with "downloading…" instead of "no": the validation failure
+    // would be swallowed by a branch that only meant to be helpful about
+    // content. Caught by `a_hostile_instance_id_is_refused`.
+    spec.validate()
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+
+    match state.agent.create(spec.clone()).await {
+        Ok(status) => Ok((
+            StatusCode::OK,
+            Json(serde_json::to_value(status).unwrap_or_else(|_| json!({}))),
+        )),
+        Err(e) => {
+            // Only a *missing content* failure turns into a download. An
+            // unconfigured game or a mistyped id is the caller's to fix, and
+            // starting a multi-gigabyte download over a typo would be worse
+            // than the error they got.
+            if !state.agent.content_is_missing(&spec.game_id).await {
+                return Err(fail(StatusCode::BAD_REQUEST, e));
+            }
+            let started = crate::install::spawn(
+                state.installs.clone(),
+                state.agent.clone(),
+                spec.game_id.clone(),
+            )
+            .await;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "installing": spec.game_id,
+                    "started": started,
+                    "status": state.installs.state(&spec.game_id).await,
+                    "message": "This game's files are not on this node yet, so the download \
+                                started. Your server will start once it finishes.",
+                })),
+            ))
+        }
+    }
 }
 
 async fn stop(
@@ -357,27 +404,39 @@ async fn remove(
 /// for a long time and moves gigabytes, and an operator asking for that should
 /// be the one who asked for it. Idempotent — content that is already installed
 /// is reported, never re-fetched.
+/// Start this game's content install, and return immediately.
+///
+/// The download used to run inside this request. A Sven Co-op install is 2.7 GB
+/// and takes tens of minutes — longer than a browser or a proxy will hold a
+/// connection — so the request would time out while the work carried on
+/// invisibly. Now the work is a task and this reports its state; poll `GET` on
+/// the same path.
 async fn install_content(
     State(state): State<ApiState>,
     Path(game): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    match state.agent.ensure_content(&game).await {
-        Ok(crate::content::Provisioned::AlreadyInstalled(dir)) => Ok(Json(json!({
-            "game": game,
-            "installed": false,
-            "dir": dir.display().to_string(),
-        }))),
-        Ok(crate::content::Provisioned::Installed { dir, bytes }) => Ok(Json(json!({
-            "game": game,
-            "installed": true,
-            "dir": dir.display().to_string(),
-            "bytes": bytes,
-        }))),
-        // A manual pack, a node that has not opted in, a digest that did not
-        // match: all things the caller has to act on, all carrying the sentence
-        // that says what to do.
-        Err(e) => Err(fail(StatusCode::BAD_REQUEST, e)),
+    // Refuse what will obviously fail *before* claiming a task, so a mistyped
+    // game id is an error rather than a "Failed" state to poll for.
+    if !state.agent.packs().await.contains_key(&game) {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            format!("no game pack installed for {game:?}"),
+        ));
     }
+    let started =
+        crate::install::spawn(state.installs.clone(), state.agent.clone(), game.clone()).await;
+    Ok(Json(json!({
+        "game": game,
+        "started": started,
+        "status": state.installs.state(&game).await,
+    })))
+}
+
+async fn install_status(
+    State(state): State<ApiState>,
+    Path(game): Path<String>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "game": game, "status": state.installs.state(&game).await }))
 }
 
 /// Instance directories with no container. Reported, never deleted — that is a

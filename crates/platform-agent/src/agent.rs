@@ -242,9 +242,88 @@ impl Agent {
             game_id: game_id.to_string(),
             version: runtime.content_version.clone(),
         };
-        self.content
+        let provisioned = self
+            .content
             .ensure(&content, &pack.content, Some(&self.docker))
-            .await
+            .await?;
+        self.create_writable_mountpoints(&content, &pack.writable_paths)?;
+        Ok(provisioned)
+    }
+
+    /// Make sure every path the pack declares writable exists inside the shared
+    /// content copy.
+    ///
+    /// **A fresh install cannot start a server without this.** Each writable
+    /// path becomes a bind mount nested inside the read-only content mount, and
+    /// a container runtime cannot create a mountpoint inside a read-only bind —
+    /// runc reports it as `mkdirat ... read-only file system`. Sven Co-op is
+    /// the live example: steamcmd creates `svencoop/maps` and
+    /// `svencoop/scripts` but not `svencoop/logs`, so a node that had just
+    /// downloaded 2.6 GB successfully still refused to start anything.
+    ///
+    /// Install is the right moment and instance start is not.
+    /// `missing_content_dirs` deliberately only reads: it runs per instance, on
+    /// shared state, and a directory appearing because somebody pressed Start is
+    /// a surprise. Here the tree is this function's to prepare, once, for the
+    /// pack it was installed for.
+    ///
+    /// The paths are validated before use even though they came from a parsed
+    /// pack, because this is a `mkdir` under a directory the node owns and
+    /// "it was validated somewhere else" is how a traversal gets in.
+    fn create_writable_mountpoints(
+        &self,
+        content: &ContentRef,
+        writable_paths: &[String],
+    ) -> Result<(), ProvisionError> {
+        let root = self
+            .layout
+            .content_dir(content)
+            .map_err(|e| ProvisionError::Io(std::io::Error::other(format!("{e}"))))?;
+        for path in writable_paths {
+            crate::store::validate_writable_path(path)
+                .map_err(|e| ProvisionError::Io(std::io::Error::other(format!("{e}"))))?;
+            let target = root.join(path);
+            // Belt and braces after validation: a symlink inside the content
+            // tree could still point out of it, and `starts_with` on the
+            // canonical parent is what catches that.
+            if !target.starts_with(&root) {
+                return Err(ProvisionError::Io(std::io::Error::other(format!(
+                    "writable path {path:?} escapes the content directory"
+                ))));
+            }
+            if !target.is_dir() {
+                std::fs::create_dir_all(&target)?;
+                tracing::info!(
+                    path = %target.display(),
+                    "created a writable mountpoint the game install did not"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this game's files are missing from the shared content tree.
+    ///
+    /// Asked before turning a failed create into a download, so that only a
+    /// *missing content* failure does so. A mistyped game id or an
+    /// unconfigured runtime is the caller's to fix, and starting a multi-gigabyte
+    /// download because somebody fat-fingered a name would be worse than the
+    /// error they got.
+    pub async fn content_is_missing(&self, game_id: &str) -> bool {
+        let Some(runtime) = self.config.runtime_for(game_id) else {
+            return false;
+        };
+        if !self.packs.read().await.contains_key(game_id) {
+            return false;
+        }
+        let content = ContentRef {
+            game_id: game_id.to_string(),
+            version: runtime.content_version.clone(),
+        };
+        match self.layout.content_dir(&content) {
+            Ok(dir) => !dir.is_dir(),
+            Err(_) => false,
+        }
     }
 
     /// Create and start an instance.
