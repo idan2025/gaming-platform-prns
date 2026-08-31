@@ -86,7 +86,10 @@ Fork of `sc-rns-bridge` with the Sven-specific parts pulled out:
   hashes. Required for private/paid servers; the current bridge accepts any link.
 - **`StreamRelay` for TCP games** alongside the datagram relay — link per TCP
   connection, no message boundaries, close propagates both ways. A separate code
-  path, not a flag on the existing one.
+  path, not a flag on the existing one. **Built 2026-08-31**
+  (`crates/game-bridge/src/stream.rs`): it rides the link's channel, which is
+  reliable and in-order, rather than `SendToLink`, which is neither ordered nor
+  sequenced.
 - **Framing v2: channel id in header bits 1–3**, so one destination fronts a
   port set (game + query + rcon). Not silently compatible — `Reassembler::push`
   ignores non-`FINAL` bits, so gate it behind an announce-advertised protocol

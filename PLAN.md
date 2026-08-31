@@ -267,8 +267,8 @@ platform, and its own release decision.
 
 Already built for Sven. What generalizing them needs is in `DESIGN.md` §2.1/§2.2:
 parametrized aspect (`SC_ASPECT_SERVER` is hardcoded at `src/relay.rs:189,207`),
-`StreamRelay` for TCP games, framing v2 channel ids for multi-port games, and
-`game-pack` manifests.
+`StreamRelay` for TCP games (**built 2026-08-31**, `stream.rs`), framing v2
+channel ids for multi-port games, and `game-pack` manifests.
 
 **The link allowlist — corrected 2026-08-30, it is not free.** This section
 claimed v0.1.9 (`c9ec90b`) already captured the peer identity at accept, so
@@ -355,12 +355,16 @@ Phases 1-3 are done. Phase 4 is built through multi-node. Pack distribution
 (§11) has its first three content drivers. What is left, in the order this
 document's own reasoning implies:
 
-1. **`StreamRelay` — TCP in the relay.** The largest lever on breadth, and it
-   gates everything downstream of it. The relay pumps datagrams, so a pack
-   declaring `transport = "tcp"` is *refused at load* today
-   (`a_tcp_pack_parses_its_field_but_is_refused_until_the_relay_can_run_it`).
-   Until it lands, no config file can describe Minecraft or Terraria — and
-   §11.3's signing would be signing packs for games the bridge cannot run.
+1. ~~**`StreamRelay` — TCP in the relay.**~~ **Built 2026-08-31**
+   (`crates/game-bridge/src/stream.rs`). A pack declaring `transport = "tcp"`
+   now runs instead of being refused at load. It is a splice, not a protocol:
+   the engine's link channel is already reliable and in-order
+   (`prns-core/src/routing/links/channel/mod.rs:27`) and the tokio runtime
+   exposes it as a byte stream with an EOF flag
+   (`prns-runtime/impls/tokio/src/runtime/node_facade/byte_stream/mod.rs:214`),
+   so `stream.rs` copies a TCP socket against that and propagates each close.
+   `framing.rs` is not on this path — chunking and ordering belong to the
+   channel. `tests/stream_relay.rs` pins it over a real loopback mesh.
 2. **Phase 5's second game — the GoldSrc sibling (app 90).** One new axis, not
    several (`GAMES.md` §7), and it is now cheap: `steamcmd` can fetch it
    unattended, which is exactly what §11.2 was for. Never let the second game be
@@ -537,9 +541,9 @@ bridge.
   drivers, signing with expiry, trust tiers. **`manual`, `archive`, and
   `steamcmd` drivers are built (2026-08-31);** `oci` and the signing/trust half
   are not. Turns "write a TOML yourself" into
-  "import one somebody curated". Note the bigger lever for breadth is
-  `StreamRelay` (TCP), without which no config file can describe Minecraft or
-  Terraria — signing a pack for a game the bridge cannot run helps nobody.
+  "import one somebody curated". The bigger lever for breadth was `StreamRelay`
+  (TCP) — signing a pack for a game the bridge cannot run helps nobody — and
+  that is built, so a pack can now describe a TCP game.
 
 - **Phase 5 — more games.** The ladder in `GAMES.md` §7: GoldSrc sibling (app 90)
   → Source/TF2 → Minetest → Minecraft Java. Each step exercises exactly one new

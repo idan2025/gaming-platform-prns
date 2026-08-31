@@ -68,6 +68,20 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   caller's identity. Pinned by
   `an_index_creates_lists_stops_and_removes_on_a_remote_agent`.
 
+**`StreamRelay` is built** (2026-08-31, `crates/game-bridge/src/stream.rs`): a
+pack declaring `transport = "tcp"` runs. It rides the link's **channel**, not
+`SendToLink` — a link data packet is acked individually and carries no sequence
+number (`prns-core/src/routing/links/data.rs:149`), so a stream on top of it
+would need sequencing, retransmission and a half-close invented inside a game
+bridge. Two rules here:
+- **`framing.rs` is not used on the stream path.** Chunking and ordering are the
+  channel's job; a second framing layer is a second place to lose boundaries.
+- **The server opens its stream reader when the link comes up, not when the
+  allowlist finishes deciding.** Stream data arriving before a sink is
+  registered is forwarded past it and dropped, and a TCP client sends its
+  handshake immediately. Pinned end to end by `tests/stream_relay.rs`, whose
+  half-close test is the one an echo-only test would not catch.
+
 **Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
 names a driver — `manual` (what always happened, and the default when the block
 is absent), `archive`, or `steamcmd` — and `crates/platform-agent/src/content.rs`

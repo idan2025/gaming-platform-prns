@@ -40,6 +40,9 @@ model:
 
 Treat this as a distinct `StreamRelay` alongside the existing `DatagramRelay`,
 selected by the pack's `transport`. Do not try to make one code path serve both.
+**Built 2026-08-31** exactly that way: `crates/game-bridge/src/stream.rs`, with
+`relay.rs` branching on `profile.transport` at the two points where a socket is
+created.
 
 ## 3. Blocker B — one destination carries one port
 
