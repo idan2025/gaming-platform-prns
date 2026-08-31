@@ -58,7 +58,11 @@ impl Agent {
         let ports = PortAllocator::with_reserved(config.port_range, &reserved);
 
         let layout = StoreLayout::new(config.data_root.clone());
-        let content = Provisioner::new(layout.clone(), config.allow_content_fetch);
+        let content = Provisioner::new(
+            layout.clone(),
+            config.allow_content_fetch,
+            config.steamcmd_image.clone(),
+        );
         let packs = packs.into_iter().map(|p| (p.id.clone(), p)).collect();
 
         Ok(Self {
@@ -184,7 +188,9 @@ impl Agent {
             game_id: game_id.to_string(),
             version: runtime.content_version.clone(),
         };
-        self.content.ensure(&content, &pack.content).await
+        self.content
+            .ensure(&content, &pack.content, Some(&self.docker))
+            .await
     }
 
     /// Create and start an instance.

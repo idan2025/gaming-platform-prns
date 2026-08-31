@@ -21,8 +21,8 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+    RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
@@ -36,6 +36,24 @@ use crate::store::Mount;
 /// A game server flushes config and logs on shutdown; killing it immediately
 /// loses that. Ten seconds is generous for a shutdown that should take one.
 const STOP_TIMEOUT_SECS: i64 = 10;
+
+/// Label marking a short-lived provisioning container, so one is never mistaken
+/// for an instance. It carries `MANAGED_LABEL` too — the agent's guard applies
+/// to everything the agent creates — and `list_managed` skips it anyway,
+/// because a task container carries no `INSTANCE_LABEL` to report.
+pub const TASK_LABEL: &str = "org.idan2025.gaming-platform-prns.task";
+
+/// How much of a failed task's output to keep. Enough to carry steamcmd's
+/// actual complaint, short enough not to put a game's whole download log into
+/// an HTTP error body.
+const TASK_LOG_TAIL_LINES: usize = 40;
+
+/// What a one-shot container did.
+#[derive(Debug, Clone)]
+pub struct TaskOutcome {
+    pub exit_code: i64,
+    pub output: String,
+}
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -219,6 +237,119 @@ impl DockerRuntime {
             .with_context(|| format!("starting container {name}"))?;
 
         Ok(created.id)
+    }
+
+    /// Run a one-shot container to completion and return its exit code and the
+    /// tail of its output.
+    ///
+    /// This is how content drivers that need a tool the node has not installed
+    /// on its host get one — `steamcmd` in particular (`content.rs`). The image
+    /// is **operator config**, never pack-supplied, for the same reason a game's
+    /// image is: an image selects the code this node executes.
+    ///
+    /// The container carries `MANAGED_LABEL` so the agent's own guard applies to
+    /// it, gets no ports and no network restrictions beyond Docker's default,
+    /// and is removed when it exits — a provisioning run that stayed around
+    /// would show up in `list_managed` as an instance nobody asked for.
+    pub async fn run_to_completion(
+        &self,
+        name: &str,
+        image: &str,
+        cmd: Vec<String>,
+        mounts: &[Mount],
+        memory_limit_bytes: Option<i64>,
+    ) -> Result<TaskOutcome> {
+        let binds: Vec<String> = mounts
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}:{}:{}",
+                    m.host_path.display(),
+                    m.container_path.display(),
+                    if m.read_only { "ro" } else { "rw" }
+                )
+            })
+            .collect();
+
+        let mut labels = HashMap::new();
+        labels.insert(MANAGED_LABEL.to_string(), "1".to_string());
+        labels.insert(TASK_LABEL.to_string(), "1".to_string());
+
+        let config = Config {
+            image: Some(image.to_string()),
+            cmd: if cmd.is_empty() { None } else { Some(cmd) },
+            labels: Some(labels),
+            host_config: Some(HostConfig {
+                binds: Some(binds),
+                memory: memory_limit_bytes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        self.docker
+            .create_container(
+                Some(CreateContainerOptions { name: name.to_string(), platform: None }),
+                config,
+            )
+            .await
+            .with_context(|| format!("creating task container {name} from {image}"))?;
+
+        // Whatever happens next, the container goes away. A provisioning run
+        // that failed and left itself behind would collide with the next
+        // attempt by name and be much harder to explain than the failure was.
+        let result = self.await_task(name).await;
+        let _ = self
+            .docker
+            .remove_container(name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .await;
+        result
+    }
+
+    async fn await_task(&self, name: &str) -> Result<TaskOutcome> {
+        use futures_util::StreamExt;
+
+        self.docker
+            .start_container::<String>(name, None)
+            .await
+            .with_context(|| format!("starting task container {name}"))?;
+
+        let mut waits = self
+            .docker
+            .wait_container(name, None::<WaitContainerOptions<String>>);
+        let mut exit_code = 0i64;
+        while let Some(next) = waits.next().await {
+            match next {
+                Ok(response) => exit_code = response.status_code,
+                // A non-zero exit arrives as an error carrying the status, which
+                // is a result here, not a failure to report.
+                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
+                    exit_code = code
+                }
+                Err(e) => return Err(e).with_context(|| format!("waiting for {name}")),
+            }
+        }
+
+        let mut logs = self.docker.logs(
+            name,
+            Some(LogsOptions::<String> {
+                stdout: true,
+                stderr: true,
+                tail: TASK_LOG_TAIL_LINES.to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut output = String::new();
+        while let Some(next) = logs.next().await {
+            match next {
+                Ok(LogOutput::StdOut { message }) | Ok(LogOutput::StdErr { message }) => {
+                    output.push_str(&String::from_utf8_lossy(&message));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Ok(TaskOutcome { exit_code, output })
     }
 
     pub async fn stop(&self, spec_id: &str) -> Result<()> {

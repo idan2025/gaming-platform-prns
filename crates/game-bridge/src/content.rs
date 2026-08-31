@@ -33,12 +33,18 @@
 //! only decides that a spec is well formed. The agent is the one that touches a
 //! disk.
 //!
+//! `steamcmd` is the same shape one level up: the pack supplies an **app id, a
+//! number**, and the agent builds the command line. Which steamcmd runs — a
+//! container image — is the node operator's config, exactly like the image a
+//! game runs in. A pack that could say "run steamcmd like *this*" would be
+//! naming what runs, so it cannot.
+//!
 //! # What is not here yet
 //!
-//! `steamcmd` (anonymous app ids only) and `oci` (an image the *operator*
-//! allowlisted) are the next two drivers in `PLAN.md` §11.2's order. They are
-//! additive variants: a pack naming one today fails to parse, loudly, which is
-//! the correct answer from a build that cannot fetch it.
+//! `oci` (pull an image the *operator* allowlisted) is the last driver in
+//! `PLAN.md` §11.2's order. It is an additive variant: a pack naming it today
+//! fails to parse, loudly, which is the correct answer from a build that cannot
+//! fetch it.
 
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +83,17 @@ pub enum PackContent {
         #[serde(default)]
         strip_components: u8,
     },
+    /// Download a Steam app anonymously.
+    ///
+    /// Only apps whose dedicated server needs no credentials can be fetched
+    /// unattended (`GAMES.md` §5); anything else stays `manual`, which is the
+    /// honest answer rather than a worse one. There is no `login` field on
+    /// purpose: a pack is a file that gets shared, and a field for credentials
+    /// is a field people put credentials in.
+    Steamcmd {
+        /// Steam application id. A number, not a command line.
+        app_id: u32,
+    },
 }
 
 impl Default for PackContent {
@@ -94,6 +111,8 @@ pub enum ContentError {
     MalformedDigest(String),
     /// `strip_components` is implausible.
     StripTooDeep(u8),
+    /// App id zero is not an app.
+    BadAppId(u32),
 }
 
 impl core::fmt::Display for ContentError {
@@ -114,6 +133,7 @@ impl core::fmt::Display for ContentError {
                 f,
                 "content strip_components {n} is over the limit of {MAX_STRIP_COMPONENTS}"
             ),
+            Self::BadAppId(n) => write!(f, "steamcmd app_id {n} is not a Steam application id"),
         }
     }
 }
@@ -140,6 +160,12 @@ impl PackContent {
                 }
                 Ok(())
             }
+            Self::Steamcmd { app_id } => {
+                if *app_id == 0 {
+                    return Err(ContentError::BadAppId(*app_id));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -147,7 +173,7 @@ impl PackContent {
     /// which is why an agent must tell an operator what is missing rather than
     /// wait for it to appear.
     pub fn is_automatic(&self) -> bool {
-        matches!(self, Self::Archive { .. })
+        matches!(self, Self::Archive { .. } | Self::Steamcmd { .. })
     }
 
     /// Driver name as it appears in the pack, for messages a human reads.
@@ -155,6 +181,7 @@ impl PackContent {
         match self {
             Self::Manual { .. } => "manual",
             Self::Archive { .. } => "archive",
+            Self::Steamcmd { .. } => "steamcmd",
         }
     }
 }
@@ -241,14 +268,47 @@ mod tests {
         assert!(matches!(content.validate(), Err(ContentError::StripTooDeep(200))));
     }
 
-    /// A driver this build cannot run must fail loudly at load. `steamcmd` and
-    /// `oci` are next in PLAN.md §11.2's order; until they exist, a pack naming
-    /// one is refused rather than half-understood.
     #[test]
-    fn an_unimplemented_driver_is_refused_not_ignored() {
+    fn a_steamcmd_spec_parses_from_the_plan_s_example() {
         let src = r#"
             driver = "steamcmd"
             app_id = 276060
+        "#;
+        let content: PackContent = toml::from_str(src).unwrap();
+        assert_eq!(content, PackContent::Steamcmd { app_id: 276060 });
+        content.validate().unwrap();
+        assert!(content.is_automatic());
+    }
+
+    /// There is no `login` field, and adding one would make every shared pack a
+    /// place people put credentials. A pack that asks for one must not parse.
+    #[test]
+    fn steamcmd_has_nowhere_to_put_credentials() {
+        let src = r#"
+            driver = "steamcmd"
+            app_id = 276060
+            login = "someone"
+            password = "hunter2"
+        "#;
+        assert!(toml::from_str::<PackContent>(src).is_err());
+    }
+
+    #[test]
+    fn app_id_zero_is_refused() {
+        assert!(matches!(
+            PackContent::Steamcmd { app_id: 0 }.validate(),
+            Err(ContentError::BadAppId(0))
+        ));
+    }
+
+    /// A driver this build cannot run must fail loudly at load. `oci` is last in
+    /// PLAN.md §11.2's order; until it exists, a pack naming it is refused
+    /// rather than half-understood.
+    #[test]
+    fn an_unimplemented_driver_is_refused_not_ignored() {
+        let src = r#"
+            driver = "oci"
+            image = "example.org/game:1"
         "#;
         assert!(toml::from_str::<PackContent>(src).is_err());
     }

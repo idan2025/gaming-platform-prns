@@ -72,6 +72,19 @@ pub struct AgentConfig {
     /// it says what is missing and leaves the disk alone.
     #[serde(default)]
     pub allow_content_fetch: bool,
+    /// Image providing `steamcmd`, for packs whose content driver is
+    /// `steamcmd` (`PLAN.md` §11.2).
+    ///
+    /// **The operator's choice, never the pack's**, exactly like
+    /// `GameRuntime.image`: an image selects the code this node executes, and a
+    /// pack that could name one would be naming what runs. The pack supplies an
+    /// app id, a number. `None` disables the driver — same shape as a game with
+    /// no runtime meaning that game cannot start here.
+    ///
+    /// The image's entrypoint must be steamcmd itself; the agent passes
+    /// arguments only, and builds all of them.
+    #[serde(default)]
+    pub steamcmd_image: Option<String>,
     /// Where the local API listens.
     ///
     /// **Loopback only, enforced.** This API creates and destroys containers and

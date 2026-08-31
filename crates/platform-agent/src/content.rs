@@ -46,7 +46,8 @@ use std::path::{Component, Path, PathBuf};
 use game_bridge::content::PackContent;
 use sha2::{Digest, Sha256};
 
-use crate::store::{ContentRef, StoreLayout};
+use crate::docker::DockerRuntime;
+use crate::store::{ContentRef, Mount, StoreLayout};
 
 /// Ceiling on the compressed bytes accepted from the network, and on the bytes
 /// written during extraction. The digest already pins *which* archive is
@@ -73,6 +74,14 @@ pub enum ProvisionError {
     ManualInstallRequired { dir: PathBuf, note: Option<String> },
     /// The operator has not allowed this node to fetch content over the network.
     FetchNotPermitted { url: String },
+    /// The pack asks for `steamcmd` and the operator has not said which image
+    /// provides it. The pack does not get to choose one.
+    NoSteamcmdImage { app_id: u32 },
+    /// The provisioning run failed. Carries what the tool actually said, which
+    /// is the only part an operator can act on.
+    ToolFailed { tool: &'static str, exit_code: i64, output: String },
+    /// A driver needs Docker and this call had none.
+    NoContainerRuntime { driver: &'static str },
     /// The `[content]` block itself is malformed.
     BadSpec(game_bridge::content::ContentError),
     /// The layout refused the game id or version.
@@ -108,6 +117,17 @@ impl core::fmt::Display for ProvisionError {
                  fetching. Set allow_content_fetch = true in the agent config once you trust \
                  this pack"
             ),
+            Self::NoSteamcmdImage { app_id } => write!(
+                f,
+                "this pack fetches Steam app {app_id}, and this node has no steamcmd_image                  configured. Which steamcmd runs is the operator's choice, like every other                  image on this node — a pack cannot name one"
+            ),
+            Self::ToolFailed { tool, exit_code, output } => {
+                write!(f, "{tool} exited {exit_code}: {}", output.trim())
+            }
+            Self::NoContainerRuntime { driver } => write!(
+                f,
+                "the {driver:?} content driver runs a container and this agent has no Docker                  connection"
+            ),
             Self::BadSpec(e) => write!(f, "unusable [content] block: {e}"),
             Self::BadContentRef(e) => write!(f, "unusable content reference: {e}"),
             Self::Http { url, detail } => write!(f, "fetching {url}: {detail}"),
@@ -137,17 +157,29 @@ impl From<io::Error> for ProvisionError {
 }
 
 /// Materializes a pack's content into a node's store.
+/// Where the shared content is mounted inside a provisioning container. An
+/// agent-internal path: nothing in a pack names it, and no game ever sees it.
+const TASK_INSTALL_DIR: &str = "/content";
+
+/// A provisioning container gets a memory cap for the same reason an instance
+/// does — one runaway job on a shared node must not take the others down.
+const TASK_MEMORY_LIMIT_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+
 pub struct Provisioner {
     layout: StoreLayout,
     /// Whether this node may download. Off by default: a pack is a file
     /// somebody wrote, and until §11.3's signing exists the operator's own
     /// switch is the only thing that says "yes, fetch what this file names".
     allow_fetch: bool,
+    /// Image providing `steamcmd`, if the operator configured one. `None`
+    /// disables the driver — the same shape as a game with no runtime, and for
+    /// the same reason: an image is the code this node executes.
+    steamcmd_image: Option<String>,
 }
 
 impl Provisioner {
-    pub fn new(layout: StoreLayout, allow_fetch: bool) -> Self {
-        Self { layout, allow_fetch }
+    pub fn new(layout: StoreLayout, allow_fetch: bool, steamcmd_image: Option<String>) -> Self {
+        Self { layout, allow_fetch, steamcmd_image }
     }
 
     /// Make sure `content` is installed, fetching it if the pack says how and
@@ -156,6 +188,7 @@ impl Provisioner {
         &self,
         content: &ContentRef,
         spec: &PackContent,
+        docker: Option<&DockerRuntime>,
     ) -> Result<Provisioned, ProvisionError> {
         spec.validate().map_err(ProvisionError::BadSpec)?;
         let dir = self
@@ -206,6 +239,84 @@ impl Provisioner {
                 let _ = fs::remove_dir_all(&staging);
                 Ok(Provisioned::Installed { dir, bytes: written })
             }
+            PackContent::Steamcmd { app_id } => {
+                if !self.allow_fetch {
+                    return Err(ProvisionError::FetchNotPermitted {
+                        url: format!("steam app {app_id}"),
+                    });
+                }
+                let image = self
+                    .steamcmd_image
+                    .clone()
+                    .ok_or(ProvisionError::NoSteamcmdImage { app_id: *app_id })?;
+                let docker = docker.ok_or(ProvisionError::NoContainerRuntime {
+                    driver: "steamcmd",
+                })?;
+
+                let staging = self.staging_root()?;
+                let installed = staging.join("unpacked");
+                fs::create_dir_all(&installed)?;
+                let mount = Mount {
+                    host_path: installed.clone(),
+                    container_path: TASK_INSTALL_DIR.into(),
+                    read_only: false,
+                };
+                // Every argument here is built by this code. The pack supplied
+                // one number, and `+login anonymous` is not negotiable: an app
+                // that needs credentials is a `manual` pack (GAMES.md §5).
+                let cmd = vec![
+                    "+force_install_dir".to_string(),
+                    TASK_INSTALL_DIR.to_string(),
+                    "+login".to_string(),
+                    "anonymous".to_string(),
+                    "+app_update".to_string(),
+                    app_id.to_string(),
+                    "validate".to_string(),
+                    "+quit".to_string(),
+                ];
+                let name = format!(
+                    "gpp-content-{}-{}",
+                    app_id,
+                    staging.file_name().and_then(|n| n.to_str()).unwrap_or("task")
+                );
+                let outcome = docker
+                    .run_to_completion(
+                        &name,
+                        &image,
+                        cmd,
+                        &[mount],
+                        Some(TASK_MEMORY_LIMIT_BYTES),
+                    )
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&staging);
+                        return Err(ProvisionError::ToolFailed {
+                            tool: "steamcmd",
+                            exit_code: -1,
+                            output: format!("{e:#}"),
+                        });
+                    }
+                };
+                if outcome.exit_code != 0 {
+                    // A partial download is not content. Same rule as a failed
+                    // digest: nothing half-done becomes an install.
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(ProvisionError::ToolFailed {
+                        tool: "steamcmd",
+                        exit_code: outcome.exit_code,
+                        output: outcome.output,
+                    });
+                }
+                let bytes = dir_size(&installed);
+                if let Some(parent) = dir.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&installed, &dir)?;
+                let _ = fs::remove_dir_all(&staging);
+                Ok(Provisioned::Installed { dir, bytes })
+            }
         }
     }
 
@@ -224,6 +335,23 @@ impl Provisioner {
         fs::create_dir_all(&dir)?;
         Ok(dir)
     }
+}
+
+/// Bytes under a directory, for reporting what an install cost. Best effort:
+/// a file that vanishes mid-walk is not worth failing a completed install over.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => total += dir_size(&entry.path()),
+            Ok(t) if t.is_file() => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => {}
+        }
+    }
+    total
 }
 
 /// Stream a URL to `dest`, refusing anything over `MAX_ARCHIVE_BYTES`.
@@ -682,9 +810,9 @@ mod tests {
     #[tokio::test]
     async fn a_manual_pack_names_the_directory_a_human_has_to_fill() {
         let tmp = tempfile::tempdir().unwrap();
-        let provisioner = Provisioner::new(layout(&tmp), true);
+        let provisioner = Provisioner::new(layout(&tmp), true, None);
         let err = provisioner
-            .ensure(&sven(), &PackContent::Manual { note: Some("buy it on Steam".into()) })
+            .ensure(&sven(), &PackContent::Manual { note: Some("buy it on Steam".into()) }, None)
             .await
             .unwrap_err();
         match err {
@@ -706,7 +834,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("hand-installed"), b"mine").unwrap();
 
-        let provisioner = Provisioner::new(l, true);
+        let provisioner = Provisioner::new(l, true, None);
         let spec = PackContent::Archive {
             // Unreachable on purpose: reaching the network at all would be the bug.
             url: "http://127.0.0.1:1/never.tar".to_string(),
@@ -714,10 +842,39 @@ mod tests {
             strip_components: 0,
         };
         assert_eq!(
-            provisioner.ensure(&sven(), &spec).await.unwrap(),
+            provisioner.ensure(&sven(), &spec, None).await.unwrap(),
             Provisioned::AlreadyInstalled(dir.clone())
         );
         assert_eq!(fs::read(dir.join("hand-installed")).unwrap(), b"mine");
+    }
+
+    /// A pack cannot choose which steamcmd runs, so a node with none configured
+    /// refuses rather than reaching for a default image off the internet.
+    #[tokio::test]
+    async fn steamcmd_without_an_operator_chosen_image_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provisioner = Provisioner::new(layout(&tmp), true, None);
+        assert!(matches!(
+            provisioner
+                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060 }, None)
+                .await,
+            Err(ProvisionError::NoSteamcmdImage { app_id: 276060 })
+        ));
+    }
+
+    /// The fetch switch covers every automatic driver, not just the one that
+    /// speaks HTTP: steamcmd downloads a game too.
+    #[tokio::test]
+    async fn steamcmd_also_waits_for_the_operator_to_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provisioner =
+            Provisioner::new(layout(&tmp), false, Some("example/steamcmd".to_string()));
+        assert!(matches!(
+            provisioner
+                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060 }, None)
+                .await,
+            Err(ProvisionError::FetchNotPermitted { .. })
+        ));
     }
 
     /// Until §11.3's signing exists, the operator's switch is the only thing
@@ -725,14 +882,14 @@ mod tests {
     #[tokio::test]
     async fn a_node_that_has_not_opted_in_does_not_fetch() {
         let tmp = tempfile::tempdir().unwrap();
-        let provisioner = Provisioner::new(layout(&tmp), false);
+        let provisioner = Provisioner::new(layout(&tmp), false, None);
         let spec = PackContent::Archive {
             url: "http://127.0.0.1:1/never.tar".to_string(),
             sha256: digest_of(b"whatever"),
             strip_components: 0,
         };
         assert!(matches!(
-            provisioner.ensure(&sven(), &spec).await,
+            provisioner.ensure(&sven(), &spec, None).await,
             Err(ProvisionError::FetchNotPermitted { .. })
         ));
     }
@@ -762,20 +919,20 @@ mod tests {
         let (url, server) = serve(body.clone()).await;
 
         let l = layout(&tmp);
-        let provisioner = Provisioner::new(l.clone(), true);
+        let provisioner = Provisioner::new(l.clone(), true, None);
         let spec = PackContent::Archive {
             url,
             sha256: digest_of(&body),
             strip_components: 1,
         };
-        let out = provisioner.ensure(&sven(), &spec).await.unwrap();
+        let out = provisioner.ensure(&sven(), &spec, None).await.unwrap();
         let dir = l.content_dir(&sven()).unwrap();
         assert_eq!(out, Provisioned::Installed { dir: dir.clone(), bytes: 3 });
         assert_eq!(fs::read(dir.join("svencoop/maps/one.bsp")).unwrap(), b"map");
 
         // Second call is a no-op, so a create that races another never refetches.
         assert_eq!(
-            provisioner.ensure(&sven(), &spec).await.unwrap(),
+            provisioner.ensure(&sven(), &spec, None).await.unwrap(),
             Provisioned::AlreadyInstalled(dir)
         );
         server.abort();
@@ -790,14 +947,14 @@ mod tests {
         let (url, server) = serve(body).await;
 
         let l = layout(&tmp);
-        let provisioner = Provisioner::new(l.clone(), true);
+        let provisioner = Provisioner::new(l.clone(), true, None);
         let spec = PackContent::Archive {
             url,
             sha256: digest_of(b"a different archive entirely"),
             strip_components: 0,
         };
         assert!(matches!(
-            provisioner.ensure(&sven(), &spec).await,
+            provisioner.ensure(&sven(), &spec, None).await,
             Err(ProvisionError::DigestMismatch { .. })
         ));
         assert!(!l.content_dir(&sven()).unwrap().exists());
@@ -818,13 +975,13 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let provisioner = Provisioner::new(layout(&tmp), true);
+        let provisioner = Provisioner::new(layout(&tmp), true, None);
         let spec = PackContent::Archive {
             url: format!("http://{addr}/missing.tar"),
             sha256: digest_of(b"x"),
             strip_components: 0,
         };
-        match provisioner.ensure(&sven(), &spec).await {
+        match provisioner.ensure(&sven(), &spec, None).await {
             Err(ProvisionError::Http { url, detail }) => {
                 assert!(url.contains("missing.tar"));
                 assert!(detail.contains("404"), "{detail}");
