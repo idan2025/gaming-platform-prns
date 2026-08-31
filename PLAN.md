@@ -365,10 +365,11 @@ document's own reasoning implies:
    so `stream.rs` copies a TCP socket against that and propagates each close.
    `framing.rs` is not on this path — chunking and ordering belong to the
    channel. `tests/stream_relay.rs` pins it over a real loopback mesh.
-2. **Phase 5's second game — the GoldSrc sibling (app 90).** One new axis, not
-   several (`GAMES.md` §7), and it is now cheap: `steamcmd` can fetch it
-   unattended, which is exactly what §11.2 was for. Never let the second game be
-   the hard game.
+2. ~~**Phase 5's second game — the GoldSrc sibling (app 90).**~~ **Done
+   2026-08-31**: `packs/half-life.toml` and `packs/counter-strike-16.toml`, no
+   Rust change, which is exactly what `GAMES.md` §7 step 1 exists to prove. The
+   next rung is Source/TF2, and it is not free — it forces blocker B (one
+   destination, several ports) and framing v2.
 3. **§11.3 signing with expiry, then §11.4 trust tiers.** Worth doing once
    packs are worth sharing, which is after (1) and (2) widen what a pack can
    describe. `oci` is the last content driver and can wait for a game that

@@ -82,6 +82,14 @@ bridge. Two rules here:
   handshake immediately. Pinned end to end by `tests/stream_relay.rs`, whose
   half-close test is the one an echo-only test would not catch.
 
+**A second game landed as data** (2026-08-31): `packs/half-life.toml` and
+`packs/counter-strike-16.toml`, GoldSrc siblings on steamcmd app 90, with **no
+Rust change** — `GAMES.md` §7 step 1's whole purpose. `tests/second_game.rs`
+reads a pack off disk, runs a server from it and makes a browse node list it,
+and never names the game in code; keep it that way, because a test that hardcodes
+the game stops testing the abstraction. The next rung (Source/TF2) is not free:
+it forces multi-port and framing v2.
+
 **Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
 names a driver — `manual` (what always happened, and the default when the block
 is absent), `archive`, or `steamcmd` — and `crates/platform-agent/src/content.rs`

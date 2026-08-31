@@ -90,15 +90,15 @@ Sven Co-op's app 276060 allows anonymous steamcmd. Many dedicated servers do
 not: they require a Steam account that owns the game, and their binaries can't
 be redistributed by a third party.
 
-The pack declares this:
-
-```toml
-content.auth = "anonymous"      # or "user_supplied"
-```
-
-`user_supplied` means the **node operator** enters their own Steam credentials
-on their own node. Those credentials never reach the central platform and are
-never stored in a pack. Central-hosted instances can only offer anonymous-pull
+**Settled differently in the code, 2026-08-31, and the code wins.** This section
+proposed a pack field `content.auth = "anonymous" | "user_supplied"`. The
+`[content]` block that shipped has no such field and no `login` field at all
+(`crates/game-bridge/src/content.rs`): `driver = "steamcmd"` is anonymous by
+construction, and a game whose files need credentials is a `manual` pack, which
+is the same answer expressed as a driver rather than a flag. A pack is a file
+that gets shared, and a field for credentials is a field people put credentials
+in — so a node operator who owns the game installs it themselves, on their own
+node, and nothing about that reaches a pack or the platform. Central-hosted instances can only offer anonymous-pull
 games; everything else is bring-your-own-node. Some games also need an explicit
 EULA acceptance step (Minecraft) — that's a pack-declared pre-start gate, not
 something the platform can click through on the user's behalf.
@@ -119,9 +119,14 @@ both needed:
 
 Each step is chosen to exercise exactly one new axis:
 
-1. **Half-Life DM / CS 1.6 / DoD** (steamcmd app 90). Same engine, same A2S,
-   same stdin console, same i686 runtime. Proves the pack is genuinely data —
-   if this needs any Rust change, the abstraction is wrong. Nearly free.
+1. ~~**Half-Life DM / CS 1.6 / DoD** (steamcmd app 90).~~ **Done 2026-08-31**,
+   and the claim held: `packs/half-life.toml` and `packs/counter-strike-16.toml`
+   are the entire change, with no Rust touched.
+   `crates/game-bridge/tests/second_game.rs` runs a bridge server from a pack
+   read off disk and makes a browse node list it; `every_shipped_pack_plans_an_instance`
+   does the node-side half. Which mod runs (valve, cstrike, dod, tfc) is a
+   runtime argument, so DoD and TFC are two more files whenever somebody wants
+   them.
 2. **Team Fortress 2 / CS:S / Garry's Mod** (Source). New: x86_64 runtime,
    RCON admin channel, multi-port. Forces blocker B.
 3. **Minetest.** New: non-Steam content source (plain download), no A2S probe.
