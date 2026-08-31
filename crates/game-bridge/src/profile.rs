@@ -40,15 +40,14 @@ pub enum QueryProtocol {
 pub enum GameTransport {
     /// One raw datagram per link packet. What the Sven bridge does.
     Udp,
-    /// A byte stream spliced onto a link. Needed by Minecraft, Terraria and
-    /// every other TCP game.
+    /// A byte stream spliced onto a link's channel. Needed by Minecraft,
+    /// Terraria and every other TCP game.
     ///
-    /// **Declarable but not yet implemented.** `DESIGN.md` §2.1's `StreamRelay`
-    /// does not exist, and `relay.rs` pumps datagrams unconditionally — it does
-    /// not branch on this field at all. A pack that declares `tcp` is therefore
-    /// refused by `GameProfile::validate` rather than silently bridged as UDP,
-    /// which is what happened before this was noticed: the wrong protocol,
-    /// working badly, with nothing in the logs to say why.
+    /// Implemented by `stream.rs` (`DESIGN.md` §2.1 `StreamRelay`): the relay
+    /// branches on this field, binds a TCP listener instead of a UDP socket on
+    /// the client, connects instead of sending on the server, and gives each
+    /// connection its own link. It does **not** share the datagram path's
+    /// framing — chunking and ordering belong to the channel there.
     Tcp,
 }
 
@@ -90,6 +89,11 @@ pub enum ProfileError {
     EmptyAppName,
     UnknownLinkClass(u8),
     /// The pack describes a transport this build cannot actually bridge.
+    ///
+    /// No variant reaches this today — UDP is the datagram relay and TCP is
+    /// `stream.rs` — but the check stays: the next transport to be declared
+    /// before it is spliced must fail loudly rather than be bridged as
+    /// something else.
     TransportNotImplemented(GameTransport),
 }
 
@@ -158,9 +162,6 @@ impl GameProfile {
         if !(1..=3).contains(&self.min_link_class) {
             return Err(ProfileError::UnknownLinkClass(self.min_link_class));
         }
-        if self.transport == GameTransport::Tcp {
-            return Err(ProfileError::TransportNotImplemented(GameTransport::Tcp));
-        }
         Ok(())
     }
 }
@@ -221,17 +222,15 @@ mod tests {
         GameProfile::sven_coop().validate().expect("sven profile is valid");
     }
 
-    /// The trap this guards: nothing in `relay.rs` branches on `transport`, so
-    /// a TCP pack would have been bridged as UDP — the wrong protocol, working
+    /// TCP is a supported transport now that `stream.rs` exists. The relay
+    /// branches on the field rather than pumping datagrams regardless, which is
+    /// what made declaring `tcp` dangerous before: the wrong protocol, working
     /// badly, with nothing in the logs to explain it.
     #[test]
-    fn a_tcp_pack_is_refused_rather_than_bridged_as_udp() {
+    fn a_tcp_pack_is_accepted_now_that_the_stream_relay_exists() {
         let mut p = GameProfile::sven_coop();
         p.transport = GameTransport::Tcp;
-        assert_eq!(
-            p.validate(),
-            Err(ProfileError::TransportNotImplemented(GameTransport::Tcp))
-        );
+        assert_eq!(p.validate(), Ok(()));
     }
 
     #[test]

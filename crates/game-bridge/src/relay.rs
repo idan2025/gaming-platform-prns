@@ -61,7 +61,7 @@ use prns_core::routing::delivery::Delivery;
 use prns_core::interfaces::InterfaceId;
 use prns_core::routing::links::LinkId;
 use prns_core::routing::request_handlers::RequestPathHash;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::LocalSet;
 use tracing::{debug, error, info, warn};
@@ -72,6 +72,8 @@ use crate::config::{
     AnnounceFormat, BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, ServerArgs,
 };
 use crate::framing::{frame, Reassembler};
+use crate::profile::GameTransport;
+use crate::stream::{self, ByteStreamReader, ByteStreamWriter};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
 
 const UDP_READ_BUF: usize = 8192;
@@ -453,7 +455,13 @@ impl BridgeSession {
                 .with_context(|| {
                     format!("invalid game host/port: {}:{}", args.game_host, args.game_port)
                 })?;
-            info!(game = %game_id, game_addr = %game_addr, "bridging to game server");
+            let transport = args.profile.transport;
+            info!(
+                game = %game_id,
+                game_addr = %game_addr,
+                transport = ?transport,
+                "bridging to game server"
+            );
 
             let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
             let link_senders: LinkSenders = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -543,6 +551,12 @@ impl BridgeSession {
                 // configured. Local to this task, which is the only owner.
                 let mut pending_identify: std::collections::HashMap<LinkId, mpsc::Receiver<Vec<u8>>> =
                     std::collections::HashMap::new();
+                // The TCP equivalent: a link's stream halves, opened at accept
+                // time so nothing the peer sends while it waits is lost.
+                let mut pending_streams: std::collections::HashMap<
+                    LinkId,
+                    (ByteStreamReader, ByteStreamWriter),
+                > = std::collections::HashMap::new();
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } => {
@@ -560,13 +574,23 @@ impl BridgeSession {
                                         identity = ?identity.as_bytes(),
                                         "peer is on the allowlist; starting relay"
                                     );
-                                    spawn_server_link_relay(
-                                        link_id,
-                                        rx,
-                                        router_senders.clone(),
-                                        router_handle.clone(),
-                                        game_addr,
-                                    );
+                                    match pending_streams.remove(&link_id) {
+                                        Some((reader, writer)) => spawn_server_link_stream_relay(
+                                            link_id,
+                                            reader,
+                                            writer,
+                                            router_senders.clone(),
+                                            router_handle.clone(),
+                                            game_addr,
+                                        ),
+                                        None => spawn_server_link_relay(
+                                            link_id,
+                                            rx,
+                                            router_senders.clone(),
+                                            router_handle.clone(),
+                                            game_addr,
+                                        ),
+                                    }
                                 }
                             } else {
                                 warn!(
@@ -575,6 +599,7 @@ impl BridgeSession {
                                     "peer is not on the allowlist; closing link"
                                 );
                                 pending_identify.remove(&link_id);
+                                pending_streams.remove(&link_id);
                                 router_senders.write().await.remove(&link_id);
                                 router_connected_clients.write().await.remove(&link_id);
                                 let _ = router_handle.close_link(link_id);
@@ -583,6 +608,7 @@ impl BridgeSession {
                         BridgeEvent::IdentifyTimeout { link_id } => {
                             // Only fires for a link still waiting: an allowed
                             // peer's entry was removed when its relay started.
+                            pending_streams.remove(&link_id);
                             if pending_identify.remove(&link_id).is_some() {
                                 warn!(
                                     link = ?link_id,
@@ -599,14 +625,37 @@ impl BridgeSession {
                             let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
                             router_senders.write().await.insert(link_id, tx);
 
+                            // A TCP game's stream reader is registered the
+                            // instant the link is up, before the allowlist has
+                            // decided anything: bytes that arrive before a sink
+                            // exists are forwarded past it and lost, and a game
+                            // client does not wait to be allowed before sending
+                            // its handshake. See `stream.rs`.
+                            let stream = match transport {
+                                GameTransport::Tcp => {
+                                    Some(stream::server_stream(&router_handle, link_id).await)
+                                }
+                                GameTransport::Udp => None,
+                            };
+
                             if allowlist.is_empty() {
-                                spawn_server_link_relay(
-                                    link_id,
-                                    rx,
-                                    router_senders.clone(),
-                                    router_handle.clone(),
-                                    game_addr,
-                                );
+                                match stream {
+                                    Some((reader, writer)) => spawn_server_link_stream_relay(
+                                        link_id,
+                                        reader,
+                                        writer,
+                                        router_senders.clone(),
+                                        router_handle.clone(),
+                                        game_addr,
+                                    ),
+                                    None => spawn_server_link_relay(
+                                        link_id,
+                                        rx,
+                                        router_senders.clone(),
+                                        router_handle.clone(),
+                                        game_addr,
+                                    ),
+                                }
                                 router_state.set_bridge_clients(router_senders.read().await.len());
                                 continue;
                             }
@@ -619,6 +668,9 @@ impl BridgeSession {
                             // the first one.
                             router_state.set_bridge_clients(router_senders.read().await.len());
                             pending_identify.insert(link_id, rx);
+                            if let Some(halves) = stream {
+                                pending_streams.insert(link_id, halves);
+                            }
                             let timeout_tx = identify_timeout_tx.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_secs(identify_timeout_secs)).await;
@@ -627,6 +679,7 @@ impl BridgeSession {
                         }
                         BridgeEvent::LinkClosed { link_id } => {
                             pending_identify.remove(&link_id);
+                            pending_streams.remove(&link_id);
                             if let Some(tx) = router_senders.write().await.remove(&link_id) {
                                 let _ = tx.send(Vec::new()).await;
                             }
@@ -692,10 +745,27 @@ impl BridgeSession {
                 None => None,
             };
 
-            let udp = UdpSocket::bind(listen_addr)
-                .await
-                .with_context(|| format!("binding UDP listener on {listen_addr}"))?;
-            info!(listen = %listen_addr, "point the game client at this address");
+            // One listener, in the game's own transport. A TCP game gets a
+            // link per connection (`stream.rs`); a UDP game keeps the datagram
+            // path's link per source address.
+            let transport = args.profile.transport;
+            let udp = match transport {
+                GameTransport::Udp => Some(
+                    UdpSocket::bind(listen_addr)
+                        .await
+                        .with_context(|| format!("binding UDP listener on {listen_addr}"))?,
+                ),
+                GameTransport::Tcp => None,
+            };
+            let tcp_listener = match transport {
+                GameTransport::Tcp => Some(
+                    TcpListener::bind(listen_addr)
+                        .await
+                        .with_context(|| format!("binding TCP listener on {listen_addr}"))?,
+                ),
+                GameTransport::Udp => None,
+            };
+            info!(listen = %listen_addr, transport = ?transport, "point the game client at this address");
 
             let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
             let destination = PreConfiguredDestination::Single {
@@ -802,11 +872,21 @@ impl BridgeSession {
                 }
             });
 
+            if let Some(listener) = tcp_listener {
+                spawn_client_tcp_listener(
+                    listener,
+                    handle.clone(),
+                    server_target.clone(),
+                    client_identity_hash,
+                );
+            }
+
+            let _udp_task = udp.map(|udp| {
             let udp: Arc<UdpSocket> = Arc::new(udp);
             let udp_handle = handle.clone();
             let udp_target = server_target.clone();
             let udp_link_data = link_data.clone();
-            let _udp_task = tokio::spawn(async move {
+            tokio::spawn(async move {
                 let mut buf = vec![0u8; UDP_READ_BUF];
                 loop {
                     let (n, src) = match udp.recv_from(&mut buf).await {
@@ -927,6 +1007,7 @@ impl BridgeSession {
                         debug!(src = %src, link = ?link_id, "client relay ended");
                     });
                 }
+            })
             });
 
             info!("client node running");
@@ -1222,6 +1303,111 @@ fn spawn_server_link_relay(
         senders.write().await.remove(&link_id);
         let _ = handle.close_link(link_id);
         debug!(link = ?link_id, "server relay ended");
+    });
+}
+
+/// Accept game-client connections and give each one its own link.
+///
+/// A TCP connection is a lifetime, not an address, so the datagram client's
+/// trick of keying links by source address does not apply: one connection is
+/// one link, and when either ends the other does.
+fn spawn_client_tcp_listener(
+    listener: TcpListener,
+    handle: PrnsNodeHandle,
+    target: Arc<RwLock<Option<DestinationHash>>>,
+    client_identity_hash: IdentityHash,
+) {
+    tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!(error = %e, "client TCP listener died");
+                    return;
+                }
+            };
+            let Some(server) = *target.read().await else {
+                warn!(peer = %peer, "connection accepted but no server discovered yet; closing");
+                continue;
+            };
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                debug!(peer = %peer, target = ?server.as_bytes(), "establishing link for a TCP connection");
+                let Some(link_id) = establish_link_with_path_retry(&handle, server).await else {
+                    return;
+                };
+                // Best effort, exactly as on the datagram path: it lets the
+                // server list this client and gates nothing.
+                if let Err(e) = handle.identify(link_id, client_identity_hash).await {
+                    debug!(peer = %peer, link = ?link_id, error = ?e, "identify failed");
+                }
+                let (reader, writer) = stream::client_stream(&handle, link_id).await;
+                let _ = stream::splice(tcp, reader, writer).await;
+                let _ = handle.close_link(link_id);
+                debug!(peer = %peer, link = ?link_id, "client stream relay ended");
+            });
+        }
+    });
+}
+
+/// Establish a link, asking for a path first if the first attempt finds none.
+///
+/// Announces can be slow or absent between same-interface peers, and the
+/// datagram client already does this dance inline; the stream client needs the
+/// same behaviour, so it is one function now rather than two copies.
+async fn establish_link_with_path_retry(
+    handle: &PrnsNodeHandle,
+    target: DestinationHash,
+) -> Option<LinkId> {
+    match handle.establish_link(target).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            info!(error = ?e, "no route to server; requesting path then retrying");
+            if let Err(pe) = handle.request_path(target).await {
+                error!(error = ?pe, "path request to server failed");
+                return None;
+            }
+            match handle.establish_link(target).await {
+                Ok(id) => Some(id),
+                Err(e2) => {
+                    error!(error = ?e2, "establish link failed after path request");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Pump one accepted link's byte stream against the local game server's TCP
+/// port until either end closes (`stream.rs`).
+///
+/// The datagram twin above binds a UDP socket per link; this connects one TCP
+/// connection per link, which is the same relationship stated in the units a
+/// stream has. A failure to connect closes the link rather than leaving a
+/// client waiting on a game that is not listening.
+fn spawn_server_link_stream_relay(
+    link_id: LinkId,
+    reader: ByteStreamReader,
+    writer: ByteStreamWriter,
+    senders: LinkSenders,
+    handle: PrnsNodeHandle,
+    game_addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        debug!(link = ?link_id, game_addr = %game_addr, "server stream relay started");
+        let tcp = match TcpStream::connect(game_addr).await {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                error!(link = ?link_id, error = %e, "failed to connect to the game server");
+                senders.write().await.remove(&link_id);
+                let _ = handle.close_link(link_id);
+                return;
+            }
+        };
+        let _ = stream::splice(tcp, reader, writer).await;
+        senders.write().await.remove(&link_id);
+        let _ = handle.close_link(link_id);
+        debug!(link = ?link_id, "server stream relay ended");
     });
 }
 

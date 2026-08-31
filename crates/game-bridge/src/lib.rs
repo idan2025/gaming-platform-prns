@@ -20,6 +20,7 @@ pub mod framing;
 pub mod pack;
 pub mod profile;
 pub mod relay;
+pub mod stream;
 
 pub use announce::{AnnounceInfo, AnnounceRecord, DecodeError, EncodeError};
 pub use browse::{browse, BrowseFilter, BrowseQuery, SortBy};
