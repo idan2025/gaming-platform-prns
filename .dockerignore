@@ -1,0 +1,4 @@
+target
+launcher/src-tauri/target
+launcher/uicheck/node_modules
+.git

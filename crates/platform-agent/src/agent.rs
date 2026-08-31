@@ -90,6 +90,15 @@ impl Agent {
         })
     }
 
+    /// The packs this agent loaded, by game id.
+    ///
+    /// Read-only: which packs exist is decided once at startup under the
+    /// operator's trust policy (`packs.rs`), and a route that could add one
+    /// would be a route that bypasses that policy.
+    pub fn packs(&self) -> &BTreeMap<String, GamePack> {
+        &self.packs
+    }
+
     pub fn config(&self) -> &AgentConfig {
         &self.config
     }

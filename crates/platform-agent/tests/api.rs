@@ -44,6 +44,105 @@ async fn serve() -> Option<(std::net::SocketAddr, tempfile::TempDir)> {
     Some((addr, dir))
 }
 
+/// The same, but with a token, so the auth layer is the real one.
+async fn serve_with_token(token: &str) -> Option<(std::net::SocketAddr, tempfile::TempDir)> {
+    let dir = tempfile::tempdir().ok()?;
+    let config = AgentConfig::parse(&config_toml(dir.path())).ok()?;
+    let agent = Agent::new(config, vec![game_bridge::GamePack::sven_coop()])
+        .await
+        .ok()?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    let router = api::router_with_token(Arc::new(agent), Some(token.to_string()));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Some((addr, dir))
+}
+
+/// **The load-bearing auth test.** Every route creates or destroys containers,
+/// so once a token exists it has to gate all of them — a single route that
+/// forgot the layer is a route that runs containers for anyone who can reach
+/// the port.
+///
+/// Loopback is not an exemption. These requests all come from loopback, and
+/// they are still refused, because a browser on the operator's machine is a
+/// loopback client and so is every other program on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_token_every_route_is_refused() {
+    let token = "t".repeat(32);
+    let Some((addr, _dir)) = serve_with_token(&token).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+
+    for path in ["/health", "/capacity", "/instances", "/orphans", "/games"] {
+        let status = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "{path} answered without a token");
+    }
+
+    // A wrong token is no better than none.
+    let status = client
+        .get(format!("http://{addr}/health"))
+        .bearer_auth("x".repeat(32))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 401, "a wrong token was accepted");
+
+    // And a destructive route is not somehow more open than a read.
+    let status = client
+        .delete(format!("http://{addr}/instances/whatever"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 401, "delete answered without a token");
+
+    // The right token works, or the test above proves only that the API is
+    // broken.
+    let status = client
+        .get(format!("http://{addr}/health"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+}
+
+/// The web UI needs to know what it may offer. A pack with no runtime is listed
+/// as not runnable rather than hidden, because "where did my game go" is the
+/// next question and the answer is one line of the operator's own config.
+#[tokio::test(flavor = "multi_thread")]
+async fn games_lists_packs_and_says_which_can_actually_run() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/games"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let games = body.as_array().expect("an array");
+    let sven = games
+        .iter()
+        .find(|g| g["id"] == "sven-coop")
+        .expect("the pack this node was given");
+    assert_eq!(sven["runnable"], serde_json::json!(true));
+    assert_eq!(sven["default_port"], serde_json::json!(27015));
+    assert!(sven["reason"].is_null());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn health_reports_the_nodes_limits() {
     let Some((addr, _dir)) = serve().await else {

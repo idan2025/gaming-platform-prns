@@ -1009,6 +1009,75 @@ working, and each shortens the distance between installing and playing.
    with nothing worth listing is furniture, and steps 1-4 are what make packs
    worth sharing.
 
+### 13.5 Host-side UI — Tauri, and where a web UI does and does not fit
+
+Asked 2026-08-31: should the platform get a host-side GUI like the one
+`svencoop-prns` ships, and is a containerised web UI viable?
+
+**The Tauri host UI is viable, and it is the strongest single thing left to
+build.** It is §13.3 step 2, and unusually for this repo it has a working
+precedent to copy rather than a design to invent. `svencoop-prns` v0.1.10's
+`gui/` exposes 25 commands over the same `controller` split this project already
+mirrors in `launcher-core`:
+
+- host: `start_bridge_server`, `stop_bridge_server`, `restart_bridge_server`,
+  `announce_now`
+- interfaces: `add_interface_tcp` / `_udp` / `_auto` / `_websocket`,
+  `remove_interface`, `rename_interface`, `list_interfaces`
+- the game process: `ds_start`, `ds_stop`, `ds_status`, `ds_query`,
+  `ds_changelevel`, `ds_set_cheats`, `ds_list_maps`
+- the player: `connect_and_launch`, `trace_path`
+
+The platform launcher today has **browse and join, and nothing else**: no host
+controls, no interface management, no launch. Extraction stays one-directional
+(§5) — copy the shape, parametrize it by pack, never let `svencoop-prns` depend
+on anything here.
+
+**One real fork in the road.** `svencoop-prns` runs the dedicated server as a
+child process it supervises. This platform moved that job to `platform-agent`
+and containers, for reasons that still hold (many servers, one shared copy of
+the content, an operator who chose the image). So a Host tab has to pick:
+
+1. **Supervise a local game process**, as `svencoop-prns` does. Simplest for one
+   person hosting one server on their desktop, and it needs no Docker. It also
+   means a second implementation of process supervision, and
+   `svencoop-prns`'s `AGENTS.md` records that this is where three releases in a
+   row broke — process-group kill, settings dedup, WebView2Loader.
+2. **Drive a local `platform-agent`** over its loopback API. Reuses everything
+   phase 3 built and gets multi-server for free, but requires Docker on a
+   player's desktop, which is a large ask for someone who wants to host one map
+   for three friends.
+
+The honest answer is **both, in that order**: (1) for the desktop case, because
+the alternative asks a player to install Docker; (2) exposed when an agent is
+already reachable. They are different audiences, not competing designs.
+
+**A containerised web UI is viable for the node, and not for the player.** The
+same `launcher-core` behind an HTTP API with the existing frontend calling
+`fetch` instead of `invoke` is a small change — that split was built for it. But
+three things do not survive the container boundary:
+
+- **§13.1 launch profiles cannot work at all.** A container cannot start a game
+  on the viewer's desktop, and the whole point of a launch profile is that the
+  program is the player's own.
+- **The join path binds a local port the player's game connects to.** Inside a
+  container that port is not where the game is looking, so it needs host
+  networking — which is a real ask, not a flag.
+- **A web UI has no user.** The Tauri app is used by whoever is at the machine;
+  a web UI is reachable by whoever can route to it, and it starts bridges and
+  binds ports. It would need the same treatment `platform-agent`'s API gets —
+  loopback-only and enforced, or real authentication.
+
+So a web UI is for **running a node headlessly** — a relay or a host on a box
+with no desktop, managed from a browser elsewhere. That is a genuine audience
+and the natural companion to the container image. It is not a replacement for
+the launcher, and it must never become the only way to do something, or the
+zero-infrastructure baseline in §13.4 quietly stops being true.
+
+**Order:** the Tauri host UI first, because it serves the player and the small
+host and has a proven shape to copy. The headless web UI after, and scoped to
+the roles that make sense without a desktop: relay, host, browse.
+
 ### 13.4 What this does not change
 
 The zero-infrastructure baseline still has to work: two launchers, any shared

@@ -133,6 +133,24 @@ pub struct AgentConfig {
     /// a trust list wrote it to mean something.
     #[serde(default)]
     pub pack_trust: Option<PackTrustConfig>,
+    /// A shared secret callers must present to use the local API.
+    ///
+    /// **This is what allows `api_bind` off loopback.** Without it the API has
+    /// no authentication at all and every route creates or destroys containers,
+    /// so the only honest boundary is "you are already on this machine" and
+    /// `validate` enforces it. With it, the agent can serve a web UI a person
+    /// reaches from another machine — which is the whole point of running the
+    /// agent in a container.
+    ///
+    /// Prefer `api_token_file`: a token in a config file is a token in a backup,
+    /// in a paste, and in a screenshot.
+    #[serde(default)]
+    pub api_token: Option<String>,
+    /// Read the API token from this file instead. The file's whole contents,
+    /// trimmed. Created with a random token on first run if it does not exist,
+    /// so a containerised agent has a secret without the operator inventing one.
+    #[serde(default)]
+    pub api_token_file: Option<PathBuf>,
 }
 
 /// The operator's pack-signing trust list (`PLAN.md` §11.4).
@@ -257,8 +275,12 @@ pub enum ConfigError {
     RelativeDataRoot(PathBuf),
     EmptyImage(String),
     RelativeContentRoot { game: String, path: PathBuf },
-    /// The local API was pointed at something other than loopback.
+    /// The local API was pointed off loopback with no token to protect it.
     NonLoopbackApiBind(SocketAddr),
+    /// An API token was configured but is too short to be worth having.
+    ApiTokenTooShort(usize),
+    /// Both `api_token` and `api_token_file` were set.
+    ApiTokenSaidTwice,
     /// A `trusted_indexes` entry was not a 32-char hex identity hash.
     BadTrustedIndex(String),
     /// The uplink identity secret path was relative, not absolute.
@@ -289,9 +311,21 @@ impl core::fmt::Display for ConfigError {
             ),
             Self::NonLoopbackApiBind(addr) => write!(
                 f,
-                "api_bind {addr} is not a loopback address. This API creates containers \
-                 and has no authentication, so it must not be reachable from the network. \
-                 Put a reverse proxy in front of it if you need remote access"
+                "api_bind {addr} is not a loopback address and no api_token or \
+                 api_token_file is set. This API creates containers, so unauthenticated \
+                 it must not be reachable from the network. Set api_token_file to serve \
+                 it beyond this host — the agent generates a token on first run"
+            ),
+            Self::ApiTokenTooShort(n) => write!(
+                f,
+                "the API token is {n} characters; {MIN_API_TOKEN_LEN} is the minimum. \
+                 It is the only thing between the network and a process that starts \
+                 containers, so leave api_token unset and let the agent generate one"
+            ),
+            Self::ApiTokenSaidTwice => write!(
+                f,
+                "set api_token or api_token_file, not both: two sources for one secret \
+                 is a way to authenticate against the one you did not mean to change"
             ),
             Self::BadTrustedIndex(s) => write!(
                 f,
@@ -339,7 +373,18 @@ impl AgentConfig {
                 why: "reaches into privileged ports, which a game server must not need",
             });
         }
-        if !self.api_bind.ip().is_loopback() {
+        if self.api_token.is_some() && self.api_token_file.is_some() {
+            return Err(ConfigError::ApiTokenSaidTwice);
+        }
+        if let Some(t) = &self.api_token {
+            if t.trim().len() < MIN_API_TOKEN_LEN {
+                return Err(ConfigError::ApiTokenTooShort(t.trim().len()));
+            }
+        }
+        // Off loopback is allowed only when something authenticates. A token in
+        // a file counts even before the file exists, because the agent creates
+        // it with a random value on first run.
+        if !self.api_bind.ip().is_loopback() && !self.api_is_authenticated() {
             return Err(ConfigError::NonLoopbackApiBind(self.api_bind));
         }
         if let Some(uplink) = &self.uplink {
@@ -379,6 +424,37 @@ impl AgentConfig {
         self.games.get(game_id)
     }
 
+    /// Whether anything at all guards the local API.
+    pub fn api_is_authenticated(&self) -> bool {
+        self.api_token.is_some() || self.api_token_file.is_some()
+    }
+
+    /// The token callers must present, creating it on first run when the
+    /// operator pointed at a file rather than pasting a secret into config.
+    ///
+    /// Generated rather than defaulted: a default token is no token, and an
+    /// agent that shipped one would be an agent every install shares.
+    pub fn load_api_token(&self) -> std::io::Result<Option<String>> {
+        if let Some(t) = &self.api_token {
+            return Ok(Some(t.trim().to_string()));
+        }
+        let Some(path) = &self.api_token_file else {
+            return Ok(None);
+        };
+        match std::fs::read_to_string(path) {
+            Ok(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Ok(_) | Err(_) => {
+                let token = generate_api_token();
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, format!("{token}\n"))?;
+                restrict_to_owner(path)?;
+                Ok(Some(token))
+            }
+        }
+    }
+
     /// The trust policy this node deploys packs under.
     ///
     /// No `[pack_trust]` section is `allowing_unsigned()` — see the field's
@@ -401,6 +477,29 @@ impl AgentConfig {
 /// `trusted_indexes` entries must be exactly that, or the uplink cannot match a
 /// verified identity against them. Uppercase is refused so a later lookup is a
 /// straight byte compare, not a case-fold.
+/// Shortest token worth having. 32 hex characters is 128 bits.
+pub const MIN_API_TOKEN_LEN: usize = 32;
+
+/// A fresh token: 32 bytes of system entropy, hex.
+fn generate_api_token() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("the system has entropy");
+    hex::encode(bytes)
+}
+
+/// Owner-only, where the platform has a notion of it. A token file the rest of
+/// the machine can read is a token the rest of the machine has.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn identity_hash(s: &str) -> Option<IdentityHash> {
     let bytes = hex::decode(s).ok()?;
     let arr: [u8; 16] = bytes.as_slice().try_into().ok()?;
@@ -540,6 +639,70 @@ cpus = 1.5
     fn a_pack_trust_key_that_is_not_an_identity_hash_is_refused() {
         let src = with_top_level("[pack_trust]\nfirst_party_keys = [\"nope\"]\n");
         assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::BadPackTrustKey(_))));
+    }
+
+    /// Without a token the API is loopback-only, enforced rather than
+    /// documented: every route creates containers.
+    #[test]
+    fn a_public_bind_without_a_token_is_refused() {
+        let src = with_top_level("api_bind = \"0.0.0.0:4750\"");
+        assert!(matches!(
+            AgentConfig::parse(&src),
+            Err(ConfigError::NonLoopbackApiBind(_))
+        ));
+    }
+
+    /// A token is what lifts that, and it is the whole reason a containerised
+    /// agent can be reached from the host at all.
+    #[test]
+    fn a_token_file_allows_a_public_bind() {
+        let src = with_top_level(
+            "api_bind = \"0.0.0.0:4750\"\napi_token_file = \"/data/api.token\"",
+        );
+        let cfg = AgentConfig::parse(&src).expect("a token permits a public bind");
+        assert!(cfg.api_is_authenticated());
+    }
+
+    #[test]
+    fn a_short_token_is_refused_rather_than_accepted_quietly() {
+        let src = with_top_level("api_token = \"hunter2\"");
+        assert!(matches!(
+            AgentConfig::parse(&src),
+            Err(ConfigError::ApiTokenTooShort(7))
+        ));
+    }
+
+    #[test]
+    fn a_token_said_two_ways_is_refused() {
+        let src = with_top_level(&format!(
+            "api_token = \"{}\"\napi_token_file = \"/data/t\"",
+            "a".repeat(32)
+        ));
+        assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::ApiTokenSaidTwice)));
+    }
+
+    /// Generated, not defaulted: a shipped default token is no token at all,
+    /// and every install would share it.
+    #[test]
+    fn a_missing_token_file_is_created_with_a_random_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("api.token");
+        let mut cfg = AgentConfig::parse(SAMPLE).unwrap();
+        cfg.api_token_file = Some(path.clone());
+
+        let first = cfg.load_api_token().unwrap().expect("a token is generated");
+        assert!(first.len() >= MIN_API_TOKEN_LEN);
+        assert!(path.exists());
+
+        // Stable across restarts, or every restart would lock out the browser
+        // that just logged in.
+        let second = cfg.load_api_token().unwrap().unwrap();
+        assert_eq!(first, second);
+
+        // And two agents do not share one.
+        let other = dir.path().join("other.token");
+        cfg.api_token_file = Some(other);
+        assert_ne!(cfg.load_api_token().unwrap().unwrap(), first);
     }
 
     #[test]

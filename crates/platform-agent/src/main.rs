@@ -90,6 +90,16 @@ async fn main() -> Result<()> {
     );
 
     let bind = config.api_bind;
+    // Loaded before the agent starts, because a misconfigured token should stop
+    // the process rather than surface as a 401 on the first request. Generated
+    // on first run when the operator pointed at a file, so a containerised
+    // agent has a secret without anyone inventing one.
+    let api_token = config
+        .load_api_token()
+        .with_context(|| "reading the API token")?;
+    if let (Some(path), Some(_)) = (&config.api_token_file, &api_token) {
+        tracing::info!(path = %path.display(), "API token in use; read it from this file");
+    }
     let uplink_config = config.uplink.clone();
     let agent = Arc::new(Agent::new(config, loaded.packs).await?);
 
@@ -107,9 +117,18 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding the local API on {bind}"))?;
-    tracing::info!(%bind, "agent listening; this API has no authentication and is loopback-only");
+    match &api_token {
+        Some(_) => tracing::info!(
+            %bind,
+            "agent listening; every request needs the API token from api_token_file"
+        ),
+        None => tracing::info!(
+            %bind,
+            "agent listening; this API has no authentication and is loopback-only"
+        ),
+    }
 
-    axum::serve(listener, api::router(agent))
+    axum::serve(listener, api::router_with_token(agent, api_token))
         .await
         .context("serving the local API")?;
     Ok(())

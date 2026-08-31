@@ -24,6 +24,20 @@ api_bind = "127.0.0.1:4750"
 # exactly what you are offering (DESIGN.md §4).
 # idle_timeout_secs = 1800
 
+# Authentication for the local API. Without it the API is loopback-only and the
+# agent refuses to start bound anywhere else: every route creates or destroys
+# containers, so unauthenticated the only honest boundary is "you are already on
+# this machine".
+#
+# Set this to serve the web UI from a container, where the API has to bind
+# 0.0.0.0 to be reachable from the host at all. The agent generates a random
+# token on first run if the file does not exist, and writes it 0600 — read it
+# out of the file, do not invent one. `api_token` inline also works and is worse:
+# a token in a config file is a token in a backup, a paste and a screenshot.
+#
+# api_bind = "0.0.0.0:4750"
+# api_token_file = "/var/lib/gaming-platform-prns/api.token"
+
 # Which pack signers this node trusts, and whether it will run a pack nobody
 # vouched for (PLAN.md §11.4). Commented out, and that is a real setting: with
 # no [pack_trust] section every readable pack in the pack directory is

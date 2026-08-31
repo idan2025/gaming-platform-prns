@@ -8,22 +8,40 @@
 //! never be one the agent depends on. An index or a hosted-deploy API arrives in
 //! phase 4 as a convenience *on top of* an agent that already works alone.
 //!
-//! # It has no authentication, and that is why it is loopback-only
+//! # Authentication, and why loopback is still the default
 //!
-//! Every route here creates or destroys containers. Anyone who can reach it can
-//! run any image the operator configured, on this host. There is no token, no
-//! signature and no identity check, so the boundary is "you are already on this
-//! machine" — and `AgentConfig::validate` enforces it by refusing a non-loopback
-//! `api_bind` rather than documenting the danger and hoping.
+//! Every route here creates or destroys containers, so anyone who can reach an
+//! unauthenticated one can run any image the operator configured, on this host.
+//! With no token that is exactly the situation, and the only honest boundary is
+//! "you are already on this machine" — `AgentConfig::validate` enforces it by
+//! refusing a non-loopback `api_bind` rather than documenting the danger and
+//! hoping.
 //!
-//! Identity challenge/response against a Reticulum keypair is the phase-4 answer
-//! (`DESIGN.md` §2.4). Until it exists, an operator who wants remote access puts
-//! an authenticating proxy in front; the agent will not pretend to do it.
+//! Setting `api_token_file` is what lifts that, because it puts something
+//! between the network and the container runtime. The rules, all of them
+//! load-bearing:
+//!
+//! * **A token is required on every route once one is configured**, loopback
+//!   included. "Local requests are trusted" is how a browser on the same
+//!   machine, or any other program on it, becomes an unauthenticated caller.
+//! * **The comparison is constant-time.** A byte-by-byte `==` on a secret leaks
+//!   it to anyone patient enough to measure.
+//! * **The token travels in a header, never a cookie.** A cookie is attached by
+//!   the browser to cross-site requests too, which would make every page on the
+//!   internet able to POST to this API from an operator's browser. A header the
+//!   page must set explicitly cannot be forged that way, so there is no CSRF
+//!   surface to defend.
+//!
+//! Identity challenge/response against a Reticulum keypair is the richer answer
+//! and already exists for the uplink (`uplink.rs`, `DESIGN.md` §2.4). This is
+//! the shared secret a browser can carry.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -46,7 +64,19 @@ fn fail(status: StatusCode, e: impl std::fmt::Display) -> (StatusCode, Json<ApiE
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
+/// What the API needs besides the agent: the token, if one is configured.
+#[derive(Clone)]
+pub struct ApiState {
+    pub agent: Arc<Agent>,
+    pub token: Option<Arc<String>>,
+}
+
 pub fn router(agent: Arc<Agent>) -> Router {
+    router_with_token(agent, None)
+}
+
+pub fn router_with_token(agent: Arc<Agent>, token: Option<String>) -> Router {
+    let state = ApiState { agent: agent.clone(), token: token.map(Arc::new) };
     Router::new()
         .route("/health", get(health))
         .route("/capacity", get(capacity))
@@ -55,7 +85,99 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content))
-        .with_state(agent)
+        .route("/games", get(games))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .with_state(state)
+}
+
+/// Reject anything without the token, on every route, once a token exists.
+///
+/// Deliberately not "unless the request came from loopback": a browser on the
+/// operator's own machine is a loopback client, and so is every other program
+/// on it. An exemption there would mean the token protects the network and
+/// nothing else.
+async fn require_token(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let Some(expected) = &state.token else {
+        // No token configured: `AgentConfig::validate` has already refused to
+        // bind anywhere but loopback, so this is the local-only mode.
+        return Ok(next.run(request).await);
+    };
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return Err(fail(StatusCode::UNAUTHORIZED, "a valid API token is required"));
+    }
+    Ok(next.run(request).await)
+}
+
+/// Compare without leaking where the first difference is.
+///
+/// The length is allowed to leak — it is not the secret — but the contents are
+/// not, so every byte of the shorter input is examined regardless.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The games this node can actually run: a pack **and** a runtime for it.
+///
+/// A pack with no `[games.<id>]` entry is listed as not runnable rather than
+/// hidden, because "why is my game missing" is the question an operator asks
+/// next, and the answer is one line of their own config.
+#[derive(Serialize)]
+struct GameOption {
+    id: String,
+    display_name: String,
+    runnable: bool,
+    /// Why not, when it is not.
+    reason: Option<String>,
+    transport: String,
+    default_port: u16,
+    extra_ports: usize,
+}
+
+async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
+    let config = state.agent.config();
+    let mut out: Vec<GameOption> = state
+        .agent
+        .packs()
+        .values()
+        .map(|pack| {
+            let runtime = config.runtime_for(&pack.id);
+            GameOption {
+                runnable: runtime.is_some(),
+                reason: runtime.is_none().then(|| {
+                    format!(
+                        "no [games.{}] section in this node's config, so nothing says which \
+                         image runs it. An image selects the code this node executes, so a \
+                         pack cannot name one",
+                        pack.id
+                    )
+                }),
+                id: pack.id.clone(),
+                display_name: pack.display_name.clone(),
+                transport: format!("{:?}", pack.transport).to_ascii_lowercase(),
+                default_port: pack.default_port,
+                extra_ports: pack.extra_ports.len(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(out)
 }
 
 /// What this node has room for.
@@ -63,25 +185,25 @@ pub fn router(agent: Arc<Agent>) -> Router {
 /// The same answer the Reticulum uplink gives, from the same
 /// `Agent::capacity` — an index placing an instance must not get one story over
 /// loopback and another over the mesh.
-async fn capacity(State(agent): State<Arc<Agent>>) -> Json<crate::uplink_wire::CapacityResp> {
-    Json(agent.capacity().await)
+async fn capacity(State(state): State<ApiState>) -> Json<crate::uplink_wire::CapacityResp> {
+    Json(state.agent.capacity().await)
 }
 
-async fn health(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
+async fn health(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(json!({
         "ok": true,
-        "max_instances": agent.config().max_instances,
+        "max_instances": state.agent.config().max_instances,
         "port_range": {
-            "start": agent.config().port_range.start,
-            "end": agent.config().port_range.end,
+            "start": state.agent.config().port_range.start,
+            "end": state.agent.config().port_range.end,
         },
     }))
 }
 
 /// Listing asks each running game how many players it has, because an index
 /// reaping idle instances must not read "could not ask" as "empty".
-async fn list(State(agent): State<Arc<Agent>>) -> ApiResult<Vec<InstanceStatus>> {
-    agent
+async fn list(State(state): State<ApiState>) -> ApiResult<Vec<InstanceStatus>> {
+    state.agent
         .list_detailed()
         .await
         .map(Json)
@@ -89,10 +211,10 @@ async fn list(State(agent): State<Arc<Agent>>) -> ApiResult<Vec<InstanceStatus>>
 }
 
 async fn create(
-    State(agent): State<Arc<Agent>>,
+    State(state): State<ApiState>,
     Json(spec): Json<InstanceSpec>,
 ) -> ApiResult<InstanceStatus> {
-    agent
+    state.agent
         .create(spec)
         .await
         .map(Json)
@@ -103,10 +225,10 @@ async fn create(
 }
 
 async fn stop(
-    State(agent): State<Arc<Agent>>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    agent
+    state.agent
         .stop(&id)
         .await
         .map(|()| Json(json!({ "stopped": id })))
@@ -114,10 +236,10 @@ async fn stop(
 }
 
 async fn remove(
-    State(agent): State<Arc<Agent>>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    agent
+    state.agent
         .remove(&id)
         .await
         .map(|()| Json(json!({ "removed": id })))
@@ -131,10 +253,10 @@ async fn remove(
 /// be the one who asked for it. Idempotent — content that is already installed
 /// is reported, never re-fetched.
 async fn install_content(
-    State(agent): State<Arc<Agent>>,
+    State(state): State<ApiState>,
     Path(game): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    match agent.ensure_content(&game).await {
+    match state.agent.ensure_content(&game).await {
         Ok(crate::content::Provisioned::AlreadyInstalled(dir)) => Ok(Json(json!({
             "game": game,
             "installed": false,
@@ -155,8 +277,8 @@ async fn install_content(
 
 /// Instance directories with no container. Reported, never deleted — that is a
 /// player's saved state, and the agent does not decide to discard it.
-async fn orphans(State(agent): State<Arc<Agent>>) -> ApiResult<Vec<String>> {
-    agent
+async fn orphans(State(state): State<ApiState>) -> ApiResult<Vec<String>> {
+    state.agent
         .orphan_dirs()
         .await
         .map(|dirs| Json(dirs.iter().map(|p| p.display().to_string()).collect()))

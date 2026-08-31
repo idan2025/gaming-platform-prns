@@ -34,6 +34,12 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          # Reticulum's natural home includes single-board machines, so an ARM
+          # Linux build is not an afterthought here. Native runner rather than
+          # cross-compilation: the engine is a real dependency and a
+          # cross-linked binary nobody has run is not evidence of anything.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
           - os: macos-13
@@ -113,7 +119,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, macos-13, windows-latest]
+        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-14, macos-13, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
