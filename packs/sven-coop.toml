@@ -22,6 +22,24 @@ writable_paths = ["svencoop/maps", "svencoop/logs", "svencoop/scripts"]
 
 notes = "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns v0.1.10 servers announce under it."
 
+# steamcmd app 276060 is the Sven Co-op Dedicated Server and it fetches
+# anonymously — the condition GAMES.md §5 puts on unattended content. The
+# reference implementation has always done exactly this:
+# `+login anonymous +app_update 276060 validate +quit` (svencoop-prns run.sh:177).
+#
+# This pack said `manual` until 2026-08-31, which was simply wrong: PLAN.md
+# §11.2 uses 276060 as its own steamcmd *example*, so the doc knew even while
+# the pack did not. 276060 is the dedicated server; 225840 is the game a player
+# owns, and they are not interchangeable.
+#
+# One thing steamcmd cannot fix: the DS has builds for Windows and Linux only,
+# with no native macOS dedicated server. That is the runtime's problem, not the
+# content driver's — a node picks the image, and a macOS node simply cannot host
+# this game.
+[content]
+driver = "steamcmd"
+app_id = 276060
+
 # How a launcher starts the player's own copy and points it at a server
 # (PLAN.md §13.1). Note what is NOT here: no executable, no path, no command.
 # The program comes from the player's own Sven Co-op installation; `steam_app_id`

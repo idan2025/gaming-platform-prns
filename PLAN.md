@@ -767,6 +767,16 @@ Only anonymous-steamcmd titles can be fetched unattended (`GAMES.md` §5).
 Anything needing credentials stays `manual`, which is the honest answer rather
 than a worse one.
 
+**Sven Co-op was `manual` and should never have been (fixed 2026-08-31).** Its
+dedicated server is app **276060** and it fetches anonymously — the reference
+implementation has always done exactly that (`svencoop-prns` `run.sh:177`:
+`+login anonymous +app_update 276060 validate +quit`). This section already used
+276060 as its own steamcmd example, so the doc knew while the pack did not. The
+lesson is narrower than "check the packs": a pack that predates a driver keeps
+whatever it said before, and nothing goes back to re-ask. 276060 is the
+dedicated server; 225840 is the game a player owns, and they are not
+interchangeable.
+
 ### 11.3 Signing, and why expiry rather than revocation
 
 A curated repository's safety is a signing key plus **a person who reviews

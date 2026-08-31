@@ -239,10 +239,11 @@ impl GamePack {
                 "svencoop/logs".to_string(),
                 "svencoop/scripts".to_string(),
             ],
-            // Sven Co-op's dedicated server is a Steam download an operator
-            // installs themselves. `manual` is the honest driver for it, not a
-            // gap waiting to be filled.
-            content: PackContent::default(),
+            // App 276060 is the Sven Co-op Dedicated Server and it fetches
+            // anonymously, which is what `steamcmd` requires. Kept in step with
+            // `packs/sven-coop.toml`, which
+            // `shipped_sven_pack_matches_the_builtin` enforces.
+            content: PackContent::Steamcmd { app_id: 276060 },
             extra_ports: Vec::new(),
             // Kept in step with `packs/sven-coop.toml`, which
             // `shipped_sven_pack_matches_the_builtin` enforces: the fallback a
@@ -433,6 +434,22 @@ mod tests {
 
     const SVEN_TOML: &str = include_str!("../../../packs/sven-coop.toml");
 
+    /// A minimal pack with **no** `[content]` block, for the tests that append
+    /// one. Deliberately not the shipped Sven pack: that one now declares a
+    /// steamcmd driver, and a test that appended a second `[content]` table to
+    /// it would be testing TOML's duplicate-key handling rather than this
+    /// schema.
+    const NO_CONTENT_TOML: &str = r#"
+schema_version = 1
+id = "content-test"
+display_name = "Content Test"
+app_name = "content-test"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+query = "a2s"
+"#;
+
     /// The shipped pack and the built-in must not drift apart, or a user who
     /// edits the file gets different behaviour from one who does not.
     #[test]
@@ -540,7 +557,7 @@ mod tests {
     /// meaning what it always meant: the operator installs the files.
     #[test]
     fn a_pack_with_no_content_block_loads_as_manual() {
-        let pack = GamePack::parse(SVEN_TOML).unwrap();
+        let pack = GamePack::parse(NO_CONTENT_TOML).unwrap();
         assert_eq!(pack.content, PackContent::Manual { note: None });
         assert!(!pack.content.is_automatic());
     }
@@ -549,7 +566,7 @@ mod tests {
     /// pack defect — not at deploy, on a node, in front of a user.
     #[test]
     fn a_bad_content_block_fails_at_load() {
-        let src = SVEN_TOML.to_string()
+        let src = NO_CONTENT_TOML.to_string()
             + "\n[content]\ndriver = \"archive\"\nurl = \"file:///etc/passwd\"\n\
                sha256 = \"9f2c00000000000000000000000000000000000000000000000000000000abcd\"\n";
         assert!(matches!(
@@ -560,7 +577,7 @@ mod tests {
 
     #[test]
     fn an_archive_content_block_round_trips_through_a_pack() {
-        let src = SVEN_TOML.to_string()
+        let src = NO_CONTENT_TOML.to_string()
             + "\n[content]\ndriver = \"archive\"\n\
                url = \"https://example.org/sven.tar.xz\"\n\
                sha256 = \"9f2c00000000000000000000000000000000000000000000000000000000abcd\"\n\
