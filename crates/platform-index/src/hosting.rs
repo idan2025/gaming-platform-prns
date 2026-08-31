@@ -43,6 +43,8 @@ use platform_agent::instance::InstancePort;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use platform_agent::uplink_wire::CapacityResp;
+
 use crate::agent_client::AgentClient;
 use crate::quota::{AccountId, InstanceRecord, QuotaPolicy, Quotas};
 
@@ -358,9 +360,9 @@ impl Hosting {
             .admit(account, &records, now)
             .map_err(|e| anyhow!("{e}"))?;
 
-        let node = self
-            .pick_node(&existing)
-            .ok_or_else(|| anyhow!("no node available"))?;
+        let node = self.pick_node(&existing).await.ok_or_else(|| {
+            anyhow!("no node with room for another instance")
+        })?;
 
         // The index picks the id. See DeployRequest.
         let instance_id = new_instance_id(&request.game_id)?;
@@ -485,13 +487,66 @@ impl Hosting {
         Ok(())
     }
 
-    /// Least-loaded node wins. Crude, and enough for a handful of nodes; real
-    /// placement needs the capacity reporting that arrives with the agent
-    /// uplink.
-    fn pick_node(&self, existing: &[HostedInstance]) -> Option<&NodeConfig> {
-        self.config.nodes.iter().min_by_key(|n| {
-            existing.iter().filter(|i| i.node == n.name).count()
-        })
+    /// Most free room wins, asking each node what it actually has.
+    ///
+    /// The index's own instance count is not the node's capacity. A node has a
+    /// `max_instances` its operator set and a port range it can exhaust, and an
+    /// index that placed on a full node would tell a user it had chosen one and
+    /// then fail the create — after the quota admission has already run. So the
+    /// node is asked, and a node reporting itself full is skipped rather than
+    /// picked and disappointed.
+    ///
+    /// **A node that cannot answer is not treated as empty.** It falls back to
+    /// the index's own count and ranks behind every node that did answer: an
+    /// unreachable node is the least attractive place to put something, and
+    /// "silence means room" is how an outage becomes a pile-up.
+    async fn pick_node(&self, existing: &[HostedInstance]) -> Option<&NodeConfig> {
+        let mut best: Option<(&NodeConfig, (u8, usize))> = None;
+        for node in &self.config.nodes {
+            let here = existing.iter().filter(|i| i.node == node.name).count();
+            let Some(ranked) = rank_node(self.node_capacity(node).await, here) else {
+                continue;
+            };
+            if best.is_none_or(|(_, current)| ranked > current) {
+                best = Some((node, ranked));
+            }
+        }
+        best.map(|(node, _)| node)
+    }
+
+    /// Ask one node what it has room for, or `None` if it cannot be asked.
+    ///
+    /// Both transports answer from the agent's own `capacity()`, so a loopback
+    /// node and a mesh node cannot give different stories.
+    async fn node_capacity(&self, node: &NodeConfig) -> Option<CapacityResp> {
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest.ok()?;
+            let client = self.agent_client().await?;
+            return client.capacity(dest).await.ok();
+        }
+        let url = format!("{}/capacity", node.api.trim_end_matches('/'));
+        let response = self.http.get(&url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<CapacityResp>().await.ok()
+    }
+}
+
+/// How attractive a node is to place on. Higher is better; `None` means skip.
+///
+/// The tuple is `(answered, free)` so that **a reported figure always beats a
+/// guess**: a node that told us it has one slot left outranks a node that said
+/// nothing, however empty the index believes that one to be. Silence is not
+/// room, and treating it as room is how one unreachable node collects every
+/// create request during an outage.
+fn rank_node(capacity: Option<CapacityResp>, own_count: usize) -> Option<(u8, usize)> {
+    match capacity {
+        // Full is full. Picking it would pass quota admission and then fail the
+        // create, after the user has been told a node was chosen.
+        Some(cap) if cap.running >= cap.max_instances => None,
+        Some(cap) => Some((1, cap.max_instances - cap.running)),
+        None => Some((0, usize::MAX - own_count)),
     }
 }
 
@@ -627,8 +682,8 @@ mod tests {
         assert_eq!(mixed[0].channel, 1);
     }
 
-    #[test]
-    fn a_node_is_picked_by_load() {
+    #[tokio::test]
+    async fn a_node_is_picked_by_load() {
         let mut c = config();
         c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None });
         let h = Hosting::new(c);
@@ -642,7 +697,41 @@ mod tests {
             ports: Vec::new(),
             owner: None,
         }];
-        assert_eq!(h.pick_node(&existing).unwrap().name, "second");
+        // Neither node answers `/capacity` here — nothing is listening — so
+        // both fall back to the index's own count and the emptier one wins.
+        assert_eq!(h.pick_node(&existing).await.unwrap().name, "second");
+    }
+
+    fn cap(running: usize, max: usize) -> CapacityResp {
+        CapacityResp {
+            max_instances: max,
+            running,
+            port_range_start: 27100,
+            port_range_end: 27199,
+        }
+    }
+
+    /// The whole reason placement asks: a full node must not be chosen and then
+    /// fail the create.
+    #[test]
+    fn a_full_node_is_skipped_rather_than_picked() {
+        assert_eq!(rank_node(Some(cap(4, 4)), 0), None);
+        assert_eq!(rank_node(Some(cap(5, 4)), 0), None, "over its own limit is still full");
+        assert!(rank_node(Some(cap(3, 4)), 0).is_some());
+    }
+
+    /// A node that answered outranks one that did not, even when the index
+    /// believes the silent one is emptier. Silence is not room.
+    #[test]
+    fn a_reported_figure_beats_a_guess() {
+        let answered = rank_node(Some(cap(3, 4)), 99).expect("has one slot");
+        let silent = rank_node(None, 0).expect("unknown, not full");
+        assert!(answered > silent, "{answered:?} should outrank {silent:?}");
+    }
+
+    #[test]
+    fn among_nodes_that_answered_the_emptiest_wins() {
+        assert!(rank_node(Some(cap(1, 8)), 0) > rank_node(Some(cap(6, 8)), 0));
     }
 
     #[test]

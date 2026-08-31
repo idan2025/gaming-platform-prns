@@ -31,6 +31,7 @@ use crate::docker::{DockerRuntime, PublishedPort};
 use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus};
 use crate::ports::PortAllocator;
 use crate::store::{ContentRef, InstancePlan, StoreLayout};
+use crate::uplink_wire::CapacityResp;
 
 pub struct Agent {
     config: AgentConfig,
@@ -338,6 +339,32 @@ impl Agent {
     }
 
     /// Everything this agent manages, as Docker currently sees it.
+    /// What this node has room for, as **both** control surfaces report it.
+    ///
+    /// The wire type is shared with the uplink deliberately: the loopback API
+    /// and the Reticulum uplink must not be able to answer the same question
+    /// differently, and two structs is how that starts.
+    ///
+    /// The running count comes from `list()`, so an instance mid-create is not
+    /// counted yet. That is honest rather than convenient: the container is the
+    /// record here as it is for ownership, and a number derived from anything
+    /// else would drift from what the node will actually accept.
+    pub async fn capacity(&self) -> CapacityResp {
+        let running = self
+            .list()
+            .await
+            .map(|instances| {
+                instances.iter().filter(|i| i.state == InstanceState::Running).count()
+            })
+            .unwrap_or(0);
+        CapacityResp {
+            max_instances: self.config.max_instances,
+            running,
+            port_range_start: self.config.port_range.start,
+            port_range_end: self.config.port_range.end,
+        }
+    }
+
     pub async fn list(&self) -> Result<Vec<InstanceStatus>> {
         let containers = self.docker.list_managed().await?;
         let specs = self.specs.lock().await;

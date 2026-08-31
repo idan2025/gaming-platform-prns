@@ -61,6 +61,12 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   trust decision at verify time would not fail any obvious test — the one that
   catches it is `a_token_stops_authorizing_when_the_identity_leaves_the_allowlist`
   and the live-wire `an_untrusted_index_cannot_even_list_over_the_uplink`.
+- **Placement asks the node, and silence is not room.** `hosting::rank_node`
+  skips a node reporting itself full, and ranks a node that could not be asked
+  *behind* every node that answered. Treating no answer as an empty node is how
+  one unreachable node collects every create during an outage. `Agent::capacity`
+  is shared by the uplink and `GET /capacity`, so the two surfaces cannot
+  disagree.
 - **The owner stamped over the uplink is the end-user's identity, not the
   index's.** The create request carries the user's identity hash; the agent sets
   `spec.owner` from it and stamps `OWNER_LABEL` unchanged. The authenticated

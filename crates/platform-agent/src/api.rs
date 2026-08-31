@@ -49,12 +49,22 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 pub fn router(agent: Arc<Agent>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/capacity", get(capacity))
         .route("/instances", get(list).post(create))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content))
         .with_state(agent)
+}
+
+/// What this node has room for.
+///
+/// The same answer the Reticulum uplink gives, from the same
+/// `Agent::capacity` — an index placing an instance must not get one story over
+/// loopback and another over the mesh.
+async fn capacity(State(agent): State<Arc<Agent>>) -> Json<crate::uplink_wire::CapacityResp> {
+    Json(agent.capacity().await)
 }
 
 async fn health(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {

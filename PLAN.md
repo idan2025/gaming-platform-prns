@@ -563,12 +563,24 @@ bridge.
   (`crates/platform-index/tests/uplink_roundtrip.rs`) pins create/list/stop/remove
   end to end and the untrusted-index refusal.
 
+  **Placement asks the node (2026-08-31).** `pick_node` ranked on the index's
+  own instance count, which is not a node's capacity: a node has a
+  `max_instances` its operator set, so the index could pass quota admission,
+  announce a node, and then fail the create. It now calls `capacity()` — and
+  `Agent::capacity` is shared by the uplink and a new `GET /capacity` on the
+  loopback API, so a node cannot answer one story over the mesh and another over
+  loopback. Two rules, both in `rank_node`: a node reporting itself full is
+  skipped, and **a node that cannot answer is not treated as empty** — it ranks
+  behind every node that did, because "silence means room" is how one
+  unreachable node collects every create during an outage.
+
   Two uplink follow-ups are deliberately not built and stay on the phase-4 list:
-  **capacity push** (agent announces capacity to the index, vs the current
-  pull-only `/capacity` over an authenticated link) and **agent auto-discovery**
-  (an index learns agents from `platform-agent.control` announces, vs the current
-  static `NodeConfig.agent` hash). Both are conveniences; neither blocks
-  multi-node, and neither changes the auth model.
+  **capacity push** (agent announces capacity to the index, vs today's pull over
+  an authenticated link — the pull is now actually used, which was the point of
+  it) and **agent auto-discovery** (an index learns agents from
+  `platform-agent.control` announces, vs the current static `NodeConfig.agent`
+  hash). Both are conveniences; neither blocks multi-node, and neither changes
+  the auth model.
 
 - **Pack distribution — after phase 4, before it matters.** §11: `[content]`
   drivers, signing with expiry, trust tiers. **`manual`, `archive` and

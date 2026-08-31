@@ -57,7 +57,6 @@ use platform_auth::{Authenticator, ChallengeResponse, Session};
 
 use crate::agent::Agent;
 use crate::config::UplinkConfig;
-use crate::instance::InstanceState;
 use crate::uplink_wire::*;
 
 /// How often the agent re-announces its control destination.
@@ -276,26 +275,9 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
                 return encode_err(OP_CAPACITY, &msg);
             }
             // Capacity is pulled, not pushed: the same authenticated link, no
-            // index-side ingress endpoint. The running count comes from list();
-            // an instance mid-create may not yet appear, which is honest.
-            let running = state
-                .agent
-                .list()
-                .await
-                .map(|instances| {
-                    instances
-                        .iter()
-                        .filter(|i| i.state == InstanceState::Running)
-                        .count()
-                })
-                .unwrap_or(0);
-            let cfg = state.agent.config();
-            let resp = CapacityResp {
-                max_instances: cfg.max_instances,
-                running,
-                port_range_start: cfg.port_range.start,
-                port_range_end: cfg.port_range.end,
-            };
+            // index-side ingress endpoint. `Agent::capacity` is shared with the
+            // loopback API so the two surfaces cannot answer differently.
+            let resp = state.agent.capacity().await;
             match payload_bytes(&resp) {
                 Ok(bytes) => encode_ok(OP_CAPACITY, &bytes),
                 Err(e) => encode_err(OP_CAPACITY, &e.to_string()),
