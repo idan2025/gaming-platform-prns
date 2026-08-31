@@ -10,7 +10,14 @@ still the design authority; this file is only the mechanics.
 | `Mesh Game Servers` (launcher) | `launcher/src-tauri` | a player, or anyone hosting from a desktop |
 | `platform-agent` | `crates/platform-agent` | a node operator, alongside Docker |
 | `platform-index` | `crates/platform-index` | anyone who wants to run an index; **nobody has to** |
+| `game-bridge` | `crates/game-bridge` | anyone hosting a game server, or donating transit, without a desktop |
 | `packs/*.toml` | this repo | shipped beside the binaries; a pack is data |
+
+`game-bridge` exists because two of the four roles (`PLAN.md` §1) otherwise had
+no way to run: the launcher joins and browses, and the agent orchestrates
+containers, so a person with a game server and no desktop could not host and
+someone donating transit needed a GUI to do it. It is the same library the
+launcher links, exposed as `server`, `client`, `relay` and `browse`.
 
 The launcher is the only artifact a player needs. An index is a convenience and
 never a dependency (`DESIGN.md` §0), so a release that shipped only the launcher
@@ -33,7 +40,7 @@ sync them.
 
 ```sh
 # Everything that is not the launcher shell
-cargo build --release --bins        # target/release/platform-{agent,index}
+cargo build --release --bins        # target/release/{game-bridge,platform-agent,platform-index}
 cargo test --workspace              # Docker-gated tests skip themselves without a daemon
 cargo clippy --workspace --all-targets
 
@@ -104,8 +111,12 @@ double every engine-pin bump in review.
 - [ ] `launcher/uicheck` passes.
 - [ ] `cargo tauri build` produces a bundle, and the installed binary is
       `mesh-game-servers`.
+- [ ] `python3 scripts/live_roundtrip.py` passes: the shipped `game-bridge`
+      binaries announce, discover each other by announce alone, and carry a UDP
+      round trip. This is the check that the *artifacts* work, not the library.
 - [ ] The launcher opens, lists a server, and joins it against a real server on
-      a second machine. Loopback tests do not prove the mesh path.
+      a second machine. Loopback tests do not prove the mesh path, and
+      `live_roundtrip.py` is still one machine.
 - [ ] A deployed `svencoop-prns` v0.1.10 peer still appears in the launcher's
       list by name, and can still be joined — the wire-compatibility promise in
       `PLAN.md` §5 is a promise to people who already installed something.

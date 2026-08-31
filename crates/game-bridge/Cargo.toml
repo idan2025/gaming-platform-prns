@@ -17,6 +17,9 @@ hex = "0.4"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# For the `game-bridge` binary's logging only. The library never installs a
+# subscriber — a launcher that links this crate owns that decision.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
 default = ["serde"]
@@ -24,3 +27,7 @@ serde = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+
+[[bin]]
+name = "game-bridge"
+path = "src/main.rs"
