@@ -98,7 +98,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh release upload "${{ inputs.tag || github.ref_name }}" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber
+        run: |
+          set -euo pipefail
+          # nullglob, because only one of the two archive shapes exists per OS
+          # and bash otherwise hands `gh` the literal pattern.
+          shopt -s nullglob
+          files=(dist/*.tar.gz dist/*.zip dist/*.sha256)
+          gh release upload "${{ inputs.tag || github.ref_name }}" "${files[@]}" --clobber
 
   launcher:
     name: launcher ${{ matrix.os }}
@@ -163,4 +169,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh release upload "${{ inputs.tag || github.ref_name }}" dist/* --clobber
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no bundles were produced" >&2
+            exit 1
+          fi
+          gh release upload "${{ inputs.tag || github.ref_name }}" "${files[@]}" --clobber
