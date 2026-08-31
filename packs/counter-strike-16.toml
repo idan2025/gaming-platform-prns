@@ -1,0 +1,34 @@
+# Game pack #3, sibling of half-life.toml. The first that is only data: adding it required no Rust
+# change at all, which is the whole point of `GAMES.md` §7 step 1. See
+# crates/game-bridge/src/pack.rs for what a pack may and may not contain.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "counter-strike-16"
+display_name = "Counter-Strike 1.6"
+app_name = "counter-strike-16"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+query = "a2s"
+
+# GoldSrc, same engine family as Sven Co-op: one UDP port, A2S on that same
+# port, tier 1 (`GAMES.md` §4).
+writable_paths = ["cstrike/maps", "cstrike/logs"]
+
+notes = "GoldSrc. Same steamcmd app (90) as half-life.toml; a different mod directory is the only difference, and the mod itself is a runtime argument the operator sets."
+
+# Every key below belongs to the [content] table, so top-level fields come
+# first — TOML has no way back out of a table.
+#
+# steamcmd app 90 is the Half-Life Dedicated Server, and it fetches anonymously
+# — the condition `GAMES.md` §5 puts on unattended content. Which mod the
+# server runs (valve, cstrike, dod, tfc) is a runtime argument, so it is the
+# node operator's config, not a pack field: one download, several packs.
+[content]
+driver = "steamcmd"
+app_id = 90
+

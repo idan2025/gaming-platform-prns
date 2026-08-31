@@ -340,6 +340,27 @@ mod tests {
         }
     }
 
+    /// The node side of `GAMES.md` §7 step 1: a game added as a file plans on
+    /// a node without a Rust change either. Every shipped pack's declared
+    /// writable paths must survive the planner, which rejects rather than
+    /// normalizes — a pack that tripped it would be a pack nobody could host.
+    #[test]
+    fn every_shipped_pack_plans_an_instance() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = game_bridge::GamePack::load_dir(&dir).expect("shipped packs read");
+        assert!(packs.packs.len() >= 3, "expected the shipped packs to be there");
+        for pack in &packs.packs {
+            let content = ContentRef { game_id: pack.id.clone(), version: "1.0".into() };
+            let plan = layout()
+                .plan_instance("inst1", &content, Path::new("/game"), &pack.writable_paths)
+                .unwrap_or_else(|e| panic!("{} does not plan: {e}", pack.id));
+            // One read-only content mount plus one writable bind per declared
+            // path — the shape `DESIGN.md` §4 requires for a shared copy.
+            assert_eq!(plan.mounts.len(), 1 + pack.writable_paths.len(), "{}", pack.id);
+            assert!(plan.mounts[0].read_only, "{}", pack.id);
+        }
+    }
+
     #[test]
     fn valid_plan() {
         let layout = layout();

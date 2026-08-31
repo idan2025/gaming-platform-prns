@@ -330,6 +330,52 @@ mod tests {
         ));
     }
 
+    /// `GAMES.md` §7 step 1: a GoldSrc sibling must be reachable by writing a
+    /// file. These three packs share an engine, a query protocol and a
+    /// transport, and differ only in the data — so if this test ever needs a
+    /// Rust change to pass, the pack abstraction is wrong, not the test.
+    #[test]
+    fn the_goldsrc_siblings_are_data_and_nothing_else() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let loaded = GamePack::load_dir(&dir).unwrap();
+        for id in ["sven-coop", "half-life", "counter-strike-16"] {
+            let pack = loaded
+                .packs
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("{id} is shipped"));
+            let profile = pack.to_profile().expect("a shipped pack is usable");
+            assert_eq!(profile.query, Some(QueryProtocol::A2s));
+            assert_eq!(profile.default_port, 27015);
+            assert_eq!(profile.min_link_class, 1);
+        }
+
+        // Distinct app names, so the three do not share a destination. A pack
+        // that copied another's `app_name` would put its servers in the other
+        // game's browser, silently.
+        let names: std::collections::BTreeSet<&str> =
+            loaded.packs.iter().map(|p| p.app_name.as_str()).collect();
+        assert_eq!(names.len(), loaded.packs.len(), "two packs share an app_name");
+    }
+
+    /// The two siblings pull the same steamcmd app and differ in mod directory.
+    /// Which mod actually runs is a runtime argument, so it stays out of the
+    /// pack — see the module docs on why a pack cannot name what runs.
+    #[test]
+    fn both_goldsrc_packs_fetch_app_90_and_differ_only_in_their_mod_dir() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let loaded = GamePack::load_dir(&dir).unwrap();
+        let get = |id: &str| {
+            loaded.packs.iter().find(|p| p.id == id).expect("shipped").clone()
+        };
+        let hl = get("half-life");
+        let cs = get("counter-strike-16");
+        assert_eq!(hl.content, PackContent::Steamcmd { app_id: 90 });
+        assert_eq!(cs.content, hl.content);
+        assert_eq!(hl.writable_paths, ["valve/maps", "valve/logs"]);
+        assert_eq!(cs.writable_paths, ["cstrike/maps", "cstrike/logs"]);
+    }
+
     #[test]
     fn load_dir_reads_the_shipped_pack_and_reports_a_broken_one() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
