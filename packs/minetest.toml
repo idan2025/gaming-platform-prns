@@ -1,0 +1,55 @@
+# Game pack #5 — GAMES.md §7 step 3, and the first pack that is not a Valve
+# game at all.
+#
+# Two firsts, both data:
+#
+#   * **No query protocol.** Luanti answers no A2S and no equivalent, so this
+#     pack simply omits `query`. That was already the schema's shape — `query`
+#     is optional and `details.rs` reports announced figures with an honest flag
+#     saying they are not live — so the probe seam did not have to be invented
+#     here. `a2s.rs` stays one implementation rather than becoming a trait: a
+#     game that asks no questions does not tell you where the seam goes.
+#   * **Content that is not steamcmd.** The `archive` driver's first real user:
+#     a URL, a digest, and a wrapper directory to strip.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "minetest"
+display_name = "Luanti (Minetest)"
+app_name = "minetest"
+default_port = 30000
+transport = "udp"
+min_link_class = 1
+
+# No `query` key at all. A server browser row for this game carries what the
+# server announced and nothing more, and the launcher says so rather than
+# showing a stale number as a live one.
+
+# Nothing. The game data below is read-only for every instance; a Luanti world
+# is per-instance state and lives in the instance's own writable space, which
+# the node gives it. A path listed here would have to exist inside the shared
+# content copy, and none of Luanti's writes belong there.
+writable_paths = []
+
+notes = "Luanti (formerly Minetest). UDP 30000, no query protocol, content from a plain archive rather than steamcmd. The engine binary is the node operator's image; this pack ships the game data."
+
+# The digest decides, not the URL (PLAN.md §11.2). These bytes were downloaded
+# and hashed twice on 2026-08-31 and matched.
+#
+# Caveat worth knowing: this is a tag archive GitHub generates on demand, not an
+# uploaded release asset, and such archives are not contractually byte-stable.
+# If GitHub ever changes how it compresses them, this digest stops matching and
+# the driver refuses the download. That is the driver working — a mirror whose
+# bytes changed is exactly what `sha256` is here to catch — but the fix is to
+# re-hash a known-good copy, not to drop the field.
+#
+# `strip_components = 1` drops the `minetest_game-5.8.0/` wrapper, so the
+# content directory holds the game itself.
+[content]
+driver = "archive"
+url = "https://github.com/luanti-org/minetest_game/archive/refs/tags/5.8.0.tar.gz"
+sha256 = "33a3bb43b08497a0bdb2f49f140a2829e582d5c16c0ad52be1595c803f706912"
+strip_components = 1

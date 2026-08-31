@@ -13,12 +13,17 @@
 //! game server is, not what game it is.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use game_bridge::config::{
     AnnounceFormat, BridgeConfig, BrowserArgs, ClientArgs, RelayArgs, ServerArgs,
 };
+use game_bridge::signing::{PackSignature, TrustPolicy, SIGNATURE_SUFFIX};
 use game_bridge::{run_bridge, GamePack};
+use personal_rns::identity::PrivateIdentityMaterial;
+use personal_rns::load_or_create_identity_secret;
+use personal_rns::prelude::*;
 
 const USAGE: &str = "\
 game-bridge — bridge a game server, or a game client, over Reticulum
@@ -27,6 +32,8 @@ usage: game-bridge server <game-id> [options]
        game-bridge client <game-id> [options]
        game-bridge relay  [options]
        game-bridge browse [options]
+       game-bridge sign   <pack.toml> [options]
+       game-bridge verify <pack.toml> [options]
        game-bridge --help | --version
 
 roles (PLAN.md §1)
@@ -36,6 +43,8 @@ roles (PLAN.md §1)
            announced server
   relay    donate transit and nothing else: no game, no announced destination
   browse   listen and list; binds no port, holds no identity, forwards nothing
+  sign     write a detached signature beside a pack (PLAN.md §11.3)
+  verify   check the signature beside a pack, and say which tier it earns
 
 common options
   --packs DIR        where to read game packs from (default: ./packs)
@@ -60,6 +69,21 @@ client options
                      announcing this game.
   --listen PORT      local port the game client connects to (default: the
                      pack's own port)
+
+sign options
+  --identity PATH    the signing key (generated on first run, like any role's)
+  --days N           how long the signature stays valid (default: 90)
+  --start UNIX       when it becomes valid (default: now)
+  --force            overwrite an existing .sig
+
+  A pack signature goes stale on purpose: nothing guarantees a node on a mesh
+  ever fetches a revocation list, so an unrefreshed node fails closed instead of
+  trusting a compromised pack forever. Re-sign before the window closes.
+
+verify options
+  --identity PATH    a key to treat as trusted, so the tier reads 'signed
+                     community' rather than 'signed by an unknown key'
+  --at UNIX          check as of this time instead of now
 
 A game id is a pack's `id`, e.g. sven-coop. `game-bridge browse` prints what it
 hears and is the cheapest way to check an interface works at all.
@@ -88,6 +112,10 @@ fn main() -> Result<()> {
         "server" | "client" => build_game_role(role, &args[1..])?,
         "relay" => BridgeConfig::Relay(build_relay(&args[1..])?),
         "browse" => BridgeConfig::Browse(build_browse(&args[1..])?),
+        // Neither of these starts a bridge, so both return before the runtime
+        // is built.
+        "sign" => return sign_pack(&args[1..]),
+        "verify" => return verify_pack_cli(&args[1..]),
         other => bail!("unknown role {other:?}\n\n{USAGE}"),
     };
 
@@ -240,4 +268,161 @@ fn build_browse(rest: &[String]) -> Result<BrowserArgs> {
         }
     }
     Ok(args)
+}
+
+// ---------------------------------------------------------------------------
+// Pack signing (PLAN.md §11.3)
+//
+// The library could already verify a signature and classify a signer before
+// anything could produce one — the tiers were enforceable and unreachable at
+// the same time. These two subcommands are what closes that: `sign` is the only
+// way a `.sig` gets written, and `verify` is how a signer checks what they just
+// made without standing up a node.
+// ---------------------------------------------------------------------------
+
+fn sign_pack(rest: &[String]) -> Result<()> {
+    let mut path: Option<PathBuf> = None;
+    let mut identity = PathBuf::from("./game-bridge-signing.identity");
+    let mut days: u64 = 90;
+    let mut start: Option<u64> = None;
+    let mut force = false;
+
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--identity" => identity = PathBuf::from(value(&mut it, "--identity")?),
+            "--days" => days = parse_num(&value(&mut it, "--days")?, "--days")?,
+            "--start" => start = Some(parse_num(&value(&mut it, "--start")?, "--start")?),
+            "--force" => force = true,
+            other if other.starts_with('-') => {
+                bail!("unknown option {other:?} for game-bridge sign\n\n{USAGE}")
+            }
+            other if path.is_none() => path = Some(PathBuf::from(other)),
+            other => bail!("game-bridge sign takes one pack, not also {other:?}"),
+        }
+    }
+    let path = path.ok_or_else(|| anyhow!("game-bridge sign needs a pack file\n\n{USAGE}"))?;
+    if days == 0 {
+        bail!("--days 0 would sign for no time at all; a window has to contain an instant");
+    }
+
+    // Parse before signing. Signing a file that is not a valid pack produces a
+    // signature that verifies over bytes nothing can load — a valid answer to
+    // the wrong question, and the sort of artifact that gets published once and
+    // debugged for an afternoon.
+    let src = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let pack = GamePack::parse(&src)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("{} is not a usable pack, so it is not signed", path.display()))?;
+
+    let sig_path = signature_path(&path);
+    if sig_path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to replace it",
+            sig_path.display()
+        );
+    }
+
+    let secret_bytes = load_signing_identity(&identity)?;
+    let secret = PrivateIdentityMaterial::from_slice(&secret_bytes[..])
+        .map_err(|e| anyhow!("identity at {}: {e:?}", identity.display()))?;
+
+    let not_before = match start {
+        Some(unix) => std::time::UNIX_EPOCH + Duration::from_secs(unix),
+        None => SystemTime::now(),
+    };
+    let signature = PackSignature::sign(
+        src.as_bytes(),
+        &secret,
+        not_before,
+        Duration::from_secs(days * 86_400),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+
+    std::fs::write(&sig_path, signature.to_toml())
+        .with_context(|| format!("writing {}", sig_path.display()))?;
+
+    println!("signed {} as {}", path.display(), pack.id);
+    println!("  signature  {}", sig_path.display());
+    println!("  signer     {}", hex::encode(secret.public().identity_hash().as_bytes()));
+    println!("  valid      unix {} .. {}", signature.not_before, signature.not_after);
+    println!(
+        "\nThe window is inside the signed material, so editing it invalidates the signature.\n\
+         Re-sign before it closes: a node that has not refreshed refuses the pack rather than\n\
+         trusting it forever (PLAN.md §11.3)."
+    );
+    Ok(())
+}
+
+fn verify_pack_cli(rest: &[String]) -> Result<()> {
+    let mut path: Option<PathBuf> = None;
+    let mut trusted: Vec<PathBuf> = Vec::new();
+    let mut at: Option<u64> = None;
+
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--identity" => trusted.push(PathBuf::from(value(&mut it, "--identity")?)),
+            "--at" => at = Some(parse_num(&value(&mut it, "--at")?, "--at")?),
+            other if other.starts_with('-') => {
+                bail!("unknown option {other:?} for game-bridge verify\n\n{USAGE}")
+            }
+            other if path.is_none() => path = Some(PathBuf::from(other)),
+            other => bail!("game-bridge verify takes one pack, not also {other:?}"),
+        }
+    }
+    let path = path.ok_or_else(|| anyhow!("game-bridge verify needs a pack file\n\n{USAGE}"))?;
+
+    let mut policy = TrustPolicy::allowing_unsigned();
+    for key_path in &trusted {
+        let bytes = load_signing_identity(key_path)?;
+        let secret = PrivateIdentityMaterial::from_slice(&bytes[..])
+            .map_err(|e| anyhow!("identity at {}: {e:?}", key_path.display()))?;
+        policy = policy.trusting(secret.public().identity_hash());
+    }
+
+    let now = match at {
+        Some(unix) => std::time::UNIX_EPOCH + Duration::from_secs(unix),
+        None => SystemTime::now(),
+    };
+    let verified = GamePack::load_verified(&path, &policy, now).map_err(|e| anyhow!("{e}"))?;
+
+    println!("{} — {}", verified.pack.id, verified.trust.label());
+    println!("  {}", verified.trust.explanation());
+    if let Some(signer) = verified.trust.signer() {
+        println!("  signer     {}", hex::encode(signer.as_bytes()));
+    }
+    if let Some(expires) = verified.expires_at {
+        println!("  expires    unix {expires}");
+    }
+    // The tier a node would give it is not the same question as whether the
+    // signature is good, and the difference is the whole point of §11.4.
+    if !policy.may_deploy(&verified.trust) {
+        println!(
+            "\nA node running the default strict policy would refuse to deploy this. Either the\n\
+             operator adds this key to pack_trust.trusted_keys, or they set\n\
+             pack_trust.allow_unsigned = true."
+        );
+    }
+    Ok(())
+}
+
+/// A pack's signature file: the pack's own name plus the suffix, so the two
+/// never drift apart.
+fn signature_path(pack: &Path) -> PathBuf {
+    let mut name = pack.as_os_str().to_os_string();
+    name.push(SIGNATURE_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// The signing key, created on first use like every other role's identity.
+///
+/// Deliberately the same file format and the same helper the bridge roles use:
+/// a signing key here is a Reticulum identity, not a second kind of key an
+/// operator has to learn to keep.
+fn load_signing_identity(path: &Path) -> Result<Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>> {
+    load_or_create_identity_secret(path)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("loading signing identity at {}", path.display()))
 }

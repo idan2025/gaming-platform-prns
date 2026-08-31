@@ -183,6 +183,11 @@ Rules there:
   `allowing_unsigned` and renders the tier in the detail pane, because a pack
   there tells a client where to point and runs no code. A pack whose signature
   *failed* is still skipped there, never shown as unsigned.
+- **`game-bridge sign` / `verify` are the only way a `.sig` exists.** Before
+  them the tiers were enforceable and unreachable at once. `sign` parses the
+  pack first and refuses to overwrite without `--force`; the signing key is an
+  ordinary Reticulum identity file. Driven by `tests/pack_signing_cli.rs`
+  against the real binary.
 - **`PackTrust::BuiltIn` is not `UnsignedLocal`.** `GamePack::sven_coop()` comes
   out of the binary, so there is no provenance question to ask about it and
   `may_deploy` allows it unconditionally.

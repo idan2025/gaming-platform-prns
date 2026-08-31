@@ -757,6 +757,20 @@ order to run — so §11.4's import/deploy split collapses there and the gate si
 at load. A refused pack is logged with its tier and the config key that would
 change the answer.
 
+**Signing is reachable from a terminal (2026-08-31):** `game-bridge sign
+<pack.toml>` writes the detached `.sig`, and `game-bridge verify <pack.toml>`
+says which tier it earns. Until those existed the library could verify a
+signature and classify a signer before anything could produce one — the tiers
+were enforceable and unreachable at the same time, which is the same shape of
+gap as the inert deploy gate in §12 one level up. `sign` parses the pack before
+signing it, because a signature over bytes nothing can load is a correct answer
+to the wrong question; it refuses to replace an existing `.sig` without
+`--force`, because an accidental re-sign silently resets a window somebody is
+relying on. The signing key is an ordinary Reticulum identity file, created on
+first use like every role's — an operator should not have to learn a second kind
+of key. `tests/pack_signing_cli.rs` drives the real binary, since the gap was
+never in the library.
+
 **A missing `[pack_trust]` section means every readable pack deploys**, and the
 agent warns at startup when there is none. That is not the safe default; it is
 the honest one while this project has no first-party key and every shipped pack
