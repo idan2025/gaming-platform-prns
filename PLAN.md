@@ -571,16 +571,27 @@ bridge.
   multi-node, and neither changes the auth model.
 
 - **Pack distribution — after phase 4, before it matters.** §11: `[content]`
-  drivers, signing with expiry, trust tiers. **`manual`, `archive`, and
-  `steamcmd` drivers are built (2026-08-31);** `oci` and the signing/trust half
-  are not. Turns "write a TOML yourself" into
-  "import one somebody curated". The bigger lever for breadth was `StreamRelay`
-  (TCP) — signing a pack for a game the bridge cannot run helps nobody — and
-  that is built, so a pack can now describe a TCP game.
+  drivers, signing with expiry, trust tiers. **`manual`, `archive` and
+  `steamcmd` drivers, signing, and the trust tiers are all built (2026-08-31)** —
+  the agent gates deploy on the operator's `[pack_trust]` policy and the
+  launcher shows the tier beside Join. `oci` is the one piece left, and §11.2
+  parks it until a game needs it. Turns "write a TOML yourself" into "import one
+  somebody curated". The bigger lever for breadth was `StreamRelay` (TCP) —
+  signing a pack for a game the bridge cannot run helps nobody — and that is
+  built, so a pack can now describe a TCP game.
 
 - **Phase 5 — more games.** The ladder in `GAMES.md` §7: GoldSrc sibling (app 90)
   → Source/TF2 → Minetest → Minecraft Java. Each step exercises exactly one new
-  axis. Never let the second game be the hard game.
+  axis. Never let the second game be the hard game. **Rungs 1 and 2 are done
+  (2026-08-31)** and both were pure data: `packs/half-life.toml`,
+  `packs/counter-strike-16.toml`, and `packs/team-fortress-2.toml`, the last
+  being the first pack to use `[[extra_ports]]` and so the first to announce
+  framing generation 2. TF2 still needs a Source dedicated-server *image* in the
+  node's config before it runs anywhere, because a pack cannot name what runs.
+  **Minetest is the next rung**, and it is the first that is not free: it has no
+  A2S probe, which forces the query protocol and the content source apart
+  (`a2s.rs` is one implementation, not yet a `GameQuery` trait — one
+  implementation does not tell you where the seam goes).
 - **Later, conditionally — Mode 3 virtual LAN.** Only after Modes 1-2 have users;
   it changes the installer, the signing story, and the support burden
   (`MODES.md`).

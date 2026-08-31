@@ -116,13 +116,23 @@ numbers separately, and each port is published in its own transport. Rules:
 - **The index passes a port set through, never invents one.** Only the node
   knows what is free there.
 
-**A second game landed as data** (2026-08-31): `packs/half-life.toml` and
-`packs/counter-strike-16.toml`, GoldSrc siblings on steamcmd app 90, with **no
-Rust change** — `GAMES.md` §7 step 1's whole purpose. `tests/second_game.rs`
-reads a pack off disk, runs a server from it and makes a browse node list it,
-and never names the game in code; keep it that way, because a test that hardcodes
-the game stops testing the abstraction. The next rung (Source/TF2) is not free:
-it forced multi-port and framing v2 — both now built.
+**Games land as data** (2026-08-31): `packs/half-life.toml`,
+`packs/counter-strike-16.toml` (GoldSrc siblings on steamcmd app 90) and
+`packs/team-fortress-2.toml` (Source, steamcmd app 232250), all with **no Rust
+change** — `GAMES.md` §7 steps 1 and 2. TF2 is the first shipped pack with
+`[[extra_ports]]`, so the first to announce framing generation 2; its RCON rides
+channel 1 as TCP beside a UDP game port, on the same port *number*, because the
+channel is what separates them on the wire. It still needs a Source
+dedicated-server image in the node's config before it runs anywhere: a pack
+cannot name what runs.
+
+`tests/second_game.rs` and `ports::tests::every_shipped_pack_gets_its_whole_port_set_or_nothing`
+pin this, and **none of them name a game in code** — they find their subject by
+the property under test. Keep it that way: a test that hardcodes an id keeps
+passing when the abstraction is replaced by a special case for that id.
+
+The next rung, Minetest, is the first that is not free — no A2S probe, which
+forces the query protocol and the content source apart.
 
 **Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
 names a driver — `manual` (what always happened, and the default when the block

@@ -1,0 +1,61 @@
+# Game pack #4, and the first Source-engine one — GAMES.md §7 step 2.
+#
+# The rung this climbs is multi-port: a Source server wants its game port and an
+# RCON admin channel reachable, where GoldSrc wanted only the game port. Both
+# now ride one Reticulum destination (GAMES.md §3), so this is still only data —
+# `[[extra_ports]]` and framing generation 2 were the Rust half and they are
+# built. What is not data is the runtime: which container image runs a Source
+# server is the node operator's config, because an image selects the code a node
+# executes (crates/game-bridge/src/pack.rs).
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "team-fortress-2"
+display_name = "Team Fortress 2"
+app_name = "team-fortress-2"
+default_port = 27015
+transport = "udp"
+min_link_class = 2
+query = "a2s"
+
+# Tier 2, not tier 1 (GAMES.md §4). Source sustains several times a GoldSrc
+# server's rate per player and its map/asset transfer on join is a burst, so a
+# link that carries Sven Co-op comfortably is not evidence this will play. The
+# number is ordering rather than a measurement, like every other tier in §4.
+
+# Both directories exist immediately after a steamcmd install of app 232250,
+# which is what makes them usable: a writable bind nested inside the read-only
+# content mount cannot create its own mountpoint, so a path listed here that the
+# install does not already contain fails the instance at start rather than being
+# created. `tf/logs` is deliberately absent for exactly that reason — the
+# install does not create it, and a server that cannot write a log file still
+# runs. An operator who wants on-disk logs makes the directory once and adds it.
+writable_paths = ["tf/cfg", "tf/maps"]
+
+notes = "Source engine. Game on UDP 27015 with A2S on the same port, RCON on TCP 27015 beside it. First pack to use extra_ports, so the first to announce framing generation 2."
+
+# RCON: TCP, and on the same number as the UDP game port — Source binds both.
+# That is not a conflict here, because a channel is what separates them on the
+# wire; the number is only what the server binds on its own host. The local
+# port this side listens on is `listen_port + channel` by default, never 27015
+# again (GAMES.md §3).
+#
+# `name` is for a human reading the pack. It selects nothing: a pack that could
+# say "run the RCON handler" would be naming what runs, and RCON here is a byte
+# stream forwarded to a port like any other.
+[[extra_ports]]
+channel = 1
+name = "rcon"
+port = 27015
+transport = "tcp"
+
+# steamcmd app 232250 is the Team Fortress 2 Dedicated Server and it fetches
+# anonymously — the condition GAMES.md §5 puts on unattended content. As always
+# the pack supplies a number and the agent builds the whole command line; there
+# is no login field, because a pack is a file people share.
+[content]
+driver = "steamcmd"
+app_id = 232250

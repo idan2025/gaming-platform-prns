@@ -100,9 +100,13 @@ orders of magnitude across games.
 
 - **Tier 1 — low-rate UDP tick.** GoldSrc (Sven, HLDM, CS 1.6), Quake-family,
   Minetest. Tens of kbit/s per player. Works, including over slow links.
-- **Tier 2 — TCP or bursty.** Minecraft Java, Terraria. Playable, but the
-  initial world/chunk transfer is a multi-megabyte burst; joins will be slow on
-  anything but a TCP/Wi-Fi interface.
+- **Tier 2 — TCP or bursty.** Minecraft Java, Terraria, and Source (TF2, CS:S,
+  Garry's Mod). Playable, but something about the join is a burst: for Minecraft
+  the initial world/chunk transfer, for Source the map and asset download. Joins
+  will be slow on anything but a TCP/Wi-Fi interface. Source is UDP and so sits
+  oddly beside two TCP games — it is here because the tier is about what a link
+  must sustain, not about which transport carries it, and Source's per-player
+  rate is several times GoldSrc's.
 - **Tier 3 — modern high-bitrate.** Rust, Ark, Valheim-scale state sync.
   Hundreds of kbit/s per player. Only viable over fast interfaces, never over a
   LoRa-class link.
@@ -158,10 +162,21 @@ Each step is chosen to exercise exactly one new axis:
    does the node-side half. Which mod runs (valve, cstrike, dod, tfc) is a
    runtime argument, so DoD and TFC are two more files whenever somebody wants
    them.
-2. **Team Fortress 2 / CS:S / Garry's Mod** (Source). New: x86_64 runtime,
-   RCON admin channel, multi-port. Forced blocker B, which is **built as of
-   2026-08-31** (§3) — what is left for TF2 itself is the runtime and the pack,
-   not the transport.
+2. ~~**Team Fortress 2 / CS:S / Garry's Mod** (Source).~~ **The pack landed
+   2026-08-31**: `packs/team-fortress-2.toml`, and again no Rust changed —
+   blocker B (multi-port, §3) had already been paid for, which is exactly what
+   made this rung data. It is the first shipped pack with `[[extra_ports]]` and
+   so the first to announce framing generation 2; RCON rides channel 1 as TCP
+   beside a UDP game port, on the same port *number*, because a channel is what
+   separates them on the wire. `second_game.rs::a_multi_port_game_is_data_too`
+   and `ports::tests::every_shipped_pack_gets_its_whole_port_set_or_nothing`
+   pin the two halves, and neither names the game.
+
+   **What is left is the runtime**, which was always the operator's: a Source
+   dedicated server image, in `[games.team-fortress-2]`. A pack cannot name one
+   (§1), so the ladder's step-2 claim is honestly "the pack is data", not "TF2
+   runs on any node today". CS:S and Garry's Mod are two more files whenever
+   somebody wants them, the same way DoD and TFC are.
 3. **Minetest.** New: non-Steam content source (plain download), no A2S probe.
    Forces the probe and content-source abstractions apart.
 4. **Minecraft Java.** New: TCP transport, JVM runtime, SLP probe,

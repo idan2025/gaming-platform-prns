@@ -10,6 +10,12 @@
 //!
 //! Topology is the browse baseline's, deliberately: no index, no account, no
 //! internet (`DESIGN.md` §0).
+//!
+//! `a_multi_port_game_is_data_too` is §7 **step 2**'s half of the same claim.
+//! Multi-port was the rung that forced Rust work (framing generation 2, stream
+//! ids, the announce gate) — so the thing worth pinning is that having paid for
+//! it once, a Source-engine game is a file again. It names no game either, and
+//! finds its subject by the property under test rather than by id.
 
 use std::time::Duration;
 
@@ -101,4 +107,58 @@ async fn a_game_added_as_a_file_shows_up_in_the_browser() {
         !rows.iter().any(|r| r.game_id() == Some("sven-coop")),
         "nothing announced sven-coop here, so nothing may list it"
     );
+}
+
+/// `GAMES.md` §7 step 2: adding a Source-engine game is data, now that
+/// multi-port is built.
+///
+/// The pack is found by *declaring extra ports*, not by name — the same
+/// discipline as the test above, for the same reason. A test that reached for
+/// "team-fortress-2" would keep passing if the abstraction were replaced by a
+/// hardcoded special case for that one id.
+#[test]
+fn a_multi_port_game_is_data_too() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+    let packs = GamePack::load_dir(&dir).expect("the shipped pack directory reads").packs;
+
+    let multi: Vec<GameProfile> = packs
+        .iter()
+        .map(|p| p.to_profile().expect("a shipped pack is usable"))
+        .filter(|p| !p.extra_ports.is_empty())
+        .collect();
+    assert!(
+        !multi.is_empty(),
+        "no shipped pack declares extra ports, so nothing proves a multi-port game is data"
+    );
+
+    for profile in &multi {
+        // Channel 0 is the game and is synthesized, never declared: the frozen
+        // port is written down in exactly one place.
+        let ports = profile.ports();
+        assert_eq!(ports.len(), 1 + profile.extra_ports.len(), "{}", profile.id);
+        assert_eq!(ports[0].channel, 0, "{}", profile.id);
+        assert_eq!(ports[0].port, profile.default_port, "{}", profile.id);
+
+        // Only a multi-port game announces generation 2. That number is what
+        // tells a peer it may send a non-zero channel id here, and a legacy
+        // peer that never hears it keeps working.
+        assert_eq!(profile.protocol_version(), 2, "{}", profile.id);
+
+        // A Source server binds RCON on the same number as its game port. That
+        // is not a conflict on the wire, because the channel separates them —
+        // so the pack must be allowed to say it, and this is the case that
+        // would break if a validator ever "helpfully" rejected a duplicate
+        // port number.
+        let channels: std::collections::BTreeSet<u8> = ports.iter().map(|p| p.channel).collect();
+        assert_eq!(channels.len(), ports.len(), "{} reuses a channel", profile.id);
+    }
+
+    // And the single-port packs are untouched by any of it: a game that needs
+    // no channels must not start advertising a capability it never exercises.
+    for pack in &packs {
+        let profile = pack.to_profile().expect("a shipped pack is usable");
+        if profile.extra_ports.is_empty() {
+            assert_eq!(profile.protocol_version(), 1, "{}", profile.id);
+        }
+    }
 }

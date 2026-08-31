@@ -167,6 +167,43 @@ mod tests {
         assert_eq!(a.available(), 1);
     }
 
+    /// The node-side half of `GAMES.md` §7 step 2: a shipped multi-port pack
+    /// gets a whole port set on a real allocator, or none of it.
+    ///
+    /// Found by the property, never by game id — the same reason
+    /// `second_game.rs` never names its game. A node's range is the operator's,
+    /// so what is checked here is the shape of the request, not the numbers.
+    #[test]
+    fn every_shipped_pack_gets_its_whole_port_set_or_nothing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = game_bridge::GamePack::load_dir(&dir).expect("shipped packs read").packs;
+        assert!(!packs.is_empty(), "expected the shipped packs to be there");
+
+        for pack in &packs {
+            let profile = pack.to_profile().expect("a shipped pack is usable");
+            let wanted = profile.ports();
+            // Every port unallocated: the pack's own numbers are what the game
+            // binds inside its container, and what they are reachable as
+            // outside comes from the node.
+            let request: Vec<Option<u16>> = wanted.iter().map(|_| None).collect();
+
+            let mut a = PortAllocator::new(range(27100, 27199));
+            let got = a.acquire(&request).unwrap_or_else(|e| panic!("{}: {e}", pack.id));
+            assert_eq!(got.len(), wanted.len(), "{}", pack.id);
+            let distinct: std::collections::BTreeSet<u16> = got.iter().copied().collect();
+            assert_eq!(distinct.len(), got.len(), "{} was given a port twice", pack.id);
+            assert_eq!(a.available(), 100 - got.len(), "{}", pack.id);
+
+            // A range one port short of the set must leave the allocator
+            // untouched, not half-filled — otherwise a retry loop leaks the
+            // rest of the set on every attempt.
+            let short = 27100 + (wanted.len() as u16) - 2;
+            let mut tight = PortAllocator::new(range(27100, short));
+            assert!(tight.acquire(&request).is_err(), "{} fit in too small a range", pack.id);
+            assert_eq!(tight.held().len(), 0, "{} kept part of a set it could not fill", pack.id);
+        }
+    }
+
     #[test]
     fn exhaustion_is_an_error_not_a_wrap_around() {
         let mut a = PortAllocator::new(range(27100, 27101));
