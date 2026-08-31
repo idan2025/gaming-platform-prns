@@ -349,6 +349,31 @@ decision.
 
 ## 8. Ordering
 
+### Where this stands, and the next three things (2026-08-31)
+
+Phases 1-3 are done. Phase 4 is built through multi-node. Pack distribution
+(§11) has its first three content drivers. What is left, in the order this
+document's own reasoning implies:
+
+1. **`StreamRelay` — TCP in the relay.** The largest lever on breadth, and it
+   gates everything downstream of it. The relay pumps datagrams, so a pack
+   declaring `transport = "tcp"` is *refused at load* today
+   (`a_tcp_pack_parses_its_field_but_is_refused_until_the_relay_can_run_it`).
+   Until it lands, no config file can describe Minecraft or Terraria — and
+   §11.3's signing would be signing packs for games the bridge cannot run.
+2. **Phase 5's second game — the GoldSrc sibling (app 90).** One new axis, not
+   several (`GAMES.md` §7), and it is now cheap: `steamcmd` can fetch it
+   unattended, which is exactly what §11.2 was for. Never let the second game be
+   the hard game.
+3. **§11.3 signing with expiry, then §11.4 trust tiers.** Worth doing once
+   packs are worth sharing, which is after (1) and (2) widen what a pack can
+   describe. `oci` is the last content driver and can wait for a game that
+   needs it.
+
+Deferred on purpose, none of them blocking: the two uplink follow-ups (capacity
+push, agent auto-discovery) later in this section, and Mode 3 (`MODES.md`),
+which stays conditional on Modes 1-2 having users.
+
 Refines `DESIGN.md` §5 by folding the four roles in. The Relay role is **not** a
 separate early phase: it would have to be built inside `svencoop-prns` to ship
 before Phase 1, and §5 forbids putting platform code there. It folds into Phase 1
