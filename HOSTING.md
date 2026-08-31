@@ -97,3 +97,52 @@ content_version = "1.0"
 ```
 
 Until that section exists, the UI lists the game and says exactly this.
+
+## Reaching the mesh: how anyone finds your server
+
+Reticulum has no global directory. A node reaches the mesh through an
+**interface**, and there are exactly two ways to get one:
+
+1. **LAN auto-discovery** (`auto = true`). Finds neighbours on the same physical
+   network with no address typed anywhere. Zero configuration, and limited to
+   one LAN.
+2. **A TCP address somebody told you.** Either you bind one and share it
+   (`tcp = "0.0.0.0:4789"`, making your node a relay others dial), or you dial
+   someone else's (`tcp = "hub.example.org:4789"`).
+
+That is the whole bootstrap. Somebody has to already know something — an
+address, or a shared LAN. It is the same problem every peer-to-peer network has,
+and Reticulum does not pretend otherwise.
+
+So a player joining your server either runs on your LAN with `--auto`, or is
+given your TCP address:
+
+```sh
+game-bridge browse --tcp 192.168.1.50:4789
+```
+
+### The containerised catch
+
+**A node in a container cannot use LAN auto-discovery.** Its "local network" is
+Docker's bridge, not yours, and the multicast discovery uses never leaves it.
+Tested: a browse node on the same host with `--auto` and nothing else does *not*
+find a server this agent is hosting, while `--tcp <host>:4789` finds it
+immediately.
+
+So a containerised node must **bind a TCP interface and publish it**:
+
+```toml
+[mesh]
+tcp = "0.0.0.0:4789"
+auto = true      # harmless, and it works if you later run outside a container
+```
+
+```yaml
+ports:
+  - "4789:4789"   # alongside the API port
+```
+
+and then share `<your address>:4789` with anyone who should find your servers.
+If you want auto-discovery to work for LAN players, run the agent with
+`network_mode: host` instead of publishing ports — at which cost the port
+publishing above stops applying and the game ports become the host's directly.
