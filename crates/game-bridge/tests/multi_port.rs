@@ -83,6 +83,15 @@ async fn ask_udp(sock: &UdpSocket, port: u16, what: &[u8], timeout: Duration) ->
 }
 
 /// TF2's shape: UDP game, TCP RCON, second UDP port for SourceTV.
+/// A separately-probed local port for each extra channel this test's profile
+/// declares, so nothing depends on two ports next to each other being free.
+fn extra_listen_ports() -> std::collections::BTreeMap<u8, u16> {
+    let mut ports = std::collections::BTreeMap::new();
+    ports.insert(1, common::free_tcp_port());
+    ports.insert(2, common::free_tcp_port());
+    ports
+}
+
 fn source_profile(game_port: u16, rcon_port: u16, tv_port: u16) -> GameProfile {
     let mut profile = GameProfile::sven_coop();
     profile.id = "multi-port-test".to_string();
@@ -154,6 +163,16 @@ async fn one_destination_carries_a_game_an_rcon_and_a_second_udp_port() {
     client_args.identity = dir.join("client.identity");
     client_args.tcp = Some(format!("127.0.0.1:{mesh_port}"));
     client_args.listen_port = listen_port;
+    // Each extra channel's local port is named explicitly rather than left to
+    // default to `listen_port + channel`. The default is right for a real
+    // client, but a test that reserved one port and then bound three
+    // consecutive ones was only checking the first: the neighbours were assumed
+    // free, and on a busy runner they are not. That is what failed on macOS
+    // ("Address already in use") and Windows ("Only one usage of each socket
+    // address") while passing on Linux, whose ephemeral allocator happens to
+    // hand out adjacent ports less eagerly.
+    let extra_local = extra_listen_ports();
+    client_args.extra_listen_ports = extra_local.clone();
     let _client = BridgeSession::start_client(client_args)
         .await
         .expect("bridge client starts");
@@ -168,7 +187,7 @@ async fn one_destination_carries_a_game_an_rcon_and_a_second_udp_port() {
     // Channel 2: a second UDP port, on the same destination and the same link
     // family, distinguished only by framing generation 2's channel bits.
     let tv_local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let answer = ask_udp(&tv_local, listen_port + 2, b"ping", Duration::from_secs(60))
+    let answer = ask_udp(&tv_local, extra_local[&2], b"ping", Duration::from_secs(60))
         .await
         .expect("the second UDP port answered");
     assert_eq!(
@@ -180,7 +199,7 @@ async fn one_destination_carries_a_game_an_rcon_and_a_second_udp_port() {
     let mut sock = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline && sock.is_none() {
-        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", listen_port + 1)).await {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", extra_local[&1])).await {
             if s.write_all(b"status").await.is_ok() {
                 let mut buf = vec![0u8; 1024];
                 if let Ok(Ok(n)) =
@@ -242,6 +261,16 @@ async fn a_client_with_extra_ports_sends_none_of_them_to_a_v1_server() {
     client_args.identity = dir.join("client.identity");
     client_args.tcp = Some(format!("127.0.0.1:{mesh_port}"));
     client_args.listen_port = listen_port;
+    // Each extra channel's local port is named explicitly rather than left to
+    // default to `listen_port + channel`. The default is right for a real
+    // client, but a test that reserved one port and then bound three
+    // consecutive ones was only checking the first: the neighbours were assumed
+    // free, and on a busy runner they are not. That is what failed on macOS
+    // ("Address already in use") and Windows ("Only one usage of each socket
+    // address") while passing on Linux, whose ephemeral allocator happens to
+    // hand out adjacent ports less eagerly.
+    let extra_local = extra_listen_ports();
+    client_args.extra_listen_ports = extra_local.clone();
     let _client = BridgeSession::start_client(client_args)
         .await
         .expect("bridge client starts");
@@ -257,7 +286,7 @@ async fn a_client_with_extra_ports_sends_none_of_them_to_a_v1_server() {
     // Channel 2 must go nowhere at all.
     let tv_local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     assert!(
-        ask_udp(&tv_local, listen_port + 2, b"ping", Duration::from_secs(5))
+        ask_udp(&tv_local, extra_local[&2], b"ping", Duration::from_secs(5))
             .await
             .is_none(),
         "an extra port must not reach a server that never advertised framing v2"
