@@ -7,16 +7,19 @@ A **decentralized server browser** for game servers over
 Find a game server on the mesh, join it, host one, or donate transit — with no
 account, no port forwarding, no central service, and no internet required.
 
-> **Status** (`PLAN.md` §8 has the detail). Phases 1-3 are complete and phase 4
-> is underway.
+> **Status** (`PLAN.md` §8 has the detail). Phases 1-4 are complete; phase 5 has
+> started with three shipped game packs and the transport work Source-engine
+> games need.
 >
 > | Phase | | |
 > | --- | --- | --- |
 > | 1 | The bridge | done — engine pinned to a patched Prns fork ([`ENGINE.md`](ENGINE.md)); relay and framing parametrized by a game pack; the announce record; a link allowlist; a Relay role with a transit off switch |
 > | 2 | Browse | done — list and filter from announces alone, no index and no internet; a detail probe over a Link; a Tauri launcher |
 > | 3 | One node, many servers | done — `platform-agent` runs many servers off one shared copy of the content, loopback-only local API, no central service |
-> | 4 | Index + hosting | partly — identity challenge/response, and an index served over both HTTP and Reticulum, with quotas. Hosted deploy, agent uplink and multi-node are still plan |
-> | 5 | More games | plan |
+> | 4 | Index + hosting | done — identity challenge/response bound to the verifying index, an index served over both HTTP and Reticulum with quotas, hosted deploy, and multi-node over an agent uplink that needs no inbound port |
+> | 5 | More games | started — TCP games over a link's channel; Half-Life and CS 1.6 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance |
+>
+> Building and tagging a release: [`RELEASE.md`](RELEASE.md).
 >
 > The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).

@@ -20,6 +20,23 @@ use tokio::sync::Mutex;
 /// How often the index folds the browse session's view into its own memory.
 const INGEST_INTERVAL: Duration = Duration::from_secs(5);
 
+const USAGE: &str = "\
+platform-index — an optional announce indexer and HTTP front door
+
+usage: platform-index [--bind ADDR] [--tcp HOST:PORT] [--auto] [--hosting FILE]
+       platform-index --help | --version
+
+  --bind ADDR       where the HTTP API listens (default: 127.0.0.1:4760)
+  --tcp HOST:PORT   dial a Reticulum TCP peer, or 0.0.0.0:PORT to bind one
+  --auto            attach auto-discovered local interfaces
+  --hosting FILE    enable hosted deploy from this config. Off without it, and
+                    off with it unless the file lists games and a node.
+
+An index is a cache of the mesh, never a source of truth: it hears servers the
+same way a launcher does and nothing depends on any particular one existing.
+
+RUST_LOG sets log filtering (default: platform_index=info).";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "platform_index=info".to_string());
@@ -36,7 +53,15 @@ async fn main() -> Result<()> {
             "--tcp" => tcp = Some(args.next().context("--tcp needs host:port")?),
             "--auto" => auto = true,
             "--hosting" => hosting_path = Some(args.next().context("--hosting needs a path")?),
-            other => anyhow::bail!("unknown argument {other:?}"),
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("platform-index {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            other => anyhow::bail!("unknown argument {other:?}\n\n{USAGE}"),
         }
     }
 

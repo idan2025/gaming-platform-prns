@@ -16,14 +16,39 @@ use platform_agent::api;
 use platform_agent::config::AgentConfig;
 use platform_agent::uplink;
 
+const USAGE: &str = "\
+platform-agent — run many game servers on one host
+
+usage: platform-agent <config.toml> [pack-dir]
+       platform-agent --help | --version
+
+  <config.toml>  this node's settings: data root, port range, per-game runtimes.
+                 There is no default: this process creates containers, so which
+                 file told it what to run should be visible on the command line.
+  [pack-dir]     directory of game packs (default: ./packs)
+
+The local API is loopback-only and unauthenticated. A `[uplink]` section in the
+config additionally serves an authenticated control destination over Reticulum,
+so an index can drive this node with no inbound port.
+
+RUST_LOG sets log filtering (default: platform_agent=info).";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_init();
 
     let mut args = std::env::args().skip(1);
-    let config_path = args.next().ok_or_else(|| {
-        anyhow::anyhow!("usage: platform-agent <config.toml> [pack-dir]")
-    })?;
+    let config_path = args.next().ok_or_else(|| anyhow::anyhow!("{USAGE}"))?;
+    // Before anything is loaded: an operator asking what this is should not be
+    // told their `--help` is a missing config file.
+    if matches!(config_path.as_str(), "-h" | "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if matches!(config_path.as_str(), "-V" | "--version") {
+        println!("platform-agent {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let pack_dir = args.next().unwrap_or_else(|| "packs".to_string());
 
     let config = AgentConfig::load(std::path::Path::new(&config_path))
