@@ -115,6 +115,27 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Live mesh-interface control for the web UI (`interfaces.rs`, `PLAN.md`
+    // §13.5). When the uplink is up we hand its node handle to a manager, load
+    // any interfaces the operator saved from the UI on a previous run, and
+    // re-attach them so a mesh link survives a restart. With no uplink the
+    // manager is `None` and the routes answer "no uplink" rather than pretending
+    // to configure a node that does not exist.
+    let interfaces = match &_uplink_node {
+        Some(node) => {
+            let sidecar = agent.config().data_root.join("agent-interfaces.json");
+            let destination = hex::encode(node.destination().as_bytes());
+            let manager = platform_agent::interfaces::InterfaceManager::new(
+                Some(node.handle()),
+                Some(destination),
+                Some(sidecar),
+            );
+            manager.reattach_saved().await;
+            Some(manager.shared())
+        }
+        None => None,
+    };
+
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding the local API on {bind}"))?;
@@ -131,7 +152,12 @@ async fn main() -> Result<()> {
 
     axum::serve(
         listener,
-        api::router_full(agent, api_token, Some(std::path::PathBuf::from(&pack_dir))),
+        api::router_full(
+            agent,
+            api_token,
+            Some(std::path::PathBuf::from(&pack_dir)),
+            interfaces,
+        ),
     )
         .await
         .context("serving the local API")?;

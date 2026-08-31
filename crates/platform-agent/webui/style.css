@@ -151,6 +151,16 @@ button.danger:hover:not(:disabled) { background: #2a1518; border-color: var(--da
 .advanced-wrap { display: flex; flex-direction: column; gap: 6px; padding-left: 8px; border-left: 2px solid var(--border-soft); }
 .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
 
+/* Mesh interfaces tab. The address input is a password type when it is not, so
+   share the text-input look, and give the <select> the same box. */
+.start-form input[type="password"], .start-form select {
+  width: 100%; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: inherit;
+}
+.start-form select:focus { outline: 1px solid var(--primary); border-color: var(--primary); }
+.mesh-identity { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.mesh-identity code { word-break: break-all; }
+
 @media (max-width: 900px) {
   .screen { padding: 12px; }
   .games-grid { grid-template-columns: 1fr; }

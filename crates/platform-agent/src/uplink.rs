@@ -81,6 +81,7 @@ struct UplinkState {
 /// A running agent uplink node. Dropping the handle stops it.
 pub struct AgentUplinkNode {
     destination: DestinationHash,
+    handle: PrnsNodeHandle,
     stop_tx: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<()>>,
 }
@@ -89,6 +90,15 @@ impl AgentUplinkNode {
     /// The destination an index links to. Also what the node announces.
     pub fn destination(&self) -> DestinationHash {
         self.destination
+    }
+
+    /// The node's command handle (`Send + Sync + Clone`, see `relay.rs`), so the
+    /// local API can add, remove, rename and list mesh interfaces on the live
+    /// node after it started (`interfaces.rs`, `PLAN.md` §13.5). The uplink was
+    /// the only place a node was created and its interfaces were fixed at start;
+    /// handing the handle out is what lets the web UI configure them live.
+    pub fn handle(&self) -> PrnsNodeHandle {
+        self.handle.clone()
     }
 
     pub async fn stop(&mut self) {
@@ -341,7 +351,12 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
     .destination_hash()
     .map_err(|e| anyhow!("invalid agent destination: {e:?}"))?;
 
-    let (init_tx, init_rx) = oneshot::channel::<Result<oneshot::Sender<()>>>();
+    // The init handshake carries the node handle out of the dedicated uplink
+    // thread as well as the stop channel, so the local API can drive interfaces
+    // on the live node (`interfaces.rs`). The handle is `Send + Sync`
+    // (`relay.rs`), so moving it across the thread boundary is sound.
+    let (init_tx, init_rx) =
+        oneshot::channel::<Result<(oneshot::Sender<()>, PrnsNodeHandle)>>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
 
     let tcp = config.tcp;
@@ -409,7 +424,7 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
                 });
 
                 let (stop_tx, stop_rx) = oneshot::channel::<()>();
-                if init_tx.send(Ok(stop_tx)).is_err() {
+                if init_tx.send(Ok((stop_tx, handle.clone()))).is_err() {
                     return;
                 }
                 debug!("agent uplink node running");
@@ -423,7 +438,7 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
         })
         .map_err(|e| anyhow!("spawning the agent uplink thread: {e}"))?;
 
-    let stop_tx = init_rx
+    let (stop_tx, handle) = init_rx
         .await
         .map_err(|_| anyhow!("agent uplink thread died before starting"))??;
 
@@ -437,6 +452,7 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
     }
     Ok(AgentUplinkNode {
         destination: destination_hash,
+        handle,
         stop_tx: Some(stop_tx),
         done: Some(done_rx),
     })

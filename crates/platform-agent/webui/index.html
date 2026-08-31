@@ -37,6 +37,7 @@
   <nav class="tabs" role="tablist">
     <button id="tab-servers" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="tab-panel-servers">Servers</button>
     <button id="tab-games" type="button" class="tab" role="tab" aria-selected="false" aria-controls="tab-panel-games">Games</button>
+    <button id="tab-interfaces" type="button" class="tab" role="tab" aria-selected="false" aria-controls="tab-panel-interfaces">Mesh</button>
   </nav>
 
   <main>
@@ -68,6 +69,73 @@
         <p class="muted">Pick a game to launch a container. Unrunnable games are shown greyed out with the reason.</p>
       </div>
       <div id="games-grid" class="games-grid"></div>
+    </section>
+
+    <section id="tab-panel-interfaces" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-interfaces">
+      <div class="panel-head">
+        <h2>Mesh interfaces</h2>
+        <p class="muted">Link this node to the Reticulum mesh. Add a TCP client to dial a relay, a TCP server to <em>be</em> a relay, or LAN auto-discovery to find neighbours on the local network. Each may be IFAC-protected so only peers sharing the network name and passphrase can talk on it. Interfaces added here are saved and re-attached on restart.</p>
+      </div>
+
+      <div id="mesh-offline" class="empty-state hidden">
+        This node has no Reticulum uplink, so there is no mesh node to attach interfaces to. Add an <code>[uplink]</code> section to the agent config and restart.
+      </div>
+
+      <div id="mesh-online" class="hidden">
+        <div class="mesh-identity">
+          <span class="muted">This node's mesh address:</span>
+          <code id="mesh-destination">—</code>
+        </div>
+
+        <table class="instances-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Kind</th>
+              <th>State</th>
+              <th>RX</th>
+              <th>TX</th>
+              <th>Links</th>
+              <th class="actions-col">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="interfaces-tbody"></tbody>
+        </table>
+        <p id="interfaces-empty" class="empty-state hidden">No interfaces yet. Add one below to link this node to the mesh.</p>
+
+        <div class="panel-head">
+          <h3>Add an interface</h3>
+        </div>
+        <form id="iface-form" class="start-form" autocomplete="off">
+          <label for="iface-kind">Kind</label>
+          <select id="iface-kind" name="kind">
+            <option value="tcp">TCP (dial a relay, or be one)</option>
+            <option value="auto">Wi-Fi / LAN auto-discovery</option>
+          </select>
+
+          <div id="iface-addr-wrap">
+            <label for="iface-addr">Address (host:port)</label>
+            <input id="iface-addr" type="text" placeholder="relay.example.com:4242 — or 0.0.0.0:4242 to be a relay">
+            <p class="muted small">A host and port dials that relay as a client. <code>0.0.0.0:PORT</code> binds a TCP server on this box so others can dial you.</p>
+          </div>
+
+          <label class="checkbox-row">
+            <input id="iface-ifac-toggle" type="checkbox">
+            IFAC-protect this interface
+          </label>
+          <div id="iface-ifac-wrap" class="advanced-wrap hidden">
+            <label for="iface-ifac-name">Network name</label>
+            <input id="iface-ifac-name" type="text" placeholder="optional">
+            <label for="iface-ifac-pass">Passphrase</label>
+            <input id="iface-ifac-pass" type="password" placeholder="optional">
+            <p class="muted small">Only peers configured with the same name and passphrase can talk on this interface.</p>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" class="primary">Add interface</button>
+          </div>
+        </form>
+      </div>
     </section>
   </main>
 </section>

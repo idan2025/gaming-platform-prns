@@ -75,6 +75,11 @@ pub struct ApiState {
     /// disables the import route rather than guessing a directory: this route
     /// writes files the node will run games from.
     pub pack_dir: Option<Arc<std::path::PathBuf>>,
+    /// Live control of the uplink node's mesh interfaces (`interfaces.rs`).
+    /// `None` when the node was built with no uplink, in which case the routes
+    /// answer "no uplink" rather than 404 — the difference between "this agent
+    /// cannot do that" and "this agent has no mesh node to do it to".
+    pub interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
 }
 
 pub fn router(agent: Arc<Agent>) -> Router {
@@ -82,19 +87,21 @@ pub fn router(agent: Arc<Agent>) -> Router {
 }
 
 pub fn router_with_token(agent: Arc<Agent>, token: Option<String>) -> Router {
-    router_full(agent, token, None)
+    router_full(agent, token, None, None)
 }
 
 pub fn router_full(
     agent: Arc<Agent>,
     token: Option<String>,
     pack_dir: Option<std::path::PathBuf>,
+    interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
 ) -> Router {
     let state = ApiState {
         agent: agent.clone(),
         installs: Arc::new(crate::install::Installs::new()),
         token: token.map(Arc::new),
         pack_dir: pack_dir.map(Arc::new),
+        interfaces,
     };
     Router::new()
         .route("/health", get(health))
@@ -106,6 +113,12 @@ pub fn router_full(
         .route("/content/:game", post(install_content).get(install_status))
         .route("/games", get(games))
         .route("/packs", post(import_pack))
+        // Configuring the mesh interfaces binds sockets and joins meshes, so it
+        // rides behind the same token gate as every container-creating route
+        // (`interfaces.rs` "Authorization is the API's").
+        .route("/interfaces", get(interfaces_status).post(interfaces_add))
+        .route("/interfaces/:id", delete(interfaces_remove))
+        .route("/interfaces/:id/rename", post(interfaces_rename))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         // The web UI is served **outside** the auth layer, deliberately. A
         // login page that needed the token to load could never be reached, and
@@ -437,6 +450,82 @@ async fn install_status(
     Path(game): Path<String>,
 ) -> Json<serde_json::Value> {
     Json(json!({ "game": game, "status": state.installs.state(&game).await }))
+}
+
+// ---- Mesh interface configuration (`interfaces.rs`, `PLAN.md` §13.5) --------
+//
+// The host's way to link this node to the Reticulum mesh from the web UI: add a
+// TCP client (dial a relay), a TCP server (be a relay), or LAN auto-discovery,
+// each optionally IFAC-protected, and have it survive a restart. Every handler
+// is thin — the manager owns the engine calls and the persistence — and an
+// `InterfaceError` becomes a 400 with the operator-facing sentence, the same
+// shape as the rest of this API.
+
+/// Map the manager, or a clear 501 when this agent has no uplink node at all
+/// (no `[uplink]` block). `interfaces == None` means the feature is not wired,
+/// which is distinct from an uplink that is present but has no interfaces yet.
+fn interface_manager(
+    state: &ApiState,
+) -> Result<&Arc<crate::interfaces::InterfaceManager>, (StatusCode, Json<ApiError>)> {
+    state.interfaces.as_ref().ok_or_else(|| {
+        fail(
+            StatusCode::NOT_IMPLEMENTED,
+            "this agent has no Reticulum uplink, so it has no mesh interfaces to configure. \
+             Add an [uplink] section to the config and restart",
+        )
+    })
+}
+
+/// The Interfaces tab's whole read: whether the uplink is up, this node's
+/// destination hash, and the live interface list.
+async fn interfaces_status(
+    State(state): State<ApiState>,
+) -> ApiResult<crate::interfaces::InterfaceStatus> {
+    Ok(Json(interface_manager(&state)?.status()))
+}
+
+/// Add one interface (`{"kind":"tcp","addr":"host:port",...}` or
+/// `{"kind":"auto"}`). A bad address or a bind failure is the caller's to fix,
+/// so it is a 400 with the reason, not a 500.
+async fn interfaces_add(
+    State(state): State<ApiState>,
+    Json(req): Json<crate::interfaces::AddInterface>,
+) -> ApiResult<serde_json::Value> {
+    interface_manager(&state)?
+        .add(req)
+        .await
+        .map(|()| Json(json!({ "ok": true })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// Remove an interface by its hex id.
+async fn interfaces_remove(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    interface_manager(&state)?
+        .remove(&id)
+        .await
+        .map(|()| Json(json!({ "removed": id })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(serde::Deserialize)]
+struct RenameReq {
+    name: String,
+}
+
+/// Rename an interface by its hex id — presentation only, so an operator can
+/// tell "the relay" from "the LAN" in the list.
+async fn interfaces_rename(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameReq>,
+) -> ApiResult<serde_json::Value> {
+    interface_manager(&state)?
+        .rename(&id, req.name)
+        .map(|()| Json(json!({ "renamed": id })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 
 /// Instance directories with no container. Reported, never deleted — that is a

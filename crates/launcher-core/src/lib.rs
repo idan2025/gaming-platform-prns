@@ -18,6 +18,10 @@
 //! JavaScript reads a missing property as `undefined` rather than failing. The
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
+pub mod settings;
+pub mod steam;
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +38,8 @@ use game_bridge::{BridgeSession, GamePack};
 use personal_rns::prelude::DestinationHash;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+
+use crate::settings::LauncherSettings;
 
 /// One row of the server list, as the UI sees it.
 ///
@@ -200,17 +206,115 @@ pub struct JoinResult {
     /// (`PLAN.md` §13.1). `false` means the old behaviour: the launcher shows
     /// the address and the player points their game at it.
     pub can_launch: bool,
+    /// Whether Play can actually run *right now*: the pack has a launch profile
+    /// **and** the player's game can be located (a saved path that still exists,
+    /// or a Steam install of the pack's `steam_app_id`). `can_launch` says the
+    /// pack *could* start a game; `launch_ready` says this machine can. The UI
+    /// shows Play when this is true and a "locate your game" prompt otherwise.
+    pub launch_ready: bool,
+}
+
+/// What the launcher knows about starting one game on this machine — the UI's
+/// input for deciding between a Play button and a "locate your game" prompt
+/// (`PLAN.md` §13.3 step 1).
+#[derive(Debug, Clone, Serialize)]
+pub struct GameLocationView {
+    pub game_id: String,
+    /// Whether the pack carries a `[launch]` block at all.
+    pub has_launch_profile: bool,
+    /// The player's own saved executable path, if they have chosen one.
+    pub saved_path: Option<String>,
+    /// Whether that saved path still points at a file — a saved path goes stale
+    /// when a game is moved or uninstalled.
+    pub saved_path_valid: bool,
+    /// The pack's client Steam app id, a hint for locating the install.
+    pub steam_app_id: Option<u32>,
+    /// Whether Steam itself was found on this machine.
+    pub steam_available: bool,
+    /// Whether the pack's app id is actually installed under Steam.
+    pub steam_installed: bool,
+    /// The bottom line: can Play run without asking the player anything more.
+    pub launch_ready: bool,
+    /// A one-line, human explanation of the state above, for the UI to show.
+    pub detail: String,
+}
+
+/// The outcome of a successful [`Launcher::play`], for the UI to confirm what it
+/// started and how.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlayResult {
+    /// `"direct"` (the player's own binary) or `"steam"` (via `-applaunch`).
+    pub method: String,
+    /// The program that was spawned, for the UI to show what it launched.
+    pub program: String,
 }
 
 /// The launcher's whole state.
 pub struct Launcher {
     inner: Arc<Mutex<Inner>>,
     packs: Vec<TrustedPack>,
+    /// The player's persisted choices — where their games live, and the name
+    /// they join under. Behind its own lock so a settings write does not block
+    /// browsing, and so [`Launcher::play`] can read it without taking the
+    /// session lock.
+    settings: Arc<Mutex<LauncherSettings>>,
+    /// Where [`settings`](Self::settings) is written back to, or `None` for an
+    /// in-memory launcher (the test constructors, or a machine with no config
+    /// directory). `None` means changes are kept for this run but not persisted.
+    settings_path: Option<PathBuf>,
 }
 
 struct Inner {
     browse: Option<BridgeSession>,
     client: Option<BridgeSession>,
+    /// What the last successful [`Launcher::join_server`] bound, so
+    /// [`Launcher::play`] knows which port and game to start against without the
+    /// UI having to hand it all back. Cleared by [`Launcher::leave`].
+    last_join: Option<JoinState>,
+}
+
+/// The address a live join is pointed at, kept so Play can start a game against
+/// it without the frontend round-tripping the details back.
+#[derive(Debug, Clone)]
+struct JoinState {
+    listen_addr: String,
+    port: u16,
+    game_id: String,
+}
+
+/// A resolved decision about *how* to start a game — the pure output of
+/// [`plan_launch`], separated from the spawning so the decision is testable
+/// without running anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchPlan {
+    /// Spawn the player's own binary directly.
+    Direct { exe: PathBuf, args: Vec<String> },
+    /// Spawn Steam with `-applaunch <id>` so Steam starts the right binary.
+    Steam { steam: PathBuf, args: Vec<String> },
+}
+
+impl LaunchPlan {
+    /// The program this plan spawns, for the [`PlayResult`] the UI shows.
+    fn program(&self) -> &Path {
+        match self {
+            LaunchPlan::Direct { exe, .. } => exe,
+            LaunchPlan::Steam { steam, .. } => steam,
+        }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            LaunchPlan::Direct { .. } => "direct",
+            LaunchPlan::Steam { .. } => "steam",
+        }
+    }
+
+    fn args(&self) -> &[String] {
+        match self {
+            LaunchPlan::Direct { args, .. } => args,
+            LaunchPlan::Steam { args, .. } => args,
+        }
+    }
 }
 
 impl Launcher {
@@ -239,7 +343,10 @@ impl Launcher {
                 expires_at: None,
             });
         }
-        Self { inner: Arc::new(Mutex::new(Inner { browse: None, client: None })), packs }
+        // No settings path: an in-memory launcher whose game-path choices last
+        // for the run but are not persisted. The disk-backed entry point is
+        // `from_pack_dir`.
+        Self::assemble(packs, LauncherSettings::default(), None)
     }
 
     /// Build a launcher over packs whose provenance is already established.
@@ -247,7 +354,22 @@ impl Launcher {
         if packs.is_empty() {
             return Self::new(Vec::new());
         }
-        Self { inner: Arc::new(Mutex::new(Inner { browse: None, client: None })), packs }
+        Self::assemble(packs, LauncherSettings::default(), None)
+    }
+
+    /// The one place the struct is put together, so a new field is added in a
+    /// single spot rather than in every constructor.
+    fn assemble(
+        packs: Vec<TrustedPack>,
+        settings: LauncherSettings,
+        settings_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner { browse: None, client: None, last_join: None })),
+            packs,
+            settings: Arc::new(Mutex::new(settings)),
+            settings_path,
+        }
     }
 
     /// Load packs from a directory, ignoring individual broken ones, and
@@ -262,7 +384,7 @@ impl Launcher {
     /// wherever packs are read.
     pub fn from_pack_dir(dir: &std::path::Path) -> Self {
         let policy = TrustPolicy::allowing_unsigned();
-        match GamePack::load_dir_verified(dir, &policy, std::time::SystemTime::now()) {
+        let launcher = match GamePack::load_dir_verified(dir, &policy, std::time::SystemTime::now()) {
             Ok(loaded) => {
                 for (path, e) in &loaded.errors {
                     tracing::warn!(path = %path, error = %e, "skipping an unreadable game pack");
@@ -273,6 +395,25 @@ impl Launcher {
                 tracing::warn!(error = %e, "no game pack directory; using the built-in pack");
                 Self::new(Vec::new())
             }
+        };
+        // Bolt persisted settings onto whatever set of packs we ended up with.
+        // A machine with no config directory (`None`) runs with in-memory
+        // settings rather than failing to start.
+        match settings::default_settings_path() {
+            Some(path) => launcher.with_settings_file(path),
+            None => launcher,
+        }
+    }
+
+    /// Load settings from `path` and remember to write changes back there.
+    /// Kept public-in-crate so [`from_pack_dir`](Self::from_pack_dir) and the
+    /// tests share exactly one loading path.
+    fn with_settings_file(self, path: PathBuf) -> Self {
+        let settings = LauncherSettings::load(&path);
+        Self {
+            settings: Arc::new(Mutex::new(settings)),
+            settings_path: Some(path),
+            ..self
         }
     }
 
@@ -418,6 +559,12 @@ impl Launcher {
         let mut args = ClientArgs::new(profile);
         args.server_hash = Some(hex::encode(hash.as_bytes()));
 
+        // Whether Play can run for this game is settled before the session lock
+        // is taken, so the two locks are never held at once.
+        let can_launch = self.launch_profile(&game_id).is_some();
+        let launch_ready = self.game_location(&game_id).await.launch_ready;
+        let listen_addr = format!("127.0.0.1:{listen_port}");
+
         let mut inner = self.inner.lock().await;
         // Stop any previous join first: two clients cannot share a listen port,
         // and `stop` waits for the socket to actually be released.
@@ -425,11 +572,12 @@ impl Launcher {
             old.stop().await;
         }
         inner.client = Some(BridgeSession::start_client(args).await?);
-        Ok(JoinResult {
-            listen_addr: format!("127.0.0.1:{listen_port}"),
-            can_launch: self.launch_profile(&game_id).is_some(),
-            game_id: Some(game_id),
-        })
+        inner.last_join = Some(JoinState {
+            listen_addr: listen_addr.clone(),
+            port: listen_port,
+            game_id: game_id.clone(),
+        });
+        Ok(JoinResult { listen_addr, can_launch, launch_ready, game_id: Some(game_id) })
     }
 
     fn launch_profile(&self, game_id: &str) -> Option<&LaunchProfile> {
@@ -475,11 +623,128 @@ impl Launcher {
         Ok(())
     }
 
+    // ---- game location and the Play button (`PLAN.md` §13.3 step 1) ---------
+
+    /// Everything the UI needs to decide between a Play button and a "locate
+    /// your game" prompt for one game, resolved against the player's saved path
+    /// and this machine's Steam install.
+    pub async fn game_location(&self, game_id: &str) -> GameLocationView {
+        let saved = {
+            let settings = self.settings.lock().await;
+            settings.game_paths.get(game_id).cloned()
+        };
+        let profile = self.launch_profile(game_id);
+        let steam_exe = steam::steam_executable();
+        // Only consult Steam for an install when the pack actually names an app
+        // id; a pack without one is not a Steam-locatable game.
+        let steam_installed = profile
+            .and_then(|p| p.steam_app_id)
+            .and_then(steam::installed_app_dir)
+            .is_some();
+        build_location_view(game_id, profile, saved.as_deref(), steam_exe.as_deref(), steam_installed)
+    }
+
+    /// Remember the player's own path to a game's executable, after checking it
+    /// is a file. The check is here, not only in [`play`](Self::play), so the
+    /// UI can reject a bad pick at the moment it is made rather than at launch.
+    pub async fn set_game_path(&self, game_id: &str, path: &Path) -> Result<()> {
+        if !path.is_file() {
+            return Err(anyhow!("{} is not a file", path.display()));
+        }
+        {
+            let mut settings = self.settings.lock().await;
+            settings.game_paths.insert(game_id.to_string(), path.to_path_buf());
+            self.persist(&settings)?;
+        }
+        Ok(())
+    }
+
+    /// Forget a saved game path, so the launcher falls back to Steam or to
+    /// asking again.
+    pub async fn clear_game_path(&self, game_id: &str) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        if settings.game_paths.remove(game_id).is_some() {
+            self.persist(&settings)?;
+        }
+        Ok(())
+    }
+
+    /// The display name the player joins under, if they have set one.
+    pub async fn player_name(&self) -> Option<String> {
+        self.settings.lock().await.player_name.clone()
+    }
+
+    /// Set (or, with an empty string, clear) the player's display name.
+    pub async fn set_player_name(&self, name: &str) -> Result<()> {
+        let trimmed = name.trim();
+        let mut settings = self.settings.lock().await;
+        settings.player_name = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+        self.persist(&settings)?;
+        Ok(())
+    }
+
+    /// Write settings back to disk when there is a path to write to. An
+    /// in-memory launcher (no `settings_path`) keeps the change for the run and
+    /// silently does not persist it, which is the intended degraded mode.
+    fn persist(&self, settings: &LauncherSettings) -> Result<()> {
+        if let Some(path) = &self.settings_path {
+            settings.save(path)?;
+        }
+        Ok(())
+    }
+
+    /// Start the game for the current join — the Play button (`PLAN.md` §13.3).
+    ///
+    /// Uses what [`join_server`](Self::join_server) bound, so the UI presses one
+    /// button and hands back nothing. The player's saved name is substituted;
+    /// the local address the bridge is listening on is what the game connects
+    /// to. Everything is spawned as an argument vector, never a shell — the
+    /// §13.1 safety property holds whether the program is the game or Steam.
+    pub async fn play(&self) -> Result<PlayResult> {
+        let join = {
+            let inner = self.inner.lock().await;
+            inner
+                .last_join
+                .clone()
+                .ok_or_else(|| anyhow!("join a server before pressing Play"))?
+        };
+        let profile = self
+            .launch_profile(&join.game_id)
+            .ok_or_else(|| anyhow!("no launch profile for {:?}", join.game_id))?
+            .clone();
+
+        let (saved, name) = {
+            let settings = self.settings.lock().await;
+            (settings.game_paths.get(&join.game_id).cloned(), settings.player_name.clone())
+        };
+        let values = LaunchValues {
+            address: join.listen_addr.clone(),
+            port: join.port,
+            password: None,
+            name,
+        };
+        let steam_exe = steam::steam_executable();
+        let plan = plan_launch(&profile, saved.as_deref(), steam_exe.as_deref(), &values)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        std::process::Command::new(plan.program())
+            .args(plan.args())
+            .spawn()
+            .map_err(|e| anyhow!("could not start {}: {e}", plan.program().display()))?;
+        Ok(PlayResult {
+            method: plan.method().to_string(),
+            program: plan.program().display().to_string(),
+        })
+    }
+
     pub async fn leave(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         if let Some(mut session) = inner.client.take() {
             session.stop().await;
         }
+        // A stale join must not let Play start a game against a port nothing is
+        // listening on any more.
+        inner.last_join = None;
         Ok(())
     }
 }
@@ -537,6 +802,83 @@ fn row_view(row: &game_bridge::DiscoveredServer) -> ServerRow {
         last_seen_secs: row.last_seen.elapsed().as_secs(),
         legacy: matches!(row.info, AnnounceInfo::Legacy { .. }),
     }
+}
+
+/// Build the UI's view of one game's launchability from already-resolved
+/// inputs. Pure — it takes the saved path, the Steam executable and whether the
+/// app is installed rather than reading them — so the branching that decides
+/// Play-vs-locate is unit-testable without a Steam install on the machine.
+fn build_location_view(
+    game_id: &str,
+    profile: Option<&LaunchProfile>,
+    saved: Option<&Path>,
+    steam_exe: Option<&Path>,
+    steam_installed: bool,
+) -> GameLocationView {
+    let has_launch_profile = profile.is_some();
+    let steam_app_id = profile.and_then(|p| p.steam_app_id);
+    let steam_available = steam_exe.is_some();
+    let saved_path_valid = saved.map(|p| p.is_file()).unwrap_or(false);
+    // Play can run now if the pack can launch at all AND the game is locatable:
+    // a saved path that still exists, or an installed Steam app we can reach
+    // through a found Steam client.
+    let via_steam = steam_app_id.is_some() && steam_available && steam_installed;
+    let launch_ready = has_launch_profile && (saved_path_valid || via_steam);
+
+    let detail = if !has_launch_profile {
+        "This game's pack does not start the game for you; join and point your game at the address."
+            .to_string()
+    } else if saved_path_valid {
+        "Ready: the launcher will start the copy you chose.".to_string()
+    } else if via_steam {
+        "Ready: the launcher will start the game through Steam.".to_string()
+    } else if saved.is_some() {
+        "Your saved game path no longer exists — pick your game again.".to_string()
+    } else if steam_app_id.is_some() && steam_available {
+        "Steam is installed but this game is not — install it, or pick your own copy.".to_string()
+    } else {
+        "Pick your copy of the game once and the launcher will remember it.".to_string()
+    };
+
+    GameLocationView {
+        game_id: game_id.to_string(),
+        has_launch_profile,
+        saved_path: saved.map(|p| p.display().to_string()),
+        saved_path_valid,
+        steam_app_id,
+        steam_available,
+        steam_installed,
+        launch_ready,
+        detail,
+    }
+}
+
+/// Decide how to start a game, without starting it — the testable core of
+/// [`Launcher::play`].
+///
+/// The player's own saved binary wins when it still exists; otherwise the
+/// launcher goes through Steam (`-applaunch <id>`) when the pack names an app id
+/// and Steam is present. With neither, it is an error rather than a guess. The
+/// pack's own arguments are appended in both cases, and `build_args` has already
+/// made them a vector of inert strings.
+fn plan_launch(
+    profile: &LaunchProfile,
+    saved: Option<&Path>,
+    steam_exe: Option<&Path>,
+    values: &LaunchValues,
+) -> Result<LaunchPlan, String> {
+    let pack_args = profile.build_args(values).map_err(|e| e.to_string())?;
+    if let Some(path) = saved {
+        if path.is_file() {
+            return Ok(LaunchPlan::Direct { exe: path.to_path_buf(), args: pack_args });
+        }
+    }
+    if let (Some(app_id), Some(steam)) = (profile.steam_app_id, steam_exe) {
+        let mut args = vec!["-applaunch".to_string(), app_id.to_string()];
+        args.extend(pack_args);
+        return Ok(LaunchPlan::Steam { steam: steam.to_path_buf(), args });
+    }
+    Err("your game could not be located; pick your copy of it and try again".to_string())
 }
 
 #[cfg(test)]
@@ -656,9 +998,10 @@ mod tests {
             listen_addr: "127.0.0.1:27015".into(),
             game_id: Some("sven-coop".into()),
             can_launch: true,
+            launch_ready: false,
         })
         .unwrap();
-        for key in ["listen_addr", "game_id", "can_launch"] {
+        for key in ["listen_addr", "game_id", "can_launch", "launch_ready"] {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
         }
     }
@@ -761,5 +1104,212 @@ query = "a2s"
         let v = l.server_details("not-a-hash").await;
         assert!(!v.reachable);
         assert!(v.error.is_some());
+    }
+
+    // ---- the Play button: location, planning, and persistence --------------
+
+    use game_bridge::launch::{LaunchKind, LaunchProfile};
+
+    fn a_profile(steam_app_id: Option<u32>) -> LaunchProfile {
+        LaunchProfile {
+            kind: LaunchKind::Goldsrc,
+            steam_app_id,
+            args: vec!["+connect {address}".into(), "+name {name}".into()],
+        }
+    }
+
+    /// A saved path that still exists is spawned directly — the player's own
+    /// binary, with the pack's arguments after it and nothing shelled.
+    #[test]
+    fn plan_launch_prefers_the_players_saved_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hl.exe");
+        std::fs::write(&exe, "x").unwrap();
+        let values = LaunchValues {
+            address: "127.0.0.1:27015".into(),
+            port: 27015,
+            name: Some("idan".into()),
+            ..Default::default()
+        };
+        let plan = plan_launch(&a_profile(Some(276060)), Some(&exe), Some(Path::new("/usr/bin/steam")), &values)
+            .unwrap();
+        match plan {
+            LaunchPlan::Direct { exe: e, args } => {
+                assert_eq!(e, exe);
+                assert_eq!(args, vec!["+connect", "127.0.0.1:27015", "+name", "idan"]);
+            }
+            other => panic!("expected a direct launch, got {other:?}"),
+        }
+    }
+
+    /// With no saved binary but a Steam app id and a Steam client, launch goes
+    /// through `steam -applaunch <id>` followed by the pack's own arguments.
+    #[test]
+    fn plan_launch_falls_back_to_steam_applaunch() {
+        let values = LaunchValues {
+            address: "127.0.0.1:27015".into(),
+            port: 27015,
+            name: Some("idan".into()),
+            ..Default::default()
+        };
+        let steam = Path::new("/usr/bin/steam");
+        let plan = plan_launch(&a_profile(Some(276060)), None, Some(steam), &values).unwrap();
+        match plan {
+            LaunchPlan::Steam { steam: s, args } => {
+                assert_eq!(s, steam);
+                assert_eq!(args[0], "-applaunch");
+                assert_eq!(args[1], "276060");
+                assert_eq!(&args[2..], &["+connect", "127.0.0.1:27015", "+name", "idan"]);
+            }
+            other => panic!("expected a steam launch, got {other:?}"),
+        }
+    }
+
+    /// A stale saved path (a game moved or uninstalled) is not spawned; the
+    /// planner falls through to Steam rather than trying to run a missing file.
+    #[test]
+    fn plan_launch_ignores_a_stale_saved_path() {
+        let values = LaunchValues::default();
+        let plan = plan_launch(
+            &a_profile(Some(276060)),
+            Some(Path::new("/nonexistent/hl.exe")),
+            Some(Path::new("/usr/bin/steam")),
+            &values,
+        )
+        .unwrap();
+        assert!(matches!(plan, LaunchPlan::Steam { .. }), "a stale path must not be launched directly");
+    }
+
+    /// No saved binary, no Steam: an error the UI can turn into a "locate your
+    /// game" prompt, never a guessed executable name.
+    #[test]
+    fn plan_launch_with_nothing_to_run_is_an_error() {
+        let err = plan_launch(&a_profile(None), None, None, &LaunchValues::default()).unwrap_err();
+        assert!(err.contains("could not be located"), "{err}");
+    }
+
+    /// The location view drives the UI's Play-vs-locate branch, so its keys are
+    /// part of the frontend contract.
+    #[test]
+    fn game_location_view_json_keys_are_the_frontend_contract() {
+        let profile = a_profile(Some(276060));
+        let v = serde_json::to_value(build_location_view(
+            "sven-coop",
+            Some(&profile),
+            None,
+            None,
+            false,
+        ))
+        .unwrap();
+        for key in [
+            "game_id", "has_launch_profile", "saved_path", "saved_path_valid", "steam_app_id",
+            "steam_available", "steam_installed", "launch_ready", "detail",
+        ] {
+            assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
+        }
+        // Not locatable here, so Play must not be offered.
+        assert_eq!(v["launch_ready"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn play_result_json_keys_are_the_frontend_contract() {
+        let v = serde_json::to_value(PlayResult { method: "steam".into(), program: "/usr/bin/steam".into() })
+            .unwrap();
+        for key in ["method", "program"] {
+            assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
+        }
+    }
+
+    /// A pack with no launch profile is never launch-ready, and the view says
+    /// so in words the UI can show.
+    #[test]
+    fn a_game_with_no_launch_profile_is_not_launch_ready() {
+        let view = build_location_view("q3", None, None, None, false);
+        assert!(!view.has_launch_profile);
+        assert!(!view.launch_ready);
+        assert!(view.detail.contains("point your game"));
+    }
+
+    /// A valid saved path makes a game launch-ready even with no Steam at all.
+    #[test]
+    fn a_saved_path_that_exists_makes_a_game_launch_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hl.exe");
+        std::fs::write(&exe, "x").unwrap();
+        let profile = a_profile(None);
+        let view = build_location_view("sven-coop", Some(&profile), Some(&exe), None, false);
+        assert!(view.saved_path_valid);
+        assert!(view.launch_ready);
+    }
+
+    /// An installed Steam app with a found Steam client is launch-ready without
+    /// the player having to pick a file.
+    #[test]
+    fn an_installed_steam_app_is_launch_ready() {
+        let profile = a_profile(Some(276060));
+        let view = build_location_view(
+            "sven-coop",
+            Some(&profile),
+            None,
+            Some(Path::new("/usr/bin/steam")),
+            true,
+        );
+        assert!(view.launch_ready);
+        assert!(view.steam_available && view.steam_installed);
+    }
+
+    /// Setting a game path persists it, and a fresh launcher loading the same
+    /// file sees it — the "remember it" half of §13.3 step 1.
+    #[tokio::test]
+    async fn a_saved_game_path_persists_across_launchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_file = dir.path().join("launcher.json");
+        let exe = dir.path().join("hl.exe");
+        std::fs::write(&exe, "x").unwrap();
+
+        let l = Launcher::new(Vec::new()).with_settings_file(settings_file.clone());
+        l.set_game_path("sven-coop", &exe).await.unwrap();
+
+        let l2 = Launcher::new(Vec::new()).with_settings_file(settings_file);
+        let view = l2.game_location("sven-coop").await;
+        assert_eq!(view.saved_path.as_deref(), Some(exe.to_str().unwrap()));
+        assert!(view.saved_path_valid);
+        assert!(view.launch_ready, "a remembered, existing path should be launch-ready");
+    }
+
+    /// A path that is not a file is refused at the moment it is picked, so the
+    /// UI can complain immediately rather than at launch.
+    #[tokio::test]
+    async fn setting_a_non_file_game_path_is_refused() {
+        let l = Launcher::new(Vec::new());
+        let err = l
+            .set_game_path("sven-coop", Path::new("/nonexistent/hl.exe"))
+            .await
+            .expect_err("a non-file path must be refused");
+        assert!(err.to_string().contains("not a file"), "{err}");
+    }
+
+    /// The player's name round-trips through settings so it is typed once, not
+    /// per join, and an empty string clears it rather than saving a blank.
+    #[tokio::test]
+    async fn a_player_name_round_trips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_file = dir.path().join("launcher.json");
+        let l = Launcher::new(Vec::new()).with_settings_file(settings_file.clone());
+        l.set_player_name("  idan  ").await.unwrap();
+        assert_eq!(l.player_name().await.as_deref(), Some("idan"), "the name is trimmed");
+
+        let l2 = Launcher::new(Vec::new()).with_settings_file(settings_file);
+        assert_eq!(l2.player_name().await.as_deref(), Some("idan"), "and it persists");
+        l2.set_player_name("").await.unwrap();
+        assert!(l2.player_name().await.is_none(), "an empty name clears rather than blanks");
+    }
+
+    /// Play before any join is a clear error, not a panic on a missing state.
+    #[tokio::test]
+    async fn play_before_a_join_is_a_clear_error() {
+        let l = Launcher::new(Vec::new());
+        let err = l.play().await.expect_err("play with no join must fail");
+        assert!(err.to_string().contains("join a server"), "{err}");
     }
 }

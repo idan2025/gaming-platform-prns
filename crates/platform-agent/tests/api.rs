@@ -56,7 +56,7 @@ async fn serve_with_packs(
         .ok()?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
     let addr = listener.local_addr().ok()?;
-    let router = api::router_full(Arc::new(agent), None, Some(packs.clone()));
+    let router = api::router_full(Arc::new(agent), None, Some(packs.clone()), None);
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -283,6 +283,25 @@ async fn health_reports_the_nodes_limits() {
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["max_instances"], serde_json::json!(2));
     assert_eq!(body["port_range"]["start"], serde_json::json!(27150));
+}
+
+/// A node with no `[uplink]` block has no mesh node to configure, so the
+/// interfaces routes answer 501 with the reason rather than 404 or a panic. The
+/// route is wired and reachable; it just has nothing to act on. (The interface
+/// logic itself is unit-tested in `interfaces.rs`; this pins the API wiring.)
+#[tokio::test(flavor = "multi_thread")]
+async fn interfaces_without_an_uplink_report_not_implemented() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let resp = reqwest::get(format!("http://{addr}/interfaces")).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 501, "no uplink must be a clear 501");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("uplink"),
+        "the error should explain the missing uplink, got {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

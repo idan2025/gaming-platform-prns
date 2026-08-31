@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 
 use launcher_core::{
-    BrowseOpts, BrowseQueryInput, BrowseStatus, GameSummary, JoinResult, Launcher, ServerDetailsView,
-    ServerRow,
+    BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView, GameSummary, JoinResult, Launcher,
+    PlayResult, ServerDetailsView, ServerRow,
 };
 use tauri::Manager;
 
@@ -81,6 +81,53 @@ async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.launcher.leave().await.map_err(|e| e.to_string())
 }
 
+/// Start the game for the current join — the Play button (`PLAN.md` §13.3). All
+/// the deciding and spawning is in `launcher-core`; this only forwards.
+#[tauri::command]
+async fn play_server(state: tauri::State<'_, AppState>) -> Result<PlayResult, String> {
+    state.launcher.play().await.map_err(|e| e.to_string())
+}
+
+/// What the launcher knows about locating one game, so the UI can choose between
+/// a Play button and a "locate your game" prompt.
+#[tauri::command]
+async fn game_location(
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+) -> Result<GameLocationView, String> {
+    Ok(state.launcher.game_location(&game_id).await)
+}
+
+/// Remember the player's own path to a game's executable. Refused if it is not a
+/// file, so the UI can complain at the moment of picking.
+#[tauri::command]
+async fn set_game_path(
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+    path: String,
+) -> Result<(), String> {
+    state
+        .launcher
+        .set_game_path(&game_id, std::path::Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn clear_game_path(state: tauri::State<'_, AppState>, game_id: String) -> Result<(), String> {
+    state.launcher.clear_game_path(&game_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn player_name(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(state.launcher.player_name().await)
+}
+
+#[tauri::command]
+async fn set_player_name(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    state.launcher.set_player_name(&name).await.map_err(|e| e.to_string())
+}
+
 /// Where game packs live: next to the executable in a shipped build, and at the
 /// repo's `packs/` when running from a checkout.
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
@@ -116,6 +163,12 @@ pub fn run() {
             server_details,
             join_server,
             leave,
+            play_server,
+            game_location,
+            set_game_path,
+            clear_game_path,
+            player_name,
+            set_player_name,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");
