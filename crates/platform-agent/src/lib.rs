@@ -12,6 +12,7 @@ pub mod docker;
 pub mod install;
 pub mod instance;
 pub mod interfaces;
+pub mod mesh;
 pub mod pack_import;
 pub mod packs;
 pub mod ports;

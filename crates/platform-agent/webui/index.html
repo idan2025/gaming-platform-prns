@@ -53,6 +53,7 @@
             <th>Game</th>
             <th>State</th>
             <th>Port</th>
+        <th>Mesh</th>
             <th>Players</th>
             <th>Uptime</th>
             <th class="actions-col">Actions</th>
@@ -78,7 +79,21 @@
       </div>
 
       <div id="mesh-offline" class="empty-state hidden">
-        This node has no Reticulum uplink, so there is no mesh node to attach interfaces to. Add an <code>[uplink]</code> section to the agent config and restart.
+        This node has no <code>[uplink]</code>, so there are no uplink interfaces to configure here.
+        That is a <em>different</em> thing from hosting games on the mesh: <code>[uplink]</code> is the
+        control destination an index drives this node through, while <code>[mesh]</code> is what announces
+        the games this node runs. Games can be on the mesh with no uplink at all — the panel below says
+        whether yours are.
+      </div>
+
+      <!-- Games on the mesh. Deliberately outside the online/offline split
+           above: an operator kept being told they had "no mesh" while their
+           servers were announced on it, because the two Reticulum jobs on this
+           node were being reported as one. -->
+      <div id="mesh-games" class="mesh-games">
+        <h3>Games on the mesh</h3>
+        <p id="mesh-games-note" class="muted">—</p>
+        <div id="mesh-games-list"></div>
       </div>
 
       <div id="mesh-online" class="hidden">
@@ -146,9 +161,11 @@
     <td class="cell-game"></td>
     <td class="cell-state"><span class="state-pill"></span></td>
     <td class="cell-port"></td>
+    <td class="cell-mesh"></td>
     <td class="cell-players"></td>
     <td class="cell-uptime"></td>
     <td class="actions-col cell-actions">
+      <button type="button" class="quiet restart-btn">Restart</button>
       <button type="button" class="quiet stop-btn">Stop</button>
       <button type="button" class="quiet danger remove-btn">Remove</button>
     </td>

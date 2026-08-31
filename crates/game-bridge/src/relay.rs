@@ -238,13 +238,51 @@ impl RequestEndpoint<ServerState> for DetailsEndpoint {
 }
 
 pub async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
+    let browsing = matches!(cfg, BridgeConfig::Browse(_));
     let session = match cfg {
         BridgeConfig::Server(args) => BridgeSession::start_server(args).await?,
         BridgeConfig::Client(args) => BridgeSession::start_client(args).await?,
         BridgeConfig::Relay(args) => BridgeSession::start_relay(args).await?,
         BridgeConfig::Browse(args) => BridgeSession::start_browser(args).await?,
     };
+    if browsing {
+        // The browse role's whole product is the list, and until now running it
+        // printed a "listening" line and then nothing at all forever — the
+        // usage text promised "prints what it hears" and the binary did not.
+        // It is the cheapest way to check an interface works, so it has to say
+        // what it heard.
+        print_discoveries_until_stopped(&session).await;
+    }
     session.await_completion().await
+}
+
+/// Print each server as it is first heard, and nothing when nothing changes.
+///
+/// A line per server rather than a repeated table: this is read in a terminal
+/// while someone waits to see whether a node is reachable, and a table redrawn
+/// every few seconds scrolls the answer away.
+async fn print_discoveries_until_stopped(session: &BridgeSession) {
+    let query = crate::browse::BrowseQuery::default();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    loop {
+        for row in session.browse(&query).await {
+            let hash = hex::encode(row.destination_hash.as_bytes());
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+            let name = row.name().unwrap_or("(unnamed)");
+            match row.record() {
+                Some(r) => println!(
+                    "{hash}  {name}  game={} map={} players={}/{} hops={}",
+                    r.game_id, r.map, r.players, r.max_players, row.hops
+                ),
+                // A deployed v0.1.10 peer announces a bare name and nothing
+                // else. Saying "legacy" is more honest than printing zeros.
+                None => println!("{hash}  {name}  (legacy peer) hops={}", row.hops),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// A running bridge: owns a `PrnsNodeHandle` (for live interface control and

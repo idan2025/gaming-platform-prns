@@ -92,6 +92,48 @@ function withInFlight(promise) {
   });
 }
 
+// Make an element copy a full value on click. Hashes are shown truncated
+// because a 32-character destination does not fit a table cell, but truncated
+// is useless if you cannot get the whole thing out — so the element carries the
+// full value and hands it over on click.
+function makeCopyable(el, value, label) {
+  if (!el || !value) return;
+  el.classList.add("copyable");
+  el.title = value + " — click to copy";
+  el.setAttribute("role", "button");
+  el.setAttribute("tabindex", "0");
+  const copy = async () => {
+    let ok = false;
+    try {
+      // Only available on a secure origin, and this UI is plain HTTP on a LAN,
+      // so the fallback is the one that usually runs.
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        ok = true;
+      }
+    } catch (_) { /* fall through */ }
+    if (!ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = value;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch (_) { ok = false; }
+    }
+    const previous = el.textContent;
+    el.textContent = ok ? "copied" : value;
+    if (!ok) el.classList.add("copy-failed");
+    setTimeout(() => { el.textContent = previous; el.classList.remove("copy-failed"); }, 1200);
+  };
+  el.onclick = copy;
+  el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); copy(); } };
+}
+
 // ---------- error banner ----------
 
 function showError(sentence) {
@@ -214,8 +256,10 @@ function renderInstances() {
       row = $("instance-row-template").content.firstElementChild.cloneNode(true);
       // Wire row action buttons once.
       const stopBtn = row.querySelector(".stop-btn");
+      const restartBtn = row.querySelector(".restart-btn");
       const removeBtn = row.querySelector(".remove-btn");
       stopBtn.addEventListener("click", () => onStop(inst.instance_id));
+      if (restartBtn) restartBtn.addEventListener("click", () => onRestart(inst.instance_id));
       removeBtn.addEventListener("click", () => onRemove(inst.instance_id, inst.name));
       tbody.appendChild(row);
       state.rows.set(inst.instance_id, row);
@@ -228,6 +272,25 @@ function renderInstances() {
     statePill.className = "state-pill " + stateClass(inst.state);
 
     row.querySelector(".cell-port").textContent = (inst.port != null ? String(inst.port) : "—");
+
+    // The mesh destination is the address a player actually joins from a
+    // launcher. Its absence is not a detail: it means this server exists on
+    // this machine's network and nowhere else, so say that rather than showing
+    // a blank cell.
+    const meshCell = row.querySelector(".cell-mesh");
+    if (meshCell) {
+      if (inst.mesh_destination) {
+        meshCell.textContent = inst.mesh_destination.slice(0, 8) + "…";
+        meshCell.classList.remove("muted-em");
+        makeCopyable(meshCell, inst.mesh_destination, "destination");
+      } else {
+        meshCell.textContent = "LAN only";
+        meshCell.title = "Not announced on the mesh. Add a [mesh] section to this node's config.";
+        meshCell.classList.add("muted-em");
+        meshCell.classList.remove("copyable");
+        meshCell.onclick = null;
+      }
+    }
 
     // Players: null is NOT zero. null means "the agent couldn't ask this game" and
     // must display as "—" with a tooltip explaining the distinction; 0 is a real
@@ -610,6 +673,25 @@ async function onInstall(gameId) {
 
 // ---------- stop / remove ----------
 
+// Turn a server off and on again. It keeps its ports and its mesh destination,
+// so a player's bookmark still works afterwards — which is why this is a
+// restart and not a remove-and-recreate.
+async function onRestart(instanceId) {
+  const row = state.rows.get(instanceId);
+  const btn = row ? row.querySelector(".restart-btn") : null;
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  try {
+    await withInFlight(api("POST", "/instances/" + encodeURIComponent(instanceId) + "/restart"));
+    clearError();
+    poll();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Failed to restart the server.");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Restart"; }
+  }
+}
+
 async function onStop(instanceId) {
   const row = state.rows.get(instanceId);
   const btn = row && row.querySelector(".stop-btn");
@@ -663,6 +745,8 @@ function formatBytes(n) {
 // (501), uplink up with interfaces, and uplink up but empty. A poll error is
 // surfaced in the banner rather than silently leaving a stale list.
 async function loadInterfaces() {
+  // Games on the mesh, which is a different question from uplink interfaces.
+  renderMeshGames();
   const offline = $("mesh-offline");
   const online = $("mesh-online");
   try {
@@ -894,3 +978,41 @@ document.addEventListener("DOMContentLoaded", () => {
 // Refresh the games grid whenever we render (cheap due to signature check).
 const _origRenderAll2 = renderAll;
 renderAll = function() { _origRenderAll2(); renderGames(); };
+
+
+// The `[mesh]` half of this node's Reticulum story: which running servers are
+// announced, and under what destination. Kept separate from the uplink panel
+// because they are separate jobs and reporting them as one is what made the tab
+// confusing.
+async function renderMeshGames() {
+  const note = $("mesh-games-note");
+  const list = $("mesh-games-list");
+  if (!note || !list) return;
+  let body;
+  try {
+    body = await api("GET", "/mesh");
+  } catch (e) {
+    if (e && e.__auth) return;
+    note.textContent = (e && e.error) || "Could not read mesh status.";
+    return;
+  }
+  note.textContent = body.note || "";
+  list.textContent = "";
+  const servers = Array.isArray(body.servers) ? body.servers : [];
+  if (!servers.length) {
+    const p = el("p", "muted", body.enabled
+      ? "No servers are running, so nothing is announced yet."
+      : "Nothing is announced: this node runs its games LAN-only.");
+    list.appendChild(p);
+    return;
+  }
+  for (const s of servers) {
+    const row = el("div", "mesh-row");
+    row.appendChild(el("span", "pack-name", s.name || s.instance_id));
+    row.appendChild(el("span", "muted", s.game_id));
+    const dest = el("code", "", s.destination ? s.destination.slice(0, 12) + "…" : "starting…");
+    if (s.destination) makeCopyable(dest, s.destination, "destination");
+    row.appendChild(dest);
+    list.appendChild(row);
+  }
+}

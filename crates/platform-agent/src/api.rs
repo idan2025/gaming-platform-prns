@@ -108,6 +108,7 @@ pub fn router_full(
         .route("/capacity", get(capacity))
         .route("/instances", get(list).post(create))
         .route("/instances/:id/stop", post(stop))
+        .route("/instances/:id/restart", post(restart))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content).get(install_status))
@@ -116,6 +117,7 @@ pub fn router_full(
         // Configuring the mesh interfaces binds sockets and joins meshes, so it
         // rides behind the same token gate as every container-creating route
         // (`interfaces.rs` "Authorization is the API's").
+        .route("/mesh", get(mesh_status))
         .route("/interfaces", get(interfaces_status).post(interfaces_add))
         .route("/interfaces/:id", delete(interfaces_remove))
         .route("/interfaces/:id/rename", post(interfaces_rename))
@@ -222,6 +224,26 @@ struct GameOption {
     transport: String,
     default_port: u16,
     extra_ports: usize,
+}
+
+/// What this node is announcing on the mesh, per running game server.
+///
+/// Distinct from `/interfaces`, which is about the `[uplink]` — the control
+/// destination an index drives this node through. A node can host games on the
+/// mesh with no uplink at all, and conflating the two is how an operator ends
+/// up being told they have "no mesh" while their servers are announced on it.
+async fn mesh_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let mesh = state.agent.mesh();
+    Json(json!({
+        "enabled": mesh.enabled(),
+        "servers": mesh.status().await,
+        "note": if mesh.enabled() {
+            "Each running server is announced under its own destination."
+        } else {
+            "This node runs its games LAN-only. Add a [mesh] section to its config to \
+             announce them on Reticulum."
+        },
+    }))
 }
 
 /// Install a game pack into this running node (`pack_import.rs`).
@@ -389,6 +411,19 @@ async fn create(
     }
 }
 
+/// Turn an instance off and on again, keeping its ports and its mesh identity.
+async fn restart(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .restart(&id)
+        .await
+        .map(|_| Json(json!({ "instance_id": id, "restarted": true })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
 async fn stop(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -470,8 +505,11 @@ fn interface_manager(
     state.interfaces.as_ref().ok_or_else(|| {
         fail(
             StatusCode::NOT_IMPLEMENTED,
-            "this agent has no Reticulum uplink, so it has no mesh interfaces to configure. \
-             Add an [uplink] section to the config and restart",
+            "this agent has no [uplink], so there are no uplink interfaces to configure here. \
+             That is a different thing from hosting games on the mesh: [uplink] is the \
+             control destination an index drives this node through, and [mesh] is what \
+             announces the games this node runs. Games can be on the mesh with no uplink \
+             at all — see the Servers tab for their destinations.",
         )
     })
 }

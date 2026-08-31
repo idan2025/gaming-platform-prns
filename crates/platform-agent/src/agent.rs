@@ -19,10 +19,12 @@
 //! that restarted would cheerfully hand a live instance's port to a new one.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
+use game_bridge::profile::GameProfile;
 use game_bridge::GamePack;
 use tokio::sync::{Mutex, RwLock};
 
@@ -50,6 +52,9 @@ pub struct Agent {
     /// authority on what is *running*; this only remembers the display name and
     /// requested size, which Docker has no place to keep.
     specs: Mutex<BTreeMap<String, InstanceSpec>>,
+    /// One mesh bridge per running instance. Empty and inert on a node with no
+    /// `[mesh]` section, which is the LAN-only behaviour that came before.
+    mesh: Arc<crate::mesh::MeshBridges>,
 }
 
 impl Agent {
@@ -84,6 +89,7 @@ impl Agent {
         );
         let packs = RwLock::new(packs.into_iter().map(|p| (p.id.clone(), p)).collect());
 
+        let mesh = crate::mesh::MeshBridges::new(config.mesh.clone());
         Ok(Self {
             config,
             layout,
@@ -92,6 +98,7 @@ impl Agent {
             ports: Mutex::new(ports),
             packs,
             specs: Mutex::new(BTreeMap::new()),
+            mesh,
         })
     }
 
@@ -121,6 +128,97 @@ impl Agent {
         let mut packs = self.packs.write().await;
         *packs = loaded.packs.iter().map(|p| (p.id.clone(), p.clone())).collect();
         Ok(loaded)
+    }
+
+    /// Where this node can actually reach a running instance's game.
+    ///
+    /// The container's own address on the Docker network and the port the game
+    /// binds **inside** it — not `127.0.0.1:<host_port>`. The agent is meant to
+    /// run in a container, and there that loopback is its own namespace: a mesh
+    /// bridge pointed at it announces a destination, accepts a link, and then
+    /// forwards every packet into nothing. The game is up, the announce is
+    /// real, and joining does not work, which is the worst of the three
+    /// possible failures because it looks like it should be fine.
+    ///
+    /// Same reasoning as `player_count`. Both learned it the same way.
+    async fn game_address(
+        &self,
+        instance_id: &str,
+        profile: &GameProfile,
+    ) -> Option<(String, u16)> {
+        let containers = self.docker.list_managed().await.ok()?;
+        let container = containers.iter().find(|c| c.instance_id == instance_id)?;
+        match &container.ip {
+            Some(ip) if !ip.is_empty() => Some((ip.clone(), profile.default_port)),
+            // No network address means nothing can reach it, the agent
+            // included. Better to announce nothing than a destination that
+            // forwards into the void.
+            _ => None,
+        }
+    }
+
+    /// Put every already-running instance back on the mesh.
+    ///
+    /// Containers outlive the agent — that is the point of `--restart` and of
+    /// the agent keeping no database — so on startup there may be servers
+    /// running that nothing is announcing. Without this an agent restart takes
+    /// every hosted server off the mesh until somebody recreates it, which is a
+    /// silent outage: the game is still up and still reachable on the LAN.
+    ///
+    /// Each identity is the one already beside that instance, so a restored
+    /// server keeps the destination players had.
+    pub async fn restore_mesh_bridges(&self) {
+        if !self.mesh.enabled() {
+            return;
+        }
+        let instances = match self.list().await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not list instances to restore mesh bridges");
+                return;
+            }
+        };
+        let packs = self.packs.read().await;
+        for instance in instances.iter().filter(|i| i.state == InstanceState::Running) {
+            let Some(pack) = packs.get(&instance.game_id) else { continue };
+            let Ok(profile) = pack.to_profile() else { continue };
+            let Some(addr) = self.game_address(&instance.instance_id, &profile).await else {
+                continue;
+            };
+            let identity = crate::mesh::identity_path(&self.config.data_root, &instance.instance_id);
+            let max_players = self
+                .specs
+                .lock()
+                .await
+                .get(&instance.instance_id)
+                .map(|s| s.max_players)
+                // The spec is this run's memory and a restart has none, so fall
+                // back to the pack's own idea rather than refusing to restore.
+                .unwrap_or(16);
+            if let Err(e) = self
+                .mesh
+                .start(
+                    &instance.instance_id,
+                    &profile,
+                    &identity,
+                    (&addr.0, addr.1),
+                    &instance.name,
+                    max_players,
+                )
+                .await
+            {
+                tracing::warn!(
+                    instance = %instance.instance_id,
+                    error = %format!("{e:#}"),
+                    "could not put this running server back on the mesh"
+                );
+            }
+        }
+    }
+
+    /// The mesh bridges this node is running, for the API and the web UI.
+    pub fn mesh(&self) -> &Arc<crate::mesh::MeshBridges> {
+        &self.mesh
     }
 
     /// The daemon handle, for a caller that needs to ask Docker something the
@@ -404,6 +502,34 @@ impl Agent {
             .await
             .insert(spec.instance_id.clone(), spec.clone());
 
+        // Put it on the mesh. A bridge that will not start leaves a server that
+        // is reachable on the LAN and not the mesh, which is degraded; failing
+        // the create here would leave one that is not reachable at all, which
+        // is broken. So this is logged and the instance stands.
+        let mut mesh_destination_now = None;
+        if let Some(addr) = self.game_address(&spec.instance_id, &profile).await {
+            let identity = crate::mesh::identity_path(&self.config.data_root, &spec.instance_id);
+            match self
+                .mesh
+                .start(
+                    &spec.instance_id,
+                    &profile,
+                    &identity,
+                    (&addr.0, addr.1),
+                    &spec.name,
+                    spec.max_players,
+                )
+                .await
+            {
+                Ok(status) => mesh_destination_now = status.and_then(|s| s.destination),
+                Err(e) => tracing::warn!(
+                    instance = %spec.instance_id,
+                    error = %format!("{e:#}"),
+                    "this server is running but is not on the mesh"
+                ),
+            }
+        }
+
         Ok(InstanceStatus {
             instance_id: spec.instance_id,
             game_id: spec.game_id,
@@ -424,6 +550,7 @@ impl Agent {
             container_id: Some(container_id),
             // Read back by the next `list`; not worth an inspect here.
             container_ip: None,
+            mesh_destination: mesh_destination_now,
             // A container created a moment ago. Both are answered by the next
             // `list`, and neither is worth a Docker round trip here.
             uptime_secs: Some(0),
@@ -433,7 +560,62 @@ impl Agent {
     }
 
     pub async fn stop(&self, instance_id: &str) -> Result<()> {
+        // Off the mesh first. A bridge still announcing a server whose game has
+        // stopped advertises a destination that accepts a link and then relays
+        // to a closed port — worse than not being listed at all.
+        self.mesh.stop(instance_id).await;
         self.docker.stop(instance_id).await
+    }
+
+    /// Restart an instance in place, and put it back on the mesh.
+    ///
+    /// The container is restarted rather than recreated, so the instance keeps
+    /// its ports and its identity — a player's bookmark still works afterwards.
+    /// The mesh bridge is torn down first and rebuilt after: the game's UDP
+    /// socket goes away across a restart, and a bridge left announcing through
+    /// it would relay links into a closed port for as long as the game took to
+    /// come back.
+    pub async fn restart(&self, instance_id: &str) -> Result<()> {
+        self.mesh.stop(instance_id).await;
+        self.docker.restart(instance_id).await?;
+
+        let instances = self.list().await?;
+        let Some(instance) = instances.iter().find(|i| i.instance_id == instance_id) else {
+            return Ok(());
+        };
+        let packs = self.packs.read().await;
+        let Some(pack) = packs.get(&instance.game_id) else { return Ok(()) };
+        let profile = pack.to_profile().map_err(|e| anyhow!("{e}"))?;
+        let Some(addr) = self.game_address(instance_id, &profile).await else { return Ok(()) };
+        let max_players = self
+            .specs
+            .lock()
+            .await
+            .get(instance_id)
+            .map(|s| s.max_players)
+            .unwrap_or(16);
+        let identity = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        if let Err(e) = self
+            .mesh
+            .start(
+                instance_id,
+                &profile,
+                &identity,
+                (&addr.0, addr.1),
+                &instance.name,
+                max_players,
+            )
+            .await
+        {
+            // Same rule as create: a server on the LAN and not the mesh is
+            // degraded, and failing the restart would leave it stopped.
+            tracing::warn!(
+                instance = %instance_id,
+                error = %format!("{e:#}"),
+                "restarted, but this server is not back on the mesh"
+            );
+        }
+        Ok(())
     }
 
     /// Stop and remove, returning the port to the pool.
@@ -454,6 +636,7 @@ impl Agent {
                 ports
             })
             .unwrap_or_default();
+        self.mesh.stop(instance_id).await;
         // Stopping first is politeness, not correctness: `remove` forces. But a
         // game server that is killed outright loses whatever it was flushing.
         let _ = self.docker.stop(instance_id).await;
@@ -517,6 +700,9 @@ impl Agent {
                     ports: c.ports,
                     container_id: Some(c.container_id),
                     container_ip: c.ip.clone(),
+                    // Filled by `list_detailed`; `list` is on the hot path and
+                    // does not take the bridge lock.
+                    mesh_destination: None,
                     uptime_secs: c.created_unix.and_then(|created| {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
                         u64::try_from(created).ok().map(|c| now.saturating_sub(c))
@@ -543,6 +729,22 @@ impl Agent {
     /// dropped.
     pub async fn list_detailed(&self) -> Result<Vec<InstanceStatus>> {
         let mut instances = self.list().await?;
+        // A container can stop without the agent stopping it — somebody ran
+        // `docker stop`, or the game crashed. Reconcile here, where the truth
+        // was just read, rather than trusting that every exit came through us.
+        let live: Vec<String> = instances
+            .iter()
+            .filter(|i| i.state == InstanceState::Running)
+            .map(|i| i.instance_id.clone())
+            .collect();
+        self.mesh.retain_only(&live).await;
+        for instance in instances.iter_mut() {
+            instance.mesh_destination = self
+                .mesh
+                .status_of(&instance.instance_id)
+                .await
+                .and_then(|s| s.destination);
+        }
         let queries = instances.iter().map(|i| self.player_count(i));
         let counts = futures_util::future::join_all(queries).await;
         for (instance, count) in instances.iter_mut().zip(counts) {

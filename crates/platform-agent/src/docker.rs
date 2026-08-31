@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
+    RemoveContainerOptions, RestartContainerOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
@@ -549,6 +549,26 @@ impl DockerRuntime {
             .stop_container(&name, Some(StopContainerOptions { t: STOP_TIMEOUT_SECS }))
             .await
             .with_context(|| format!("stopping container {name}"))?;
+        Ok(())
+    }
+
+    /// Restart the container in place.
+    ///
+    /// Keeps the container, so the instance keeps its published ports, its
+    /// mounts and its identity — a restart is "turn it off and on again", not
+    /// "make me a new one". Recreating instead would hand the instance
+    /// different host ports and orphan the destination players had.
+    ///
+    /// `assert_managed` first, like every other operation: this agent only ever
+    /// touches containers carrying its own label, and a restart is as
+    /// destructive as a stop to whoever is playing.
+    pub async fn restart(&self, spec_id: &str) -> Result<()> {
+        let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
+        self.assert_managed(&name).await?;
+        self.docker
+            .restart_container(&name, Some(RestartContainerOptions { t: STOP_TIMEOUT_SECS as isize }))
+            .await
+            .with_context(|| format!("restarting container {name}"))?;
         Ok(())
     }
 

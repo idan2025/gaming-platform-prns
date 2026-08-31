@@ -290,6 +290,7 @@ mod tests {
             ports: Vec::new(),
             container_id: Some("abc".to_string()),
             container_ip: None,
+            mesh_destination: None,
             uptime_secs: None,
             owner: None,
             players_now: None,

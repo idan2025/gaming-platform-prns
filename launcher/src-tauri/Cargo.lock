@@ -2102,6 +2102,7 @@ dependencies = [
  "personal-rns",
  "prns-core",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

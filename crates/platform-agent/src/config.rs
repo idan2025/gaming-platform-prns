@@ -133,6 +133,19 @@ pub struct AgentConfig {
     /// a trust list wrote it to mean something.
     #[serde(default)]
     pub pack_trust: Option<PackTrustConfig>,
+    /// How this node puts the games it runs on the Reticulum mesh
+    /// (`crates/platform-agent/src/mesh.rs`).
+    ///
+    /// **Absent means LAN-only**, which is what this agent did before the
+    /// section existed: containers with published UDP ports and nothing
+    /// announcing them. Present, each running instance gets its own bridge, its
+    /// own identity and its own announced destination.
+    ///
+    /// Deliberately not the same switch as `[uplink]`. That is the control
+    /// destination an *index* drives this node through and it carries no game
+    /// traffic; an operator may want either without the other.
+    #[serde(default)]
+    pub mesh: Option<crate::mesh::MeshConfig>,
     /// A shared secret callers must present to use the local API.
     ///
     /// **This is what allows `api_bind` off loopback.** Without it the API has

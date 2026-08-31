@@ -104,6 +104,10 @@ async fn main() -> Result<()> {
     let agent = Arc::new(Agent::new(config, loaded.packs).await?);
     warn_if_data_root_is_not_shared_with_the_daemon(&agent).await;
 
+    // Containers outlive this process, so a restart can find servers running
+    // that nothing is announcing. Put them back on the mesh before serving.
+    agent.restore_mesh_bridges().await;
+
     // The Reticulum control uplink is opt-in via `[uplink]` in the config. When
     // present, the agent also announces a `platform-agent.control` destination
     // and answers authenticated create/stop/remove/list requests over a Link, so

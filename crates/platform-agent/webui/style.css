@@ -166,3 +166,14 @@ button.danger:hover:not(:disabled) { background: #2a1518; border-color: var(--da
   .games-grid { grid-template-columns: 1fr; }
   .card-meta { grid-template-columns: 1fr 1fr; }
 }
+
+/* A truncated hash is useless if you cannot get the whole thing out, so the
+   cell hands over its full value on click. */
+.copyable { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.copyable:hover { color: var(--accent, #7aa2f7); }
+.copyable:focus-visible { outline: 2px solid var(--accent, #7aa2f7); outline-offset: 2px; }
+.copy-failed { color: var(--warn, #e0af68); }
+
+.mesh-games { margin-top: 14px; }
+.mesh-games .mesh-row { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; }
+.mesh-games .mesh-row + .mesh-row { border-top: 1px solid var(--border, #2a2f3a); }

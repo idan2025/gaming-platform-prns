@@ -113,6 +113,15 @@ pub struct InstanceStatus {
     /// the host.
     #[serde(default)]
     pub container_ip: Option<String>,
+    /// Hex Reticulum destination this server is announced under, when the node
+    /// puts its games on the mesh. `None` means LAN-only — either the node has
+    /// no `[mesh]` section, or this instance's bridge did not start.
+    ///
+    /// This is the address a player joins from a launcher, and it is the whole
+    /// difference between a server on the mesh and a container with a published
+    /// port.
+    #[serde(default)]
+    pub mesh_destination: Option<String>,
     /// Players on this server right now, when the game can be asked.
     ///
     /// `None` is **not zero**, and the difference decides whether an instance
