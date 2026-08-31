@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
     }
     let uplink_config = config.uplink.clone();
     let agent = Arc::new(Agent::new(config, loaded.packs).await?);
+    warn_if_data_root_is_not_shared_with_the_daemon(&agent).await;
 
     // The Reticulum control uplink is opt-in via `[uplink]` in the config. When
     // present, the agent also announces a `platform-agent.control` destination
@@ -142,4 +143,34 @@ fn tracing_init() {
     // dashboard.
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "platform_agent=info".to_string());
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+/// Warn when this agent's `data_root` is not the same path to the Docker daemon
+/// as it is here.
+///
+/// The agent starts game servers as sibling containers and asks the **host's**
+/// daemon to bind-mount each instance directory, so the daemon resolves
+/// `data_root` in the host's filesystem rather than in this process's. If the
+/// two disagree, Docker does not error: it creates the missing bind source as
+/// an empty directory, and a game server starts with no game files. That is a
+/// baffling symptom from the other end, so say it here instead.
+///
+/// The daemon is asked rather than `/proc/self/mountinfo` guessed at, because
+/// from inside a container a correct `-v /data:/data` and a broken named volume
+/// at `/data` look identical — both are a mount point called `/data`. Anything
+/// the daemon will not confirm stays silent: a false alarm about a working
+/// deployment teaches an operator to ignore the message.
+async fn warn_if_data_root_is_not_shared_with_the_daemon(agent: &Agent) {
+    let root = &agent.config().data_root;
+    if agent.docker().path_is_shared_with_host(root).await == Some(false) {
+        tracing::warn!(
+            data_root = %root.display(),
+            "data_root is not the same path to the Docker daemon as it is here. \
+             Game servers run as sibling containers, so the daemon resolves this path \
+             on the HOST — Docker will create an empty directory there instead of \
+             failing, and your servers will start with no game files. Bind the same \
+             absolute path on both sides (-v {0}:{0}); a named volume cannot work here",
+            root.display()
+        );
+    }
 }

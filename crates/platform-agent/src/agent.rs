@@ -123,6 +123,12 @@ impl Agent {
         Ok(loaded)
     }
 
+    /// The daemon handle, for a caller that needs to ask Docker something the
+    /// agent itself does not model.
+    pub fn docker(&self) -> &DockerRuntime {
+        &self.docker
+    }
+
     pub fn config(&self) -> &AgentConfig {
         &self.config
     }

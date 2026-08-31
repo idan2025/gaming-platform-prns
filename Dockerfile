@@ -39,8 +39,14 @@ RUN useradd --system --create-home --uid 10001 mesh
 USER mesh
 WORKDIR /home/mesh
 
-# No ENTRYPOINT of its own beyond the binary: which role this container plays is
-# the operator's decision, exactly as which image a game runs in is. An image
-# that picked a role would be choosing from the wrong side of the machine.
-ENTRYPOINT ["game-bridge"]
-CMD ["--help"]
+# **No ENTRYPOINT.** Which role this container plays — `platform-agent`,
+# `game-bridge server`, `game-bridge relay`, `platform-index` — is the
+# operator's decision, exactly as which image a game runs in is. An ENTRYPOINT
+# would pick one and then silently swallow the operator's choice as arguments to
+# it, which is what an earlier version of this file did: `docker run <image>
+# platform-agent ...` ran `game-bridge platform-agent ...` and printed a help
+# page.
+#
+# So `command:` in a compose file, or the argument after the image name, names
+# the binary. CMD is only what you get when you say nothing.
+CMD ["platform-agent", "--help"]

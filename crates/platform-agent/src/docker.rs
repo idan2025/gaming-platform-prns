@@ -163,6 +163,41 @@ impl DockerRuntime {
     /// Filtered by label rather than by name, because a name prefix is a
     /// convention anyone can adopt by accident and a label is something only
     /// this agent sets.
+    /// Whether `path` is visible to the **daemon** at the same absolute path it
+    /// has inside this process, when this process is itself in a container.
+    ///
+    /// This is the one question `/proc/self/mountinfo` cannot answer: a bind of
+    /// `/data:/data` and a named volume mounted at `/data` are indistinguishable
+    /// from inside — both are simply a mount point called `/data`. The daemon
+    /// knows the difference, and the agent is already talking to it.
+    ///
+    /// It matters because the agent asks the daemon to bind-mount instance
+    /// directories into game containers, and the daemon resolves those paths on
+    /// the host. If they mean something else there, Docker creates the missing
+    /// source as an empty directory rather than failing, and a game server
+    /// starts with no game files.
+    ///
+    /// `None` means "could not tell" — not in a container, no id to look up, or
+    /// the daemon would not say. Never guess: a false alarm about a working
+    /// deployment trains an operator to ignore the message.
+    pub async fn path_is_shared_with_host(&self, path: &std::path::Path) -> Option<bool> {
+        let id = own_container_id()?;
+        let details = self.docker.inspect_container(&id, None).await.ok()?;
+        let mounts = details.mounts?;
+        // The mount covering `path` is the one with the longest destination that
+        // is a prefix of it — nested mounts are legal and the innermost wins.
+        let covering = mounts
+            .iter()
+            .filter(|m| {
+                m.destination
+                    .as_deref()
+                    .is_some_and(|d| path.starts_with(d))
+            })
+            .max_by_key(|m| m.destination.as_deref().map(str::len).unwrap_or(0))?;
+        // Shared exactly when the daemon's name for it equals ours.
+        Some(covering.source.as_deref() == covering.destination.as_deref())
+    }
+
     pub async fn list_managed(&self) -> Result<Vec<ManagedContainer>> {
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec![MANAGED_LABEL.to_string()]);
@@ -499,6 +534,20 @@ impl DockerRuntime {
             Err(e) => Err(e).with_context(|| format!("inspecting container {name}")),
         }
     }
+}
+
+/// This container's id, as the daemon knows it.
+///
+/// The hostname is the short id by default and `inspect` accepts it. An
+/// operator who set `--hostname` breaks this, which is why every caller treats
+/// `None` as "could not tell" rather than as an answer.
+fn own_container_id() -> Option<String> {
+    if !std::path::Path::new("/.dockerenv").exists() {
+        return None;
+    }
+    let host = std::fs::read_to_string("/etc/hostname").ok()?;
+    let host = host.trim();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 #[cfg(test)]

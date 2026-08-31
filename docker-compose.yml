@@ -1,0 +1,85 @@
+# Host side of the platform, in a container, managed from a browser.
+#
+#   mkdir -p ./packs && cp crates/platform-agent/agent.example.toml ./agent.toml
+#   # edit agent.toml: api_bind = "0.0.0.0:4750", api_token_file, data_root
+#   sudo mkdir -p /var/lib/gaming-platform-prns
+#   docker compose up -d
+#   sudo cat /var/lib/gaming-platform-prns/api.token   # the token the UI asks for
+#   xdg-open http://localhost:4750
+#
+# ===========================================================================
+# The one rule that will bite you: data_root must be the SAME PATH on both
+# sides
+# ===========================================================================
+# The agent starts game servers as **sibling** containers on the host's Docker
+# daemon, not nested inside itself, and it asks that daemon to bind-mount each
+# instance's directory. The daemon resolves those paths in the **host's**
+# filesystem — it has no idea what the agent's container can see.
+#
+# So `data_root` has to name a path that means the same thing in both places,
+# which means a bind mount with an identical path on each side of the colon:
+#
+#     - /var/lib/gaming-platform-prns:/var/lib/gaming-platform-prns
+#
+# **A named volume does not work here**, however tidy it looks. Docker would
+# put it at /var/lib/docker/volumes/<name>/_data on the host while the agent
+# calls it /data, and the game containers would then be handed /data from the
+# host root — a path that does not exist. Docker creates missing bind sources
+# as empty directories, so the failure is not an error: it is a game server
+# starting with no game files, which is a genuinely confusing afternoon.
+#
+# The same reasoning applies to the packs directory if you ever bind it into a
+# game container, and to anything else the agent hands the daemon.
+#
+# ===========================================================================
+# Read this before mounting the socket
+# ===========================================================================
+# `/var/run/docker.sock` is root on the host. Anything that can reach it can
+# start a container with the host filesystem mounted, so a process holding this
+# socket is not "isolated in a container" in any meaningful sense — it is a
+# root-equivalent process wearing one.
+#
+# That is what running containers requires; it is not a flaw in the agent. It
+# does mean the API in front of it deserves the respect you would give a root
+# shell:
+#
+#   * The token is the only thing between the network and that socket. The
+#     agent generates it on first run into the file `api_token_file` names, and
+#     refuses to bind off loopback without one.
+#   * `ports:` below publishes to 127.0.0.1 only. Change that to 0.0.0.0 and you
+#     have published a root-equivalent API to your network. For real remote
+#     access put TLS and a proxy in front: the token travels in a header, and
+#     plain HTTP hands it to anyone on the path.
+#   * Do not run this against a Docker daemon you do not own.
+
+services:
+  agent:
+    image: ghcr.io/idan2025/gaming-platform-prns:latest
+    # Or build it from this checkout instead:
+    # build: .
+    command: ["platform-agent", "/config/agent.toml", "/packs"]
+    restart: unless-stopped
+
+    ports:
+      # Loopback on purpose. See the socket note above before widening this.
+      - "127.0.0.1:4750:4750"
+
+    volumes:
+      # The daemon this agent drives. Root-equivalent — see above.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # This node's settings. Inside a container `api_bind` must be
+      # 0.0.0.0:4750, because loopback here is the container and nothing else
+      # can reach it.
+      - ./agent.toml:/config/agent.toml:ro
+
+      # Game packs. Packs installed through the web UI land here, so a real
+      # directory rather than a volume means you can see and back them up.
+      - ./packs:/packs
+
+      # Instance state and shared game content — the game's files, and whatever
+      # players built in each instance's writable space.
+      #
+      # Identical on both sides of the colon, and `data_root` in agent.toml must
+      # be this same path. See the rule at the top of this file.
+      - /var/lib/gaming-platform-prns:/var/lib/gaming-platform-prns
