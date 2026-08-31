@@ -136,6 +136,15 @@ pub struct ManagedContainer {
     pub ports: Vec<InstancePort>,
     pub owner: Option<String>,
     pub game_id: Option<String>,
+    /// The container's own address on the Docker network, when it has one.
+    ///
+    /// This is how the agent reaches a running game to ask how many players it
+    /// has. Not `127.0.0.1:<host_port>`: the agent is meant to run in a
+    /// container, and there its loopback is its own namespace, not the host's —
+    /// so the query goes nowhere and every instance reports "could not ask".
+    /// The container's address on the bridge works from inside the agent's
+    /// container and from the host alike.
+    pub ip: Option<String>,
     /// Unix seconds the container was created, as Docker reports it.
     ///
     /// Creation rather than start, deliberately: quota admission and reaping
@@ -240,6 +249,13 @@ impl DockerRuntime {
                     port,
                     ports,
                     created_unix: c.created,
+                    ip: c.network_settings.as_ref().and_then(|n| {
+                        n.networks.as_ref().and_then(|nets| {
+                            nets.values()
+                                .filter_map(|e| e.ip_address.clone())
+                                .find(|a| !a.is_empty())
+                        })
+                    }),
                     owner: labels.get(OWNER_LABEL).cloned(),
                     game_id: labels.get(GAME_LABEL).cloned(),
                 })

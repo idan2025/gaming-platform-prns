@@ -106,6 +106,13 @@ pub struct InstanceStatus {
     /// Who this was deployed for, if anyone. Read back off the container label.
     #[serde(default)]
     pub owner: Option<String>,
+    /// The container's address on the Docker network, when it is running.
+    ///
+    /// Not part of the public contract a user cares about; it is here so the
+    /// agent can reach the game to query it, from inside a container or from
+    /// the host.
+    #[serde(default)]
+    pub container_ip: Option<String>,
     /// Players on this server right now, when the game can be asked.
     ///
     /// `None` is **not zero**, and the difference decides whether an instance

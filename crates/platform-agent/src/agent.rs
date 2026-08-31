@@ -422,6 +422,8 @@ impl Agent {
                 })
                 .collect(),
             container_id: Some(container_id),
+            // Read back by the next `list`; not worth an inspect here.
+            container_ip: None,
             // A container created a moment ago. Both are answered by the next
             // `list`, and neither is worth a Docker round trip here.
             uptime_secs: Some(0),
@@ -514,6 +516,7 @@ impl Agent {
                     port: c.port,
                     ports: c.ports,
                     container_id: Some(c.container_id),
+                    container_ip: c.ip.clone(),
                     uptime_secs: c.created_unix.and_then(|created| {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
                         u64::try_from(created).ok().map(|c| now.saturating_sub(c))
@@ -562,8 +565,15 @@ impl Agent {
         // game declaring no query is unknown, which is the honest answer.
         match profile.query? {
             game_bridge::profile::QueryProtocol::A2s => {
-                let port = instance.port?;
-                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                // The container's own address and the port the game binds
+                // *inside* it. Not `127.0.0.1:<host_port>`: this agent is meant
+                // to run in a container, where that loopback is its own
+                // namespace and the query reaches nothing — every instance
+                // would report "could not ask", and reaping would then never
+                // touch anything because unknown is deliberately never treated
+                // as empty.
+                let ip: std::net::IpAddr = instance.container_ip.as_ref()?.parse().ok()?;
+                let addr = std::net::SocketAddr::new(ip, profile.default_port);
                 game_bridge::a2s::query(addr).await.ok().map(|s| u32::from(s.info.players))
             }
         }
