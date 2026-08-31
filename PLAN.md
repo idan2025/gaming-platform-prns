@@ -509,9 +509,9 @@ bridge.
   multi-node, and neither changes the auth model.
 
 - **Pack distribution — after phase 4, before it matters.** §11: `[content]`
-  drivers, signing with expiry, trust tiers. **`manual` and `archive` drivers
-  are built (2026-08-31);** `steamcmd`, `oci`, and the signing/trust half are
-  not. Turns "write a TOML yourself" into
+  drivers, signing with expiry, trust tiers. **`manual`, `archive`, and
+  `steamcmd` drivers are built (2026-08-31);** `oci` and the signing/trust half
+  are not. Turns "write a TOML yourself" into
   "import one somebody curated". Note the bigger lever for breadth is
   `StreamRelay` (TCP), without which no config file can describe Minecraft or
   Terraria — signing a pack for a game the bridge cannot run helps nobody.
@@ -626,7 +626,7 @@ Drivers to build, in order: `manual` (name what already happens), `archive`
 `steamcmd` (anonymous app ids only), `oci` (pull an image the *operator*
 allowlisted). Each takes typed fields and nothing else.
 
-**`manual` and `archive` are built (2026-08-31.)** The schema is
+**`manual`, `archive`, and `steamcmd` are built (2026-08-31).** The schema is
 `crates/game-bridge/src/content.rs`; the half that touches a disk is
 `crates/platform-agent/src/content.rs`. Absent `[content]` means `manual`, so
 every pack written before the field keeps its meaning. Three properties carry
@@ -642,8 +642,17 @@ Two node-operator decisions sit on top of it. Installing is its own step
 silently became a gigabyte download would time out. And fetching is **off
 unless the operator turns it on** (`allow_content_fetch`): the digest keeps the
 bytes honest, but until §11.3 exists nothing says the operator wanted those
-bytes at all. `steamcmd` and `oci` are additive variants; a pack naming one
-today fails to parse, loudly.
+bytes at all.
+
+`steamcmd` follows the same seam one level up: the pack supplies `app_id`, a
+number, and the agent builds the whole command line — `+login anonymous` is not
+negotiable, so an app needing credentials stays `manual`. There is no `login`
+field, because a pack is a file that gets shared and a field for credentials is
+a field people put credentials in. Which steamcmd runs is `steamcmd_image` in
+the agent config, and none configured disables the driver — the same rule as
+`GameRuntime.image`. A failed run discards its staging directory, so a partial
+download never becomes an install. `oci` is the one variant left; a pack naming
+it today fails to parse, loudly.
 
 Only anonymous-steamcmd titles can be fetched unattended (`GAMES.md` §5).
 Anything needing credentials stays `manual`, which is the honest answer rather

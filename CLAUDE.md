@@ -70,8 +70,8 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
 
 **Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
 names a driver — `manual` (what always happened, and the default when the block
-is absent) or `archive` — and `crates/platform-agent/src/content.rs` fetches,
-verifies, and extracts. It does not weaken "a pack cannot name what runs": the
+is absent), `archive`, or `steamcmd` — and `crates/platform-agent/src/content.rs`
+fetches, verifies, and extracts. It does not weaken "a pack cannot name what runs": the
 pack names an enum variant this build implements and hands it typed parameters.
 
 Rules there a later change could quietly break:
@@ -84,6 +84,12 @@ Rules there a later change could quietly break:
 - **Extraction stages and renames.** `plan_and_check` treats "the directory
   exists" as "the content is installed", so extracting straight into place would
   let an interrupted download look like a complete install.
+- **`steamcmd_image` is operator config and a pack supplies only an app id.**
+  Letting a pack name the image, or adding a `login` field to the driver, breaks
+  the same rule as `GameRuntime.image` — and a credentials field on a format
+  built to be shared is a credentials leak with a schema.
+- **A failed provisioning run installs nothing.** Non-zero exit discards the
+  staging directory, like a failed digest does.
 - **Existing content is never replaced.** It may be bind-mounted read-only into
   containers running right now; a new version is a new directory.
 
