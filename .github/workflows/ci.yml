@@ -57,7 +57,24 @@ jobs:
       # `launcher/src-tauri` is excluded from the workspace, so this does not
       # build a webview anywhere — that is the `launcher` job's business.
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --workspace
+
+      # `platform-agent` is a Linux node daemon: it drives a Docker socket and
+      # bind-mounts host paths, and its unit tests are written in POSIX paths
+      # throughout — `/data/instances/...` compared against joins that use `\`
+      # on Windows, and `is_absolute()` fixtures that a drive-letter platform
+      # rightly calls relative. Rewriting all of that would be churn in service
+      # of a platform the agent is not shipped for.
+      #
+      # It is still **compiled** here, because it is a workspace member and a
+      # break in it is a break — and the crates that genuinely ship on Windows,
+      # `game-bridge` and `launcher-core`, are still fully tested.
+      - name: Test (Windows — the crates that ship there)
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --workspace --exclude platform-agent
+          cargo check -p platform-agent --all-targets
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets

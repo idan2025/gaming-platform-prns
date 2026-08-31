@@ -423,7 +423,14 @@ impl AgentConfig {
             if runtime.image.trim().is_empty() {
                 return Err(ConfigError::EmptyImage(game.clone()));
             }
-            if !runtime.content_root.is_absolute() {
+            // Judged as a **container** path, not a host one. `content_root`
+            // names a directory inside a Linux container, so it is POSIX
+            // whatever the agent is running on — `Path::is_absolute()` asks the
+            // host, and on Windows it calls the perfectly valid `/game`
+            // relative because it has no drive letter. An operator driving
+            // Linux containers from a Windows host would have had a correct
+            // config refused.
+            if !runtime.content_root.to_string_lossy().starts_with('/') {
                 return Err(ConfigError::RelativeContentRoot {
                     game: game.clone(),
                     path: runtime.content_root.clone(),
@@ -527,8 +534,22 @@ fn is_identity_hash_hex(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"
-data_root = "/var/lib/gaming-platform-prns"
+    /// A host path that is absolute on the platform the tests are running on.
+    ///
+    /// `data_root` really is a host path, so `Path::is_absolute()` is the right
+    /// question for it — which means the fixture has to answer that question
+    /// correctly on Windows too, where `/var/lib/...` is not absolute.
+    #[cfg(windows)]
+    const SAMPLE_DATA_ROOT: &str = "C:\\\\ProgramData\\\\gaming-platform-prns";
+    #[cfg(not(windows))]
+    const SAMPLE_DATA_ROOT: &str = "/var/lib/gaming-platform-prns";
+
+    fn sample() -> String {
+        SAMPLE_TEMPLATE.replace("__DATA_ROOT__", SAMPLE_DATA_ROOT)
+    }
+
+    const SAMPLE_TEMPLATE: &str = r#"
+data_root = "__DATA_ROOT__"
 max_instances = 4
 
 [port_range]
@@ -546,12 +567,12 @@ cpus = 1.5
     /// TOML appends land inside the last table, so a key meant for the top
     /// level has to go before the first one.
     fn with_top_level(line: &str) -> String {
-        SAMPLE.replacen("max_instances = 4", &format!("max_instances = 4\n{line}"), 1)
+        sample().replacen("max_instances = 4", &format!("max_instances = 4\n{line}"), 1)
     }
 
     #[test]
     fn a_sample_config_parses() {
-        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        let cfg = AgentConfig::parse(&sample()).unwrap();
         assert_eq!(cfg.port_range.len(), 100);
         let rt = cfg.runtime_for("sven-coop").unwrap();
         assert_eq!(rt.content_root, PathBuf::from("/game"));
@@ -563,19 +584,19 @@ cpus = 1.5
     /// not invent a default image for it.
     #[test]
     fn a_game_with_no_operator_entry_has_no_runtime() {
-        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        let cfg = AgentConfig::parse(&sample()).unwrap();
         assert!(cfg.runtime_for("minecraft").is_none());
     }
 
     #[test]
     fn unknown_config_keys_are_rejected() {
-        let src = SAMPLE.to_string() + "\nrun_as_root = true\n";
+        let src = sample() + "\nrun_as_root = true\n";
         assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::Parse(_))));
     }
 
     #[test]
     fn a_relative_data_root_is_refused() {
-        let src = SAMPLE.replace('"' .to_string().as_str(), "\"").replace(
+        let src = sample().replace('"' .to_string().as_str(), "\"").replace(
             "data_root = \"/var/lib/gaming-platform-prns\"",
             "data_root = \"data\"",
         );
@@ -584,22 +605,22 @@ cpus = 1.5
 
     #[test]
     fn a_privileged_or_backwards_port_range_is_refused() {
-        let low = SAMPLE.replace("start = 27100", "start = 80").replace("end = 27199", "end = 90");
+        let low = sample().replace("start = 27100", "start = 80").replace("end = 27199", "end = 90");
         assert!(matches!(AgentConfig::parse(&low), Err(ConfigError::BadPortRange { .. })));
 
-        let backwards = SAMPLE.replace("end = 27199", "end = 27000");
+        let backwards = sample().replace("end = 27199", "end = 27000");
         assert!(matches!(AgentConfig::parse(&backwards), Err(ConfigError::BadPortRange { .. })));
     }
 
     #[test]
     fn an_empty_image_is_refused() {
-        let src = SAMPLE.replace("image = \"ghcr.io/idan2025/svencoop-prns:0.1.10\"", "image = \"  \"");
+        let src = sample().replace("image = \"ghcr.io/idan2025/svencoop-prns:0.1.10\"", "image = \"  \"");
         assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::EmptyImage(_))));
     }
 
     #[test]
     fn a_relative_container_content_root_is_refused() {
-        let src = SAMPLE.replace("content_root = \"/game\"", "content_root = \"game\"");
+        let src = sample().replace("content_root = \"/game\"", "content_root = \"game\"");
         assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::RelativeContentRoot { .. })));
     }
 
@@ -618,7 +639,7 @@ cpus = 1.5
 
     #[test]
     fn the_api_defaults_to_loopback() {
-        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        let cfg = AgentConfig::parse(&sample()).unwrap();
         assert!(cfg.api_bind.ip().is_loopback());
         let src = with_top_level("api_bind = \"127.0.0.1:9999\"");
         assert_eq!(AgentConfig::parse(&src).unwrap().api_bind.port(), 9999);
@@ -629,7 +650,7 @@ cpus = 1.5
     /// packs are all unsigned — which every node's are today.
     #[test]
     fn no_pack_trust_section_means_every_pack_deploys() {
-        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        let cfg = AgentConfig::parse(&sample()).unwrap();
         assert!(cfg.pack_trust.is_none());
         assert!(cfg.pack_trust_policy().allow_unsigned);
     }
@@ -700,7 +721,7 @@ cpus = 1.5
     fn a_missing_token_file_is_created_with_a_random_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("api.token");
-        let mut cfg = AgentConfig::parse(SAMPLE).unwrap();
+        let mut cfg = AgentConfig::parse(&sample()).unwrap();
         cfg.api_token_file = Some(path.clone());
 
         let first = cfg.load_api_token().unwrap().expect("a token is generated");
@@ -720,7 +741,7 @@ cpus = 1.5
 
     #[test]
     fn an_agent_without_an_uplink_is_local_only() {
-        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        let cfg = AgentConfig::parse(&sample()).unwrap();
         assert!(cfg.uplink.is_none());
     }
 
