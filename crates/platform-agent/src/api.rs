@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -69,6 +69,10 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 pub struct ApiState {
     pub agent: Arc<Agent>,
     pub token: Option<Arc<String>>,
+    /// Where packs live, so a pack can be imported into a running node. `None`
+    /// disables the import route rather than guessing a directory: this route
+    /// writes files the node will run games from.
+    pub pack_dir: Option<Arc<std::path::PathBuf>>,
 }
 
 pub fn router(agent: Arc<Agent>) -> Router {
@@ -76,7 +80,19 @@ pub fn router(agent: Arc<Agent>) -> Router {
 }
 
 pub fn router_with_token(agent: Arc<Agent>, token: Option<String>) -> Router {
-    let state = ApiState { agent: agent.clone(), token: token.map(Arc::new) };
+    router_full(agent, token, None)
+}
+
+pub fn router_full(
+    agent: Arc<Agent>,
+    token: Option<String>,
+    pack_dir: Option<std::path::PathBuf>,
+) -> Router {
+    let state = ApiState {
+        agent: agent.clone(),
+        token: token.map(Arc::new),
+        pack_dir: pack_dir.map(Arc::new),
+    };
     Router::new()
         .route("/health", get(health))
         .route("/capacity", get(capacity))
@@ -86,8 +102,50 @@ pub fn router_with_token(agent: Arc<Agent>, token: Option<String>) -> Router {
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content))
         .route("/games", get(games))
+        .route("/packs", post(import_pack))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        // The web UI is served **outside** the auth layer, deliberately. A
+        // login page that needed the token to load could never be reached, and
+        // these three files are the same for every install — they contain no
+        // secret and no data about this node. Everything they then ask for goes
+        // through the layer above.
+        //
+        // Embedded rather than read from disk: the agent is meant to run in a
+        // container, and a UI that depended on a directory being mounted is a
+        // UI that is missing on exactly the deployment it was built for.
+        .route("/", get(ui_index))
+        .route("/app.js", get(ui_js))
+        .route("/style.css", get(ui_css))
         .with_state(state)
+}
+
+const UI_INDEX: &str = include_str!("../webui/index.html");
+const UI_JS: &str = include_str!("../webui/app.js");
+const UI_CSS: &str = include_str!("../webui/style.css");
+
+/// `no-store`, because the operator's browser holding a stale UI against a
+/// freshly upgraded agent is a confusing bug to be handed.
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn ui_index() -> Response {
+    asset("text/html; charset=utf-8", UI_INDEX)
+}
+
+async fn ui_js() -> Response {
+    asset("text/javascript; charset=utf-8", UI_JS)
+}
+
+async fn ui_css() -> Response {
+    asset("text/css; charset=utf-8", UI_CSS)
 }
 
 /// Reject anything without the token, on every route, once a token exists.
@@ -150,11 +208,58 @@ struct GameOption {
     extra_ports: usize,
 }
 
+/// Install a game pack into this running node (`pack_import.rs`).
+///
+/// The reload afterwards goes through `Agent::reload_packs`, which re-runs the
+/// operator's `[pack_trust]` policy. Writing the file and then inserting it
+/// straight into the agent's map would be an import route that bypasses the
+/// trust gate — the one thing that gate exists to stop. So a pack the policy
+/// refuses lands on disk and still does not run, and the response says so.
+async fn import_pack(
+    State(state): State<ApiState>,
+    Json(request): Json<crate::pack_import::ImportRequest>,
+) -> ApiResult<serde_json::Value> {
+    let Some(dir) = state.pack_dir.clone() else {
+        return Err(fail(
+            StatusCode::NOT_IMPLEMENTED,
+            "this agent was not told where packs live, so it cannot install one",
+        ));
+    };
+    let policy = state.agent.config().pack_trust_policy();
+    let now = std::time::SystemTime::now();
+
+    let imported = crate::pack_import::import(&request, &dir, &policy, now, |id| {
+        state.agent.config().runtime_for(id).is_some()
+    })
+    .await
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+
+    let reloaded = state
+        .agent
+        .reload_packs(&dir, now)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // A pack the trust policy will not deploy is on disk and not loaded. Saying
+    // which, and why, is the difference between "it did not work" and one line
+    // of config.
+    let refused = reloaded
+        .refused
+        .iter()
+        .find(|r| r.pack.pack.id == imported.id)
+        .map(|r| r.why());
+
+    Ok(Json(json!({
+        "imported": imported,
+        "loaded": refused.is_none(),
+        "refused_reason": refused,
+    })))
+}
+
 async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
     let config = state.agent.config();
-    let mut out: Vec<GameOption> = state
-        .agent
-        .packs()
+    let packs = state.agent.packs().await;
+    let mut out: Vec<GameOption> = packs
         .values()
         .map(|pack| {
             let runtime = config.runtime_for(&pack.id);

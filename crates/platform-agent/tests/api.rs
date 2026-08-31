@@ -44,6 +44,25 @@ async fn serve() -> Option<(std::net::SocketAddr, tempfile::TempDir)> {
     Some((addr, dir))
 }
 
+/// With a real pack directory, so the import route has somewhere to write.
+async fn serve_with_packs(
+) -> Option<(std::net::SocketAddr, std::path::PathBuf, tempfile::TempDir)> {
+    let dir = tempfile::tempdir().ok()?;
+    let packs = dir.path().join("packs");
+    std::fs::create_dir_all(&packs).ok()?;
+    let config = AgentConfig::parse(&config_toml(dir.path())).ok()?;
+    let agent = Agent::new(config, vec![game_bridge::GamePack::sven_coop()])
+        .await
+        .ok()?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    let router = api::router_full(Arc::new(agent), None, Some(packs.clone()));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Some((addr, packs, dir))
+}
+
 /// The same, but with a token, so the auth layer is the real one.
 async fn serve_with_token(token: &str) -> Option<(std::net::SocketAddr, tempfile::TempDir)> {
     let dir = tempfile::tempdir().ok()?;
@@ -116,6 +135,112 @@ async fn without_the_token_every_route_is_refused() {
         .unwrap()
         .status();
     assert_eq!(status, 200);
+}
+
+/// The UI must load without a token — a login page you need the token to reach
+/// is a login page nobody can use. It carries no secret and no data about this
+/// node; everything it then asks for goes through the auth layer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_web_ui_loads_without_a_token_but_the_api_still_does_not() {
+    let token = "t".repeat(32);
+    let Some((addr, _dir)) = serve_with_token(&token).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+
+    for (path, needle) in [
+        ("/", "<html"),
+        ("/app.js", "Bearer"),
+        ("/style.css", ":root"),
+    ] {
+        let resp = client.get(format!("http://{addr}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} did not serve");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains(needle), "{path} served something unexpected");
+    }
+
+    // And serving the UI did not open the API.
+    let status = client
+        .get(format!("http://{addr}/instances"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 401);
+}
+
+/// Importing a pack must take effect on a *running* node — "add a game" that
+/// needed a restart would not be one click. The reload goes through the
+/// operator's trust policy, so this also proves the import did not bypass it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_imported_pack_becomes_runnable_without_a_restart() {
+    let Some((addr, dir, _tmp)) = serve_with_packs().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+
+    let before: Vec<serde_json::Value> = client
+        .get(format!("http://{addr}/games"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!before.iter().any(|g| g["id"] == "imported-game"));
+
+    let pack = r#"
+schema_version = 1
+id = "imported-game"
+display_name = "Imported Game"
+app_name = "imported-game"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+query = "a2s"
+"#;
+    let resp = client
+        .post(format!("http://{addr}/packs"))
+        .json(&serde_json::json!({ "toml": pack }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["imported"]["id"], "imported-game");
+    assert_eq!(body["loaded"], serde_json::json!(true));
+    // No [games.imported-game] runtime, so it is installed and not runnable —
+    // and it says so rather than failing later at start.
+    assert_eq!(body["imported"]["runnable"], serde_json::json!(false));
+
+    assert!(dir.join("imported-game.toml").exists());
+
+    let after: Vec<serde_json::Value> = client
+        .get(format!("http://{addr}/games"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let found = after
+        .iter()
+        .find(|g| g["id"] == "imported-game")
+        .expect("the imported pack is live without a restart");
+    assert_eq!(found["runnable"], serde_json::json!(false));
+    assert!(found["reason"].as_str().unwrap().contains("games.imported-game"));
+
+    // A second import of the same id is refused rather than replacing a pack
+    // whose game may be running.
+    let again = client
+        .post(format!("http://{addr}/packs"))
+        .json(&serde_json::json!({ "toml": pack }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 400);
 }
 
 /// The web UI needs to know what it may offer. A pack with no runtime is listed

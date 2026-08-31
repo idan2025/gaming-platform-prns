@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
 use game_bridge::GamePack;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::AgentConfig;
 use crate::content::{ProvisionError, Provisioned, Provisioner};
@@ -40,7 +40,12 @@ pub struct Agent {
     content: Provisioner,
     docker: DockerRuntime,
     ports: Mutex<PortAllocator>,
-    packs: BTreeMap<String, GamePack>,
+    /// Behind a lock because a pack can now be imported into a *running* node
+    /// (`pack_import.rs`): "add a game" that needed a restart would not be one
+    /// click. Reloading goes through `reload_packs`, which re-runs the
+    /// operator's trust policy — there is still exactly one place that decides
+    /// which packs this node will run.
+    packs: RwLock<BTreeMap<String, GamePack>>,
     /// What the agent was asked for, keyed by instance id. Docker remains the
     /// authority on what is *running*; this only remembers the display name and
     /// requested size, which Docker has no place to keep.
@@ -77,7 +82,7 @@ impl Agent {
             config.allow_content_fetch,
             config.steamcmd_image.clone(),
         );
-        let packs = packs.into_iter().map(|p| (p.id.clone(), p)).collect();
+        let packs = RwLock::new(packs.into_iter().map(|p| (p.id.clone(), p)).collect());
 
         Ok(Self {
             config,
@@ -90,13 +95,32 @@ impl Agent {
         })
     }
 
-    /// The packs this agent loaded, by game id.
+    /// The packs this agent will run, by game id.
     ///
-    /// Read-only: which packs exist is decided once at startup under the
-    /// operator's trust policy (`packs.rs`), and a route that could add one
-    /// would be a route that bypasses that policy.
-    pub fn packs(&self) -> &BTreeMap<String, GamePack> {
-        &self.packs
+    /// A clone rather than a borrow, because the set can change under an import.
+    pub async fn packs(&self) -> BTreeMap<String, GamePack> {
+        self.packs.read().await.clone()
+    }
+
+    /// Re-read a pack directory under the operator's trust policy and adopt the
+    /// result.
+    ///
+    /// **Goes through `packs::load_deployable`, never around it.** An import
+    /// route that installed straight into this map would be a route that
+    /// bypasses `[pack_trust]`, which is the one thing the gate exists to stop.
+    /// Returns what was refused so a caller can say why a game it just imported
+    /// did not appear.
+    pub async fn reload_packs(
+        &self,
+        dir: &std::path::Path,
+        now: SystemTime,
+    ) -> Result<crate::packs::DeployablePacks> {
+        let policy = self.config.pack_trust_policy();
+        let loaded = crate::packs::load_deployable(dir, &policy, now)
+            .map_err(|e| anyhow!("{e}"))?;
+        let mut packs = self.packs.write().await;
+        *packs = loaded.packs.iter().map(|p| (p.id.clone(), p.clone())).collect();
+        Ok(loaded)
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -112,11 +136,11 @@ impl Agent {
     /// Docker 500 quoting `mkdirat ... read-only file system`. That tells an
     /// operator nothing. Checking here turns it into the name of the directory
     /// their game install is missing.
-    pub fn plan_and_check(&self, spec: &InstanceSpec) -> Result<InstancePlan> {
+    pub async fn plan_and_check(&self, spec: &InstanceSpec) -> Result<InstancePlan> {
         spec.validate().map_err(|e| anyhow!("{e}"))?;
 
-        let pack = self
-            .packs
+        let packs = self.packs.read().await;
+        let pack = packs
             .get(&spec.game_id)
             .ok_or_else(|| anyhow!("no game pack installed for {:?}", spec.game_id))?;
         let runtime = self.config.runtime_for(&spec.game_id).ok_or_else(|| {
@@ -197,7 +221,8 @@ impl Agent {
     /// explicit step, run once per game and version, and `create` keeps failing
     /// fast with a sentence naming this one.
     pub async fn ensure_content(&self, game_id: &str) -> Result<Provisioned, ProvisionError> {
-        let pack = self.packs.get(game_id).ok_or_else(|| {
+        let packs = self.packs.read().await;
+        let pack = packs.get(game_id).ok_or_else(|| {
             ProvisionError::Io(std::io::Error::other(format!(
                 "no game pack installed for {game_id:?}"
             )))
@@ -229,7 +254,7 @@ impl Agent {
             ));
         }
 
-        let plan = self.plan_and_check(&spec)?;
+        let plan = self.plan_and_check(&spec).await?;
         for dir in &plan.host_dirs_to_create {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating {}", dir.display()))?;
@@ -239,8 +264,8 @@ impl Agent {
             .config
             .runtime_for(&spec.game_id)
             .ok_or_else(|| anyhow!("no runtime for {:?}", spec.game_id))?;
-        let pack = self
-            .packs
+        let packs = self.packs.read().await;
+        let pack = packs
             .get(&spec.game_id)
             .ok_or_else(|| anyhow!("no game pack installed for {:?}", spec.game_id))?;
 
@@ -447,7 +472,7 @@ impl Agent {
         if instance.state != InstanceState::Running {
             return None;
         }
-        let profile = self.packs.get(&instance.game_id)?.to_profile().ok()?;
+        let profile = self.packs.read().await.get(&instance.game_id)?.to_profile().ok()?;
         // The pack names an enum this build implements — never a command. A
         // game declaring no query is unknown, which is the honest answer.
         match profile.query? {

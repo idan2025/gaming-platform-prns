@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesh Host</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="error-banner" class="error-banner hidden" role="alert" aria-live="assertive">
+  <span id="error-text"></span>
+  <button id="error-dismiss" type="button" aria-label="Dismiss error">×</button>
+</div>
+
+<!-- Token screen -->
+<section id="token-screen" class="screen centered" aria-labelledby="token-heading">
+  <h1 id="token-heading">Mesh Host</h1>
+  <p class="help">This agent is password-protected. The token is in the file named by
+    <code>api_token_file</code> in the agent config.</p>
+  <form id="token-form" autocomplete="off">
+    <label for="token-input">Agent token</label>
+    <input id="token-input" type="password" name="token" required>
+    <button type="submit" class="primary">Connect</button>
+  </form>
+  <p id="token-error" class="inline-error" aria-live="polite"></p>
+</section>
+
+<!-- Main UI -->
+<section id="main-ui" class="screen hidden">
+  <header class="app-header">
+    <div class="brand">Mesh Host</div>
+    <div id="status-pill" class="status-pill" title="Running instances vs. host capacity">— of — running</div>
+    <button id="disconnect-btn" type="button" class="quiet danger">Disconnect</button>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button id="tab-servers" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="tab-panel-servers">Servers</button>
+    <button id="tab-games" type="button" class="tab" role="tab" aria-selected="false" aria-controls="tab-panel-games">Games</button>
+  </nav>
+
+  <main>
+    <section id="tab-panel-servers" class="tab-panel" role="tabpanel" aria-labelledby="tab-servers">
+      <div class="panel-head">
+        <h2>Running servers</h2>
+        <p class="muted">Containers created from game definitions. Stop a server to halt the process; remove it to delete the container.</p>
+      </div>
+      <table class="instances-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Game</th>
+            <th>State</th>
+            <th>Port</th>
+            <th>Players</th>
+            <th>Uptime</th>
+            <th class="actions-col">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="instances-tbody"></tbody>
+      </table>
+      <p id="instances-empty" class="empty-state hidden">No servers are running. Go to the <button type="button" class="link-btn" id="empty-goto-games">Games</button> tab to start one.</p>
+    </section>
+
+    <section id="tab-panel-games" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-games">
+      <div class="panel-head">
+        <h2>Games</h2>
+        <p class="muted">Pick a game to launch a container. Unrunnable games are shown greyed out with the reason.</p>
+      </div>
+      <div id="games-grid" class="games-grid"></div>
+    </section>
+  </main>
+</section>
+
+<template id="instance-row-template">
+  <tr>
+    <td class="cell-name"></td>
+    <td class="cell-game"></td>
+    <td class="cell-state"><span class="state-pill"></span></td>
+    <td class="cell-port"></td>
+    <td class="cell-players"></td>
+    <td class="cell-uptime"></td>
+    <td class="actions-col cell-actions">
+      <button type="button" class="quiet stop-btn">Stop</button>
+      <button type="button" class="quiet danger remove-btn">Remove</button>
+    </td>
+  </tr>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

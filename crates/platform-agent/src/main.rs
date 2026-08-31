@@ -128,7 +128,10 @@ async fn main() -> Result<()> {
         ),
     }
 
-    axum::serve(listener, api::router_with_token(agent, api_token))
+    axum::serve(
+        listener,
+        api::router_full(agent, api_token, Some(std::path::PathBuf::from(&pack_dir))),
+    )
         .await
         .context("serving the local API")?;
     Ok(())
