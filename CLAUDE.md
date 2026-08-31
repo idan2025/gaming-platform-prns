@@ -150,6 +150,31 @@ Rules there a later change could quietly break:
   containers running right now; a new version is a new directory.
 
 
+**Pack signing is wired into the node** (`PLAN.md` §11.3, §11.4):
+`crates/game-bridge/src/signing.rs` verifies detached Ed25519 signatures with a
+validity window, and `crates/platform-agent/src/packs.rs` is the node's half —
+the agent loads only packs its operator's `[pack_trust]` policy will deploy.
+Rules there:
+- **A signature that does not verify is an error, never a downgrade to
+  unsigned.** An expired, forged or truncated `.sig` must not read as "this pack
+  is unsigned", or an operator who allowed unsigned local packs would silently
+  accept the one case they most wanted to hear about. Caught by
+  `an_expired_signature_is_an_error_not_an_unsigned_pack` and
+  `a_forged_signature_is_not_retried_as_an_unsigned_pack`.
+- **The gate must have a caller.** It shipped inert once: a trust module nothing
+  calls tests green and enforces nothing. `a_strict_policy_refuses_the_same_pack_and_says_what_to_write`
+  fails if `strict()` and `allowing_unsigned()` ever again behave identically on
+  a node.
+- **A missing `[pack_trust]` section deploys everything, and the agent says so.**
+  Deliberate while there is no first-party key and every shipped pack is
+  unsigned; a strict default would be deleted rather than satisfied. Inside a
+  section that exists, `allow_unsigned` defaults to false.
+
+**The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
+`cargo fmt --all` — it reformats every file, in a style the tree was not written
+in. Format new files with `rustfmt --config use_small_heuristics=Max <file>`,
+which is close to the surrounding style, and match neighbouring code by eye.
+
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:
 `profile::tests::destination_hash_matches_deployed_sven` freezes the destination

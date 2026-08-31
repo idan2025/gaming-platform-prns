@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use game_bridge::signing::TrustPolicy;
+use prns_core::identity::IdentityHash;
 use serde::{Deserialize, Serialize};
 
 /// Prefix on every container this agent creates.
@@ -117,6 +119,44 @@ pub struct AgentConfig {
     /// working either way.
     #[serde(default)]
     pub uplink: Option<UplinkConfig>,
+    /// Which pack signers this node trusts, and whether it deploys a pack
+    /// nobody vouched for (`PLAN.md` §11.3, §11.4).
+    ///
+    /// **Absent means today's behavior: every readable pack is deployable.**
+    /// Not because that is safe, but because the alternative is worse right
+    /// now — this project has no first-party key yet and the shipped packs are
+    /// unsigned, so a strict default would leave an upgraded node unable to
+    /// start anything, which an operator would fix by deleting the section
+    /// rather than by signing anything. The agent warns at startup when the
+    /// section is missing. Present, the section is the operator's word:
+    /// `allow_unsigned` then defaults to **false**, because someone who wrote
+    /// a trust list wrote it to mean something.
+    #[serde(default)]
+    pub pack_trust: Option<PackTrustConfig>,
+}
+
+/// The operator's pack-signing trust list (`PLAN.md` §11.4).
+///
+/// Both key lists are identity hashes, 32 lowercase hex characters, exactly
+/// like `uplink.trusted_indexes`. `first_party_keys` is config rather than a
+/// constant for the reason `game_bridge::signing::TrustPolicy` gives: a key
+/// compiled into a binary cannot be rotated without a release.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackTrustConfig {
+    /// Keys this operator considers the project's own.
+    #[serde(default)]
+    pub first_party_keys: Vec<String>,
+    /// Keys this operator vouches for.
+    #[serde(default)]
+    pub trusted_keys: Vec<String>,
+    /// Deploy a pack that is unsigned, or signed by a key neither list names.
+    ///
+    /// **Defaults to false inside a section that exists.** The section itself
+    /// is opt-in (see `AgentConfig::pack_trust`); writing one and then getting
+    /// the permissive default would make the trust list decorative.
+    #[serde(default)]
+    pub allow_unsigned: bool,
 }
 
 /// The agent's Reticulum control uplink, as the operator writes it.
@@ -223,6 +263,8 @@ pub enum ConfigError {
     BadTrustedIndex(String),
     /// The uplink identity secret path was relative, not absolute.
     RelativeUplinkIdentityPath(PathBuf),
+    /// A `pack_trust` key was not a 32-char hex identity hash.
+    BadPackTrustKey(String),
 }
 
 impl core::fmt::Display for ConfigError {
@@ -261,6 +303,9 @@ impl core::fmt::Display for ConfigError {
                  resolve against whatever directory the agent started in",
                 p.display()
             ),
+            Self::BadPackTrustKey(s) => {
+                write!(f, "pack_trust key {s:?} is not a 32-character hex identity hash")
+            }
         }
     }
 }
@@ -309,6 +354,13 @@ impl AgentConfig {
                 }
             }
         }
+        if let Some(trust) = &self.pack_trust {
+            for key in trust.first_party_keys.iter().chain(trust.trusted_keys.iter()) {
+                if !is_identity_hash_hex(key) {
+                    return Err(ConfigError::BadPackTrustKey(key.clone()));
+                }
+            }
+        }
         for (game, runtime) in &self.games {
             if runtime.image.trim().is_empty() {
                 return Err(ConfigError::EmptyImage(game.clone()));
@@ -326,12 +378,35 @@ impl AgentConfig {
     pub fn runtime_for(&self, game_id: &str) -> Option<&GameRuntime> {
         self.games.get(game_id)
     }
+
+    /// The trust policy this node deploys packs under.
+    ///
+    /// No `[pack_trust]` section is `allowing_unsigned()` — see the field's
+    /// docs for why the permissive reading is the one a missing section gets.
+    /// Keys are already known to be well-formed hex by `validate`, so a
+    /// key that fails to parse here cannot come from a successful `load`.
+    pub fn pack_trust_policy(&self) -> TrustPolicy {
+        let Some(cfg) = &self.pack_trust else {
+            return TrustPolicy::allowing_unsigned();
+        };
+        TrustPolicy {
+            first_party_keys: cfg.first_party_keys.iter().filter_map(|k| identity_hash(k)).collect(),
+            trusted_keys: cfg.trusted_keys.iter().filter_map(|k| identity_hash(k)).collect(),
+            allow_unsigned: cfg.allow_unsigned,
+        }
+    }
 }
 
 /// A Reticulum identity hash is 16 bytes, written as 32 lowercase hex chars.
 /// `trusted_indexes` entries must be exactly that, or the uplink cannot match a
 /// verified identity against them. Uppercase is refused so a later lookup is a
 /// straight byte compare, not a case-fold.
+fn identity_hash(s: &str) -> Option<IdentityHash> {
+    let bytes = hex::decode(s).ok()?;
+    let arr: [u8; 16] = bytes.as_slice().try_into().ok()?;
+    Some(IdentityHash::new(arr))
+}
+
 fn is_identity_hash_hex(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
@@ -435,6 +510,36 @@ cpus = 1.5
         assert!(cfg.api_bind.ip().is_loopback());
         let src = with_top_level("api_bind = \"127.0.0.1:9999\"");
         assert_eq!(AgentConfig::parse(&src).unwrap().api_bind.port(), 9999);
+    }
+
+    /// A config with no `[pack_trust]` is today's behavior: every pack on disk
+    /// runs. Deliberate, so an upgrade does not silently stop a node whose
+    /// packs are all unsigned — which every node's are today.
+    #[test]
+    fn no_pack_trust_section_means_every_pack_deploys() {
+        let cfg = AgentConfig::parse(SAMPLE).unwrap();
+        assert!(cfg.pack_trust.is_none());
+        assert!(cfg.pack_trust_policy().allow_unsigned);
+    }
+
+    /// Inside a section that exists, `allow_unsigned` defaults to false: an
+    /// operator who wrote a trust list wrote it to mean something.
+    #[test]
+    fn a_pack_trust_section_defaults_to_refusing_the_unvouched() {
+        let src = with_top_level(
+            "[pack_trust]\ntrusted_keys = [\"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"]\n",
+        );
+        let cfg = AgentConfig::parse(&src).unwrap();
+        let policy = cfg.pack_trust_policy();
+        assert!(!policy.allow_unsigned);
+        assert_eq!(policy.trusted_keys.len(), 1);
+        assert!(policy.first_party_keys.is_empty());
+    }
+
+    #[test]
+    fn a_pack_trust_key_that_is_not_an_identity_hash_is_refused() {
+        let src = with_top_level("[pack_trust]\nfirst_party_keys = [\"nope\"]\n");
+        assert!(matches!(AgentConfig::parse(&src), Err(ConfigError::BadPackTrustKey(_))));
     }
 
     #[test]

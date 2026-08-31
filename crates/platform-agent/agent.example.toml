@@ -24,6 +24,20 @@ api_bind = "127.0.0.1:4750"
 # exactly what you are offering (DESIGN.md §4).
 # idle_timeout_secs = 1800
 
+# Which pack signers this node trusts, and whether it will run a pack nobody
+# vouched for (PLAN.md §11.4). Commented out, and that is a real setting: with
+# no [pack_trust] section every readable pack in the pack directory is
+# deployable, signed or not, and the agent says so at startup. Uncomment to
+# restrict.
+#
+# Keys are identity hashes — 32 lowercase hex characters — like
+# uplink.trusted_indexes. Inside the section allow_unsigned defaults to false,
+# so writing a trust list is enough to start enforcing it.
+#
+# [pack_trust]
+# trusted_keys = ["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"]
+# allow_unsigned = false
+
 # UDP ports the agent may allocate. Must not reach below 1024.
 [port_range]
 start = 27100

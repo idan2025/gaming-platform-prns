@@ -39,11 +39,13 @@
 //! `PLAN.md` §5, because deployed v0.1.10 servers announce under it.
 
 use std::path::Path;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentError, PackContent};
 use crate::profile::{GamePort, GameProfile, GameTransport, ProfileError, QueryProtocol};
+use crate::signing::{self, PackTrust, SigFileError, TrustPolicy};
 
 /// Manifest schema version. Bumped when a field changes meaning, not when one
 /// is added — unknown fields are rejected (see `deny_unknown_fields`), but a
@@ -178,6 +180,9 @@ pub enum PackError {
     Invalid(ProfileError),
     /// The pack's `[content]` block is not usable.
     InvalidContent(ContentError),
+    /// The signature beside the pack was unreadable, malformed, forged or
+    /// stale. Never a demotion to unsigned — see `signing.rs`.
+    Signature(SigFileError),
 }
 
 impl core::fmt::Display for PackError {
@@ -191,6 +196,7 @@ impl core::fmt::Display for PackError {
             ),
             Self::Invalid(e) => write!(f, "pack describes an unusable game: {e}"),
             Self::InvalidContent(e) => write!(f, "pack describes unusable content: {e}"),
+            Self::Signature(e) => write!(f, "pack signature: {e}"),
         }
     }
 }
@@ -307,6 +313,88 @@ impl From<ContentError> for PackError {
 impl From<ProfileError> for PackError {
     fn from(e: ProfileError) -> Self {
         Self::Invalid(e)
+    }
+}
+
+/// A pack, where it was read from, and what its provenance turned out to be
+/// (`PLAN.md` §11.4).
+///
+/// The tier travels with the pack rather than being looked up later, because
+/// §11.4 wants it shown at import and at deploy — two places that would
+/// otherwise each have to remember to ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedPack {
+    pub pack: GamePack,
+    pub trust: PackTrust,
+    /// The file this was read from, for a message that names it.
+    pub file: String,
+    /// Unix seconds this pack's signature goes stale, if it has one. A
+    /// launcher shows it so a signature can be refreshed before it lapses,
+    /// rather than at the moment a deploy fails.
+    pub expires_at: Option<u64>,
+}
+
+/// What a directory of packs yielded when provenance was checked too.
+pub struct VerifiedPacks {
+    pub packs: Vec<TrustedPack>,
+    pub errors: Vec<(String, PackError)>,
+}
+
+impl GamePack {
+    /// Load a pack and establish its trust tier from the signature beside it.
+    ///
+    /// The bytes verified are the bytes parsed — read once, used for both — so
+    /// there is no window in which the file could change between the two.
+    pub fn load_verified(
+        path: &Path,
+        policy: &TrustPolicy,
+        now: SystemTime,
+    ) -> Result<TrustedPack, PackError> {
+        let src = std::fs::read_to_string(path).map_err(PackError::Io)?;
+        let pack = Self::parse(&src)?;
+        let signature = signing::read_signature_beside(path).map_err(PackError::Signature)?;
+        let trust = signing::verify_pack(src.as_bytes(), signature.as_ref(), policy, now)
+            .map_err(|e| PackError::Signature(SigFileError::Signature(e)))?;
+        Ok(TrustedPack {
+            pack,
+            trust,
+            file: path.display().to_string(),
+            expires_at: signature.map(|s| s.not_after),
+        })
+    }
+
+    /// Load every `*.toml` in a directory, with its tier.
+    ///
+    /// A pack whose signature failed lands in `errors` like a malformed pack
+    /// does — it is not loaded as an unsigned one. A `.sig` file is not itself
+    /// a pack and is skipped by extension.
+    pub fn load_dir_verified(
+        dir: &Path,
+        policy: &TrustPolicy,
+        now: SystemTime,
+    ) -> Result<VerifiedPacks, PackError> {
+        let mut packs = Vec::new();
+        let mut errors = Vec::new();
+        let entries = std::fs::read_dir(dir).map_err(PackError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(PackError::Io)?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            match Self::load_verified(&path, policy, now) {
+                Ok(pack) => packs.push(pack),
+                Err(e) => errors.push((path.display().to_string(), e)),
+            }
+        }
+        packs.sort_by(|a, b| a.pack.id.cmp(&b.pack.id));
+        Ok(VerifiedPacks { packs, errors })
+    }
+}
+
+impl From<SigFileError> for PackError {
+    fn from(e: SigFileError) -> Self {
+        Self::Signature(e)
     }
 }
 

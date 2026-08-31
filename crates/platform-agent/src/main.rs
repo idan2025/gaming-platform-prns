@@ -10,10 +10,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use game_bridge::GamePack;
 use platform_agent::agent::Agent;
 use platform_agent::api;
 use platform_agent::config::AgentConfig;
+use platform_agent::packs;
 use platform_agent::uplink;
 
 const USAGE: &str = "\
@@ -55,13 +55,39 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("loading {config_path}"))?;
 
-    let loaded = GamePack::load_dir(std::path::Path::new(&pack_dir))
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("loading packs from {pack_dir}"))?;
+    // Packs are read under the operator's trust policy (`PLAN.md` §11.4): a
+    // pack this node will not deploy is never loaded, and a pack whose
+    // signature failed is refused rather than demoted to unsigned.
+    let policy = config.pack_trust_policy();
+    if config.pack_trust.is_none() {
+        tracing::warn!(
+            "no [pack_trust] section: every readable pack in {pack_dir} is deployable here, \
+             signed or not. Add one to restrict what this node will run (PLAN.md §11.4)"
+        );
+    }
+    let loaded = packs::load_deployable(
+        std::path::Path::new(&pack_dir),
+        &policy,
+        std::time::SystemTime::now(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .with_context(|| format!("loading packs from {pack_dir}"))?;
     for (path, e) in &loaded.errors {
         tracing::warn!(path = %path, error = %e, "skipping an unreadable game pack");
     }
-    tracing::info!(packs = loaded.packs.len(), "game packs loaded");
+    for refused in &loaded.refused {
+        tracing::warn!(
+            pack = %refused.pack.pack.id,
+            file = %refused.pack.file,
+            "refusing to load a game pack: {}",
+            refused.why()
+        );
+    }
+    tracing::info!(
+        packs = loaded.packs.len(),
+        refused = loaded.refused.len(),
+        "game packs loaded"
+    );
 
     let bind = config.api_bind;
     let uplink_config = config.uplink.clone();

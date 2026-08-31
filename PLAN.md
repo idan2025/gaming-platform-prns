@@ -731,6 +731,28 @@ revocation list. So **signed packs carry a validity window and go stale**. An
 unrefreshed node fails closed instead of trusting a compromised pack forever,
 and it degrades correctly offline — which a CRL does not.
 
+**Built (2026-08-31):** `crates/game-bridge/src/signing.rs` — detached Ed25519
+pack signatures with `not_before`/`not_after` inside the signed material,
+`PackTrust` tiers, `TrustPolicy`, and `GamePack::load_verified`/
+`load_dir_verified`. The load-bearing rule ("a signature that does not verify is
+an error, never a downgrade") is pinned by
+`an_expired_signature_is_an_error_not_an_unsigned_pack`.
+
+**Wired into the node (2026-08-31):** `crates/platform-agent/src/packs.rs`
+reads the pack directory under the operator's policy and hands the agent only
+what that policy will deploy; the policy comes from a `[pack_trust]` section in
+the agent config. The agent has no import step — every pack it reads it reads in
+order to run — so §11.4's import/deploy split collapses there and the gate sits
+at load. A refused pack is logged with its tier and the config key that would
+change the answer.
+
+**A missing `[pack_trust]` section means every readable pack deploys**, and the
+agent warns at startup when there is none. That is not the safe default; it is
+the honest one while this project has no first-party key and every shipped pack
+is unsigned. A strict default would leave an upgraded node unable to start
+anything, and the operator's fix would be to delete the section rather than to
+sign a pack. Inside a section that exists, `allow_unsigned` defaults to false.
+
 ### 11.4 Trust tiers, shown rather than buried
 
 1. **First-party** — signed by the project key.
@@ -749,4 +771,42 @@ Signing raises confidence in *who wrote a description*; it does not turn a
 description into code. If a future pack format ever needs to carry executable
 intent, that is a new decision and this section is the argument against it.
 
+## 12. Bug sweep — 2026-08-31
 
+Scope: the signing work (`crates/game-bridge/src/signing.rs`, `pack.rs`
+`load_verified`/`load_dir_verified`, `lib.rs` module export). All three findings
+are fixed; the entry stays because finding 1 is the shape of mistake this design
+invites again.
+
+1. **The deploy gate was inert.** `load_verified`, `load_dir_verified`,
+   `TrustPolicy::may_deploy`, and `verify_pack` had no caller: every pack-load
+   path was still the unsigned one, so a forged or stale `.sig` changed nothing.
+   A trust module that nothing calls tests green and enforces nothing — the
+   tests exercise the checker, not the path a node takes. **Fixed** by
+   `platform-agent/src/packs.rs` and the `[pack_trust]` config section; the
+   test that would catch a regression to inert is
+   `a_strict_policy_refuses_the_same_pack_and_says_what_to_write`, which fails
+   if `strict()` and `allowing_unsigned()` ever again behave identically on a
+   node. `a_forged_signature_is_not_retried_as_an_unsigned_pack` covers the
+   other half: a failed signature must not fall back to the unsigned path.
+2. **`PackSignature::remaining_secs` ignored `not_before`**, returning
+   `not_after - now` for a window that had not opened — a launcher would show a
+   future-dated signature as valid for a long time. **Fixed**: 0 before the
+   window opens.
+3. **`sign` truncates `valid_for` to whole seconds and saturates.** Neither is
+   exploitable (an `EmptyWindow` or a far-future window). **Documented** on
+   `sign` rather than changed: seconds is the resolution both bounds are signed
+   at.
+
+Verified sound, no defect: domain separation (`PACK_SIGNING_DOMAIN` ≠
+`platform_auth::AUTH_DOMAIN`, confirmed byte-equal to the constant at
+`crates/platform-auth/src/lib.rs:46`); window-inside-the-signature (editing
+`not_after` invalidates the signature, pinned by test); signed-material length
+prefix prevents boundary shifting; `read_signature_beside` treats
+present-but-unreadable as an error, not as unsigned; crypto-checked-before-clock
+in `verify` so a forged-and-stale signature reports as forged.
+
+**Still not wired:** the launcher shows no tier. §11.4 wants the tier shown at
+import as well as enforced at deploy, and `launcher-core` still loads packs
+through the unsigned `GamePack::load_dir`. That is presentation, and it changes
+the frontend contract, so it is its own change.

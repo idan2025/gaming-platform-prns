@@ -10,6 +10,7 @@ pub mod config;
 pub mod content;
 pub mod docker;
 pub mod instance;
+pub mod packs;
 pub mod ports;
 pub mod store;
 pub mod uplink;
