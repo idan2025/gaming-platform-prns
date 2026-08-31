@@ -45,26 +45,7 @@ challenge/response auth and the operator's `trusted_indexes` allowlist
 (`crates/platform-index/src/agent_client.rs`). The loopback HTTP API stays for
 local use. A Docker-gated two-node round-trip test pins it end to end.
 
-**Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
-names a driver — `manual` (what always happened, and the default when the block
-is absent) or `archive` — and `crates/platform-agent/src/content.rs` fetches,
-verifies, and extracts. It does not weaken "a pack cannot name what runs": the
-pack names an enum variant this build implements and hands it typed parameters.
-
-Rules there a later change could quietly break:
-- **The digest decides, not the URL.** The archive is hashed before anything is
-  extracted, and mismatched bytes are discarded. Verifying after extraction, or
-  making `sha256` optional, would pass casual testing and turn a hijacked mirror
-  into node compromise.
-- **Archive entry paths are rejected, never repaired** — a link's *target*
-  included, since a symlink to `/` is a path escape with extra steps.
-- **Extraction stages and renames.** `plan_and_check` treats "the directory
-  exists" as "the content is installed", so extracting straight into place would
-  let an interrupted download look like a complete install.
-- **Existing content is never replaced.** It may be bind-mounted read-only into
-  containers running right now; a new version is a new directory.
-
-Two rules there that a later change could quietly break:
+Two rules in phase 4's index and uplink that a later change could quietly break:
 - **An auth signature is bound to the verifier's identity.** Anyone can run an
   index, so a hostile one could otherwise relay a challenge to a second index
   and replay the user's signature there. Removing the audience from the signed
@@ -86,6 +67,26 @@ Two rules there that a later change could quietly break:
   index is trusted to assert it; the agent does not overwrite it with the
   caller's identity. Pinned by
   `an_index_creates_lists_stops_and_removes_on_a_remote_agent`.
+
+**Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
+names a driver — `manual` (what always happened, and the default when the block
+is absent) or `archive` — and `crates/platform-agent/src/content.rs` fetches,
+verifies, and extracts. It does not weaken "a pack cannot name what runs": the
+pack names an enum variant this build implements and hands it typed parameters.
+
+Rules there a later change could quietly break:
+- **The digest decides, not the URL.** The archive is hashed before anything is
+  extracted, and mismatched bytes are discarded. Verifying after extraction, or
+  making `sha256` optional, would pass casual testing and turn a hijacked mirror
+  into node compromise.
+- **Archive entry paths are rejected, never repaired** — a link's *target*
+  included, since a symlink to `/` is a path escape with extra steps.
+- **Extraction stages and renames.** `plan_and_check` treats "the directory
+  exists" as "the content is installed", so extracting straight into place would
+  let an interrupted download look like a complete install.
+- **Existing content is never replaced.** It may be bind-mounted read-only into
+  containers running right now; a new version is a new directory.
+
 
 Two tests are load-bearing rather than routine, and a change that breaks either
 is breaking `PLAN.md` §5, not just a test:
