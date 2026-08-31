@@ -1,4 +1,10 @@
 :root {
+  /* Tells the browser to draw its own widgets to match, and it is the only
+     thing that reaches the parts CSS cannot: a native <select>'s dropdown is
+     rendered by the platform, not the page, so a dark UI with no color-scheme
+     opens a white list over it. Both values, because the palette below already
+     follows prefers-color-scheme. */
+  color-scheme: light dark;
   --bg: #f7f7f8;
   --bg-elev: #ffffff;
   --bg-hover: #eef0f3;
@@ -148,6 +154,13 @@ input, select {
 input[type=search] { width: 100%; }
 input[type=number] { width: 64px; }
 select { padding: 0 6px; cursor: pointer; }
+/* Belt and braces for the popup: `color-scheme` handles it on browsers that
+   honour it, and these keep the options legible where the widget takes page
+   colours instead. */
+option, optgroup {
+  background: var(--bg-elev);
+  color: var(--fg);
+}
 input:focus-visible, select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 0;

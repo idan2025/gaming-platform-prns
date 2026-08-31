@@ -1,4 +1,8 @@
 :root {
+  /* This UI is dark only, so say so: a native <select>'s dropdown is drawn by
+     the platform rather than the page, and without this it opens as a white
+     list over a dark form. */
+  color-scheme: dark;
   --bg: #0e1116;
   --bg-elev: #161b22;
   --bg-elev2: #1c232c;
@@ -177,3 +181,7 @@ button.danger:hover:not(:disabled) { background: #2a1518; border-color: var(--da
 .mesh-games { margin-top: 14px; }
 .mesh-games .mesh-row { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; }
 .mesh-games .mesh-row + .mesh-row { border-top: 1px solid var(--border, #2a2f3a); }
+
+/* Same reasoning as `color-scheme` above, for browsers that give the popup the
+   page's colours instead of the UA's. */
+option, optgroup { background: var(--bg-elev); color: var(--text); }
