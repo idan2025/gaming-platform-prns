@@ -86,6 +86,13 @@ function makeInvoke(scenario) {
           signer: null,
           signature_expires_at: null,
         }];
+      case 'list_interfaces':
+        return scenario.interfaces ?? [];
+      case 'saved_browse_opts':
+        return scenario.savedOpts ?? { tcp: null, auto: false };
+      case 'add_interface':
+      case 'remove_interface':
+        return null;
       case 'server_details':
         return scenario.details ?? details;
       case 'start_browse':
@@ -261,6 +268,24 @@ await run('pack provenance: no pack for this game', {
   const t = doc.querySelector('#detail').textContent;
   check('a game with no installed pack says so', /no pack for quake-3/i.test(t), t.slice(-400));
   check('no undefined when no pack matches', !t.includes('undefined'), t.slice(-400));
+});
+
+// Reticulum has no directory, so a saved relay address is knowledge the player
+// was given. It has to be visible and removable, not just remembered.
+await run('saved mesh connections are shown', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+  interfaces: [
+    { id: 'tcp:hub.example.org:4789', label: 'hub.example.org:4789', kind: 'tcp' },
+    { id: 'auto', label: 'LAN auto-discovery', kind: 'auto' },
+  ],
+  savedOpts: { tcp: 'hub.example.org:4789', auto: true },
+}, (win, doc) => {
+  const t = doc.body.textContent;
+  check('a saved peer address is shown', t.includes('hub.example.org:4789'), t.slice(0, 300));
+  check('a saved auto interface is shown', t.includes('LAN auto-discovery'), t.slice(0, 300));
+  check('saved connections can be forgotten', /Forget/.test(t));
+  check('no undefined in the interface list', !t.includes('undefined'), t.slice(0, 300));
 });
 
 await run('nothing heard yet', {

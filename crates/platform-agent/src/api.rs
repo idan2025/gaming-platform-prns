@@ -118,6 +118,8 @@ pub fn router_full(
         // rides behind the same token gate as every container-creating route
         // (`interfaces.rs` "Authorization is the API's").
         .route("/mesh", get(mesh_status))
+        .route("/mesh/interfaces", get(mesh_interfaces).post(mesh_interface_add))
+        .route("/mesh/interfaces/:id", delete(mesh_interface_remove))
         .route("/interfaces", get(interfaces_status).post(interfaces_add))
         .route("/interfaces/:id", delete(interfaces_remove))
         .route("/interfaces/:id/rename", post(interfaces_rename))
@@ -244,6 +246,51 @@ async fn mesh_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
              announce them on Reticulum."
         },
     }))
+}
+
+/// The interfaces every game bridge on this node attaches.
+///
+/// Distinct from `/interfaces`, which configures the `[uplink]`. These are what
+/// carry **game** traffic, and they are the ones an operator hosting servers
+/// actually needs.
+async fn mesh_interfaces(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let mesh = state.agent.mesh();
+    Json(json!({
+        "enabled": mesh.enabled(),
+        "configured": mesh.interfaces().await,
+    }))
+}
+
+async fn mesh_interface_add(
+    State(state): State<ApiState>,
+    Json(iface): Json<crate::mesh::MeshInterface>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .mesh()
+        .add_interface(iface)
+        .await
+        .map(|_| Json(json!({ "ok": true })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+async fn mesh_interface_remove(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let removed = state
+        .agent
+        .mesh()
+        .remove_interface(&id)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({
+        "removed": removed,
+        // The engine cannot detach a live interface, and saying otherwise would
+        // have an operator watch traffic keep flowing and conclude the button
+        // is broken.
+        "note": "Forgotten for future bridges. Servers already running keep this                  interface until they restart.",
+    })))
 }
 
 /// Install a game pack into this running node (`pack_import.rs`).

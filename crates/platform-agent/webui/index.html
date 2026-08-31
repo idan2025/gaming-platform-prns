@@ -94,6 +94,30 @@
         <h3>Games on the mesh</h3>
         <p id="mesh-games-note" class="muted">—</p>
         <div id="mesh-games-list"></div>
+
+        <h3>Interfaces for hosted games</h3>
+        <p class="muted">How the servers this node runs reach the mesh. A TCP address
+          like <code>0.0.0.0:4789</code> binds a relay others dial; anything else dials
+          one. LAN auto-discovery finds neighbours with no address — but not from
+          inside a container, where the local network is Docker's own.
+          Added here, these apply to every server and are remembered across restarts.</p>
+        <form id="mesh-iface-form" class="start-form">
+          <label for="mesh-iface-kind">Kind</label>
+          <select id="mesh-iface-kind">
+            <option value="tcp">TCP</option>
+            <option value="auto">LAN auto-discovery</option>
+          </select>
+          <label for="mesh-iface-addr">Address (host:port)</label>
+          <input id="mesh-iface-addr" type="text" placeholder="hub.example.org:4789">
+          <label for="mesh-iface-ifac">IFAC network name (optional)</label>
+          <input id="mesh-iface-ifac" type="text" placeholder="leave empty for an open network">
+          <label for="mesh-iface-pass">IFAC passphrase (optional)</label>
+          <input id="mesh-iface-pass" type="password" placeholder="shared secret">
+          <div class="form-actions">
+            <button type="submit" class="primary">Add interface</button>
+          </div>
+        </form>
+        <div id="mesh-iface-list"></div>
       </div>
 
       <div id="mesh-online" class="hidden">

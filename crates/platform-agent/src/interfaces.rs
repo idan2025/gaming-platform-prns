@@ -444,7 +444,7 @@ impl InterfaceManager {
 /// host binds a server; any other host dials a client. Copied from the
 /// standalone's `add_interface_tcp`, minus the UDP/WebSocket siblings the agent
 /// does not build.
-async fn attach_tcp(
+pub(crate) async fn attach_tcp(
     handle: &PrnsNodeHandle,
     addr: &str,
     ifac_name: Option<&str>,
@@ -486,7 +486,7 @@ async fn attach_tcp(
 }
 
 /// Attach a Wi-Fi/LAN auto-discovery interface and return its captured id.
-fn attach_auto(
+pub(crate) fn attach_auto(
     handle: &PrnsNodeHandle,
     ifac_name: Option<&str>,
     ifac_passphrase: Option<&str>,
@@ -509,7 +509,7 @@ fn attach_auto(
 }
 
 /// The node's current interface ids, for a before/after diff.
-fn interface_ids(handle: &PrnsNodeHandle) -> Vec<InterfaceId> {
+pub(crate) fn interface_ids(handle: &PrnsNodeHandle) -> Vec<InterfaceId> {
     handle.interfaces().iter().map(|s| s.id).collect()
 }
 

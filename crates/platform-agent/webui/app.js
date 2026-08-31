@@ -747,6 +747,7 @@ function formatBytes(n) {
 async function loadInterfaces() {
   // Games on the mesh, which is a different question from uplink interfaces.
   renderMeshGames();
+  renderMeshInterfaces();
   const offline = $("mesh-offline");
   const online = $("mesh-online");
   try {
@@ -970,6 +971,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const origRenderAll = renderAll;
   // No-op alias kept for clarity; renderGames compares signature to avoid rebuilds.
 
+  wireMeshInterfaceForm();
+
   const t = getToken();
   if (t) tryConnect(t);
   else showTokenScreen();
@@ -1015,4 +1018,85 @@ async function renderMeshGames() {
     row.appendChild(dest);
     list.appendChild(row);
   }
+}
+
+
+// Interfaces the hosted games use. Separate from the uplink's, because they are
+// what carries game traffic and they are the ones an operator hosting servers
+// actually has to get right.
+async function renderMeshInterfaces() {
+  const list = $("mesh-iface-list");
+  if (!list) return;
+  let body;
+  try {
+    body = await api("GET", "/mesh/interfaces");
+  } catch (e) {
+    if (e && e.__auth) return;
+    list.textContent = (e && e.error) || "Could not read mesh interfaces.";
+    return;
+  }
+  list.textContent = "";
+  const configured = Array.isArray(body.configured) ? body.configured : [];
+  if (!configured.length) {
+    list.appendChild(el("p", "muted",
+      "None added here. The [mesh] section in this node's config may still give every server a TCP interface or auto-discovery."));
+    return;
+  }
+  for (const i of configured) {
+    const row = el("div", "mesh-row");
+    row.appendChild(el("span", "pack-name", i.kind === "auto" ? "LAN auto-discovery" : i.addr));
+    if (i.ifac) row.appendChild(el("span", "badge trust-ok", "IFAC " + (i.ifac_name || "")));
+    const del = el("button", "quiet danger", "Forget");
+    del.type = "button";
+    del.onclick = async () => {
+      del.disabled = true;
+      try {
+        const r = await withInFlight(api("DELETE", "/mesh/interfaces/" + encodeURIComponent(i.id)));
+        // Forgetting is not detaching — the engine cannot remove a live
+        // interface — so say so rather than let the list imply otherwise.
+        if (r && r.note) showError(r.note);
+        renderMeshInterfaces();
+      } catch (e) {
+        showError((e && e.error) || "Could not forget that interface.");
+      } finally { del.disabled = false; }
+    };
+    row.appendChild(del);
+    list.appendChild(row);
+  }
+}
+
+function wireMeshInterfaceForm() {
+  const form = $("mesh-iface-form");
+  if (!form) return;
+  const kind = $("mesh-iface-kind");
+  const addr = $("mesh-iface-addr");
+  const syncKind = () => { addr.disabled = kind.value === "auto"; };
+  kind.addEventListener("change", syncKind);
+  syncKind();
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { kind: kind.value };
+    if (kind.value === "tcp") {
+      const a = addr.value.trim();
+      if (!a) { showError("A TCP interface needs an address, like hub.example.org:4789."); return; }
+      body.addr = a;
+    }
+    const name = $("mesh-iface-ifac").value.trim();
+    const pass = $("mesh-iface-pass").value;
+    if (name) body.ifac_name = name;
+    if (pass) body.ifac_passphrase = pass;
+    const btn = form.querySelector("button[type=submit]");
+    if (btn) { btn.disabled = true; btn.textContent = "Adding…"; }
+    try {
+      await withInFlight(api("POST", "/mesh/interfaces", body));
+      clearError();
+      // The passphrase is a secret; do not leave it sitting in the form.
+      $("mesh-iface-pass").value = "";
+      renderMeshInterfaces();
+    } catch (err) {
+      showError((err && err.error) || "Could not add that interface.");
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "Add interface"; }
+    }
+  });
 }

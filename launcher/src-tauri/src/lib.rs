@@ -119,6 +119,43 @@ async fn clear_game_path(state: tauri::State<'_, AppState>, game_id: String) -> 
 }
 
 #[tauri::command]
+async fn list_interfaces(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<launcher_core::InterfaceEntry>, String> {
+    Ok(state.launcher.interfaces().await)
+}
+
+#[tauri::command]
+async fn add_interface(
+    state: tauri::State<'_, AppState>,
+    kind: String,
+    addr: Option<String>,
+) -> Result<(), String> {
+    let iface = match kind.as_str() {
+        "auto" => launcher_core::settings::LauncherInterface::Auto,
+        "tcp" => launcher_core::settings::LauncherInterface::Tcp {
+            addr: addr.unwrap_or_default(),
+        },
+        other => return Err(format!("unknown interface kind {other:?}")),
+    };
+    state.launcher.add_interface(iface).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_interface(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    state.launcher.remove_interface(&id).await.map_err(|e| e.to_string())
+}
+
+/// The saved interfaces as browse options, so the UI can start browsing with
+/// what the player configured instead of asking again.
+#[tauri::command]
+async fn saved_browse_opts(
+    state: tauri::State<'_, AppState>,
+) -> Result<launcher_core::BrowseOpts, String> {
+    Ok(state.launcher.saved_browse_opts().await)
+}
+
+#[tauri::command]
 async fn player_name(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
     Ok(state.launcher.player_name().await)
 }
@@ -168,6 +205,10 @@ pub fn run() {
             set_game_path,
             clear_game_path,
             player_name,
+            list_interfaces,
+            add_interface,
+            remove_interface,
+            saved_browse_opts,
             set_player_name,
         ])
         .run(tauri::generate_context!())

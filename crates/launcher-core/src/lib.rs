@@ -30,6 +30,7 @@ use game_bridge::announce::AnnounceInfo;
 use game_bridge::browse::{BrowseFilter, SortBy};
 use game_bridge::config::{BrowserArgs, ClientArgs};
 use game_bridge::details::StatsSource;
+use crate::settings::LauncherInterface;
 use game_bridge::launch::{LaunchProfile, LaunchValues};
 use game_bridge::pack::TrustedPack;
 use game_bridge::profile::GameProfile;
@@ -182,13 +183,32 @@ pub struct ServerDetailsView {
 }
 
 /// How the browse node attaches to the mesh.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// `Serialize` too, because the launcher hands the saved set back to its own UI
+/// so a player starts browsing with what they configured rather than retyping
+/// it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BrowseOpts {
     /// `host:port` to dial, or `0.0.0.0:port` to bind. `None` with `auto` off
     /// means the node has no interfaces and will hear nothing.
     pub tcp: Option<String>,
     pub auto: bool,
+}
+
+/// One of this launcher's saved interfaces, for the UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceEntry {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+fn kind_of(i: &LauncherInterface) -> String {
+    match i {
+        LauncherInterface::Tcp { .. } => "tcp".to_string(),
+        LauncherInterface::Auto => "auto".to_string(),
+    }
 }
 
 /// What a join produced.
@@ -674,6 +694,71 @@ impl Launcher {
         self.settings.lock().await.player_name.clone()
     }
 
+    /// The interfaces this launcher uses to reach the mesh.
+    pub async fn interfaces(&self) -> Vec<InterfaceEntry> {
+        self.settings
+            .lock()
+            .await
+            .interfaces
+            .iter()
+            .map(|i| InterfaceEntry { id: i.id(), label: i.label(), kind: kind_of(i) })
+            .collect()
+    }
+
+    /// Remember one more way to reach the mesh.
+    ///
+    /// Takes effect on the **next** browse: the engine cannot add an interface
+    /// to a node that is already running, and pretending otherwise would have a
+    /// player add a relay, see nothing new, and conclude the launcher is
+    /// broken. `start_browse` applies the whole saved set.
+    ///
+    /// Re-adding the same address replaces it rather than stacking a duplicate.
+    pub async fn add_interface(&self, iface: LauncherInterface) -> Result<()> {
+        if let LauncherInterface::Tcp { addr } = &iface {
+            if addr.trim().is_empty() {
+                return Err(anyhow!("a TCP interface needs an address, like hub.example.org:4789"));
+            }
+        }
+        let mut settings = self.settings.lock().await;
+        let id = iface.id();
+        settings.interfaces.retain(|i| i.id() != id);
+        settings.interfaces.push(iface);
+        self.persist(&settings)?;
+        Ok(())
+    }
+
+    /// Forget one. Also effective on the next browse, for the same reason.
+    pub async fn remove_interface(&self, id: &str) -> Result<bool> {
+        let mut settings = self.settings.lock().await;
+        let before = settings.interfaces.len();
+        settings.interfaces.retain(|i| i.id() != id);
+        let removed = settings.interfaces.len() != before;
+        if removed {
+            self.persist(&settings)?;
+        }
+        Ok(removed)
+    }
+
+    /// The saved interfaces as browse options, so a player who configured them
+    /// once does not retype anything to start browsing.
+    ///
+    /// Only one TCP address survives, because `BrowserArgs` takes one. The
+    /// first saved wins; the rest are kept for when the bridge grows a list,
+    /// and are not silently discarded from the settings file.
+    pub async fn saved_browse_opts(&self) -> BrowseOpts {
+        let settings = self.settings.lock().await;
+        BrowseOpts {
+            tcp: settings.interfaces.iter().find_map(|i| match i {
+                LauncherInterface::Tcp { addr } => Some(addr.clone()),
+                _ => None,
+            }),
+            auto: settings
+                .interfaces
+                .iter()
+                .any(|i| matches!(i, LauncherInterface::Auto)),
+        }
+    }
+
     /// Set (or, with an empty string, clear) the player's display name.
     pub async fn set_player_name(&self, name: &str) -> Result<()> {
         let trimmed = name.trim();
@@ -1035,6 +1120,49 @@ mod tests {
         assert!(l
             .launch_game("quake-3", std::path::Path::new("/bin/sh"), &LaunchValues::default())
             .is_err());
+    }
+
+    /// A player configures how they reach the mesh once, not on every launch.
+    /// Reticulum has no directory, so a relay address is knowledge the player
+    /// had to be given — losing it between runs makes them re-solve the
+    /// bootstrap every time.
+    #[tokio::test]
+    async fn interfaces_round_trip_and_replace_by_address() {
+        let l = Launcher::new(Vec::new());
+        l.add_interface(LauncherInterface::Tcp { addr: "hub:4789".into() }).await.unwrap();
+        l.add_interface(LauncherInterface::Auto).await.unwrap();
+        assert_eq!(l.interfaces().await.len(), 2);
+
+        // The same address again replaces rather than stacks.
+        l.add_interface(LauncherInterface::Tcp { addr: "hub:4789".into() }).await.unwrap();
+        assert_eq!(l.interfaces().await.len(), 2);
+
+        assert!(l.remove_interface("tcp:hub:4789").await.unwrap());
+        assert_eq!(l.interfaces().await.len(), 1);
+        assert!(!l.remove_interface("tcp:hub:4789").await.unwrap());
+    }
+
+    /// A TCP interface with no address would attach to nothing and report
+    /// success, which is the shape of bug a player cannot diagnose.
+    #[tokio::test]
+    async fn a_tcp_interface_needs_an_address() {
+        let l = Launcher::new(Vec::new());
+        assert!(l.add_interface(LauncherInterface::Tcp { addr: "  ".into() }).await.is_err());
+    }
+
+    /// The saved set becomes browse options directly, so pressing Start uses
+    /// what the player configured.
+    #[tokio::test]
+    async fn saved_interfaces_become_browse_options() {
+        let l = Launcher::new(Vec::new());
+        let empty = l.saved_browse_opts().await;
+        assert!(empty.tcp.is_none() && !empty.auto);
+
+        l.add_interface(LauncherInterface::Auto).await.unwrap();
+        l.add_interface(LauncherInterface::Tcp { addr: "hub:4789".into() }).await.unwrap();
+        let opts = l.saved_browse_opts().await;
+        assert_eq!(opts.tcp.as_deref(), Some("hub:4789"));
+        assert!(opts.auto);
     }
 
     /// §11.4 wants the tier shown, so it has to reach the UI. These are the

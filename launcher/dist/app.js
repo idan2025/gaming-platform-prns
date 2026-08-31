@@ -19,6 +19,8 @@ const state = {
   errorTimer: null,
   pollTimer: null,
   startingBrowse: false,
+  interfaces: [],
+  savedOpts: {},
 };
 
 const LINK_CLASS = { 1: 'Low-rate', 2: 'TCP / bursty', 3: 'High-bitrate' };
@@ -238,9 +240,16 @@ function renderList() {
 
   // empty states
   if (!b || !b.running) {
-    list.innerHTML = '';
-    state.rowEls.clear();
-    renderEmptyNotRunning();
+    // Built once, not on every poll. This panel holds the peer-address input,
+    // and rebuilding it every two seconds destroyed the element the player was
+    // typing into — the caret vanished mid-word, which is what "something takes
+    // focus every second" was. The panel's contents do not depend on anything
+    // that changes while the node is stopped, so there is nothing to redraw.
+    if (!list.querySelector('.empty')) {
+      list.innerHTML = '';
+      state.rowEls.clear();
+      renderEmptyNotRunning();
+    }
     return;
   }
   if (state.servers.length === 0) {
@@ -286,6 +295,16 @@ function renderList() {
   }
 }
 
+// The one part of the stopped-state panel that changes: the Start button while
+// a start is in flight. Updated in place, because redrawing the panel to move a
+// label would take the input with it.
+function refreshStartButton() {
+  const btn = $('start-browse-btn');
+  if (!btn) return;
+  btn.disabled = state.startingBrowse;
+  btn.textContent = state.startingBrowse ? 'Starting…' : 'Start browse node';
+}
+
 function renderEmptyNotRunning() {
   const list = $('list');
   list.innerHTML = '';
@@ -302,6 +321,24 @@ function renderEmptyNotRunning() {
   tcp.placeholder = 'host:port of a TCP peer — leave blank for local network only';
   tcp.value = state.tcpPeer || '';
   tcp.oninput = () => { state.tcpPeer = tcp.value; };
+  // Remembered rather than retyped. Reticulum has no directory, so a relay
+  // address is something a person had to be told — losing it between runs makes
+  // them go and ask again.
+  const save = el('button', 'ghost', 'Remember');
+  save.type = 'button';
+  save.title = 'Save these so this launcher uses them every time';
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const addr = (state.tcpPeer || '').trim();
+      if (addr) await invoke('add_interface', { kind: 'tcp', addr });
+      if (state.autoDiscover) await invoke('add_interface', { kind: 'auto', addr: null });
+      await loadInterfaces();
+      hideError();
+    } catch (e) {
+      showError('Could not save that interface: ' + String(e && e.message || e));
+    } finally { save.disabled = false; }
+  };
   const autoWrap = el('label', 'toggle');
   const auto = el('input');
   auto.type = 'checkbox';
@@ -312,9 +349,12 @@ function renderEmptyNotRunning() {
   conn.appendChild(lbl);
   conn.appendChild(tcp);
   conn.appendChild(autoWrap);
+  conn.appendChild(save);
   wrap.appendChild(conn);
+  wrap.appendChild(renderInterfaceList());
 
   const btn = el('button', '', 'Start browse node');
+  btn.id = 'start-browse-btn';
   btn.onclick = startBrowse;
   btn.disabled = state.startingBrowse;
   btn.textContent = state.startingBrowse ? 'Starting…' : 'Start browse node';
@@ -644,13 +684,19 @@ function kvRow(parent, k, v, fallback, unknown) {
 // offer it rather than assuming a LAN neighbour exists.
 function browseOpts() {
   const tcp = (state.tcpPeer || '').trim();
-  return { tcp: tcp === '' ? null : tcp, auto: state.autoDiscover };
+  // What is typed wins; the saved set fills in when nothing is. A player who
+  // configured a relay once should not have to retype it to press Start.
+  const saved = state.savedOpts || {};
+  return {
+    tcp: tcp !== '' ? tcp : (saved.tcp || null),
+    auto: state.autoDiscover || !!saved.auto,
+  };
 }
 
 async function startBrowse() {
   state.startingBrowse = true;
   renderStatus();
-  renderEmptyNotRunning();
+  refreshStartButton();
   try {
     await invoke('start_browse', { opts: browseOpts() });
     hideError();
@@ -960,7 +1006,63 @@ async function init() {
     }
   });
   await loadGames();
+  // The saved interfaces, so pressing Start uses what was configured rather
+  // than asking the player to retype a relay address they were given once.
+  try {
+    state.interfaces = await invoke('list_interfaces') || [];
+    state.savedOpts = await invoke('saved_browse_opts') || {};
+    if (state.savedOpts.tcp && !state.tcpPeer) state.tcpPeer = state.savedOpts.tcp;
+    if (state.savedOpts.auto) state.autoDiscover = true;
+  } catch (_) { /* an older backend simply has none */ }
   await pollAll();
   state.pollTimer = setInterval(pollAll, 2000);
 }
 init().catch(err => showError('Init failed: ' + String(err && err.message || err)));
+
+
+// ---------- saved mesh interfaces ----------
+//
+// How this launcher reaches the mesh, kept between runs. Applied when the
+// browse node starts: the engine cannot add an interface to a node that is
+// already running, so a change here takes effect on the next start rather than
+// pretending to act immediately.
+
+async function loadInterfaces() {
+  try {
+    state.interfaces = await invoke('list_interfaces') || [];
+  } catch (err) {
+    state.interfaces = [];
+  }
+  const host = $('iface-list');
+  if (host) host.replaceWith(renderInterfaceList());
+}
+
+function renderInterfaceList() {
+  const wrap = el('div', 'iface-list');
+  wrap.id = 'iface-list';
+  const saved = state.interfaces || [];
+  if (!saved.length) {
+    const p = el('p', 'iface-empty', 'No saved connections yet. Enter a peer address or tick local discovery, then press Remember.');
+    wrap.appendChild(p);
+    return wrap;
+  }
+  wrap.appendChild(el('div', 'iface-title', 'Saved connections — used every time this launcher starts'));
+  saved.forEach(i => {
+    const row = el('div', 'iface-row');
+    row.appendChild(el('span', 'iface-label', i.label));
+    const del = el('button', 'ghost', 'Forget');
+    del.type = 'button';
+    del.onclick = async () => {
+      del.disabled = true;
+      try {
+        await invoke('remove_interface', { id: i.id });
+        await loadInterfaces();
+      } catch (e) {
+        showError('Could not forget that: ' + String(e && e.message || e));
+      } finally { del.disabled = false; }
+    };
+    row.appendChild(del);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}

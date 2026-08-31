@@ -97,15 +97,181 @@ struct Bridge {
     status: MeshStatus,
 }
 
+/// An interface every game bridge on this node attaches, added at runtime.
+///
+/// Separate from `MeshConfig.tcp`/`auto`, which are what the operator wrote in
+/// the config file and every bridge gets at birth. These are the ones added
+/// from the web UI afterwards: persisted, applied to bridges that already
+/// exist, and given to bridges started later. An operator should not have to
+/// edit TOML and restart to reach one more relay — that is the whole reason the
+/// node has a UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum MeshInterface {
+    Tcp {
+        addr: String,
+        #[serde(default)]
+        ifac_name: Option<String>,
+        #[serde(default)]
+        ifac_passphrase: Option<String>,
+    },
+    Auto {
+        #[serde(default)]
+        ifac_name: Option<String>,
+        #[serde(default)]
+        ifac_passphrase: Option<String>,
+    },
+}
+
+impl MeshInterface {
+    /// What identifies this interface to a person and in the saved set. The
+    /// IFAC secret is deliberately not part of it: re-adding the same address
+    /// with a corrected passphrase should replace the entry, not stack a second
+    /// one beside it.
+    pub fn id(&self) -> String {
+        match self {
+            Self::Tcp { addr, .. } => format!("tcp:{addr}"),
+            Self::Auto { .. } => "auto".to_string(),
+        }
+    }
+
+    /// The half of this that is safe to hand back over the API. The IFAC
+    /// passphrase is a shared secret; it goes in and is never returned, the
+    /// same rule `interfaces.rs` follows for the uplink's.
+    pub fn public(&self) -> serde_json::Value {
+        match self {
+            Self::Tcp { addr, ifac_name, .. } => serde_json::json!({
+                "id": self.id(), "kind": "tcp", "addr": addr,
+                "ifac_name": ifac_name, "ifac": ifac_name.is_some(),
+            }),
+            Self::Auto { ifac_name, .. } => serde_json::json!({
+                "id": self.id(), "kind": "auto", "addr": null,
+                "ifac_name": ifac_name, "ifac": ifac_name.is_some(),
+            }),
+        }
+    }
+
+    async fn attach_to(&self, session: &BridgeSession) {
+        let handle = session.handle();
+        match self {
+            Self::Tcp { addr, ifac_name, ifac_passphrase } => {
+                // The id it captures is not needed here: this set is keyed by
+                // address, and the engine cannot detach a live interface
+                // anyway.
+                let _ = crate::interfaces::attach_tcp(
+                    handle,
+                    addr,
+                    ifac_name.as_deref(),
+                    ifac_passphrase.as_deref(),
+                )
+                .await;
+            }
+            Self::Auto { ifac_name, ifac_passphrase } => {
+                let _ = crate::interfaces::attach_auto(
+                    handle,
+                    ifac_name.as_deref(),
+                    ifac_passphrase.as_deref(),
+                );
+            }
+        }
+    }
+}
+
 /// Every instance's mesh bridge, by instance id.
 pub struct MeshBridges {
     config: Option<MeshConfig>,
     bridges: Mutex<BTreeMap<String, Bridge>>,
+    /// Interfaces added at runtime, applied to every bridge and persisted so a
+    /// restart does not quietly take the node off a relay it was using.
+    extra: Mutex<Vec<MeshInterface>>,
+    extra_path: Option<PathBuf>,
 }
 
 impl MeshBridges {
     pub fn new(config: Option<MeshConfig>) -> Arc<Self> {
-        Arc::new(Self { config, bridges: Mutex::new(BTreeMap::new()) })
+        Arc::new(Self {
+            config,
+            bridges: Mutex::new(BTreeMap::new()),
+            extra: Mutex::new(Vec::new()),
+            extra_path: None,
+        })
+    }
+
+    /// Same, but remembering runtime interfaces in a file beside the node's
+    /// other state.
+    pub fn with_store(config: Option<MeshConfig>, path: PathBuf) -> Arc<Self> {
+        let extra = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<MeshInterface>>(&s).ok())
+            .unwrap_or_default();
+        Arc::new(Self {
+            config,
+            bridges: Mutex::new(BTreeMap::new()),
+            extra: Mutex::new(extra),
+            extra_path: Some(path),
+        })
+    }
+
+    /// The runtime interfaces, without their IFAC secrets.
+    pub async fn interfaces(&self) -> Vec<serde_json::Value> {
+        self.extra.lock().await.iter().map(|i| i.public()).collect()
+    }
+
+    /// Attach an interface to every bridge now and to every bridge later.
+    ///
+    /// Re-adding the same id replaces the saved entry rather than stacking a
+    /// duplicate, so correcting a passphrase is one action instead of a remove
+    /// and an add.
+    pub async fn add_interface(&self, iface: MeshInterface) -> Result<()> {
+        if !self.enabled() {
+            return Err(anyhow!(
+                "this node runs its games LAN-only, so there is nothing to attach an \
+                 interface to. Add a [mesh] section to its config and restart"
+            ));
+        }
+        {
+            let bridges = self.bridges.lock().await;
+            for bridge in bridges.values() {
+                iface.attach_to(&bridge.session).await;
+            }
+        }
+        let mut extra = self.extra.lock().await;
+        let id = iface.id();
+        extra.retain(|i| i.id() != id);
+        extra.push(iface);
+        self.save(&extra)?;
+        Ok(())
+    }
+
+    /// Forget a runtime interface.
+    ///
+    /// **Forgetting is not detaching.** The engine offers no way to remove an
+    /// interface from a running node, so a bridge that already has this one
+    /// keeps it until it restarts. Saying so is better than pretending: an
+    /// operator who removes a relay and watches traffic keep flowing would
+    /// otherwise conclude the button does nothing.
+    pub async fn remove_interface(&self, id: &str) -> Result<bool> {
+        let mut extra = self.extra.lock().await;
+        let before = extra.len();
+        extra.retain(|i| i.id() != id);
+        let removed = extra.len() != before;
+        if removed {
+            self.save(&extra)?;
+        }
+        Ok(removed)
+    }
+
+    fn save(&self, extra: &[MeshInterface]) -> Result<()> {
+        let Some(path) = &self.extra_path else { return Ok(()) };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Written beside and renamed, so an interrupted save cannot leave a
+        // truncated file that reads as "no interfaces" on the next start.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(extra)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Whether this node puts its games on the mesh at all.
@@ -166,6 +332,12 @@ impl MeshBridges {
         let session = BridgeSession::start_server(args)
             .await
             .map_err(|e| anyhow!("starting the mesh bridge: {e}"))?;
+
+        // Everything added since startup, so a bridge born now reaches the same
+        // relays as the ones already running.
+        for iface in self.extra.lock().await.iter() {
+            iface.attach_to(&session).await;
+        }
 
         let status = MeshStatus {
             instance_id: instance_id.to_string(),
@@ -260,6 +432,90 @@ mod tests {
         let bridges = MeshBridges::new(Some(MeshConfig::default()));
         bridges.retain_only(&["a".to_string()]).await;
         assert!(bridges.status().await.is_empty());
+    }
+
+    /// A LAN-only node has nothing to attach an interface to, and says so
+    /// rather than accepting the setting and silently doing nothing.
+    #[tokio::test]
+    async fn adding_an_interface_to_a_lan_only_node_is_refused() {
+        let bridges = MeshBridges::new(None);
+        let err = bridges
+            .add_interface(MeshInterface::Auto { ifac_name: None, ifac_passphrase: None })
+            .await
+            .expect_err("LAN-only has nothing to attach to");
+        assert!(format!("{err}").contains("[mesh]"), "{err}");
+    }
+
+    /// Re-adding the same address replaces the entry rather than stacking a
+    /// duplicate, so fixing a passphrase is one action.
+    #[tokio::test]
+    async fn re_adding_an_address_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridges =
+            MeshBridges::with_store(Some(MeshConfig::default()), dir.path().join("i.json"));
+        bridges
+            .add_interface(MeshInterface::Tcp {
+                addr: "hub:4789".into(),
+                ifac_name: None,
+                ifac_passphrase: None,
+            })
+            .await
+            .unwrap();
+        bridges
+            .add_interface(MeshInterface::Tcp {
+                addr: "hub:4789".into(),
+                ifac_name: Some("net".into()),
+                ifac_passphrase: Some("secret".into()),
+            })
+            .await
+            .unwrap();
+        let list = bridges.interfaces().await;
+        assert_eq!(list.len(), 1, "the same address must not stack");
+        assert_eq!(list[0]["ifac_name"], "net");
+    }
+
+    /// **The IFAC passphrase is a shared secret and never comes back out.**
+    /// Same rule the uplink's interfaces follow.
+    #[tokio::test]
+    async fn an_ifac_passphrase_is_never_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridges =
+            MeshBridges::with_store(Some(MeshConfig::default()), dir.path().join("i.json"));
+        bridges
+            .add_interface(MeshInterface::Tcp {
+                addr: "hub:4789".into(),
+                ifac_name: Some("net".into()),
+                ifac_passphrase: Some("hunter2".into()),
+            })
+            .await
+            .unwrap();
+        let rendered = serde_json::to_string(&bridges.interfaces().await).unwrap();
+        assert!(!rendered.contains("hunter2"), "the passphrase leaked: {rendered}");
+        // But the fact that one is set is worth showing.
+        assert!(rendered.contains("\"ifac\":true"), "{rendered}");
+    }
+
+    /// Interfaces added from the UI survive a restart, or an operator would
+    /// silently drop off a relay every time the node came back.
+    #[tokio::test]
+    async fn interfaces_are_remembered_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i.json");
+        {
+            let bridges = MeshBridges::with_store(Some(MeshConfig::default()), path.clone());
+            bridges
+                .add_interface(MeshInterface::Tcp {
+                    addr: "hub:4789".into(),
+                    ifac_name: None,
+                    ifac_passphrase: None,
+                })
+                .await
+                .unwrap();
+        }
+        let reopened = MeshBridges::with_store(Some(MeshConfig::default()), path);
+        assert_eq!(reopened.interfaces().await.len(), 1);
+        assert!(reopened.remove_interface("tcp:hub:4789").await.unwrap());
+        assert!(reopened.interfaces().await.is_empty());
     }
 
     /// The default is 30 seconds and `[mesh]` may be written empty — an

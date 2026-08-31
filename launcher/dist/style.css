@@ -563,3 +563,12 @@ input:focus-visible, select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* Saved mesh connections. Reticulum has no directory, so a relay address is
+   knowledge somebody gave the player — it belongs on screen, not in memory. */
+.iface-list { margin-top: 10px; }
+.iface-title { color: var(--fg-muted); font-size: 12px; margin-bottom: 4px; }
+.iface-empty { color: var(--fg-muted); font-style: italic; margin: 6px 0 0; }
+.iface-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.iface-row + .iface-row { border-top: 1px solid color-mix(in srgb, var(--fg-faint) 20%, transparent); }
+.iface-label { flex: 1; font-variant-numeric: tabular-nums; }

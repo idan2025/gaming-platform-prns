@@ -37,6 +37,41 @@ pub struct LauncherSettings {
     /// The display name the player joins under, reused across games so it is
     /// typed once rather than per join.
     pub player_name: Option<String>,
+    /// How this launcher reaches the mesh, remembered between runs.
+    ///
+    /// Reticulum has no global directory: a node gets an interface from LAN
+    /// auto-discovery or from a TCP address somebody told it. Making a player
+    /// retype a relay address on every launch is making them re-solve the
+    /// bootstrap problem every time.
+    #[serde(default)]
+    pub interfaces: Vec<LauncherInterface>,
+}
+
+/// One way this launcher reaches the mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum LauncherInterface {
+    /// Dial a relay, or bind one with `0.0.0.0:PORT`.
+    Tcp { addr: String },
+    /// Find neighbours on the local network with no address at all.
+    Auto,
+}
+
+impl LauncherInterface {
+    /// What names this interface to a person and in the saved list.
+    pub fn id(&self) -> String {
+        match self {
+            Self::Tcp { addr } => format!("tcp:{addr}"),
+            Self::Auto => "auto".to_string(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Tcp { addr } => addr.clone(),
+            Self::Auto => "LAN auto-discovery".to_string(),
+        }
+    }
 }
 
 impl LauncherSettings {

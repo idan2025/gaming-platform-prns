@@ -89,7 +89,12 @@ impl Agent {
         );
         let packs = RwLock::new(packs.into_iter().map(|p| (p.id.clone(), p)).collect());
 
-        let mesh = crate::mesh::MeshBridges::new(config.mesh.clone());
+        // Runtime interfaces live beside the node's other state, so adding a
+        // relay from the UI survives a restart.
+        let mesh = crate::mesh::MeshBridges::with_store(
+            config.mesh.clone(),
+            config.data_root.join("mesh-interfaces.json"),
+        );
         Ok(Self {
             config,
             layout,
