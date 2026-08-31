@@ -1,0 +1,202 @@
+// Headless render pass over launcher/dist: real DOM (jsdom), mocked Tauri
+// bridge, payloads shaped exactly like launcher-core serializes them.
+//
+// This is not a screenshot. It catches the class of bug the frontend contract
+// actually has: a property that does not exist reads as undefined, and a null
+// that must render as "unknown" rendering as 0.
+import { JSDOM, VirtualConsole } from 'jsdom';
+import fs from 'node:fs';
+
+const DIST = new URL('../dist/', import.meta.url).pathname;
+const html = fs.readFileSync(`${DIST}index.html`, 'utf8');
+const appJs = fs.readFileSync(`${DIST}app.js`, 'utf8');
+
+const failures = [];
+const consoleErrors = [];
+
+function check(name, cond, detail = '') {
+  if (!cond) failures.push(`${name}${detail ? ': ' + detail : ''}`);
+}
+
+const row = (over = {}) => ({
+  destination_hash: 'aabbccddeeff00112233445566778899',
+  name: 'Idan\'s Server',
+  game_id: 'sven-coop',
+  map: 'svencoop1',
+  players: 4,
+  max_players: 32,
+  hops: 1,
+  interface_label: 'tcp/127.0.0.1:4242',
+  min_link_class: 1,
+  passworded: false,
+  allowlisted: false,
+  dedicated: true,
+  transport_mode: 0,
+  last_seen_secs: 3,
+  legacy: false,
+  ...over,
+});
+
+// A deployed v0.1.10 peer: a name and nothing else. Every optional field null.
+const legacyRow = row({
+  destination_hash: '99887766554433221100ffeeddccbbaa',
+  name: 'sc-rns-bridge',
+  game_id: null, map: null, players: null, max_players: null,
+  min_link_class: null, passworded: null, allowlisted: null,
+  dedicated: null, transport_mode: null, legacy: true, hops: 3,
+});
+
+const details = {
+  destination_hash: row().destination_hash,
+  reachable: true,
+  rtt_ms: 84,
+  players_online: 4,
+  max_players: 32,
+  player_names: ['a', 'b'],
+  roster_truncated: false,
+  map: 'svencoop1',
+  uptime_secs: 7200,
+  bridge_clients: 2,
+  stats_source: 'live',
+  stats_age_secs: 1,
+  error: null,
+};
+
+const calls = [];
+function makeInvoke(scenario) {
+  return async (cmd, args) => {
+    calls.push(cmd);
+    switch (cmd) {
+      case 'browse_status':
+        return scenario.status;
+      case 'list_servers':
+        return scenario.rows(args?.query ?? {});
+      case 'list_games':
+        return [{ id: 'sven-coop', display_name: 'Sven Co-op' }];
+      case 'server_details':
+        return scenario.details ?? details;
+      case 'start_browse':
+      case 'stop_browse':
+      case 'leave':
+        return null;
+      case 'join_server':
+        return { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop' };
+      default:
+        throw new Error(`the UI called an unknown command: ${cmd}`);
+    }
+  };
+}
+
+async function run(label, scenario, assertions) {
+  const virtualConsole = new VirtualConsole();
+  virtualConsole.on('jsdomError', e => consoleErrors.push(`${label}: ${e.message}`));
+  virtualConsole.on('error', (...a) => consoleErrors.push(`${label}: ${a.join(' ')}`));
+
+  const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole });
+  const { window } = dom;
+  window.__TAURI__ = { core: { invoke: makeInvoke(scenario) } };
+  window.eval(appJs);
+  // init() runs a few awaits deep; let the microtask queue drain.
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  await assertions(window, window.document);
+  window.clearInterval?.(undefined);
+  dom.window.close();
+}
+
+const running = { running: true, interfaces: [{ id: '1', label: 'tcp/127.0.0.1:4242', connected: true }], heard_total: 2 };
+
+await run('two servers', {
+  status: running,
+  rows: () => [row(), legacyRow],
+}, (win, doc) => {
+  const rows = doc.querySelectorAll('#list .row');
+  check('list renders a row per server', rows.length === 2, `got ${rows.length}`);
+
+  const text = doc.querySelector('#list').textContent;
+  check('the named server is shown', text.includes("Idan's Server"));
+  check('the map is shown', text.includes('svencoop1'));
+  check('a known player count renders', text.includes('4/32'));
+
+  // The rule from launcher-core: unknown must not render as zero.
+  const legacyEl = rows[1];
+  const players = legacyEl.querySelector('[data-cell="players"]').textContent;
+  check('a legacy row shows unknown players as a dash, not 0', players === '—', `got ${JSON.stringify(players)}`);
+  const game = legacyEl.querySelector('[data-cell="game"]').textContent;
+  check('a legacy row shows its game as Unknown', game === 'Unknown', `got ${JSON.stringify(game)}`);
+  check('a legacy row is badged', legacyEl.textContent.includes('legacy'));
+  check('no undefined leaked into the list', !text.includes('undefined'), text.slice(0, 200));
+});
+
+await run('detail pane', {
+  status: running,
+  rows: () => [row()],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const pane = doc.querySelector('#detail');
+  check('the detail pane opens on click', !pane.hidden);
+  const t = pane.textContent;
+  check('the detail pane shows the live source', /live/i.test(t), t.slice(0, 300));
+  check('the detail pane shows an rtt', t.includes('84'), t.slice(0, 300));
+  check('no undefined leaked into the detail pane', !t.includes('undefined'), t.slice(0, 300));
+});
+
+await run('unreachable server', {
+  status: running,
+  rows: () => [row()],
+  details: { ...details, reachable: false, rtt_ms: null, players_online: null,
+             player_names: null, uptime_secs: null, bridge_clients: null,
+             stats_source: 'announced', stats_age_secs: null, error: 'no answer' },
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const pane = doc.querySelector('#detail');
+  const t = pane.textContent;
+  check('a probe that did not answer is a state, not an error banner',
+    doc.querySelector('#error').classList.contains('hidden'), doc.querySelector('#error').textContent);
+  check('the pane says the numbers are announced, not live', /announce/i.test(t), t.slice(0, 300));
+  check('no undefined in an unreachable pane', !t.includes('undefined'), t.slice(0, 300));
+});
+
+await run('join', {
+  status: running,
+  rows: () => [row()],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const join = doc.querySelector('#detail .btn-join');
+  check('the detail pane offers a join button', !!join);
+  join.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const t = doc.querySelector('#detail').textContent;
+  // The launcher does not launch the game (a pack cannot name a command), so
+  // the address it hands back is the whole product of a join.
+  check('a join tells the player where to point their game', t.includes('127.0.0.1:27015'), t.slice(-300));
+  check('no undefined after a join', !t.includes('undefined'), t.slice(-300));
+});
+
+await run('nothing heard yet', {
+  status: { running: true, interfaces: [], heard_total: 0 },
+  rows: () => [],
+}, (win, doc) => {
+  const t = doc.querySelector('#list').textContent;
+  check('an empty list explains itself', t.trim().length > 0);
+  check('no undefined in the empty state', !t.includes('undefined'), t.slice(0, 200));
+});
+
+await run('browse not running', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+}, (win, doc) => {
+  const t = doc.querySelector('#list').textContent;
+  check('a stopped browser explains how to start', t.trim().length > 0, t.slice(0, 200));
+});
+
+for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
+
+if (failures.length) {
+  console.log('FAIL');
+  for (const f of failures) console.log('  - ' + f);
+  process.exit(1);
+}
+console.log(`OK — ${new Set(calls).size} commands exercised: ${[...new Set(calls)].join(', ')}`);

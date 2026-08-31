@@ -1,0 +1,8 @@
+{
+  "name": "launcher-uicheck",
+  "private": true,
+  "type": "module",
+  "description": "Headless render pass over launcher/dist. Not part of cargo test: it needs npm install jsdom.",
+  "scripts": { "test": "node render.mjs" },
+  "devDependencies": { "jsdom": "^26.0.0" }
+}
