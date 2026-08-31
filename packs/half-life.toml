@@ -32,3 +32,16 @@ notes = "GoldSrc. Same engine, A2S and single UDP port as Sven Co-op; the pack d
 driver = "steamcmd"
 app_id = 90
 
+# How a launcher starts the player's own copy and points it at a server
+# (PLAN.md §13.1). Note what is NOT here: no executable, no path, no command.
+# The program comes from the player's own Half-Life installation; `steam_app_id`
+# only helps the launcher find it in a Steam library the player already has.
+#
+# `args` is a template over a fixed vocabulary — address, port, password, name —
+# substituted into an argument vector that is spawned directly. Nothing is ever
+# passed to a shell, which is what makes characters like `;` and `$()` inert
+# text rather than syntax. A node never reads this block.
+[launch]
+kind = "goldsrc"
+steam_app_id = 70
+args = ["+connect {address}", "+password {password}"]

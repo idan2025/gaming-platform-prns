@@ -972,11 +972,21 @@ pack survivable. Defence in depth, in that order.
 Each step is independently useful — none is a prerequisite for the platform
 working, and each shortens the distance between installing and playing.
 
-1. **Launch profiles (§13.1).** `[launch]` in the schema, the typed-substitution
-   argument builder, a `kind` enum starting with `goldsrc` and `source`, and
-   game-location detection. Ends at: the Join button starts the game.
-   *The test that matters:* an `args` entry containing shell metacharacters is
-   passed through as one inert argument, never interpreted.
+1. ~~**Launch profiles (§13.1).**~~ **Core built 2026-08-31.**
+   `crates/game-bridge/src/launch.rs` is the schema and the argument builder;
+   `[launch]` is on the pack and validated at parse, so a bad template is a bad
+   pack rather than a surprise at Join; `Launcher::launch_game` spawns the
+   player's own binary with an argument vector; all four shipped packs carry a
+   profile; `JoinResult.can_launch` tells the UI whether a Play button is
+   possible. `shell_metacharacters_are_inert_text_not_syntax` is the test that
+   matters, and `no_shipped_pack_can_launch_anything_but_the_players_own_game`
+   holds every shipped pack to it by property rather than by id.
+
+   **Still to do:** game-location detection (find a Steam library, or let the
+   player pick their game once and remember it) and the Play button itself.
+   Until then `launch_game` is reachable only with a path a caller supplies —
+   which is the same built-but-uncalled shape this repo keeps producing, so it
+   is named here rather than left to be discovered.
 2. **Host from the launcher.** A Host tab: pick a game, name it, set max
    players, start. Runs the same `BridgeSession` the CLI does — the launcher
    already links `game-bridge` directly, so this is UI, not protocol. Ends at:

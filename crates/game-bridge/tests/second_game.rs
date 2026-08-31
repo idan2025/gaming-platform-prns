@@ -162,3 +162,56 @@ fn a_multi_port_game_is_data_too() {
         }
     }
 }
+
+/// `PLAN.md` §13.1: every shipped `[launch]` block obeys the rules that make an
+/// unreviewed pack survivable. Found by the property, never by game id — a pack
+/// added later gets checked without anyone remembering to add it here.
+///
+/// The ceiling this pins is the one the pack marketplace rests on (§13.2): the
+/// worst a hostile `[launch]` block can do is start the player's own game with
+/// odd flags. It is not enforced by a scanner, because intent is not in the
+/// syntax; it is enforced by the format, and this is the format's test.
+#[test]
+fn no_shipped_pack_can_launch_anything_but_the_players_own_game() {
+    use game_bridge::launch::{LaunchValues, MAX_ARGS};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+    let packs = GamePack::load_dir(&dir).expect("the shipped pack directory reads").packs;
+    let with_launch: Vec<&GamePack> = packs.iter().filter(|p| p.launch.is_some()).collect();
+    assert!(!with_launch.is_empty(), "no shipped pack has a launch profile to check");
+
+    let values = LaunchValues {
+        address: "127.0.0.1:27015".into(),
+        port: 27015,
+        password: Some("pw".into()),
+        name: Some("player".into()),
+    };
+
+    for pack in with_launch {
+        let launch = pack.launch.as_ref().expect("filtered");
+        launch.validate().unwrap_or_else(|e| panic!("{}: {e}", pack.id));
+        assert!(launch.args.len() <= MAX_ARGS, "{}", pack.id);
+
+        let args = launch.build_args(&values).unwrap_or_else(|e| panic!("{}: {e}", pack.id));
+
+        // Rule 1: the pack names no program. The vector is arguments only —
+        // the executable comes from the player's own installation, and nothing
+        // in a pack contributes to it.
+        for arg in &args {
+            assert!(
+                arg.starts_with('+') || arg.starts_with('-') || !arg.contains('/'),
+                "{}: {arg:?} looks like a path, and a pack must not name one",
+                pack.id
+            );
+        }
+
+        // Rule 2: whatever a template contains, it arrives as arguments, not as
+        // syntax. Nothing here is ever handed to a shell, so this asserts the
+        // shape the launcher must keep: one vector, spawned directly.
+        assert!(
+            args.iter().all(|a| !a.is_empty()),
+            "{}: an empty argument means a flag lost its value",
+            pack.id
+        );
+    }
+}

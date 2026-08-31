@@ -26,6 +26,7 @@ use game_bridge::announce::AnnounceInfo;
 use game_bridge::browse::{BrowseFilter, SortBy};
 use game_bridge::config::{BrowserArgs, ClientArgs};
 use game_bridge::details::StatsSource;
+use game_bridge::launch::{LaunchProfile, LaunchValues};
 use game_bridge::pack::TrustedPack;
 use game_bridge::profile::GameProfile;
 use game_bridge::signing::{PackTrust, TrustPolicy};
@@ -195,6 +196,10 @@ pub struct BrowseOpts {
 pub struct JoinResult {
     pub listen_addr: String,
     pub game_id: Option<String>,
+    /// Whether this game's pack knows how to start the player's own copy
+    /// (`PLAN.md` §13.1). `false` means the old behaviour: the launcher shows
+    /// the address and the player points their game at it.
+    pub can_launch: bool,
 }
 
 /// The launcher's whole state.
@@ -422,8 +427,52 @@ impl Launcher {
         inner.client = Some(BridgeSession::start_client(args).await?);
         Ok(JoinResult {
             listen_addr: format!("127.0.0.1:{listen_port}"),
+            can_launch: self.launch_profile(&game_id).is_some(),
             game_id: Some(game_id),
         })
+    }
+
+    fn launch_profile(&self, game_id: &str) -> Option<&LaunchProfile> {
+        self.packs.iter().find(|p| p.pack.id == game_id)?.pack.launch.as_ref()
+    }
+
+    /// Start the player's own copy of the game, pointed at the port `join_server`
+    /// bound (`PLAN.md` §13.1).
+    ///
+    /// **The program is the player's, not the pack's.** `executable` is a path
+    /// this machine's owner chose — detected in a Steam library or picked once
+    /// in a file dialog — and the pack contributes only the arguments after it.
+    ///
+    /// The arguments are spawned as a **vector, never through a shell**. That
+    /// is the whole safety property of §13.1: a `;` or a `$(...)` in a
+    /// stranger's pack is one byte of one argument. Never route this through
+    /// `sh -c`, and never join these into a string.
+    pub fn launch_game(
+        &self,
+        game_id: &str,
+        executable: &std::path::Path,
+        values: &LaunchValues,
+    ) -> Result<()> {
+        let profile = self
+            .launch_profile(game_id)
+            .ok_or_else(|| anyhow!("no launch profile for {game_id:?}"))?;
+        let args = profile.build_args(values).map_err(|e| anyhow!("{e}"))?;
+
+        // The player's own binary must exist and be a file. A pack cannot reach
+        // this argument, but a stale saved path can, and "failed to launch" is
+        // a better answer than a confusing spawn error.
+        if !executable.is_file() {
+            return Err(anyhow!(
+                "{} is not a file; point the launcher at your game again",
+                executable.display()
+            ));
+        }
+
+        std::process::Command::new(executable)
+            .args(&args)
+            .spawn()
+            .map_err(|e| anyhow!("could not start {}: {e}", executable.display()))?;
+        Ok(())
     }
 
     pub async fn leave(&self) -> Result<()> {
@@ -597,6 +646,52 @@ mod tests {
     fn a_pack_passed_in_without_provenance_reads_as_unsigned() {
         let games = Launcher::new(vec![GamePack::sven_coop()]).list_games();
         assert_eq!(games[0].trust, "unsigned local");
+    }
+
+    /// A join tells the frontend whether a Play button is possible. `can_launch`
+    /// is a key the UI branches on, so it is part of the contract.
+    #[test]
+    fn join_result_json_keys_are_the_frontend_contract() {
+        let v = serde_json::to_value(JoinResult {
+            listen_addr: "127.0.0.1:27015".into(),
+            game_id: Some("sven-coop".into()),
+            can_launch: true,
+        })
+        .unwrap();
+        for key in ["listen_addr", "game_id", "can_launch"] {
+            assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
+        }
+    }
+
+    /// The built-in pack carries a launch profile, so a fresh install with no
+    /// pack directory can still offer Play rather than an address to copy.
+    #[test]
+    fn the_builtin_pack_can_start_the_players_own_game() {
+        let l = Launcher::new(Vec::new());
+        assert!(l.launch_profile("sven-coop").is_some());
+    }
+
+    /// Refusing early with a clear message beats a spawn error a player cannot
+    /// act on. The path is the player's own saved choice, and it goes stale.
+    #[test]
+    fn launching_with_a_missing_executable_says_so_rather_than_spawning() {
+        let l = Launcher::new(Vec::new());
+        let err = l
+            .launch_game(
+                "sven-coop",
+                std::path::Path::new("/nonexistent/hl.exe"),
+                &LaunchValues::default(),
+            )
+            .expect_err("a missing binary must not launch");
+        assert!(err.to_string().contains("not a file"), "{err}");
+    }
+
+    #[test]
+    fn launching_a_game_with_no_profile_is_a_clear_error() {
+        let l = Launcher::new(Vec::new());
+        assert!(l
+            .launch_game("quake-3", std::path::Path::new("/bin/sh"), &LaunchValues::default())
+            .is_err());
     }
 
     /// §11.4 wants the tier shown, so it has to reach the UI. These are the

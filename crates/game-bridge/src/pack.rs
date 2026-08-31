@@ -44,6 +44,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentError, PackContent};
+use crate::launch::{LaunchError, LaunchKind, LaunchProfile};
 use crate::profile::{GamePort, GameProfile, GameTransport, ProfileError, QueryProtocol};
 use crate::signing::{self, PackTrust, SigFileError, TrustPolicy};
 
@@ -111,6 +112,17 @@ pub struct GamePack {
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
+    /// How a launcher starts the player's own copy of this game and points it
+    /// at a server (`PLAN.md` §13.1).
+    ///
+    /// **Client-side only, and it names no executable.** The program comes from
+    /// the player's own installation; this block only says which engine family
+    /// it is and where the launcher's own values go in its arguments. A node
+    /// never reads this — a pack still cannot say what a node executes, which
+    /// is a different machine belonging to a different person. See
+    /// `launch.rs`'s module docs for the four rules that carry it.
+    #[serde(default)]
+    pub launch: Option<LaunchProfile>,
 }
 
 /// One extra port, as it appears in a pack's `[[extra_ports]]`.
@@ -183,6 +195,8 @@ pub enum PackError {
     /// The signature beside the pack was unreadable, malformed, forged or
     /// stale. Never a demotion to unsigned — see `signing.rs`.
     Signature(SigFileError),
+    /// The pack's `[launch]` block is not usable.
+    InvalidLaunch(LaunchError),
 }
 
 impl core::fmt::Display for PackError {
@@ -197,6 +211,7 @@ impl core::fmt::Display for PackError {
             Self::Invalid(e) => write!(f, "pack describes an unusable game: {e}"),
             Self::InvalidContent(e) => write!(f, "pack describes unusable content: {e}"),
             Self::Signature(e) => write!(f, "pack signature: {e}"),
+            Self::InvalidLaunch(e) => write!(f, "pack describes an unusable launch: {e}"),
         }
     }
 }
@@ -229,6 +244,14 @@ impl GamePack {
             // gap waiting to be filled.
             content: PackContent::default(),
             extra_ports: Vec::new(),
+            // Kept in step with `packs/sven-coop.toml`, which
+            // `shipped_sven_pack_matches_the_builtin` enforces: the fallback a
+            // fresh install uses must not be a different game from the file.
+            launch: Some(LaunchProfile {
+                kind: LaunchKind::Goldsrc,
+                steam_app_id: Some(225840),
+                args: vec!["+connect {address}".to_string(), "+password {password}".to_string()],
+            }),
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -249,6 +272,11 @@ impl GamePack {
         // loaded, with the file in hand, rather than when someone tries to host.
         pack.to_profile()?;
         pack.content.validate().map_err(PackError::InvalidContent)?;
+        // A bad template is a bad pack, reported with the file in hand rather
+        // than at the moment a player presses Join.
+        if let Some(launch) = &pack.launch {
+            launch.validate().map_err(PackError::InvalidLaunch)?;
+        }
         Ok(pack)
     }
 

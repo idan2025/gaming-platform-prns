@@ -17,6 +17,7 @@ pub mod config;
 pub mod content;
 pub mod details;
 pub mod framing;
+pub mod launch;
 pub mod pack;
 pub mod profile;
 pub mod relay;
