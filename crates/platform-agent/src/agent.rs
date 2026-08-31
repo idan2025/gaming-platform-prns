@@ -19,6 +19,7 @@
 //! that restarted would cheerfully hand a live instance's port to a new one.
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
@@ -302,8 +303,11 @@ impl Agent {
                 })
                 .collect(),
             container_id: Some(container_id),
-            uptime_secs: None,
+            // A container created a moment ago. Both are answered by the next
+            // `list`, and neither is worth a Docker round trip here.
+            uptime_secs: Some(0),
             owner: spec.owner,
+            players_now: None,
         })
     }
 
@@ -338,7 +342,6 @@ impl Agent {
         Ok(())
     }
 
-    /// Everything this agent manages, as Docker currently sees it.
     /// What this node has room for, as **both** control surfaces report it.
     ///
     /// The wire type is shared with the uplink deliberately: the loopback API
@@ -392,10 +395,59 @@ impl Agent {
                     port: c.port,
                     ports: c.ports,
                     container_id: Some(c.container_id),
-                    uptime_secs: None,
+                    uptime_secs: c.created_unix.and_then(|created| {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                        u64::try_from(created).ok().map(|c| now.saturating_sub(c))
+                    }),
+                    // `list` is on the hot path — capacity asks it before every
+                    // placement — so it never queries a game. `list_detailed`
+                    // is the one that does.
+                    players_now: None,
                 }
             })
             .collect())
+    }
+
+    /// `list`, plus how many players each running instance actually has.
+    ///
+    /// Separate from `list` because asking costs a UDP round trip per instance
+    /// and `capacity` must stay cheap. The queries run concurrently, so the
+    /// whole call costs one query timeout rather than one per instance.
+    ///
+    /// **A game that cannot be asked reports `None`, never `0`.** The pack says
+    /// which query protocol a game speaks, and a game that speaks none — or one
+    /// that did not answer this time — is unknown. An index reaping on "no
+    /// players" would otherwise stop a busy server the moment a query was
+    /// dropped.
+    pub async fn list_detailed(&self) -> Result<Vec<InstanceStatus>> {
+        let mut instances = self.list().await?;
+        let queries = instances.iter().map(|i| self.player_count(i));
+        let counts = futures_util::future::join_all(queries).await;
+        for (instance, count) in instances.iter_mut().zip(counts) {
+            instance.players_now = count;
+        }
+        Ok(instances)
+    }
+
+    /// Ask one instance's game how many players it has, if it can be asked.
+    ///
+    /// The query is aimed at the published port on this node's own loopback:
+    /// the game is a container this agent started, not a stranger on the
+    /// network.
+    async fn player_count(&self, instance: &InstanceStatus) -> Option<u32> {
+        if instance.state != InstanceState::Running {
+            return None;
+        }
+        let profile = self.packs.get(&instance.game_id)?.to_profile().ok()?;
+        // The pack names an enum this build implements — never a command. A
+        // game declaring no query is unknown, which is the honest answer.
+        match profile.query? {
+            game_bridge::profile::QueryProtocol::A2s => {
+                let port = instance.port?;
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                game_bridge::a2s::query(addr).await.ok().map(|s| u32::from(s.info.players))
+            }
+        }
     }
 
     /// Instance directories with no corresponding container.

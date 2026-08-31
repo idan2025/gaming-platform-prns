@@ -78,9 +78,11 @@ async fn health(State(agent): State<Arc<Agent>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Listing asks each running game how many players it has, because an index
+/// reaping idle instances must not read "could not ask" as "empty".
 async fn list(State(agent): State<Arc<Agent>>) -> ApiResult<Vec<InstanceStatus>> {
     agent
-        .list()
+        .list_detailed()
         .await
         .map(Json)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))

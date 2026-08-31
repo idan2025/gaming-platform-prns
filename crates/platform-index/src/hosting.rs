@@ -36,6 +36,7 @@
 
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use personal_rns::prelude::DestinationHash;
@@ -46,7 +47,7 @@ use tokio::sync::Mutex;
 use platform_agent::uplink_wire::CapacityResp;
 
 use crate::agent_client::AgentClient;
-use crate::quota::{AccountId, InstanceRecord, QuotaPolicy, Quotas};
+use crate::quota::{AccountId, InstanceRecord, QuotaPolicy, Quotas, ReapReason};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +161,18 @@ pub struct HostedInstance {
     #[serde(default)]
     pub ports: Vec<InstancePort>,
     pub owner: Option<String>,
+    /// Seconds this instance has existed, as the node reports it. `None` means
+    /// the node did not say — which is "age unknown", never "brand new".
+    #[serde(default)]
+    pub uptime_secs: Option<u64>,
+    /// Players on it right now, as the node reports it.
+    ///
+    /// `None` is **not zero**. A game that speaks no query protocol, or one
+    /// that did not answer, is unknown, and reaping treats unknown as "leave it
+    /// alone" — stopping a busy server because a UDP query was dropped is worse
+    /// than letting an idle one run.
+    #[serde(default)]
+    pub players_now: Option<u32>,
 }
 
 /// What a caller asks for.
@@ -277,6 +290,8 @@ impl Hosting {
                     port: r.port,
                     ports: r.ports,
                     owner: r.owner,
+                    uptime_secs: r.uptime_secs,
+                    players_now: r.players_now,
                 })
                 .collect());
         }
@@ -302,6 +317,8 @@ impl Hosting {
                 port: r["port"].as_u64().map(|p| p as u16),
                 ports: ports_from_json(&r["ports"]),
                 owner: r["owner"].as_str().map(str::to_string),
+                uptime_secs: r["uptime_secs"].as_u64(),
+                players_now: r["players_now"].as_u64().map(|p| p as u32),
             })
             .collect())
     }
@@ -340,22 +357,7 @@ impl Hosting {
         }
 
         let existing = self.all_instances().await?;
-        let records: Vec<InstanceRecord> = existing
-            .iter()
-            .map(|i| InstanceRecord {
-                instance_id: i.instance_id.clone(),
-                account: AccountId(i.owner.clone().unwrap_or_default()),
-                // The node does not report creation time yet, so quota
-                // admission sees every instance as old enough to have escaped
-                // the create cooldown. That makes the cooldown ineffective
-                // rather than wrong; the instance-count limits, which are the
-                // ones that actually bound resource use, are exact.
-                created_at: now,
-                last_player_seen: None,
-                players_now: 0,
-                exempt_from_reaping: false,
-            })
-            .collect();
+        let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
         self.quotas
             .admit(account, &records, now)
             .map_err(|e| anyhow!("{e}"))?;
@@ -399,6 +401,9 @@ impl Hosting {
                 port: created.port,
                 ports: created.ports,
                 owner: Some(account.0.clone()),
+                // Just created, and nobody has had time to join.
+                uptime_secs: Some(0),
+                players_now: Some(0),
             });
         }
 
@@ -435,6 +440,8 @@ impl Hosting {
             port: created["port"].as_u64().map(|p| p as u16),
             ports: ports_from_json(&created["ports"]),
             owner: Some(account.0.clone()),
+            uptime_secs: Some(0),
+            players_now: Some(0),
         })
     }
 
@@ -487,6 +494,78 @@ impl Hosting {
         Ok(())
     }
 
+    /// Ask one node to stop one instance, on whichever transport it uses.
+    ///
+    /// Stop rather than remove: the instance's writable state is whatever
+    /// players built there, and reclaiming compute is not a reason to destroy
+    /// it. The node's own `orphan_dirs` refuses to delete such state
+    /// automatically for the same reason.
+    async fn stop_on(&self, node: &NodeConfig, instance_id: &str) -> Result<()> {
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client = self
+                .agent_client()
+                .await
+                .ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            return client
+                .stop(dest, instance_id)
+                .await
+                .with_context(|| format!("asking agent {} to stop it", node.name));
+        }
+        let url = format!(
+            "{}/instances/{}/stop",
+            node.api.trim_end_matches('/'),
+            instance_id
+        );
+        let response = self.http.post(&url).send().await.context("asking the node")?;
+        if !response.status().is_success() {
+            return Err(anyhow!("the node refused to stop it"));
+        }
+        Ok(())
+    }
+
+    /// Stop the instances the quota policy says have outlived their welcome.
+    ///
+    /// `PLAN.md` §8 phase 4 promises idle reaping "from day one", because
+    /// public deploy plus anonymous identities is free compute. The policy has
+    /// always been here; until now nothing called it, so nothing was ever
+    /// reaped and an abandoned server ran until an operator noticed.
+    ///
+    /// Returns what it stopped, so a caller can log it. A node that refuses is
+    /// logged and skipped rather than failing the sweep: the other instances
+    /// are still costing the same node time.
+    pub async fn reap_idle(&self, now: SystemTime) -> Result<Vec<(String, ReapReason)>> {
+        if self.quotas.policy().idle_timeout.is_none() {
+            return Ok(Vec::new());
+        }
+        let existing = self.all_instances().await?;
+        let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
+
+        let mut reaped = Vec::new();
+        for (instance_id, reason) in self.quotas.to_reap(&records, now) {
+            let Some(instance) = existing.iter().find(|i| i.instance_id == instance_id) else {
+                continue;
+            };
+            let Some(node) = self.config.nodes.iter().find(|n| n.name == instance.node) else {
+                continue;
+            };
+            // Stop, not remove. The instance directory holds whatever players
+            // built there, and reaping is about reclaiming compute, not about
+            // destroying state — `orphan_dirs` on the node already refuses to
+            // delete that automatically for the same reason.
+            match self.stop_on(node, &instance_id).await {
+                Ok(()) => {
+                    tracing::info!(instance = %instance_id, node = %node.name, ?reason, "reaped an idle instance");
+                    reaped.push((instance_id, reason));
+                }
+                Err(e) => {
+                    tracing::warn!(instance = %instance_id, node = %node.name, error = %e, "could not reap")
+                }
+            }
+        }
+        Ok(reaped)
+    }
+
     /// Most free room wins, asking each node what it actually has.
     ///
     /// The index's own instance count is not the node's capacity. A node has a
@@ -530,6 +609,41 @@ impl Hosting {
             return None;
         }
         response.json::<CapacityResp>().await.ok()
+    }
+}
+
+/// A node's view of an instance, as the quota engine wants to see it.
+///
+/// Two conversions carry the weight:
+///
+/// * **`created_at` comes from the node's `uptime_secs`**, not from `now`. The
+///   index used to stamp every instance as created this instant, which made the
+///   create cooldown ineffective and would make reaping impossible — nothing is
+///   ever old enough to judge. A node that reports no uptime still reads as
+///   "created now", which is the safe direction: unknown age means too young to
+///   reap.
+/// * **`players_now: None` becomes `exempt_from_reaping`.** The quota engine's
+///   `players_now` is a count, so unknown has nowhere to live in it. Rather than
+///   flatten unknown to zero — which would stop a busy server whose query was
+///   dropped — an instance nobody can ask is pinned. An idle instance that is
+///   never reaped is a wasted slot; a populated one that is reaped is players
+///   thrown out of a game.
+fn record_for(instance: &HostedInstance, now: SystemTime) -> InstanceRecord {
+    let created_at = instance
+        .uptime_secs
+        .and_then(|secs| now.checked_sub(Duration::from_secs(secs)))
+        .unwrap_or(now);
+    InstanceRecord {
+        instance_id: instance.instance_id.clone(),
+        account: AccountId(instance.owner.clone().unwrap_or_default()),
+        created_at,
+        // The node reports a count now, not a history. An instance with players
+        // right now is never reaped regardless of this, and one without is
+        // judged on age, which is `NeverHadPlayers` — conservative, and correct
+        // until a node keeps a last-seen timestamp of its own.
+        last_player_seen: None,
+        players_now: instance.players_now.unwrap_or(0),
+        exempt_from_reaping: instance.players_now.is_none(),
     }
 }
 
@@ -696,10 +810,81 @@ mod tests {
             port: None,
             ports: Vec::new(),
             owner: None,
+            uptime_secs: None,
+            players_now: None,
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
         assert_eq!(h.pick_node(&existing).await.unwrap().name, "second");
+    }
+
+    fn hosted(id: &str, uptime: Option<u64>, players: Option<u32>) -> HostedInstance {
+        HostedInstance {
+            instance_id: id.into(),
+            node: "local".into(),
+            game_id: "sven-coop".into(),
+            name: id.into(),
+            state: "running".into(),
+            port: None,
+            ports: Vec::new(),
+            owner: Some("acct".into()),
+            uptime_secs: uptime,
+            players_now: players,
+        }
+    }
+
+    fn t() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    /// The index used to stamp every instance as created *now*, which made the
+    /// create cooldown ineffective and would make reaping impossible: nothing
+    /// is ever old enough to judge.
+    #[test]
+    fn age_comes_from_the_node_not_from_the_clock() {
+        let r = record_for(&hosted("a", Some(3600), Some(0)), t());
+        assert_eq!(r.created_at, t() - Duration::from_secs(3600));
+    }
+
+    /// A node that did not report uptime reads as brand new — too young to
+    /// reap. Unknown age must fall on the safe side.
+    #[test]
+    fn an_unknown_age_reads_as_too_young_rather_than_ancient() {
+        let r = record_for(&hosted("a", None, Some(0)), t());
+        assert_eq!(r.created_at, t());
+    }
+
+    /// The load-bearing one. `players_now: None` means "could not ask", and
+    /// flattening it to zero would stop a busy server whose UDP query was
+    /// dropped. It is pinned instead.
+    #[test]
+    fn an_instance_nobody_can_ask_is_never_reaped() {
+        let unknown = record_for(&hosted("a", Some(86_400), None), t());
+        assert!(unknown.exempt_from_reaping, "unknown players must not be read as empty");
+
+        let known_empty = record_for(&hosted("b", Some(86_400), Some(0)), t());
+        assert!(!known_empty.exempt_from_reaping, "a node that says zero means zero");
+    }
+
+    /// End to end through the quota engine: an old, empty, answerable instance
+    /// is reaped, and neither an unanswerable nor a populated one is.
+    #[test]
+    fn the_reaper_picks_only_the_instance_it_should() {
+        let policy = QuotaPolicy {
+            idle_timeout: Some(Duration::from_secs(600)),
+            min_lifetime: Duration::from_secs(300),
+            ..QuotaPolicy::default()
+        };
+        let q = Quotas::new(policy);
+        let old = 86_400;
+        let records = vec![
+            record_for(&hosted("empty", Some(old), Some(0)), t()),
+            record_for(&hosted("busy", Some(old), Some(7)), t()),
+            record_for(&hosted("unasked", Some(old), None), t()),
+            record_for(&hosted("young", Some(60), Some(0)), t()),
+        ];
+        let reaped: Vec<String> = q.to_reap(&records, t()).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(reaped, vec!["empty".to_string()]);
     }
 
     fn cap(running: usize, max: usize) -> CapacityResp {

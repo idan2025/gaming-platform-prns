@@ -61,6 +61,12 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   trust decision at verify time would not fail any obvious test — the one that
   catches it is `a_token_stops_authorizing_when_the_identity_leaves_the_allowlist`
   and the live-wire `an_untrusted_index_cannot_even_list_over_the_uplink`.
+- **`players_now: None` is not zero, and reaping depends on it.** The agent
+  A2S-queries its own instances per the pack's declared protocol; a game that
+  speaks none, or one that did not answer, reports `None`.
+  `hosting::record_for` turns that into `exempt_from_reaping` rather than a
+  count of zero — flattening it would stop a busy server whose UDP query was
+  dropped. Caught by `an_instance_nobody_can_ask_is_never_reaped`.
 - **Placement asks the node, and silence is not room.** `hosting::rank_node`
   skips a node reporting itself full, and ranks a node that could not be asked
   *behind* every node that answered. Treating no answer as an empty node is how

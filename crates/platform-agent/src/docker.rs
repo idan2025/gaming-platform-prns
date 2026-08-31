@@ -136,6 +136,14 @@ pub struct ManagedContainer {
     pub ports: Vec<InstancePort>,
     pub owner: Option<String>,
     pub game_id: Option<String>,
+    /// Unix seconds the container was created, as Docker reports it.
+    ///
+    /// Creation rather than start, deliberately: quota admission and reaping
+    /// both ask "how long has this existed", and a container that has been
+    /// restarted has not thereby become new. `None` for a Docker that did not
+    /// report it, which reads downstream as "age unknown" and never as "age
+    /// zero".
+    pub created_unix: Option<i64>,
 }
 
 impl DockerRuntime {
@@ -196,6 +204,7 @@ impl DockerRuntime {
                     state,
                     port,
                     ports,
+                    created_unix: c.created,
                     owner: labels.get(OWNER_LABEL).cloned(),
                     game_id: labels.get(GAME_LABEL).cloned(),
                 })

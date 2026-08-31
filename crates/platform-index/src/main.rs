@@ -20,6 +20,13 @@ use tokio::sync::Mutex;
 /// How often the index folds the browse session's view into its own memory.
 const INGEST_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the idle sweep runs.
+///
+/// Not the same thing as the idle timeout: the timeout decides *whether* an
+/// instance is over its welcome, and this decides how late the answer can be.
+/// A minute is far below any sane timeout and costs one listing per node.
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
 const USAGE: &str = "\
 platform-index — an optional announce indexer and HTTP front door
 
@@ -146,6 +153,32 @@ async fn main() -> Result<()> {
         if let Some(h) = &state.hosting {
             h.set_agent_client(client).await;
         }
+    }
+
+    // Idle reaping. `PLAN.md` §8 phase 4 wants it "from day one", because public
+    // deploy plus anonymous identities is free compute — and until now the
+    // policy existed and nothing ran it, so an abandoned server ran until an
+    // operator noticed. The sweep is cheap (one listing per node) and its
+    // interval is not the timeout: it decides how late a reap can be, not
+    // whether one happens.
+    if state.hosting.is_some() {
+        let reaper_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(REAP_INTERVAL);
+            loop {
+                ticker.tick().await;
+                let Some(hosting) = &reaper_state.hosting else { break };
+                match hosting.reap_idle(std::time::SystemTime::now()).await {
+                    Ok(reaped) if !reaped.is_empty() => {
+                        tracing::info!(count = reaped.len(), "reaped idle instances")
+                    }
+                    Ok(_) => {}
+                    // A sweep that could not reach a node is a warning, not a
+                    // reason to stop sweeping: the next tick tries again.
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "idle sweep failed"),
+                }
+            }
+        });
     }
 
     let ingest_state = state.clone();

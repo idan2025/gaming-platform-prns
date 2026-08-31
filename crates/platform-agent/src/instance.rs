@@ -106,6 +106,14 @@ pub struct InstanceStatus {
     /// Who this was deployed for, if anyone. Read back off the container label.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Players on this server right now, when the game can be asked.
+    ///
+    /// `None` is **not zero**, and the difference decides whether an instance
+    /// is reaped: a game whose pack declares no query protocol, or one that did
+    /// not answer, must never read as empty. An index that treated unknown as
+    /// zero would stop a busy server for being idle.
+    #[serde(default)]
+    pub players_now: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

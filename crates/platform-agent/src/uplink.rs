@@ -260,7 +260,9 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
                 return encode_err(OP_LIST, &msg);
             }
-            match state.agent.list().await {
+            // `list_detailed`, so an index deciding what to reap sees real
+            // player counts rather than a field it would have to guess at.
+            match state.agent.list_detailed().await {
                 Ok(instances) => encode_list_resp(&instances, instances.len()),
                 Err(e) => encode_err(OP_LIST, &format!("{e:#}")),
             }

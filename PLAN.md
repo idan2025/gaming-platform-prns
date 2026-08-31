@@ -546,6 +546,25 @@ bridge.
   means hosting is off — the same shape as the agent making the container image
   an operator's choice.
 
+  **Idle reaping actually runs (2026-08-31).** This section promised it "from
+  day one" and the policy was written, but `Quotas::to_reap` had no caller:
+  nothing was ever reaped, and an abandoned server ran until an operator
+  noticed. Wiring it needed two things the node was not reporting. Age came from
+  `now`, so every instance looked newly created — which also made the create
+  cooldown ineffective — and is now derived from the container's creation time.
+  Player counts did not exist at all, and without them a busy server would have
+  been reaped as "never had players": the agent now A2S-queries its own
+  instances per the pack's declared protocol, on the node's loopback.
+
+  Two rules there, both testable without a node:
+  **`players_now: None` is not zero.** A game whose pack declares no query, or
+  one that did not answer, is unknown, and `record_for` pins such an instance
+  rather than flattening unknown to empty. An idle instance that is never reaped
+  is a wasted slot; a populated one that is reaped is players thrown out of a
+  game. **Unknown age reads as newly created**, so it is too young to judge
+  rather than ancient. The sweep stops rather than removes: an instance's
+  writable state is whatever players built there.
+
   Ownership lives on the container as a label; the index reconstructs who owns
   what by asking the node, so there is no index-side instance table to drift out
   of step with reality. "Not found" and "not yours" are the same answer, so the

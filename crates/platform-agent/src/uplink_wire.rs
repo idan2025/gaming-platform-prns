@@ -291,6 +291,7 @@ mod tests {
             container_id: Some("abc".to_string()),
             uptime_secs: None,
             owner: None,
+            players_now: None,
         }
     }
 
