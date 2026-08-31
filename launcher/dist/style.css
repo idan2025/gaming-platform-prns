@@ -442,6 +442,40 @@ input:focus-visible, select:focus-visible {
 .btn-join:hover { filter: brightness(1.05); }
 .btn-join:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .btn-join:disabled { opacity: 0.5; cursor: default; }
+/* Play — the primary action once a join can start the player's own game
+   (PLAN.md §13.3). Emphasised with the success colour so it reads as "go". */
+.btn-play {
+  flex: 1 1 auto;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border: 1px solid var(--ok);
+  background: var(--ok);
+  color: var(--accent-fg);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.btn-play:hover { filter: brightness(1.05); }
+.btn-play:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
+.btn-play:disabled { opacity: 0.5; cursor: default; }
+/* Locate game — a secondary, outline action: the player points the launcher at
+   their own copy once so Play can light up. */
+.btn-locate {
+  flex: 1 1 auto;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.btn-locate:hover { background: var(--accent); color: var(--accent-fg); }
+.btn-locate:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .join-msg { font-size: 11px; color: var(--fg-muted); }
 .join-msg.ok { color: var(--ok); }
 .join-msg.err { color: var(--error); }

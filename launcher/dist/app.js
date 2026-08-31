@@ -555,8 +555,27 @@ function renderDetail() {
   if (d.joining) { join.disabled = true; join.textContent = 'Joining…'; }
   else if (d.joined) { join.textContent = 'Join again'; }
   foot.appendChild(join);
+
+  // The Play button (PLAN.md §13.3). It appears only once a join has bound a
+  // local port and only for a game whose pack can start it (`can_launch`).
+  // When the game cannot yet be found on this machine (`launch_ready` is
+  // false), the button becomes "Locate game" so the player points the launcher
+  // at their own copy once — the launcher never guesses an executable.
+  if (d.joined && d.canLaunch) {
+    if (d.launchReady) {
+      const play = el('button', 'btn-play', d.playing ? 'Starting…' : 'Play');
+      play.disabled = !!d.playing;
+      play.onclick = playServer;
+      foot.appendChild(play);
+    } else {
+      const locate = el('button', 'btn-locate', 'Locate game');
+      locate.onclick = () => locateGame((d.announce && d.announce.game_id) || null);
+      foot.appendChild(locate);
+    }
+  }
+
   if (d.joinMsg) {
-    const m = el('span', 'join-msg ' + (d.joined ? 'ok' : 'err'), d.joinMsg);
+    const m = el('span', 'join-msg ' + (d.joinErr ? 'err' : 'ok'), d.joinMsg);
     foot.appendChild(m);
   }
   pane.appendChild(foot);
@@ -660,6 +679,7 @@ async function joinServer() {
   if (!d || d.joining) return;
   d.joining = true;
   d.joinMsg = null;
+  d.joinErr = false;
   renderDetail();
   try {
     const res = await invoke('join_server', {
@@ -667,15 +687,87 @@ async function joinServer() {
       gameId: (d.announce && d.announce.game_id) || null,
     });
     d.joined = true;
-    d.joinMsg = 'Connected. Point your game at ' + res.listen_addr +
-                ' — the launcher does not start the game for you.';
+    d.listenAddr = res.listen_addr;
+    d.canLaunch = !!res.can_launch;
+    d.launchReady = !!res.launch_ready;
+    d.joinErr = false;
+    if (d.canLaunch && d.launchReady) {
+      d.joinMsg = 'Connected. Press Play to start the game (listening on ' + res.listen_addr + ').';
+    } else if (d.canLaunch) {
+      d.joinMsg = 'Connected on ' + res.listen_addr +
+                  '. Locate your game once to enable Play, or point your game at that address.';
+    } else {
+      d.joinMsg = 'Connected. Point your game at ' + res.listen_addr +
+                  ' — this pack does not start the game for you.';
+    }
   } catch (err) {
     d.joined = false;
+    d.joinErr = true;
     d.joinMsg = 'Could not join: ' + String(err && err.message || err);
   } finally {
     d.joining = false;
     renderDetail();
   }
+}
+
+// The Play button (PLAN.md §13.3). Everything that decides *how* to start the
+// game — the player's own saved binary, or Steam `-applaunch` — is in
+// launcher-core; this only asks it to, and reports what it started. The
+// arguments are spawned as a vector there, never a shell.
+async function playServer() {
+  const d = state.detail;
+  if (!d || d.playing) return;
+  d.playing = true;
+  d.joinMsg = null;
+  renderDetail();
+  try {
+    const res = await invoke('play_server');
+    d.joinErr = false;
+    d.joinMsg = res.method === 'steam'
+      ? 'Starting the game through Steam…'
+      : 'Starting your game…';
+  } catch (err) {
+    d.joinErr = true;
+    d.joinMsg = 'Could not start the game: ' + String(err && err.message || err);
+  } finally {
+    d.playing = false;
+    renderDetail();
+  }
+}
+
+// "Locate game": the launcher never guesses an executable, so when a game
+// cannot be found automatically the player points it at their own copy once and
+// it is remembered (settings.rs). No file-dialog plugin is required — a prompt
+// keeps the shell's permission surface unchanged.
+async function locateGame(gameId) {
+  const d = state.detail;
+  if (!d || !gameId) return;
+  let hint = '';
+  try {
+    const loc = await invoke('game_location', { gameId });
+    hint = loc && loc.detail ? '\n\n' + loc.detail : '';
+  } catch (_) { /* a missing location just means an empty hint */ }
+  const path = window.prompt(
+    'Enter the full path to your ' + gameId + ' executable' +
+    ' (the launcher will remember it):' + hint,
+    (d.savedPath || ''));
+  if (path == null) return; // cancelled
+  const trimmed = path.trim();
+  if (trimmed === '') return;
+  try {
+    await invoke('set_game_path', { gameId, path: trimmed });
+    const loc = await invoke('game_location', { gameId });
+    d.savedPath = loc.saved_path || trimmed;
+    d.launchReady = !!loc.launch_ready;
+    d.joinErr = !d.launchReady;
+    d.joinMsg = d.launchReady
+      ? 'Game located. Press Play to start it.'
+      : (loc.detail || 'That path did not work — try again.');
+  } catch (err) {
+    d.joinErr = true;
+    d.joinMsg = 'Could not set the game path: ' + String(err && err.message || err);
+  }
+  renderDetail();
 }
 
 function clearMetadataFilters() {
