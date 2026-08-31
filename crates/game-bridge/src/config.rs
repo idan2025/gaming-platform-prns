@@ -105,8 +105,16 @@ impl ServerArgs {
 pub struct ClientArgs {
     /// Which game this bridge fronts.
     pub profile: GameProfile,
-    /// Local port the game client connects to.
+    /// Local port the game client connects to. Channel 0, the game itself.
     pub listen_port: u16,
+    /// Local ports for the pack's extra channels (`GAMES.md` §3), keyed by
+    /// channel. A channel with no entry lands on `listen_port + channel`.
+    ///
+    /// Not defaulted to the game's *own* port numbers: those belong to the
+    /// server's host, and a player whose machine already runs something on
+    /// 27015 should not have a bridge fight it for the port.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub extra_listen_ports: std::collections::BTreeMap<u8, u16>,
     /// Destination hash of the server to join, hex. When `None` the client
     /// waits for an announce of this game's server aspect and takes the first
     /// one it hears.
@@ -132,6 +140,7 @@ impl ClientArgs {
         Self {
             profile,
             listen_port,
+            extra_listen_ports: std::collections::BTreeMap::new(),
             server_hash: None,
             identity: PathBuf::from("./game-bridge-client.identity"),
             tcp: None,

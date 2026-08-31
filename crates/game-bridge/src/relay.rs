@@ -44,6 +44,7 @@
 //! `PrnsNodeHandle` (which is `Send + Sync`) for live control plus a stop
 //! channel.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -71,7 +72,7 @@ use crate::details::{ServerDetails, StatsSource, DETAILS_ENDPOINT_ID};
 use crate::config::{
     AnnounceFormat, BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, ServerArgs,
 };
-use crate::framing::{frame, Reassembler};
+use crate::framing::{self, ChannelReassembler};
 use crate::profile::GameTransport;
 use crate::stream::{self, ByteStreamReader, ByteStreamWriter};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
@@ -456,6 +457,36 @@ impl BridgeSession {
                     format!("invalid game host/port: {}:{}", args.game_host, args.game_port)
                 })?;
             let transport = args.profile.transport;
+            // Extra ports live on the same host as the game (`GAMES.md` §3 is
+            // about one server's several ports, not several hosts).
+            let extra_udp: Vec<(u8, SocketAddr)> = args
+                .profile
+                .extra_ports
+                .iter()
+                .filter(|p| p.transport == GameTransport::Udp)
+                .map(|p| -> Result<(u8, SocketAddr)> {
+                    Ok((
+                        p.channel,
+                        format!("{}:{}", args.game_host, p.port)
+                            .parse()
+                            .with_context(|| format!("invalid extra port {}", p.port))?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let extra_tcp: Vec<(u8, SocketAddr)> = args
+                .profile
+                .extra_ports
+                .iter()
+                .filter(|p| p.transport == GameTransport::Tcp)
+                .map(|p| -> Result<(u8, SocketAddr)> {
+                    Ok((
+                        p.channel,
+                        format!("{}:{}", args.game_host, p.port)
+                            .parse()
+                            .with_context(|| format!("invalid extra port {}", p.port))?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
             info!(
                 game = %game_id,
                 game_addr = %game_addr,
@@ -544,6 +575,8 @@ impl BridgeSession {
             let identify_timeout_tx = event_tx.clone();
             let router_state = state.clone();
             let identify_timeout_secs = args.identify_timeout_secs.max(1);
+            let router_extra_udp = extra_udp.clone();
+            let router_extra_tcp = extra_tcp.clone();
             let _router_task = tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 // Links accepted but not yet identified, held with their
@@ -553,10 +586,8 @@ impl BridgeSession {
                     std::collections::HashMap::new();
                 // The TCP equivalent: a link's stream halves, opened at accept
                 // time so nothing the peer sends while it waits is lost.
-                let mut pending_streams: std::collections::HashMap<
-                    LinkId,
-                    (ByteStreamReader, ByteStreamWriter),
-                > = std::collections::HashMap::new();
+                let mut pending_streams: std::collections::HashMap<LinkId, Vec<StreamPort>> =
+                    std::collections::HashMap::new();
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } => {
@@ -574,23 +605,16 @@ impl BridgeSession {
                                         identity = ?identity.as_bytes(),
                                         "peer is on the allowlist; starting relay"
                                     );
-                                    match pending_streams.remove(&link_id) {
-                                        Some((reader, writer)) => spawn_server_link_stream_relay(
-                                            link_id,
-                                            reader,
-                                            writer,
-                                            router_senders.clone(),
-                                            router_handle.clone(),
-                                            game_addr,
-                                        ),
-                                        None => spawn_server_link_relay(
-                                            link_id,
-                                            rx,
-                                            router_senders.clone(),
-                                            router_handle.clone(),
-                                            game_addr,
-                                        ),
-                                    }
+                                    start_server_link(
+                                        link_id,
+                                        rx,
+                                        pending_streams.remove(&link_id).unwrap_or_default(),
+                                        transport,
+                                        game_addr,
+                                        &router_extra_udp,
+                                        &router_senders,
+                                        &router_handle,
+                                    );
                                 }
                             } else {
                                 warn!(
@@ -625,37 +649,35 @@ impl BridgeSession {
                             let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
                             router_senders.write().await.insert(link_id, tx);
 
-                            // A TCP game's stream reader is registered the
+                            // Every TCP port's stream reader is registered the
                             // instant the link is up, before the allowlist has
                             // decided anything: bytes that arrive before a sink
                             // exists are forwarded past it and lost, and a game
                             // client does not wait to be allowed before sending
                             // its handshake. See `stream.rs`.
-                            let stream = match transport {
-                                GameTransport::Tcp => {
-                                    Some(stream::server_stream(&router_handle, link_id).await)
-                                }
-                                GameTransport::Udp => None,
-                            };
+                            let mut streams: Vec<StreamPort> = Vec::new();
+                            if transport == GameTransport::Tcp {
+                                let (reader, writer) =
+                                    stream::server_stream(&router_handle, link_id, framing::CHANNEL_GAME).await;
+                                streams.push((framing::CHANNEL_GAME, game_addr, reader, writer));
+                            }
+                            for (channel, addr) in &router_extra_tcp {
+                                let (reader, writer) =
+                                    stream::server_stream(&router_handle, link_id, *channel).await;
+                                streams.push((*channel, *addr, reader, writer));
+                            }
 
                             if allowlist.is_empty() {
-                                match stream {
-                                    Some((reader, writer)) => spawn_server_link_stream_relay(
-                                        link_id,
-                                        reader,
-                                        writer,
-                                        router_senders.clone(),
-                                        router_handle.clone(),
-                                        game_addr,
-                                    ),
-                                    None => spawn_server_link_relay(
-                                        link_id,
-                                        rx,
-                                        router_senders.clone(),
-                                        router_handle.clone(),
-                                        game_addr,
-                                    ),
-                                }
+                                start_server_link(
+                                    link_id,
+                                    rx,
+                                    streams,
+                                    transport,
+                                    game_addr,
+                                    &router_extra_udp,
+                                    &router_senders,
+                                    &router_handle,
+                                );
                                 router_state.set_bridge_clients(router_senders.read().await.len());
                                 continue;
                             }
@@ -668,8 +690,8 @@ impl BridgeSession {
                             // the first one.
                             router_state.set_bridge_clients(router_senders.read().await.len());
                             pending_identify.insert(link_id, rx);
-                            if let Some(halves) = stream {
-                                pending_streams.insert(link_id, halves);
+                            if !streams.is_empty() {
+                                pending_streams.insert(link_id, streams);
                             }
                             let timeout_tx = identify_timeout_tx.clone();
                             tokio::spawn(async move {
@@ -745,27 +767,50 @@ impl BridgeSession {
                 None => None,
             };
 
-            // One listener, in the game's own transport. A TCP game gets a
-            // link per connection (`stream.rs`); a UDP game keeps the datagram
-            // path's link per source address.
-            let transport = args.profile.transport;
-            let udp = match transport {
-                GameTransport::Udp => Some(
-                    UdpSocket::bind(listen_addr)
-                        .await
-                        .with_context(|| format!("binding UDP listener on {listen_addr}"))?,
-                ),
-                GameTransport::Tcp => None,
-            };
-            let tcp_listener = match transport {
-                GameTransport::Tcp => Some(
-                    TcpListener::bind(listen_addr)
-                        .await
-                        .with_context(|| format!("binding TCP listener on {listen_addr}"))?,
-                ),
-                GameTransport::Udp => None,
-            };
-            info!(listen = %listen_addr, transport = ?transport, "point the game client at this address");
+            // One local listener per declared port, in that port's own
+            // transport. A TCP port gets a link per connection (`stream.rs`); a
+            // UDP port keeps the datagram path's link per source address.
+            //
+            // Channel 0 lands on `listen_port`; an extra port lands on
+            // `listen_port + channel` unless the caller named one, which keeps
+            // the mapping predictable without hard-coding the game's own port
+            // numbers onto the player's machine.
+            let mut udp_sockets: Vec<(u8, Arc<UdpSocket>)> = Vec::new();
+            let mut tcp_listeners: Vec<(u8, TcpListener)> = Vec::new();
+            for port in args.profile.ports() {
+                let local_port = if port.channel == framing::CHANNEL_GAME {
+                    args.listen_port
+                } else {
+                    args.extra_listen_ports
+                        .get(&port.channel)
+                        .copied()
+                        .unwrap_or_else(|| args.listen_port.saturating_add(port.channel as u16))
+                };
+                let addr: SocketAddr = format!("127.0.0.1:{local_port}")
+                    .parse()
+                    .with_context(|| format!("invalid local port: {local_port}"))?;
+                match port.transport {
+                    GameTransport::Udp => {
+                        let sock = UdpSocket::bind(addr)
+                            .await
+                            .with_context(|| format!("binding UDP listener on {addr}"))?;
+                        udp_sockets.push((port.channel, Arc::new(sock)));
+                    }
+                    GameTransport::Tcp => {
+                        let listener = TcpListener::bind(addr)
+                            .await
+                            .with_context(|| format!("binding TCP listener on {addr}"))?;
+                        tcp_listeners.push((port.channel, listener));
+                    }
+                }
+                info!(
+                    channel = port.channel,
+                    name = %port.name,
+                    listen = %addr,
+                    transport = ?port.transport,
+                    "point this port's client at this address"
+                );
+            }
 
             let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
             let destination = PreConfiguredDestination::Single {
@@ -802,6 +847,14 @@ impl BridgeSession {
             let handle = node.handle();
 
             let server_target: Arc<RwLock<Option<DestinationHash>>> = Arc::new(RwLock::new(target_hash));
+            // What the target server said it speaks. `PLAN.md` §5: a channel id
+            // may only be sent to a peer whose announce advertised framing
+            // generation 2, because `Reassembler::push` on a deployed peer
+            // masks only `FLAG_FINAL` and would silently mis-reassemble the
+            // rest of the header. Unknown means generation 1 — an explicit
+            // server hash with no announce heard yet gets the safe answer, not
+            // the convenient one.
+            let peer_framing: Arc<RwLock<u8>> = Arc::new(RwLock::new(framing::FRAMING_V1));
             if let Some(h) = target_hash {
                 info!(server_hash = ?h.as_bytes(), "will connect to explicit server hash");
             } else {
@@ -832,10 +885,9 @@ impl BridgeSession {
             }
 
             let link_data: LinkSenders = Arc::new(RwLock::new(std::collections::HashMap::new()));
-            let udp_links: Arc<RwLock<std::collections::HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
-                Arc::new(RwLock::new(std::collections::HashMap::new()));
 
             let router_target = server_target.clone();
+            let router_peer_framing = peer_framing.clone();
             let router_link_data = link_data.clone();
             let router_discovered = discovered.clone();
             let _router_task = tokio::spawn(async move {
@@ -843,11 +895,21 @@ impl BridgeSession {
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } => {
+                            // A legacy announce carries no version at all, and
+                            // that is exactly the peer that must never be sent
+                            // a channel id, so it reads as generation 1.
+                            let version = match &info {
+                                AnnounceInfo::Record(r) => r.protocol_version,
+                                AnnounceInfo::Legacy { .. } => framing::FRAMING_V1,
+                            };
                             remember_server(&router_discovered, destination, hops, source_interface, info).await;
                             let mut t = router_target.write().await;
                             if t.is_none() {
                                 info!(server_hash = ?destination.as_bytes(), "discovered a server announce");
                                 *t = Some(destination);
+                            }
+                            if *t == Some(destination) {
+                                *router_peer_framing.write().await = version;
                             }
                         }
                         BridgeEvent::LinkEstablished { .. } => {}
@@ -872,143 +934,32 @@ impl BridgeSession {
                 }
             });
 
-            if let Some(listener) = tcp_listener {
+            for (channel, listener) in tcp_listeners {
                 spawn_client_tcp_listener(
                     listener,
                     handle.clone(),
                     server_target.clone(),
+                    peer_framing.clone(),
                     client_identity_hash,
+                    channel,
                 );
             }
 
-            let _udp_task = udp.map(|udp| {
-            let udp: Arc<UdpSocket> = Arc::new(udp);
-            let udp_handle = handle.clone();
-            let udp_target = server_target.clone();
-            let udp_link_data = link_data.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; UDP_READ_BUF];
-                loop {
-                    let (n, src) = match udp.recv_from(&mut buf).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!(error = %e, "client UDP listener died");
-                            return;
-                        }
-                    };
-                    let pkt = buf[..n].to_vec();
-
-                    if let Some(tx) = udp_links.read().await.get(&src).cloned() {
-                        if tx.send(pkt).await.is_err() {
-                            udp_links.write().await.remove(&src);
-                        }
-                        continue;
-                    }
-
-                    let Some(target) = *udp_target.read().await else {
-                        warn!(src = %src, "first packet seen but no server discovered yet; dropping");
-                        continue;
-                    };
-
-                    let handle = udp_handle.clone();
-                    let udp = udp.clone();
-                    let links = udp_links.clone();
-                    let link_data_map = udp_link_data.clone();
-                    tokio::spawn(async move {
-                        debug!(src = %src, target = ?target.as_bytes(), "establishing link to server");
-                        let link_id = match handle.establish_link(target).await {
-                            Ok(id) => id,
-                            Err(e) => {
-                                info!(src = %src, error = ?e, "no route to server; requesting path then retrying");
-                                match handle.request_path(target).await {
-                                    Ok(_) => {}
-                                    Err(pe) => {
-                                        error!(src = %src, error = ?pe, "path request to server failed");
-                                        return;
-                                    }
-                                }
-                                match handle.establish_link(target).await {
-                                    Ok(id) => id,
-                                    Err(e2) => {
-                                        error!(src = %src, error = ?e2, "establish link failed after path request");
-                                        return;
-                                    }
-                                }
-                            }
-                        };
-                        debug!(src = %src, link = ?link_id, "link established");
-                        // Best-effort: lets the server list this client. Does
-                        // not block the relay if it fails (e.g. an older peer
-                        // without identify support).
-                        if let Err(e) = handle.identify(link_id, client_identity_hash).await {
-                            debug!(src = %src, link = ?link_id, error = ?e, "identify failed");
-                        }
-
-                        let (udp_to_link_tx, mut udp_to_link_rx) = mpsc::channel::<Vec<u8>>(256);
-                        links.write().await.insert(src, udp_to_link_tx);
-
-                        for chunk in frame(&pkt) {
-                            let Some(payload) = link_payload(&chunk, link_id) else {
-                                links.write().await.remove(&src);
-                                let _ = handle.close_link(link_id);
-                                return;
-                            };
-                            if handle
-                                .issue(PrnsCommand::SendToLink(SendToLink { link_id, payload }))
-                                .is_none()
-                            {
-                                error!(src = %src, link = ?link_id, "first send failed: node stopped");
-                                links.write().await.remove(&src);
-                                let _ = handle.close_link(link_id);
-                                return;
-                            }
-                        }
-
-                        let (link_to_udp_tx, mut link_to_udp_rx) = mpsc::channel::<Vec<u8>>(256);
-                        link_data_map.write().await.insert(link_id, link_to_udp_tx);
-                        debug!(src = %src, link = ?link_id, "client relay registered");
-
-                        let h1 = handle.clone();
-                        let send_task = tokio::spawn(async move {
-                            while let Some(bytes) = udp_to_link_rx.recv().await {
-                                if bytes.is_empty() {
-                                    break;
-                                }
-                                for chunk in frame(&bytes) {
-                                    let Some(payload) = link_payload(&chunk, link_id) else {
-                                        return;
-                                    };
-                                    if h1
-                                        .issue(PrnsCommand::SendToLink(SendToLink { link_id, payload }))
-                                        .is_none()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                        });
-
-                        let udp_back = udp.clone();
-                        let recv_task = tokio::spawn(async move {
-                            let mut reassembler = Reassembler::default();
-                            while let Some(chunk) = link_to_udp_rx.recv().await {
-                                if let Some(datagram) = reassembler.push(&chunk) {
-                                    if udp_back.send_to(&datagram, src).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        let _ = tokio::join!(send_task, recv_task);
-                        link_data_map.write().await.remove(&link_id);
-                        links.write().await.remove(&src);
-                        let _ = handle.close_link(link_id);
-                        debug!(src = %src, link = ?link_id, "client relay ended");
-                    });
-                }
-            })
-            });
+            // One forwarder per declared port. Channel 0 is the game and is
+            // what every peer speaks; the rest are the pack's extra ports, and
+            // a peer that never advertised framing v2 simply never gets one
+            // (`framing.rs`).
+            for (channel, sock) in udp_sockets {
+                spawn_client_udp_forwarder(
+                    sock,
+                    channel,
+                    handle.clone(),
+                    server_target.clone(),
+                    peer_framing.clone(),
+                    link_data.clone(),
+                    client_identity_hash,
+                );
+            }
 
             info!("client node running");
             Ok((handle, async move { let _ = node.run().await; }))
@@ -1234,48 +1185,79 @@ fn spawn_server_link_relay(
     senders: LinkSenders,
     handle: PrnsNodeHandle,
     game_addr: SocketAddr,
+    extra_udp: Vec<(u8, SocketAddr)>,
 ) {
     tokio::spawn(async move {
         debug!(link = ?link_id, game_addr = %game_addr, "server relay started");
-        let sock = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                error!(link = ?link_id, error = %e, "failed to bind relay UDP socket");
+
+        // One socket per channel: channel 0 is the game, the rest are the
+        // pack's extra UDP ports (`GAMES.md` §3). They are opened up front
+        // rather than on first use, so a failure is one log line at link setup
+        // instead of a silently missing port mid-session.
+        let mut sockets: BTreeMap<u8, Arc<UdpSocket>> = BTreeMap::new();
+        for (channel, addr) in std::iter::once((framing::CHANNEL_GAME, game_addr))
+            .chain(extra_udp.into_iter())
+        {
+            let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    error!(link = ?link_id, channel, error = %e, "failed to bind relay UDP socket");
+                    senders.write().await.remove(&link_id);
+                    let _ = handle.close_link(link_id);
+                    return;
+                }
+            };
+            if let Err(e) = sock.connect(addr).await {
+                error!(link = ?link_id, channel, error = %e, "failed to connect relay UDP socket");
                 senders.write().await.remove(&link_id);
                 let _ = handle.close_link(link_id);
                 return;
             }
-        };
-        if let Err(e) = sock.connect(game_addr).await {
-            error!(link = ?link_id, error = %e, "failed to connect relay UDP socket to game server");
-            senders.write().await.remove(&link_id);
-            let _ = handle.close_link(link_id);
-            return;
+            sockets.insert(channel, sock);
         }
-        let sock_send = sock.clone();
+
+        let send_sockets = sockets.clone();
         let to_game = tokio::spawn(async move {
-            let mut reassembler = Reassembler::default();
+            let mut reassembler = ChannelReassembler::default();
             while let Some(chunk) = rx.recv().await {
                 if chunk.is_empty() {
                     break;
                 }
-                if let Some(datagram) = reassembler.push(&chunk) {
-                    if sock_send.send(&datagram).await.is_err() {
-                        break;
-                    }
+                let Some((channel, datagram)) = reassembler.push(&chunk) else {
+                    continue;
+                };
+                let Some(sock) = send_sockets.get(&channel) else {
+                    // A channel this pack does not declare. Dropping it is the
+                    // only safe answer: there is no port to send it to, and
+                    // guessing one would be a peer choosing what this node
+                    // talks to.
+                    debug!(link = ?link_id, channel, "chunk for an undeclared channel; dropping");
+                    continue;
+                };
+                if sock.send(&datagram).await.is_err() {
+                    break;
                 }
             }
         });
-        let sock_recv = sock.clone();
-        let from_game = {
+
+        let mut from_game_tasks = Vec::new();
+        for (channel, sock) in sockets {
             let handle = handle.clone();
-            tokio::spawn(async move {
+            from_game_tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; UDP_READ_BUF];
                 loop {
-                    match sock_recv.recv(&mut buf).await {
+                    match sock.recv(&mut buf).await {
                         Ok(n) if n > 0 => {
                             let datagram = &buf[..n];
-                            for chunk in frame(datagram) {
+                            // A reply always rides the channel its request came
+                            // in on, so a v1 peer — which only ever sends
+                            // channel 0 — only ever receives channel 0. That is
+                            // the whole gate: this side never *initiates* a
+                            // channel a peer did not ask for.
+                            let Ok(chunks) = framing::frame_on_channel(datagram, channel) else {
+                                return;
+                            };
+                            for chunk in chunks {
                                 let Some(payload) = link_payload(&chunk, link_id) else {
                                     return;
                                 };
@@ -1292,17 +1274,247 @@ fn spawn_server_link_relay(
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            debug!(link = ?link_id, error = ?e, "UDP recv from game server ended");
+                            debug!(link = ?link_id, channel, error = ?e, "UDP recv from game ended");
                             break;
                         }
                     }
                 }
-            })
-        };
-        let _ = tokio::join!(to_game, from_game);
+            }));
+        }
+
+        let _ = to_game.await;
+        for task in from_game_tasks {
+            task.abort();
+        }
         senders.write().await.remove(&link_id);
         let _ = handle.close_link(link_id);
         debug!(link = ?link_id, "server relay ended");
+    });
+}
+
+/// One TCP port's halves for a link: which channel, which address, and the two
+/// ends of its byte stream.
+type StreamPort = (u8, SocketAddr, ByteStreamReader, ByteStreamWriter);
+
+/// Start everything one accepted link needs: the datagram relay for its UDP
+/// ports, and one splice per TCP port.
+///
+/// Called from two places — a link with no allowlist, and a link that has just
+/// identified — and existing so those two cannot drift. A TCP *game* port
+/// connects eagerly, because a game server greets a connecting client; an extra
+/// TCP port connects on its first byte, because a node should not open an RCON
+/// connection to itself for every player who joins.
+#[allow(clippy::too_many_arguments)]
+fn start_server_link(
+    link_id: LinkId,
+    rx: mpsc::Receiver<Vec<u8>>,
+    streams: Vec<StreamPort>,
+    transport: GameTransport,
+    game_addr: SocketAddr,
+    extra_udp: &[(u8, SocketAddr)],
+    senders: &LinkSenders,
+    handle: &PrnsNodeHandle,
+) {
+    for (channel, addr, reader, writer) in streams {
+        if channel == framing::CHANNEL_GAME {
+            spawn_server_link_stream_relay(
+                link_id,
+                reader,
+                writer,
+                senders.clone(),
+                handle.clone(),
+                addr,
+            );
+        } else {
+            tokio::spawn(async move {
+                match stream::splice_on_first_byte(addr, reader, writer).await {
+                    Ok(totals) if totals == stream::SpliceTotals::default() => {}
+                    Ok(_) => debug!(link = ?link_id, channel, "extra TCP port relay ended"),
+                    Err(e) => {
+                        debug!(link = ?link_id, channel, error = %e, "extra TCP port relay failed")
+                    }
+                }
+            });
+        }
+    }
+
+    // The datagram relay owns the link's chunk receiver, so it runs whenever
+    // the game itself is UDP. A TCP game with UDP extras is not a shape any
+    // pack describes today; if one appears, this is where it goes.
+    if transport == GameTransport::Udp {
+        spawn_server_link_relay(
+            link_id,
+            rx,
+            senders.clone(),
+            handle.clone(),
+            game_addr,
+            extra_udp.to_vec(),
+        );
+    }
+}
+
+/// Whether this client may put `channel` on the wire towards a peer that
+/// advertised `peer_version`.
+///
+/// Channel 0 is always allowed: it is what every deployed peer speaks and its
+/// header bits are frozen (`PLAN.md` §5). Anything else needs the peer to have
+/// said generation 2 out loud, because `Reassembler::push` on a generation-1
+/// peer masks only `FLAG_FINAL` and mis-reassembles the rest of the header
+/// instead of rejecting it.
+fn may_use_channel(channel: u8, peer_version: u8) -> bool {
+    channel == framing::CHANNEL_GAME || framing::supports_channels(peer_version)
+}
+
+/// Pump one local UDP port onto links, one link per game-client source address.
+///
+/// Extracted from the client's inline loop when extra ports arrived
+/// (`GAMES.md` §3): channel 0 and an extra UDP port differ only in the channel
+/// their chunks carry, and two copies of this would be two places for that to
+/// drift.
+#[allow(clippy::too_many_arguments)]
+fn spawn_client_udp_forwarder(
+    udp: Arc<UdpSocket>,
+    channel: u8,
+    handle: PrnsNodeHandle,
+    target: Arc<RwLock<Option<DestinationHash>>>,
+    peer_framing: Arc<RwLock<u8>>,
+    link_data: LinkSenders,
+    client_identity_hash: IdentityHash,
+) {
+    let udp_links: Arc<RwLock<std::collections::HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; UDP_READ_BUF];
+        loop {
+            let (n, src) = match udp.recv_from(&mut buf).await {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(channel, error = %e, "client UDP listener died");
+                    return;
+                }
+            };
+            let pkt = buf[..n].to_vec();
+
+            if let Some(tx) = udp_links.read().await.get(&src).cloned() {
+                if tx.send(pkt).await.is_err() {
+                    udp_links.write().await.remove(&src);
+                }
+                continue;
+            }
+
+            let Some(server) = *target.read().await else {
+                warn!(src = %src, "first packet seen but no server discovered yet; dropping");
+                continue;
+            };
+
+            // The `PLAN.md` §5 gate. An extra port exists only on framing
+            // generation 2; sending its channel id to a peer that advertised
+            // generation 1 would not be refused by that peer, it would be
+            // silently mis-reassembled.
+            if !may_use_channel(channel, *peer_framing.read().await) {
+                warn!(
+                    src = %src,
+                    channel,
+                    "server does not advertise framing v2; not sending it an extra port"
+                );
+                continue;
+            }
+
+            let handle = handle.clone();
+            let udp = udp.clone();
+            let links = udp_links.clone();
+            let link_data_map = link_data.clone();
+            tokio::spawn(async move {
+                debug!(src = %src, channel, target = ?server.as_bytes(), "establishing link to server");
+                let Some(link_id) = establish_link_with_path_retry(&handle, server).await else {
+                    return;
+                };
+                debug!(src = %src, link = ?link_id, "link established");
+                // Best-effort: lets the server list this client. Does not block
+                // the relay if it fails (e.g. an older peer without identify).
+                if let Err(e) = handle.identify(link_id, client_identity_hash).await {
+                    debug!(src = %src, link = ?link_id, error = ?e, "identify failed");
+                }
+
+                let (udp_to_link_tx, mut udp_to_link_rx) = mpsc::channel::<Vec<u8>>(256);
+                links.write().await.insert(src, udp_to_link_tx);
+
+                let Ok(first_chunks) = framing::frame_on_channel(&pkt, channel) else {
+                    links.write().await.remove(&src);
+                    let _ = handle.close_link(link_id);
+                    return;
+                };
+                for chunk in first_chunks {
+                    let Some(payload) = link_payload(&chunk, link_id) else {
+                        links.write().await.remove(&src);
+                        let _ = handle.close_link(link_id);
+                        return;
+                    };
+                    if handle
+                        .issue(PrnsCommand::SendToLink(SendToLink { link_id, payload }))
+                        .is_none()
+                    {
+                        error!(src = %src, link = ?link_id, "first send failed: node stopped");
+                        links.write().await.remove(&src);
+                        let _ = handle.close_link(link_id);
+                        return;
+                    }
+                }
+
+                let (link_to_udp_tx, mut link_to_udp_rx) = mpsc::channel::<Vec<u8>>(256);
+                link_data_map.write().await.insert(link_id, link_to_udp_tx);
+                debug!(src = %src, link = ?link_id, channel, "client relay registered");
+
+                let h1 = handle.clone();
+                let send_task = tokio::spawn(async move {
+                    while let Some(bytes) = udp_to_link_rx.recv().await {
+                        if bytes.is_empty() {
+                            break;
+                        }
+                        let Ok(chunks) = framing::frame_on_channel(&bytes, channel) else {
+                            return;
+                        };
+                        for chunk in chunks {
+                            let Some(payload) = link_payload(&chunk, link_id) else {
+                                return;
+                            };
+                            if h1
+                                .issue(PrnsCommand::SendToLink(SendToLink { link_id, payload }))
+                                .is_none()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+
+                let udp_back = udp.clone();
+                let recv_task = tokio::spawn(async move {
+                    let mut reassembler = ChannelReassembler::default();
+                    while let Some(chunk) = link_to_udp_rx.recv().await {
+                        let Some((got, datagram)) = reassembler.push(&chunk) else {
+                            continue;
+                        };
+                        // A reply on a channel this socket does not serve is a
+                        // server confusing two ports; dropping it is better
+                        // than handing a game the wrong port's bytes.
+                        if got != channel {
+                            debug!(link = ?link_id, channel, got, "reply on an unexpected channel; dropping");
+                            continue;
+                        }
+                        if udp_back.send_to(&datagram, src).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                let _ = tokio::join!(send_task, recv_task);
+                link_data_map.write().await.remove(&link_id);
+                links.write().await.remove(&src);
+                let _ = handle.close_link(link_id);
+                debug!(src = %src, link = ?link_id, "client relay ended");
+            });
+        }
     });
 }
 
@@ -1315,7 +1527,9 @@ fn spawn_client_tcp_listener(
     listener: TcpListener,
     handle: PrnsNodeHandle,
     target: Arc<RwLock<Option<DestinationHash>>>,
+    peer_framing: Arc<RwLock<u8>>,
     client_identity_hash: IdentityHash,
+    channel: u8,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1330,9 +1544,22 @@ fn spawn_client_tcp_listener(
                 warn!(peer = %peer, "connection accepted but no server discovered yet; closing");
                 continue;
             };
+            // An extra TCP port rides its own stream ids rather than framing's
+            // channel bits, so it cannot corrupt a generation-1 peer — but that
+            // peer registered no reader on those ids, so the connection would
+            // sit open forever waiting for an answer nobody is listening for.
+            // Refusing it now is the honest failure.
+            if !may_use_channel(channel, *peer_framing.read().await) {
+                warn!(
+                    peer = %peer,
+                    channel,
+                    "server does not advertise framing v2; refusing an extra TCP port"
+                );
+                continue;
+            }
             let handle = handle.clone();
             tokio::spawn(async move {
-                debug!(peer = %peer, target = ?server.as_bytes(), "establishing link for a TCP connection");
+                debug!(peer = %peer, channel, target = ?server.as_bytes(), "establishing link for a TCP connection");
                 let Some(link_id) = establish_link_with_path_retry(&handle, server).await else {
                     return;
                 };
@@ -1341,10 +1568,10 @@ fn spawn_client_tcp_listener(
                 if let Err(e) = handle.identify(link_id, client_identity_hash).await {
                     debug!(peer = %peer, link = ?link_id, error = ?e, "identify failed");
                 }
-                let (reader, writer) = stream::client_stream(&handle, link_id).await;
+                let (reader, writer) = stream::client_stream(&handle, link_id, channel).await;
                 let _ = stream::splice(tcp, reader, writer).await;
                 let _ = handle.close_link(link_id);
-                debug!(peer = %peer, link = ?link_id, "client stream relay ended");
+                debug!(peer = %peer, link = ?link_id, channel, "client stream relay ended");
             });
         }
     });
@@ -1622,11 +1849,6 @@ type ConnectedClients = Arc<RwLock<std::collections::HashMap<LinkId, IdentityHas
 const DEFAULT_SERVER_ANNOUNCE_NAME: &[u8] = b"sc-rns-bridge";
 const DEFAULT_SERVER_ANNOUNCE_NAME_STR: &str = "sc-rns-bridge";
 
-/// The framing generation this build speaks, advertised in the record so a
-/// future channel-id format can be negotiated instead of assumed. Generation 1
-/// is `framing.rs` as frozen by `PLAN.md` §5.
-const FRAMING_GENERATION: u8 = 1;
-
 /// The legacy announce payload: the configured name (trimmed, UTF-8, truncated
 /// to the wire budget), or the fixed default. Byte-identical to v0.1.10.
 pub fn server_announce_name_bytes(name: &Option<String>) -> Vec<u8> {
@@ -1658,7 +1880,7 @@ pub fn server_announce_record(args: &ServerArgs) -> AnnounceRecord {
         .unwrap_or(DEFAULT_SERVER_ANNOUNCE_NAME_STR);
 
     AnnounceRecord {
-        protocol_version: FRAMING_GENERATION,
+        protocol_version: args.profile.protocol_version(),
         flags: AnnounceFlags {
             passworded: args.passworded,
             allowlisted: !args.allowlist.is_empty(),
@@ -1795,6 +2017,29 @@ type ZeroizingIdentity = Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>;
 mod tests {
     use super::*;
 
+    /// The framing generation a *single-port* server announces. Generation 1 is
+    /// `framing.rs` as frozen by `PLAN.md` §5, and it is what every deployed
+    /// peer speaks. A server whose pack declares extra ports announces
+    /// generation 2 instead — `GameProfile::protocol_version` decides.
+    const FRAMING_GENERATION: u8 = framing::FRAMING_V1;
+
+    /// `PLAN.md` §5's gate, at the point where the decision is made. A
+    /// deployed v0.1.10 peer announces generation 1 (or announces a bare name,
+    /// which reads as generation 1), and it would silently mis-reassemble a
+    /// chunk carrying a channel id rather than reject it.
+    #[test]
+    fn a_channel_id_is_never_sent_to_a_peer_that_did_not_advertise_v2() {
+        assert!(may_use_channel(framing::CHANNEL_GAME, framing::FRAMING_V1));
+        assert!(may_use_channel(framing::CHANNEL_GAME, framing::FRAMING_V2));
+        for channel in 1..=framing::MAX_CHANNEL {
+            assert!(
+                !may_use_channel(channel, framing::FRAMING_V1),
+                "channel {channel} must not go to a generation-1 peer"
+            );
+            assert!(may_use_channel(channel, framing::FRAMING_V2));
+        }
+    }
+
     #[test]
     fn server_announce_name_bytes_uses_default_when_unset() {
         assert_eq!(server_announce_name_bytes(&None), DEFAULT_SERVER_ANNOUNCE_NAME);
@@ -1845,7 +2090,10 @@ mod tests {
         assert_eq!(r.map, "svencoop1");
         assert_eq!((r.players, r.max_players), (4, 32));
         assert_eq!(r.min_link_class, 1);
-        assert_eq!(r.protocol_version, FRAMING_GENERATION);
+        assert_eq!(
+            r.protocol_version, FRAMING_GENERATION,
+            "a single-port game announces generation 1, like every deployed peer"
+        );
     }
 
     /// The legacy format must stay byte-identical to v0.1.10, or deployed Sven
@@ -1911,7 +2159,7 @@ mod tests {
     #[test]
     fn every_framed_chunk_fits_the_engine_cap() {
         let datagram = vec![0xabu8; crate::framing::MAX_CHUNK * 3 + 1];
-        for chunk in frame(&datagram) {
+        for chunk in framing::frame(&datagram) {
             assert!(
                 SendToLinkPayload::from_slice(&chunk).is_ok(),
                 "chunk of {} bytes exceeds the engine cap",

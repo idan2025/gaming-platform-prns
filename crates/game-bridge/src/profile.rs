@@ -51,6 +51,32 @@ pub enum GameTransport {
     Tcp,
 }
 
+/// One port a game wants reachable, and the framing channel that carries it.
+///
+/// `GAMES.md` §3: a Source-engine server is a game port **and** an RCON port
+/// (TCP, often the same number) **and** optionally SourceTV. A destination
+/// fronts one port, so the extra ones ride framing channels
+/// (`framing.rs`) or, for a TCP port, their own stream ids (`stream.rs`).
+///
+/// Channel 0 is the game itself and is frozen to framing generation 1, so it is
+/// never listed here: it comes from `default_port` and `transport`, which stay
+/// the single source of truth for the port every peer already speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GamePort {
+    /// Framing channel, 1..=7. Channel 0 is the game port and is implicit.
+    pub channel: u8,
+    /// What this port is, for humans and logs: `"rcon"`, `"tv"`. Never parsed
+    /// into behaviour — a name that selected code would be a pack naming what
+    /// runs.
+    pub name: String,
+    /// Port on the game host.
+    pub port: u16,
+    /// This port's own transport. RCON is TCP on a server whose game port is
+    /// UDP, which is exactly why this is per-port and not per-game.
+    pub transport: GameTransport,
+}
+
 /// Everything the bridge needs to know about one game.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -78,12 +104,27 @@ pub struct GameProfile {
     /// `platform-agent` to give each instance writable space over a shared
     /// read-only copy of the content. Validated before use, never trusted.
     pub writable_paths: Vec<String>,
+    /// Extra ports beyond the game's own, each on its own framing channel
+    /// (`GAMES.md` §3). Empty for every single-port game, which is most of
+    /// them — and a single-port game's wire behaviour is unchanged by this
+    /// field existing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub extra_ports: Vec<GamePort>,
 }
 
 /// Why a profile cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileError {
     EmptyId,
+    /// A port claimed channel 0, which belongs to the game and comes from
+    /// `default_port`.
+    ExtraPortOnGameChannel,
+    /// A channel id the three header bits cannot carry.
+    ChannelTooLarge(u8),
+    /// Two ports claimed the same channel.
+    DuplicateChannel(u8),
+    /// A port has no name, or two share one.
+    BadPortName(String),
     IdTooLong(usize),
     IdNotAscii,
     EmptyAppName,
@@ -101,6 +142,16 @@ impl core::fmt::Display for ProfileError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EmptyId => write!(f, "game id is empty"),
+            Self::ExtraPortOnGameChannel => write!(
+                f,
+                "channel 0 is the game's own port and comes from default_port; an extra port \
+                 cannot claim it (framing generation 1 is frozen there)"
+            ),
+            Self::ChannelTooLarge(c) => {
+                write!(f, "channel {c} is over the maximum of {}", crate::framing::MAX_CHANNEL)
+            }
+            Self::DuplicateChannel(c) => write!(f, "two ports claim channel {c}"),
+            Self::BadPortName(n) => write!(f, "port name {n:?} is empty or duplicated"),
             Self::IdTooLong(n) => {
                 write!(f, "game id is {n} bytes, over the {MAX_GAME_ID_LEN}-byte announce budget")
             }
@@ -122,6 +173,36 @@ impl core::fmt::Display for ProfileError {
 impl std::error::Error for ProfileError {}
 
 impl GameProfile {
+    /// Every port this game wants reachable, channel 0 first.
+    ///
+    /// Channel 0 is synthesized from `default_port`/`transport` rather than
+    /// stored, so there is exactly one place the frozen port is written down.
+    pub fn ports(&self) -> Vec<GamePort> {
+        let mut ports = vec![GamePort {
+            channel: crate::framing::CHANNEL_GAME,
+            name: "game".to_string(),
+            port: self.default_port,
+            transport: self.transport,
+        }];
+        ports.extend(self.extra_ports.iter().cloned());
+        ports
+    }
+
+    /// What this build advertises in an announce.
+    ///
+    /// A single-port game announces generation 1: nothing about it needs
+    /// channels, and announcing a capability it never exercises would put a
+    /// number on the wire that means less than it says. A multi-port game
+    /// announces generation 2, which is what tells a peer it may send a
+    /// non-zero channel here (`framing.rs`).
+    pub fn protocol_version(&self) -> u8 {
+        if self.extra_ports.is_empty() {
+            crate::framing::FRAMING_V1
+        } else {
+            crate::framing::FRAMING_V2
+        }
+    }
+
     /// Sven Co-op, as `idan2025/Svencoop-Prns` v0.1.10 speaks it.
     ///
     /// The values here are **frozen by `PLAN.md` §5**: `app_name` must stay
@@ -143,6 +224,9 @@ impl GameProfile {
                 "svencoop/logs".to_string(),
                 "svencoop/scripts".to_string(),
             ],
+            // GoldSrc plays and answers A2S on one port. Nothing to multiplex,
+            // so it announces framing generation 1 like every deployed peer.
+            extra_ports: Vec::new(),
         }
     }
 
@@ -161,6 +245,22 @@ impl GameProfile {
         }
         if !(1..=3).contains(&self.min_link_class) {
             return Err(ProfileError::UnknownLinkClass(self.min_link_class));
+        }
+        let mut seen_channels = std::collections::BTreeSet::new();
+        let mut seen_names = std::collections::BTreeSet::new();
+        for port in &self.extra_ports {
+            if port.channel == crate::framing::CHANNEL_GAME {
+                return Err(ProfileError::ExtraPortOnGameChannel);
+            }
+            if port.channel > crate::framing::MAX_CHANNEL {
+                return Err(ProfileError::ChannelTooLarge(port.channel));
+            }
+            if !seen_channels.insert(port.channel) {
+                return Err(ProfileError::DuplicateChannel(port.channel));
+            }
+            if port.name.trim().is_empty() || !seen_names.insert(port.name.clone()) {
+                return Err(ProfileError::BadPortName(port.name.clone()));
+            }
         }
         Ok(())
     }

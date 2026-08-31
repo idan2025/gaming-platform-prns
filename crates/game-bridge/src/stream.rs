@@ -53,22 +53,27 @@ use tracing::debug;
 
 pub use personal_rns::runtime::{ByteStreamReader, ByteStreamWriter};
 
-/// Stream id carrying game-client bytes towards the server.
+/// The stream id pair carrying one channel's two directions.
 ///
-/// Fixed rather than negotiated: one link is one connection here, so there is
-/// nothing to multiplex and nothing to agree on. The pair below is the whole
-/// wire contract of the stream relay, and both ends read the direction they do
-/// not write.
-pub const CLIENT_TO_SERVER: StreamId = match StreamId::new(1) {
-    Ok(id) => id,
-    Err(_) => panic!("stream id 1 is in range"),
-};
-
-/// Stream id carrying game-server bytes towards the client.
-pub const SERVER_TO_CLIENT: StreamId = match StreamId::new(2) {
-    Ok(id) => id,
-    Err(_) => panic!("stream id 2 is in range"),
-};
+/// Derived from the channel rather than negotiated: one link is one connection,
+/// so there is nothing to multiplex within a channel and nothing to agree on.
+/// Channel 0 keeps ids 1 and 2, which is what the single-port stream relay
+/// used before extra ports existed.
+///
+/// This is how a TCP extra port (`GAMES.md` §3, RCON beside a game port) rides
+/// a link **without** touching framing's channel bits: those bits are a
+/// datagram concern, and a stream never passes through `frame`.
+pub const fn stream_ids(channel: u8) -> (StreamId, StreamId) {
+    let to_server = match StreamId::new(2 * channel as u16 + 1) {
+        Ok(id) => id,
+        Err(_) => panic!("a channel is at most 7, so its stream ids are small"),
+    };
+    let to_client = match StreamId::new(2 * channel as u16 + 2) {
+        Ok(id) => id,
+        Err(_) => panic!("a channel is at most 7, so its stream ids are small"),
+    };
+    (to_server, to_client)
+}
 
 /// How much of the TCP socket to move per channel write.
 ///
@@ -81,20 +86,20 @@ const COPY_BUF: usize = 16 * 1024;
 pub async fn server_stream(
     handle: &PrnsNodeHandle,
     link_id: LinkId,
+    channel: u8,
 ) -> (ByteStreamReader, ByteStreamWriter) {
-    handle
-        .byte_stream(link_id, CLIENT_TO_SERVER, SERVER_TO_CLIENT)
-        .await
+    let (to_server, to_client) = stream_ids(channel);
+    handle.byte_stream(link_id, to_server, to_client).await
 }
 
 /// Open the client side of a link's byte stream. Mirrors `server_stream`.
 pub async fn client_stream(
     handle: &PrnsNodeHandle,
     link_id: LinkId,
+    channel: u8,
 ) -> (ByteStreamReader, ByteStreamWriter) {
-    handle
-        .byte_stream(link_id, SERVER_TO_CLIENT, CLIENT_TO_SERVER)
-        .await
+    let (to_server, to_client) = stream_ids(channel);
+    handle.byte_stream(link_id, to_client, to_server).await
 }
 
 /// Bytes moved by one splice, socket-to-link and link-to-socket.
@@ -112,13 +117,32 @@ pub struct SpliceTotals {
 /// TCP clients actually do.
 pub async fn splice(
     tcp: TcpStream,
+    reader: ByteStreamReader,
+    writer: ByteStreamWriter,
+) -> io::Result<SpliceTotals> {
+    splice_with_prefix(tcp, reader, writer, Vec::new()).await
+}
+
+/// `splice`, with bytes already read from the stream written to the socket
+/// first.
+///
+/// An extra TCP port is connected **lazily**, on its first byte: a node should
+/// not open an RCON connection to its own game server for every player who
+/// joins, and most links never carry one. Those first bytes are already out of
+/// the reader by then, so they are handed back in here rather than dropped.
+pub async fn splice_with_prefix(
+    tcp: TcpStream,
     mut reader: ByteStreamReader,
     mut writer: ByteStreamWriter,
+    prefix: Vec<u8>,
 ) -> io::Result<SpliceTotals> {
     // Nagle would batch a game's small writes into the latency it is trying to
     // avoid, and every byte here already pays a mesh round trip.
     let _ = tcp.set_nodelay(true);
     let (mut socket_read, mut socket_write) = tcp.into_split();
+    if !prefix.is_empty() {
+        socket_write.write_all(&prefix).await?;
+    }
 
     let to_link = tokio::spawn(async move {
         let mut buf = vec![0u8; COPY_BUF];
@@ -167,4 +191,25 @@ pub async fn splice(
         "stream relay ended"
     );
     Ok(totals)
+}
+
+/// Wait for a stream's first bytes, then connect and splice.
+///
+/// The lazy half of an extra TCP port: the reader is registered when the link
+/// comes up (see the module docs on why that has to be early), but nothing is
+/// connected until a peer actually speaks on it.
+pub async fn splice_on_first_byte(
+    addr: std::net::SocketAddr,
+    mut reader: ByteStreamReader,
+    writer: ByteStreamWriter,
+) -> io::Result<SpliceTotals> {
+    let mut first = vec![0u8; COPY_BUF];
+    let n = reader.read(&mut first).await?;
+    if n == 0 {
+        return Ok(SpliceTotals::default());
+    }
+    let tcp = TcpStream::connect(addr).await?;
+    // The socket did not exist when these arrived, so they go out first.
+    first.truncate(n);
+    splice_with_prefix(tcp, reader, writer, first).await
 }

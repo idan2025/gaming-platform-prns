@@ -268,7 +268,8 @@ platform, and its own release decision.
 Already built for Sven. What generalizing them needs is in `DESIGN.md` §2.1/§2.2:
 parametrized aspect (`SC_ASPECT_SERVER` is hardcoded at `src/relay.rs:189,207`),
 `StreamRelay` for TCP games (**built 2026-08-31**, `stream.rs`), framing v2
-channel ids for multi-port games, and `game-pack` manifests.
+channel ids for multi-port games (**built 2026-08-31**, `GAMES.md` §3), and
+`game-pack` manifests.
 
 **The link allowlist — corrected 2026-08-30, it is not free.** This section
 claimed v0.1.9 (`c9ec90b`) already captured the peer identity at accept, so
@@ -368,8 +369,11 @@ document's own reasoning implies:
 2. ~~**Phase 5's second game — the GoldSrc sibling (app 90).**~~ **Done
    2026-08-31**: `packs/half-life.toml` and `packs/counter-strike-16.toml`, no
    Rust change, which is exactly what `GAMES.md` §7 step 1 exists to prove. The
-   next rung is Source/TF2, and it is not free — it forces blocker B (one
-   destination, several ports) and framing v2.
+   next rung was Source/TF2, and blocker B (one destination, several ports) plus
+   framing v2 is **done 2026-08-31** — a pack's `[[extra_ports]]`, UDP extras on
+   framing channel ids, TCP extras on their own stream ids, and the version gate
+   on the peer's announce (`GAMES.md` §3, `tests/multi_port.rs`). TF2 itself now
+   needs a runtime and a pack, not transport work.
 3. **§11.3 signing with expiry, then §11.4 trust tiers.** Worth doing once
    packs are worth sharing, which is after (1) and (2) widen what a pack can
    describe. `oci` is the last content driver and can wait for a game that

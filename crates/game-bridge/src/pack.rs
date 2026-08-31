@@ -43,7 +43,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::content::{ContentError, PackContent};
-use crate::profile::{GameProfile, GameTransport, ProfileError, QueryProtocol};
+use crate::profile::{GamePort, GameProfile, GameTransport, ProfileError, QueryProtocol};
 
 /// Manifest schema version. Bumped when a field changes meaning, not when one
 /// is added — unknown fields are rejected (see `deny_unknown_fields`), but a
@@ -97,9 +97,42 @@ pub struct GamePack {
     /// place to put a command; see `content.rs`.
     #[serde(default)]
     pub content: PackContent,
+    /// Extra ports this game wants reachable beyond its own, each on a framing
+    /// channel (`GAMES.md` §3). Absent for a single-port game, which is most of
+    /// them.
+    ///
+    /// A port is data — a number, a transport and a label. The label never
+    /// selects behaviour; a pack that could say "run the RCON handler" would be
+    /// naming what runs.
+    #[serde(default)]
+    pub extra_ports: Vec<PackPort>,
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+/// One extra port, as it appears in a pack's `[[extra_ports]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackPort {
+    /// Framing channel, 1..=7. Channel 0 is the game port and is implicit.
+    pub channel: u8,
+    /// What this port is, for humans: `"rcon"`, `"tv"`.
+    pub name: String,
+    pub port: u16,
+    /// This port's own transport — RCON is TCP beside a UDP game port.
+    pub transport: PackTransport,
+}
+
+impl From<&PackPort> for GamePort {
+    fn from(p: &PackPort) -> Self {
+        Self {
+            channel: p.channel,
+            name: p.name.clone(),
+            port: p.port,
+            transport: p.transport.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +222,7 @@ impl GamePack {
             // installs themselves. `manual` is the honest driver for it, not a
             // gap waiting to be filled.
             content: PackContent::default(),
+            extra_ports: Vec::new(),
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -250,6 +284,7 @@ impl GamePack {
             min_link_class: self.min_link_class,
             query: self.query.map(Into::into),
             writable_paths: self.writable_paths.clone(),
+            extra_ports: self.extra_ports.iter().map(GamePort::from).collect(),
         };
         profile.validate()?;
         Ok(profile)

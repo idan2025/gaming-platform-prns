@@ -82,13 +82,32 @@ bridge. Two rules here:
   handshake immediately. Pinned end to end by `tests/stream_relay.rs`, whose
   half-close test is the one an echo-only test would not catch.
 
+**Multi-port is built** (2026-08-31, `GAMES.md` §3): a pack's `[[extra_ports]]`
+puts several of a server's ports on one destination — UDP extras on framing
+generation 2's channel ids, TCP extras on their own stream id pairs
+(`stream::stream_ids`), because a stream never passes through `frame()`. Rules a
+later change could quietly break:
+- **Only a multi-port game announces generation 2**, derived from `extra_ports`
+  by `GameProfile::protocol_version()`.
+- **The gate reads the *peer's* announce, never the local pack.**
+  `relay::may_use_channel` decides, and a legacy announce reads as generation 1.
+  Removing it would not fail any obvious test and would silently corrupt every
+  deployed peer; the ones that catch it are
+  `a_channel_id_is_never_sent_to_a_peer_that_did_not_advertise_v2` and
+  `a_client_with_extra_ports_sends_none_of_them_to_a_v1_server`.
+- **A reply rides the channel its request came in on**, so this side never
+  initiates a channel a peer did not ask for, and a chunk for an undeclared
+  channel is dropped rather than guessed onto a port.
+- **Extra local ports are `listen_port + channel`** (overridable per channel),
+  never the game's own numbers: those belong to the server's host.
+
 **A second game landed as data** (2026-08-31): `packs/half-life.toml` and
 `packs/counter-strike-16.toml`, GoldSrc siblings on steamcmd app 90, with **no
 Rust change** — `GAMES.md` §7 step 1's whole purpose. `tests/second_game.rs`
 reads a pack off disk, runs a server from it and makes a browse node list it,
 and never names the game in code; keep it that way, because a test that hardcodes
 the game stops testing the abstraction. The next rung (Source/TF2) is not free:
-it forces multi-port and framing v2.
+it forced multi-port and framing v2 — both now built.
 
 **Pack distribution has started** (`PLAN.md` §11.2): a pack's `[content]` block
 names a driver — `manual` (what always happened, and the default when the block

@@ -60,6 +60,37 @@ Gate it: put a protocol version in the announce `app_data` and only send a
 non-zero channel to peers that advertised support. Channel 0 stays exactly the
 current wire format forever.
 
+**Built 2026-08-31**, exactly that shape. A pack declares `[[extra_ports]]` —
+`channel`, `name`, `port`, `transport` — and `GameProfile::ports()` puts the
+game's own port on channel 0 in front of them, so the frozen port is written
+down once (`crates/game-bridge/src/profile.rs`). Four rules carry the weight:
+
+- **A UDP extra port rides framing's channel bits; a TCP extra port rides its
+  own stream id pair** — `stream_ids(channel)` in `stream.rs`, channel 0 keeping
+  ids 1 and 2. A stream never passes through `frame()`, so the channel bits are
+  a datagram concern and putting a stream on them would invent a second framing
+  layer (`PLAN.md` §8's `StreamRelay` note).
+- **Only a multi-port game announces generation 2.**
+  `GameProfile::protocol_version()` derives it from `extra_ports` being
+  non-empty. A single-port game announcing a capability it never exercises would
+  put a number on the wire that means less than it says.
+- **The client checks the peer's announce before it sends a channel id, not its
+  own pack.** `relay::may_use_channel` is the gate; a legacy announce, which
+  carries no version at all, reads as generation 1. Pinned by
+  `a_channel_id_is_never_sent_to_a_peer_that_did_not_advertise_v2` and, on a
+  real mesh, `a_client_with_extra_ports_sends_none_of_them_to_a_v1_server`.
+- **A reply rides the channel its request arrived on.** The server never
+  *initiates* a channel, so a v1 peer — which only ever sends channel 0 — only
+  ever receives channel 0, and a chunk for a channel the pack does not declare is
+  dropped rather than guessed onto a port.
+
+Local ports are the player's, not the server's: channel 0 lands on
+`listen_port` and an extra channel on `listen_port + channel` unless the caller
+names one in `extra_listen_ports`. A player whose machine already runs something
+on 27015 should not have a bridge fight it for the port.
+`crates/game-bridge/tests/multi_port.rs` runs a game port, an RCON port and a
+second UDP port across one destination at the same time.
+
 ## 4. Viability tiers — label every pack
 
 The link budget is real and differs per game. `MAX_CHUNK` is 1900 bytes
@@ -128,7 +159,9 @@ Each step is chosen to exercise exactly one new axis:
    runtime argument, so DoD and TFC are two more files whenever somebody wants
    them.
 2. **Team Fortress 2 / CS:S / Garry's Mod** (Source). New: x86_64 runtime,
-   RCON admin channel, multi-port. Forces blocker B.
+   RCON admin channel, multi-port. Forced blocker B, which is **built as of
+   2026-08-31** (§3) — what is left for TF2 itself is the runtime and the pack,
+   not the transport.
 3. **Minetest.** New: non-Steam content source (plain download), no A2S probe.
    Forces the probe and content-source abstractions apart.
 4. **Minecraft Java.** New: TCP transport, JVM runtime, SLP probe,
@@ -142,7 +175,7 @@ cheaper to discover that against a GoldSrc sibling than against a JVM TCP game.
 ## 8. Consequences for `DESIGN.md`
 
 - `game-bridge` grows a `StreamRelay` and a channel-multiplexed framing v2 with
-  announce-advertised version negotiation.
+  announce-advertised version negotiation. **Both built 2026-08-31** (§2, §3).
 - `game-pack` covers all nine axes in §1, plus `min_link_class`, `content.auth`,
   and pre-start gates (EULA).
 - `platform-agent` allocates a **port set** per instance, not a single port, and
