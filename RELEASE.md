@@ -129,9 +129,49 @@ double every engine-pin bump in review.
       `Cargo.toml`.
 - [ ] `README.md`'s status table matches what is actually built.
 
+## Cross-platform artifacts come from CI
+
+`.github/workflows/release.yml` builds what this machine cannot: macOS and
+Windows. A Tauri app cannot honestly be cross-compiled from Linux — macOS needs
+the Apple SDK, Windows needs MSVC and WebView2 — and there are no cross linkers
+here either.
+
+Two jobs, both uploading to the tag's release with `gh release upload --clobber`:
+
+- **cli** — `game-bridge`, `platform-agent`, `platform-index` for
+  `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` and
+  `x86_64-pc-windows-msvc`, packaged with `packs/`.
+- **launcher** — `cargo tauri build` on ubuntu-22.04, macos-14, macos-13 and
+  windows-latest.
+
+It fires on a `v*` tag push, and takes a `tag` input for `workflow_dispatch`
+when the tag already exists:
+
+```sh
+gh workflow run release.yml -f tag=v0.1.0
+```
+
+Two things it has to do that are not obvious, both learned by watching it fail:
+
+- **Windows cannot check out the engine without `core.longpaths`.** The Prns
+  fork carries benchmark result files whose paths exceed 260 characters, and
+  cargo fails before compiling anything with `path too long: ...`. Setting
+  `core.longpaths` is not enough on its own — `CARGO_NET_GIT_FETCH_WITH_CLI=true`
+  is what makes cargo honour it, because libgit2 does not.
+- **`gh release upload` must not be handed an unmatched glob.** Only one archive
+  shape exists per OS, so `dist/*.zip` on Linux failed the job with
+  `no matches found` after a successful build. `nullglob` and an array.
+
 ## What is deliberately not automated
 
-There is no CI in this repo and no release workflow. Two of the checks above
-need a Docker daemon and a second machine on a shared interface, so a green
-pipeline that skipped them would be a worse signal than no pipeline: it would
-report success for the parts that do not need proving.
+The workflow builds and uploads; it gates nothing. Two of the checks above need
+a Docker daemon and a second machine on a shared interface, so a green pipeline
+that skipped them would be a worse signal than no pipeline: it would report
+success for the parts that do not need proving.
+
+## macOS bundles are unsigned
+
+There is no Apple Developer certificate here, so the `.dmg` is neither signed
+nor notarized and Gatekeeper will refuse it on first open. Right-click → Open,
+or `xattr -d com.apple.quarantine`. Signing is a paid account and a decision
+about identity, not a build flag.

@@ -350,6 +350,27 @@ decision.
 
 ## 8. Ordering
 
+### v0.1.0 is tagged and released (2026-08-31)
+
+`v0.1.0` on `main`, with a GitHub release carrying four artifacts: the launcher
+(`.deb`/`.rpm`/`.AppImage` on Linux, `.dmg` on macOS, an installer on Windows),
+and `game-bridge` / `platform-agent` / `platform-index` per target.
+`RELEASE.md` has the mechanics and `.github/workflows/release.yml` builds what
+this machine cannot.
+
+Two things about that release are worth keeping in view rather than in a
+changelog:
+
+- **`game-bridge` had to be written for it.** Two of the four roles in §1 —
+  Host and Relay — had no artifact at all: the launcher joins and browses, the
+  agent orchestrates containers. A platform whose whole premise is "host a
+  server without infrastructure" shipped no way to host from a terminal. That is
+  the kind of gap only packaging finds.
+- **Two checklist items are unverified**, both needing hardware this was built
+  without: a two-machine test over a shared interface, and a deployed
+  `svencoop-prns` v0.1.10 peer listing and joining. The second is §5's promise to
+  people who already installed something, so it is the more important of the two.
+
 ### Where this stands, and the next three things (2026-08-31)
 
 Phases 1-3 are done. Phase 4 is built through multi-node. Pack distribution
