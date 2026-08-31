@@ -1,0 +1,140 @@
+name: release
+
+# Cross-platform artifacts for a tag. This machine builds Linux x86_64; macOS
+# and Windows come from runners, because a Tauri app cannot honestly be
+# cross-compiled from Linux (macOS needs the Apple SDK, Windows needs MSVC and
+# WebView2) — see RELEASE.md.
+#
+# Nothing here gates a release: the checks that matter need a Docker daemon and
+# a second machine on a shared interface, and a green pipeline that skipped them
+# would be a worse signal than no pipeline. This job only builds and uploads.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and upload to (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli:
+    name: cli ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # game-bridge, platform-agent, platform-index. The launcher is a separate
+      # job because it needs a webview toolchain.
+      - name: Build
+        run: cargo build --release --bins
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          name="gaming-platform-prns-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/game-bridge target/release/platform-agent target/release/platform-index "dist/$name/"
+          cp -r packs "dist/$name/packs"
+          cp README.md RELEASE.md ENGINE.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "gaming-platform-prns-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/release/game-bridge.exe,target/release/platform-agent.exe,target/release/platform-index.exe "dist/$name/"
+          Copy-Item -Recurse packs "dist/$name/packs"
+          Copy-Item README.md,RELEASE.md,ENGINE.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash | Out-File "dist/$name.zip.sha256"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "${{ inputs.tag || github.ref_name }}" dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber
+
+  launcher:
+    name: launcher ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+          key: launcher-${{ matrix.os }}
+
+      # WebKitGTK and the AppImage tooling. librsvg2-dev is not optional:
+      # without it linuxdeploy's gtk plugin fails after the deb and rpm have
+      # already succeeded (RELEASE.md).
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf file rpm
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Bundle
+        working-directory: launcher/src-tauri
+        run: cargo tauri build
+
+      - name: Collect bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find launcher/src-tauri/target/release/bundle -maxdepth 2 \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) \
+            -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "${{ inputs.tag || github.ref_name }}" dist/* --clobber
