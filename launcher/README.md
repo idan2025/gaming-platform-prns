@@ -21,6 +21,29 @@ Two rules the frontend has to keep, both from `launcher-core`'s own docs:
   asymmetric and an allowlisted server refuses probes on purpose, so the detail
   pane says so — it does not raise an error banner or call the server offline.
 
+## Looking at it
+
+There is no screenshot tooling on this machine, but Xvfb and ffmpeg are enough:
+
+```sh
+Xvfb :99 -screen 0 1280x800x24 &
+DISPLAY=:99 ./src-tauri/target/release/mesh-game-servers &
+# WebKit takes ~30s to map a window on a cold start here
+DISPLAY=:99 ffmpeg -f x11grab -video_size 1280x800 -i :99 -frames:v 1 -y shot.png
+```
+
+**WebKitGTK caches the embedded frontend per app identifier.** A CSS or JS
+change that does not appear after a rebuild is almost always that cache, not the
+build:
+
+```sh
+rm -rf ~/.local/share/org.idan2025.gamingplatformprns.launcher
+```
+
+This cost an hour once: two correct rebuilds in a row rendered the old
+stylesheet, which looked exactly like `cargo build` failing to re-embed
+`dist/`.
+
 ## Checks
 
 ```sh

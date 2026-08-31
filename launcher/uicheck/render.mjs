@@ -8,7 +8,13 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 import fs from 'node:fs';
 
 const DIST = new URL('../dist/', import.meta.url).pathname;
-const html = fs.readFileSync(`${DIST}index.html`, 'utf8');
+// The stylesheet is inlined so jsdom actually applies it: a `display` rule can
+// defeat the `hidden` attribute, which is how the detail pane once held a third
+// of the window while "closed".
+const css = fs.readFileSync(`${DIST}style.css`, 'utf8');
+const html = fs
+  .readFileSync(`${DIST}index.html`, 'utf8')
+  .replace('<link rel="stylesheet" href="style.css">', `<style>${css}</style>`);
 const appJs = fs.readFileSync(`${DIST}app.js`, 'utf8');
 
 const failures = [];
@@ -104,6 +110,21 @@ async function run(label, scenario, assertions) {
 }
 
 const running = { running: true, interfaces: [{ id: '1', label: 'tcp/127.0.0.1:4242', connected: true }], heard_total: 2 };
+
+await run('closed panes take no space', {
+  status: running,
+  rows: () => [row()],
+}, (win, doc) => {
+  // `.detail { display: flex }` is an author rule and beats the UA's
+  // `[hidden] { display: none }`, so the attribute alone is not enough.
+  const detail = doc.querySelector('#detail');
+  check('the detail pane is hidden before anything is selected', detail.hidden);
+  check(
+    'a hidden detail pane is display:none, not an empty column',
+    win.getComputedStyle(detail).display === 'none',
+    win.getComputedStyle(detail).display
+  );
+});
 
 await run('two servers', {
   status: running,

@@ -463,6 +463,11 @@ input:focus-visible, select:focus-visible {
 }
 
 .hidden { display: none !important; }
+/* The detail pane is toggled with the `hidden` *attribute* (`app.js`), and
+   `.detail` sets `display: flex`. An author rule beats the UA's
+   `[hidden] { display: none }`, so without this the closed pane still held its
+   340px column and a third of the window sat empty. */
+[hidden] { display: none !important; }
 
 @media (max-width: 720px) {
   .topbar { flex-wrap: wrap; gap: 8px; }

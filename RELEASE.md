@@ -79,6 +79,11 @@ that fails without them:
   cannot be produced on the same air-gapped machine that `cargo vendor` was
   meant to serve. Build it somewhere with a network and ship the artifact.
 
+**A stale frontend is a cache, not a build failure.** WebKitGTK keeps the
+embedded assets under `~/.local/share/<bundle identifier>`; delete that
+directory when a CSS or JS change does not appear in a rebuilt launcher
+(`launcher/README.md`).
+
 Windows and macOS bundles have not been produced or tested from this repo.
 `webviewInstallMode: offlineInstaller` is set for the Windows case
 (`PLAN.md` §9): a genuinely offline machine that lacks WebView2 could otherwise
