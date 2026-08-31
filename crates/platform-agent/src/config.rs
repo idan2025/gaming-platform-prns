@@ -42,6 +42,19 @@ pub const INSTANCE_LABEL: &str = "org.idan2025.gaming-platform-prns.instance";
 /// index needs no database of its own.
 pub const OWNER_LABEL: &str = "org.idan2025.gaming-platform-prns.owner";
 
+/// Label carrying the instance's whole port set, as `channel:host_port/proto`
+/// separated by commas — `"0:27151/udp,1:27152/tcp"`.
+///
+/// Docker reports published ports, but not which of them is the game and which
+/// is RCON, and the mapping is exactly what an agent must not guess: a restarted
+/// agent has to give the same answer as the one that created the container. The
+/// container is the record here for the same reason it is for ownership.
+pub const PORTS_LABEL: &str = "org.idan2025.gaming-platform-prns.ports";
+
+/// Label carrying the game id, so a listing can name the game of a container
+/// this agent run did not create.
+pub const GAME_LABEL: &str = "org.idan2025.gaming-platform-prns.game";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {

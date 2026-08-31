@@ -179,6 +179,10 @@ cheaper to discover that against a GoldSrc sibling than against a JVM TCP game.
 - `game-pack` covers all nine axes in §1, plus `min_link_class`, `content.auth`,
   and pre-start gates (EULA).
 - `platform-agent` allocates a **port set** per instance, not a single port, and
-  dedupes content **per game**, not per instance.
+  dedupes content **per game**, not per instance. **Port sets built 2026-08-31**
+  (`ports.rs::acquire`, all-or-nothing): one host port per port the pack
+  declares, each published in its own transport, recorded on the container in
+  `PORTS_LABEL` so a restarted agent gives the same answer as the one that
+  created it.
 - `platform-api` filters the deploy catalog by what a node can actually run:
   link class, runtime arch, and whether the operator supplied content credentials.

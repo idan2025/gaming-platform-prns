@@ -27,8 +27,8 @@ use tokio::sync::Mutex;
 
 use crate::config::AgentConfig;
 use crate::content::{ProvisionError, Provisioned, Provisioner};
-use crate::docker::DockerRuntime;
-use crate::instance::{InstanceSpec, InstanceState, InstanceStatus};
+use crate::docker::{DockerRuntime, PublishedPort};
+use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus};
 use crate::ports::PortAllocator;
 use crate::store::{ContentRef, InstancePlan, StoreLayout};
 
@@ -54,7 +54,19 @@ impl Agent {
         // Seed the allocator from what is already running, or the agent will
         // hand out a port a live instance is using.
         let running = docker.list_managed().await?;
-        let reserved: Vec<u16> = running.iter().filter_map(|c| c.port).collect();
+        // Every port of every live instance, not just its game port: an RCON
+        // port handed to a second instance is the same collision as a game port
+        // handed twice.
+        let reserved: Vec<u16> = running
+            .iter()
+            .flat_map(|c| {
+                let mut ports: Vec<u16> = c.ports.iter().map(|p| p.host_port).collect();
+                if ports.is_empty() {
+                    ports.extend(c.port);
+                }
+                ports
+            })
+            .collect();
         let ports = PortAllocator::with_reserved(config.port_range, &reserved);
 
         let layout = StoreLayout::new(config.data_root.clone());
@@ -216,27 +228,52 @@ impl Agent {
             .config
             .runtime_for(&spec.game_id)
             .ok_or_else(|| anyhow!("no runtime for {:?}", spec.game_id))?;
+        let pack = self
+            .packs
+            .get(&spec.game_id)
+            .ok_or_else(|| anyhow!("no game pack installed for {:?}", spec.game_id))?;
 
-        let port = {
-            let mut ports = self.ports.lock().await;
-            match spec.port {
-                Some(p) => {
-                    ports.reserve(p).map_err(|e| anyhow!("{e}"))?;
-                    p
+        // What this game wants reachable: channel 0 from `default_port`, plus
+        // whatever the pack declares as extra ports (`GAMES.md` §3). The pack
+        // decides which ports exist; the node decides what they are reachable
+        // as.
+        let profile = pack.to_profile().map_err(|e| anyhow!("invalid game pack: {e}"))?;
+        let wanted = profile.ports();
+        let requested: Vec<Option<u16>> = wanted
+            .iter()
+            .map(|p| {
+                if p.channel == game_bridge::framing::CHANNEL_GAME {
+                    spec.port
+                } else {
+                    spec.extra_ports.get(&p.channel).copied()
                 }
-                None => ports.allocate().map_err(|e| anyhow!("{e}"))?,
-            }
+            })
+            .collect();
+        let host_ports = {
+            let mut ports = self.ports.lock().await;
+            ports.acquire(&requested).map_err(|e| anyhow!("{e}"))?
         };
+        let published: Vec<PublishedPort> = wanted
+            .iter()
+            .zip(&host_ports)
+            .map(|(p, &host_port)| PublishedPort {
+                channel: p.channel,
+                container_port: p.port,
+                host_port,
+                transport: p.transport,
+            })
+            .collect();
 
         let started = self
             .docker
-            .create_and_start(&spec, runtime, &plan.mounts, port)
+            .create_and_start(&spec, runtime, &plan.mounts, &published)
             .await;
         let container_id = match started {
             Ok(id) => id,
             Err(e) => {
-                // Give the port back, or a failed start leaks one every attempt.
-                self.ports.lock().await.release(port);
+                // Give the whole set back, or a failed start leaks a port per
+                // channel on every attempt.
+                self.ports.lock().await.release_all(&host_ports);
                 return Err(e);
             }
         };
@@ -251,7 +288,18 @@ impl Agent {
             game_id: spec.game_id,
             name: spec.name,
             state: InstanceState::Running,
-            port: Some(port),
+            port: published
+                .iter()
+                .find(|p| p.channel == game_bridge::framing::CHANNEL_GAME)
+                .map(|p| p.host_port),
+            ports: published
+                .iter()
+                .map(|p| InstancePort {
+                    channel: p.channel,
+                    host_port: p.host_port,
+                    transport: p.transport,
+                })
+                .collect(),
             container_id: Some(container_id),
             uptime_secs: None,
             owner: spec.owner,
@@ -264,20 +312,27 @@ impl Agent {
 
     /// Stop and remove, returning the port to the pool.
     pub async fn remove(&self, instance_id: &str) -> Result<()> {
-        let port = self
+        let held: Vec<u16> = self
             .docker
             .list_managed()
             .await?
             .into_iter()
             .find(|c| c.instance_id == instance_id)
-            .and_then(|c| c.port);
+            .map(|c| {
+                let mut ports: Vec<u16> = c.ports.iter().map(|p| p.host_port).collect();
+                // A container from a build before the port label still has its
+                // game port to give back.
+                if ports.is_empty() {
+                    ports.extend(c.port);
+                }
+                ports
+            })
+            .unwrap_or_default();
         // Stopping first is politeness, not correctness: `remove` forces. But a
         // game server that is killed outright loses whatever it was flushing.
         let _ = self.docker.stop(instance_id).await;
         self.docker.remove(instance_id).await?;
-        if let Some(p) = port {
-            self.ports.lock().await.release(p);
-        }
+        self.ports.lock().await.release_all(&held);
         self.specs.lock().await.remove(instance_id);
         Ok(())
     }
@@ -308,6 +363,7 @@ impl Agent {
                     instance_id: c.instance_id,
                     state: c.state,
                     port: c.port,
+                    ports: c.ports,
                     container_id: Some(c.container_id),
                     uptime_secs: None,
                 }

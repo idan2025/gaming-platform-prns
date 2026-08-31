@@ -1,5 +1,8 @@
 //! What the agent is asked to run, and what it currently is.
 
+use std::collections::BTreeMap;
+
+use game_bridge::profile::GameTransport;
 use serde::{Deserialize, Serialize};
 
 /// Longest instance id. Matches the store planner's cap, because an id becomes
@@ -28,6 +31,16 @@ pub struct InstanceSpec {
     /// had across a restart.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Fixed host ports for the game's *extra* channels (`GAMES.md` §3), keyed
+    /// by channel. Same purpose as `port` and the same default: absent means
+    /// "allocate one".
+    ///
+    /// Which channels exist is the pack's business, not the caller's — a
+    /// channel named here that the pack does not declare is ignored rather than
+    /// honoured, because a spec that could open a port the game never asked for
+    /// is a spec choosing what the node exposes.
+    #[serde(default)]
+    pub extra_ports: BTreeMap<u8, u16>,
     /// Who asked for this, when something else is deploying on a user's behalf.
     /// An identity hash in hex; opaque to the agent.
     ///
@@ -58,13 +71,34 @@ pub enum InstanceState {
     Unknown,
 }
 
+/// One published port of a running instance: which channel it serves, which
+/// host port it landed on, and in which transport.
+///
+/// `host_port` is the node's, allocated from the operator's range; the port
+/// *inside* the container is the pack's own number and is not reported, because
+/// nothing outside the node can reach it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstancePort {
+    pub channel: u8,
+    pub host_port: u16,
+    pub transport: GameTransport,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceStatus {
     pub instance_id: String,
     pub game_id: String,
     pub name: String,
     pub state: InstanceState,
+    /// The game's own port — channel 0, and the one a player connects to. Kept
+    /// as its own field rather than "the first of `ports`": it is the existing
+    /// contract, and every single-port game has exactly this and nothing else.
     pub port: Option<u16>,
+    /// Every port this instance publishes, channel 0 included. Empty for a
+    /// container started by a build that predates port sets, which is why
+    /// `port` is still read on its own.
+    #[serde(default)]
+    pub ports: Vec<InstancePort>,
     pub container_id: Option<String>,
     /// Seconds since the container started, when it is running.
     #[serde(default)]
@@ -159,7 +193,8 @@ mod tests {
             name: "Test".to_string(),
             max_players: 8,
             port: None,
-        owner: None,
+            extra_ports: BTreeMap::new(),
+            owner: None,
         }
     }
 

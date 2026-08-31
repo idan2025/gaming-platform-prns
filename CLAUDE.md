@@ -101,6 +101,21 @@ later change could quietly break:
 - **Extra local ports are `listen_port + channel`** (overridable per channel),
   never the game's own numbers: those belong to the server's host.
 
+The agent hosts a multi-port game too (2026-08-31): `ports.rs::acquire` takes a
+whole set or none, `PublishedPort` carries the container-side and host-side
+numbers separately, and each port is published in its own transport. Rules:
+- **A port set is all-or-nothing.** A half-allocated instance never starts and
+  leaks the rest of its set on every retry (`a_set_that_does_not_fit_gives_back_everything_it_took`).
+- **The container is the record for ports, as it is for ownership.**
+  `PORTS_LABEL` carries `channel:host_port/proto`, so a restarted agent knows
+  which published port is the game and which is RCON; Docker alone cannot say.
+  Seeding and release both read the whole set, not just `port`.
+- **The container-side number is the pack's, the host-side is the node's.** A
+  Source server binds 27015 inside whichever node it lands on; what that is
+  reachable as outside comes from the operator's range.
+- **The index passes a port set through, never invents one.** Only the node
+  knows what is free there.
+
 **A second game landed as data** (2026-08-31): `packs/half-life.toml` and
 `packs/counter-strike-16.toml`, GoldSrc siblings on steamcmd app 90, with **no
 Rust change** — `GAMES.md` §7 step 1's whole purpose. `tests/second_game.rs`

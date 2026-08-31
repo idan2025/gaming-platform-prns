@@ -275,6 +275,7 @@ mod tests {
             name: "test".to_string(),
             max_players: 8,
             port: None,
+            extra_ports: Default::default(),
             owner: None,
         }
     }
@@ -286,6 +287,7 @@ mod tests {
             name: id.to_string(),
             state: InstanceState::Running,
             port: Some(27100),
+            ports: Vec::new(),
             container_id: Some("abc".to_string()),
             uptime_secs: None,
             owner: None,

@@ -77,6 +77,33 @@ impl PortAllocator {
         self.range
     }
 
+    /// Take a whole port set at once — one host port per port the game
+    /// declares (`GAMES.md` §3: a Source server is a game port *and* an RCON
+    /// port *and* maybe SourceTV).
+    ///
+    /// A `Some(p)` slot asks for that exact port, a `None` slot takes whatever
+    /// is next. **All or nothing**: a set that cannot be satisfied in full
+    /// gives every port back before returning, because a half-allocated
+    /// instance is one that never starts and leaks the rest of its set on every
+    /// retry.
+    pub fn acquire(&mut self, requested: &[Option<u16>]) -> Result<Vec<u16>, PortError> {
+        let mut taken = Vec::with_capacity(requested.len());
+        for slot in requested {
+            let got = match slot {
+                Some(p) => self.reserve(*p).map(|()| *p),
+                None => self.allocate(),
+            };
+            match got {
+                Ok(p) => taken.push(p),
+                Err(e) => {
+                    self.release_all(&taken);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(taken)
+    }
+
     pub fn allocate(&mut self) -> Result<u16, PortError> {
         match self.free.pop_front() {
             Some(port) => {
@@ -104,6 +131,13 @@ impl PortAllocator {
     pub fn release(&mut self, port: u16) {
         if self.held.remove(&port) && self.range.contains(port) {
             self.free.push_back(port);
+        }
+    }
+
+    /// Give a whole set back, for an instance that is going away.
+    pub fn release_all(&mut self, ports: &[u16]) {
+        for &port in ports {
+            self.release(port);
         }
     }
 
@@ -186,6 +220,46 @@ mod tests {
             a.reserve(80),
             Err(PortError::OutOfRange { port: 80, range: range(27100, 27102) })
         );
+    }
+
+    /// A game with an RCON port and a TV port needs three host ports, and it
+    /// needs all three or none: a container that starts with two of them is a
+    /// server missing a port nobody can reach.
+    #[test]
+    fn a_port_set_is_taken_whole() {
+        let mut a = PortAllocator::new(range(27100, 27102));
+        let set = a.acquire(&[None, None, None]).unwrap();
+        assert_eq!(set, vec![27100, 27101, 27102]);
+        assert_eq!(a.available(), 0);
+    }
+
+    /// The all-or-nothing half, which is the one that matters: a failed acquire
+    /// must leave the pool exactly as it found it, or every retry burns ports.
+    #[test]
+    fn a_set_that_does_not_fit_gives_back_everything_it_took() {
+        let mut a = PortAllocator::new(range(27100, 27101));
+        assert_eq!(
+            a.acquire(&[None, None, None]),
+            Err(PortError::Exhausted { range: range(27100, 27101) })
+        );
+        assert_eq!(a.available(), 2, "a failed set must not hold anything");
+        assert!(a.held().is_empty());
+        assert_eq!(a.acquire(&[None, None]).unwrap(), vec![27100, 27101]);
+    }
+
+    /// A fixed slot is for an instance that must keep the port it had — an
+    /// RCON port somebody wrote into a firewall rule, say. A taken one fails
+    /// the whole set rather than quietly handing out a different port.
+    #[test]
+    fn a_set_can_pin_some_ports_and_let_the_rest_float() {
+        let mut a = PortAllocator::new(range(27100, 27103));
+        let set = a.acquire(&[Some(27102), None]).unwrap();
+        assert_eq!(set, vec![27102, 27100]);
+
+        let mut b = PortAllocator::new(range(27100, 27103));
+        b.reserve(27101).unwrap();
+        assert_eq!(b.acquire(&[None, Some(27101)]), Err(PortError::AlreadyHeld(27101)));
+        assert_eq!(b.available(), 3, "the floating port taken first must come back");
     }
 
     /// After a restart the agent rebuilds from what is actually running. If it

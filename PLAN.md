@@ -373,7 +373,8 @@ document's own reasoning implies:
    framing v2 is **done 2026-08-31** — a pack's `[[extra_ports]]`, UDP extras on
    framing channel ids, TCP extras on their own stream ids, and the version gate
    on the peer's announce (`GAMES.md` §3, `tests/multi_port.rs`). TF2 itself now
-   needs a runtime and a pack, not transport work.
+   needs a runtime and a pack, not transport work — the node-side half (a port
+   set per instance) is done too, same day.
 3. **§11.3 signing with expiry, then §11.4 trust tiers.** Worth doing once
    packs are worth sharing, which is after (1) and (2) widen what a pack can
    describe. `oci` is the last content driver and can wait for a game that
@@ -475,7 +476,13 @@ bridge.
   copy per instance does not scale), port allocation. Agent has a local API; still
   no central service.
 
-  **Built 2026-08-30**, with one correction and one finding.
+  **Built 2026-08-30**, with one correction and one finding, and **extended to
+  port sets 2026-08-31** so a multi-port game (`GAMES.md` §3) can be hosted:
+  `ports.rs::acquire` takes one host port per port the pack declares or none at
+  all, `PublishedPort` keeps the container-side number (the pack's) apart from
+  the host-side one (the node's), and the whole set is recorded on the container
+  in `PORTS_LABEL` — Docker reports published ports but not which is the game and
+  which is RCON, and a restarted agent must not guess.
 
   *The overlay is not an overlay.* Mounting overlayfs inside a container needs
   `CAP_SYS_ADMIN`, and a game server is the last process that should have it. So

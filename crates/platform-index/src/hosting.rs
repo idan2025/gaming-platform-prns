@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use personal_rns::prelude::DestinationHash;
+use platform_agent::instance::InstancePort;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -124,6 +125,20 @@ impl HostingConfig {
     }
 }
 
+/// Read a node's port set out of its JSON reply.
+///
+/// A row this build cannot parse is skipped rather than failing the listing:
+/// the index is a cache, and a node speaking a shape it does not recognise is
+/// still a node whose instances a user has to be able to see and stop.
+fn ports_from_json(value: &serde_json::Value) -> Vec<InstancePort> {
+    let Some(rows) = value.as_array() else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| serde_json::from_value(row.clone()).ok())
+        .collect()
+}
+
 /// One hosted instance, as the index reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedInstance {
@@ -132,7 +147,16 @@ pub struct HostedInstance {
     pub game_id: String,
     pub name: String,
     pub state: String,
+    /// The game's own port, which is what a player needs.
     pub port: Option<u16>,
+    /// Every port the node published for this instance, channel 0 included
+    /// (`GAMES.md` §3). Empty for a single-port game and for a node running a
+    /// build that predates port sets, which is why `port` stays on its own.
+    ///
+    /// Passed through, never invented: the node allocated these and the index
+    /// is a cache of what the node says.
+    #[serde(default)]
+    pub ports: Vec<InstancePort>,
     pub owner: Option<String>,
 }
 
@@ -249,6 +273,7 @@ impl Hosting {
                     name: r.name,
                     state: format!("{:?}", r.state).to_ascii_lowercase(),
                     port: r.port,
+                    ports: r.ports,
                     owner: r.owner,
                 })
                 .collect());
@@ -273,6 +298,7 @@ impl Hosting {
                 name: r["name"].as_str().unwrap_or_default().to_string(),
                 state: r["state"].as_str().unwrap_or("unknown").to_string(),
                 port: r["port"].as_u64().map(|p| p as u16),
+                ports: ports_from_json(&r["ports"]),
                 owner: r["owner"].as_str().map(str::to_string),
             })
             .collect())
@@ -351,7 +377,11 @@ impl Hosting {
                 game_id: request.game_id.clone(),
                 name: request.name.clone(),
                 max_players: request.max_players,
+                // The node picks every port, game and extras alike. An index
+                // that named one would be choosing from the wrong side of the
+                // machine: only the node knows what is free there.
                 port: None,
+                extra_ports: Default::default(),
                 owner: None,
             };
             let created = client
@@ -365,6 +395,7 @@ impl Hosting {
                 name: request.name.clone(),
                 state: format!("{:?}", created.state).to_ascii_lowercase(),
                 port: created.port,
+                ports: created.ports,
                 owner: Some(account.0.clone()),
             });
         }
@@ -400,6 +431,7 @@ impl Hosting {
             name: request.name.clone(),
             state: created["state"].as_str().unwrap_or("unknown").to_string(),
             port: created["port"].as_u64().map(|p| p as u16),
+            ports: ports_from_json(&created["ports"]),
             owner: Some(account.0.clone()),
         })
     }
@@ -567,6 +599,34 @@ mod tests {
         assert!(!nasty.contains('.') || nasty.starts_with("etcpasswd-"), "{nasty}");
     }
 
+    /// A node's port set has to survive the HTTP hop intact, or a user hosting
+    /// a Source server is told the game port and left guessing at RCON. A row
+    /// this build cannot read is skipped, never fatal — the index is a cache.
+    #[test]
+    fn a_nodes_port_set_survives_the_json_hop() {
+        // `Udp`/`Tcp`, not `udp`/`tcp`: `GameTransport` serializes by variant
+        // name everywhere else a launcher or index reads it, and this is the
+        // same enum, not a second spelling of it.
+        let ports = ports_from_json(&serde_json::json!([
+            {"channel": 0, "host_port": 27151, "transport": "Udp"},
+            {"channel": 1, "host_port": 27152, "transport": "Tcp"}
+        ]));
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[1].host_port, 27152);
+        assert_eq!(ports[1].transport, game_bridge::profile::GameTransport::Tcp);
+
+        assert!(ports_from_json(&serde_json::Value::Null).is_empty());
+
+        // One unreadable row costs that row, not the whole set — and it is
+        // never guessed into a port number.
+        let mixed = ports_from_json(&serde_json::json!([
+            {"channel": 0},
+            {"channel": 1, "host_port": 27152, "transport": "Tcp"}
+        ]));
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].channel, 1);
+    }
+
     #[test]
     fn a_node_is_picked_by_load() {
         let mut c = config();
@@ -579,6 +639,7 @@ mod tests {
             name: "a".into(),
             state: "running".into(),
             port: None,
+            ports: Vec::new(),
             owner: None,
         }];
         assert_eq!(h.pick_node(&existing).unwrap().name, "second");

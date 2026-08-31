@@ -27,8 +27,11 @@ use bollard::container::{
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
 
-use crate::config::{GameRuntime, INSTANCE_LABEL, MANAGED_LABEL, OWNER_LABEL};
-use crate::instance::{InstanceSpec, InstanceState};
+use game_bridge::framing::CHANNEL_GAME;
+use game_bridge::profile::GameTransport;
+
+use crate::config::{GameRuntime, GAME_LABEL, INSTANCE_LABEL, MANAGED_LABEL, OWNER_LABEL, PORTS_LABEL};
+use crate::instance::{InstancePort, InstanceSpec, InstanceState};
 use crate::store::Mount;
 
 /// How long a container gets to exit on its own before Docker kills it.
@@ -59,13 +62,78 @@ pub struct DockerRuntime {
     docker: Docker,
 }
 
+/// One port to publish: the number the game binds *inside* the container, the
+/// node's port it appears on outside, and which transport.
+///
+/// The container-side number comes from the pack (`GameProfile::ports()`) and
+/// the host-side one from the node's allocator, which is the whole reason they
+/// are separate fields: the game's port numbers are the game's business and the
+/// node's range is the operator's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedPort {
+    pub channel: u8,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub transport: GameTransport,
+}
+
+fn proto(transport: GameTransport) -> &'static str {
+    match transport {
+        GameTransport::Udp => "udp",
+        GameTransport::Tcp => "tcp",
+    }
+}
+
+/// Render a port set for `PORTS_LABEL`: `channel:host_port/proto`, comma
+/// separated.
+fn encode_ports_label(ports: &[PublishedPort]) -> String {
+    ports
+        .iter()
+        .map(|p| format!("{}:{}/{}", p.channel, p.host_port, proto(p.transport)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Read a port set back off a container.
+///
+/// Tolerant on purpose: an entry this build cannot parse is skipped rather than
+/// failing the whole listing, because the alternative is an agent that cannot
+/// see — and therefore cannot stop — a container it created.
+fn decode_ports_label(label: &str) -> Vec<InstancePort> {
+    label
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            let (channel, rest) = entry.split_once(':')?;
+            let (port, proto) = rest.split_once('/')?;
+            let transport = match proto {
+                "udp" => GameTransport::Udp,
+                "tcp" => GameTransport::Tcp,
+                _ => return None,
+            };
+            Some(InstancePort {
+                channel: channel.parse().ok()?,
+                host_port: port.parse().ok()?,
+                transport,
+            })
+        })
+        .collect()
+}
+
 /// What Docker says about one managed container.
 #[derive(Debug, Clone)]
 pub struct ManagedContainer {
     pub instance_id: String,
     pub container_id: String,
     pub state: InstanceState,
+    /// The game's own port — channel 0 of the port set. Falls back to whatever
+    /// Docker reports published when the container carries no port label,
+    /// because a container created by an older build is still this agent's to
+    /// manage.
     pub port: Option<u16>,
+    /// The whole port set, off `PORTS_LABEL`. Empty for a container that
+    /// predates the label.
+    pub ports: Vec<InstancePort>,
     pub owner: Option<String>,
     pub game_id: Option<String>,
 }
@@ -109,18 +177,27 @@ impl DockerRuntime {
                     // "stopped": saying so would report a running server as down.
                     _ => InstanceState::Unknown,
                 };
-                let port = c.ports.as_ref().and_then(|ports| {
-                    ports.iter().find_map(|p| p.public_port)
-                });
+                let ports = labels
+                    .get(PORTS_LABEL)
+                    .map(|l| decode_ports_label(l))
+                    .unwrap_or_default();
+                let port = ports
+                    .iter()
+                    .find(|p| p.channel == CHANNEL_GAME)
+                    .map(|p| p.host_port)
+                    .or_else(|| {
+                        c.ports
+                            .as_ref()
+                            .and_then(|ports| ports.iter().find_map(|p| p.public_port))
+                    });
                 Some(ManagedContainer {
                     instance_id,
                     container_id: c.id.unwrap_or_default(),
                     state,
                     port,
+                    ports,
                     owner: labels.get(OWNER_LABEL).cloned(),
-                    game_id: labels
-                        .get("org.idan2025.gaming-platform-prns.game")
-                        .cloned(),
+                    game_id: labels.get(GAME_LABEL).cloned(),
                 })
             })
             .collect())
@@ -160,14 +237,15 @@ impl DockerRuntime {
         spec: &InstanceSpec,
         runtime: &GameRuntime,
         mounts: &[Mount],
-        host_port: u16,
+        ports: &[PublishedPort],
     ) -> Result<String> {
         let name = spec.container_name();
 
         let mut labels = HashMap::new();
         labels.insert(MANAGED_LABEL.to_string(), "1".to_string());
         labels.insert(INSTANCE_LABEL.to_string(), spec.instance_id.clone());
-        labels.insert("org.idan2025.gaming-platform-prns.game".to_string(), spec.game_id.clone());
+        labels.insert(GAME_LABEL.to_string(), spec.game_id.clone());
+        labels.insert(PORTS_LABEL.to_string(), encode_ports_label(ports));
         if let Some(owner) = &spec.owner {
             labels.insert(OWNER_LABEL.to_string(), owner.clone());
         }
@@ -186,15 +264,24 @@ impl DockerRuntime {
             })
             .collect();
 
-        let container_port = format!("{}/udp", spec.port.unwrap_or(host_port));
+        // The container side is the pack's own number and the host side is the
+        // node's — a Source server binds 27015 inside whichever node it lands
+        // on, and the operator's range decides what that is reachable as
+        // outside. One binding per declared port, in that port's transport:
+        // publishing RCON as UDP would be a port that answers nothing.
         let mut port_bindings = HashMap::new();
-        port_bindings.insert(
-            container_port.clone(),
-            Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(host_port.to_string()),
-            }]),
-        );
+        let mut exposed = HashMap::new();
+        for p in ports {
+            let container_port = format!("{}/{}", p.container_port, proto(p.transport));
+            port_bindings.insert(
+                container_port.clone(),
+                Some(vec![PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some(p.host_port.to_string()),
+                }]),
+            );
+            exposed.insert(container_port, HashMap::new());
+        }
 
         let env: Vec<String> = runtime
             .env
@@ -217,7 +304,7 @@ impl DockerRuntime {
             image: Some(runtime.image.clone()),
             labels: Some(labels),
             env: if env.is_empty() { None } else { Some(env) },
-            exposed_ports: Some(HashMap::from([(container_port, HashMap::new())])),
+            exposed_ports: Some(exposed),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -402,5 +489,46 @@ impl DockerRuntime {
             }
             Err(e) => Err(e).with_context(|| format!("inspecting container {name}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The label is how a restarted agent learns which port is the game and
+    /// which is RCON. Docker reports published ports, but not what they mean,
+    /// and an agent that guessed would hand a player the admin port.
+    #[test]
+    fn a_port_set_round_trips_through_its_label() {
+        let ports = vec![
+            PublishedPort { channel: 0, container_port: 27015, host_port: 27151, transport: GameTransport::Udp },
+            PublishedPort { channel: 1, container_port: 27015, host_port: 27152, transport: GameTransport::Tcp },
+            PublishedPort { channel: 2, container_port: 27020, host_port: 27153, transport: GameTransport::Udp },
+        ];
+        let label = encode_ports_label(&ports);
+        assert_eq!(label, "0:27151/udp,1:27152/tcp,2:27153/udp");
+
+        let decoded = decode_ports_label(&label);
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], InstancePort { channel: 0, host_port: 27151, transport: GameTransport::Udp });
+        assert_eq!(decoded[1].transport, GameTransport::Tcp, "RCON must not come back as UDP");
+        assert_eq!(decoded[2].host_port, 27153);
+    }
+
+    /// An entry this build cannot read is skipped, not fatal: the alternative
+    /// is an agent that cannot see — and therefore cannot stop or free the
+    /// ports of — a container it created itself.
+    #[test]
+    fn an_unreadable_entry_does_not_lose_the_rest_of_the_set() {
+        let decoded = decode_ports_label("0:27151/udp,nonsense,9:70000/udp,1:27152/sctp,2:27153/tcp");
+        assert_eq!(
+            decoded,
+            vec![
+                InstancePort { channel: 0, host_port: 27151, transport: GameTransport::Udp },
+                InstancePort { channel: 2, host_port: 27153, transport: GameTransport::Tcp },
+            ]
+        );
+        assert!(decode_ports_label("").is_empty());
     }
 }

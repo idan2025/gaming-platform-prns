@@ -12,7 +12,8 @@
 use std::collections::BTreeMap;
 
 use platform_agent::config::{GameRuntime, MANAGED_LABEL};
-use platform_agent::docker::DockerRuntime;
+use game_bridge::profile::GameTransport;
+use platform_agent::docker::{DockerRuntime, PublishedPort};
 use platform_agent::instance::{InstanceSpec, InstanceState};
 use platform_agent::store::Mount;
 
@@ -71,6 +72,16 @@ fn test_runtime() -> GameRuntime {
     }
 }
 
+/// One UDP game port, which is what a single-port pack asks for.
+fn one_port(host_port: u16) -> Vec<PublishedPort> {
+    vec![PublishedPort {
+        channel: 0,
+        container_port: host_port,
+        host_port,
+        transport: GameTransport::Udp,
+    }]
+}
+
 fn spec(id: &str) -> InstanceSpec {
     InstanceSpec {
         instance_id: id.to_string(),
@@ -78,6 +89,7 @@ fn spec(id: &str) -> InstanceSpec {
         name: "Test".to_string(),
         max_players: 8,
         port: None,
+        extra_ports: BTreeMap::new(),
         owner: None,
     }
 }
@@ -178,7 +190,7 @@ async fn an_instance_can_be_created_started_stopped_and_removed() {
     ];
 
     let outcome = async {
-        rt.create_and_start(&spec(&id), &test_runtime(), &mounts, 27199).await?;
+        rt.create_and_start(&spec(&id), &test_runtime(), &mounts, &one_port(27199)).await?;
         assert_eq!(rt.state_of(&id).await?, InstanceState::Running, "the instance did not come up");
 
         let managed = rt.list_managed().await?;
@@ -200,6 +212,82 @@ async fn an_instance_can_be_created_started_stopped_and_removed() {
     outcome.expect("the instance lifecycle should complete");
 }
 
+/// A multi-port game (`GAMES.md` §3) against a real daemon: a UDP game port and
+/// a TCP RCON port on one container, published on different host ports, and read
+/// back with each channel still attached to the right one.
+///
+/// The transports are the point. Publishing RCON as UDP would produce a port
+/// that answers nothing, and Docker would report it just as happily.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_port_instance_publishes_each_port_in_its_own_transport() {
+    let Some(rt) = runtime_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_test_image() {
+        eprintln!("skipping: could not build the test image");
+        return;
+    }
+
+    let id = format!("mport{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+
+    // The game binds 27015 inside the container whichever node it lands on; the
+    // host side comes from the node's own range, which is why they differ here.
+    let ports = vec![
+        PublishedPort {
+            channel: 0,
+            container_port: 27015,
+            host_port: 27191,
+            transport: GameTransport::Udp,
+        },
+        PublishedPort {
+            channel: 1,
+            container_port: 27015,
+            host_port: 27192,
+            transport: GameTransport::Tcp,
+        },
+    ];
+
+    let outcome = async {
+        rt.create_and_start(&spec(&id), &test_runtime(), &[], &ports).await?;
+        let managed = rt.list_managed().await?;
+        let me = managed
+            .iter()
+            .find(|c| c.instance_id == id)
+            .expect("the container the agent just created is missing from its inventory");
+
+        assert_eq!(me.ports.len(), 2, "both published ports should come back");
+        let game = me.ports.iter().find(|p| p.channel == 0).expect("no channel 0");
+        let rcon = me.ports.iter().find(|p| p.channel == 1).expect("no channel 1");
+        assert_eq!(game.host_port, 27191);
+        assert_eq!(game.transport, GameTransport::Udp);
+        assert_eq!(rcon.host_port, 27192);
+        assert_eq!(rcon.transport, GameTransport::Tcp, "RCON published as UDP answers nothing");
+        assert_eq!(
+            me.port,
+            Some(27191),
+            "the game port is channel 0, not whichever port Docker happened to list first"
+        );
+
+        // And the daemon really holds both bindings, in the right protocol.
+        let inspected = std::process::Command::new("docker")
+            .args(["inspect", "-f", "{{json .HostConfig.PortBindings}}", &name])
+            .output()?;
+        let text = String::from_utf8_lossy(&inspected.stdout).to_string();
+        assert!(text.contains("27015/udp"), "the game port is not published as UDP: {text}");
+        assert!(text.contains("27015/tcp"), "the RCON port is not published as TCP: {text}");
+
+        rt.remove(&id).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    docker_rm(&name);
+    outcome.expect("a multi-port instance should run");
+}
+
 /// The label is what the guard reads, so it had better be on the container the
 /// agent itself creates — otherwise the agent would refuse to manage its own.
 #[tokio::test(flavor = "multi_thread")]
@@ -215,7 +303,7 @@ async fn a_created_container_carries_the_managed_label() {
     let name = format!("gpp-{id}");
     docker_rm(&name);
 
-    let created = rt.create_and_start(&spec(&id), &test_runtime(), &[], 27198).await;
+    let created = rt.create_and_start(&spec(&id), &test_runtime(), &[], &one_port(27198)).await;
     let labels = std::process::Command::new("docker")
         .args(["inspect", "-f", "{{json .Config.Labels}}", &name])
         .output();
@@ -255,7 +343,7 @@ async fn the_shared_content_mount_is_read_only_in_the_container() {
         read_only: true,
     }];
 
-    let created = rt.create_and_start(&spec(&id), &test_runtime(), &mounts, 27197).await;
+    let created = rt.create_and_start(&spec(&id), &test_runtime(), &mounts, &one_port(27197)).await;
     let write_attempt = std::process::Command::new("docker")
         .args(["exec", &name, "sh", "-c", "touch /game/scribble"])
         .output();
@@ -301,7 +389,7 @@ async fn a_missing_mountpoint_in_shared_content_fails_to_start() {
         Mount { host_path: content.clone(), container_path: "/game".into(), read_only: true },
         Mount { host_path: writable.clone(), container_path: "/game/logs".into(), read_only: false },
     ];
-    let result = rt.create_and_start(&spec(&id), &test_runtime(), &mounts, 27196).await;
+    let result = rt.create_and_start(&spec(&id), &test_runtime(), &mounts, &one_port(27196)).await;
     docker_rm(&name);
     let _ = std::fs::remove_dir_all(&dir);
 
