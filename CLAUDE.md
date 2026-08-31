@@ -294,10 +294,27 @@ Two facts that decide the browser's design, both easy to get wrong:
 | Engine dependency is a **fork** of Prns, pinned by rev | `PLAN.md` §7 |
 | Launcher stays **Tauri v2** | `PLAN.md` §9 |
 
-Open questions are listed in `PLAN.md` §10 and `DESIGN.md` §7. Two are now
-decided: which games are hostable (the operator's choice, no shipped list) and
-whether community packs are allowed (yes, tiered — `PLAN.md` §11). If you resolve
-one, move it out of the open list and record the reasoning.
+Open questions are listed in `PLAN.md` §10 and `DESIGN.md` §7. Three are now
+decided: which games are hostable (the operator's choice, no shipped list),
+whether community packs are allowed (yes, tiered — `PLAN.md` §11), and whether a
+pack may carry launch arguments (yes, **on the player's own machine only** —
+`PLAN.md` §13.1). If you resolve one, move it out of the open list and record the
+reasoning.
+
+**`PLAN.md` §13 is the current work**: the last mile to a player, and a pack
+marketplace. The rule that keeps §13.1 safe is not the repository's review — it
+is the format. A `[launch]` block never names an executable (that comes from the
+player's own installed game), its `args` are a typed template substituted into an
+argument **vector** that is spawned without a shell, and `kind` is an enum this
+build implements. So shell metacharacters in a pack are inert characters, and the
+worst an unreviewed pack can do is start the player's own game with odd flags.
+**A scanner is not the safety property** — intent is not in the syntax, and
+saying otherwise would sell users a guarantee the code does not make.
+
+**The launcher and the node are not symmetrical, and must never be unified.** A
+launch profile affects the machine of the person who installed that pack; a node
+runs code on someone else's hardware for strangers. `GameRuntime.image` stays
+operator config and a pack still cannot name what a node executes.
 
 ## The reference implementation
 

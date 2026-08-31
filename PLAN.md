@@ -679,8 +679,13 @@ node supply (user-contributed is the default under the decentralization rule, so
 agents are untrusted), whether Mode 3 justifies a privileged installer, and
 monetization.
 
-Two have since been decided:
+Three have since been decided:
 
+- **Whether a pack may carry launch arguments** — decided 2026-08-31: **yes, on
+  the player's own machine only, as a constrained template, and never on a
+  node.** §13.1 is the design and §13.2 the reasoning. The node rule is
+  untouched: a pack still cannot name a command, an image, or an argv that a
+  node executes.
 - **Which games are legally hostable** — decided 2026-08-30 by not deciding it
   centrally. The platform ships no list; an index operator configures what their
   nodes will host (§8 phase 4, `hosting.example.toml`).
@@ -879,3 +884,125 @@ A fifth tier was needed: **`PackTrust::BuiltIn`**, for `GamePack::sven_coop()`.
 built-in one did not — it is part of the binary. "Unsigned local" would invent a
 provenance question about a file that does not exist, and a policy refusing it
 would be the program refusing itself, so `may_deploy` allows it unconditionally.
+
+
+## 13. The last mile — seamless, and a pack marketplace
+
+Decided 2026-08-31, after an honest look at what a player actually experiences.
+The plumbing is in good shape: a launcher browses, filters, probes and joins
+with no index and no internet, and a node runs many servers off shared content.
+What is thin is everything either side of that. A player still points their game
+at `127.0.0.1:27015` by hand, hosting is a terminal command, Sven's content is
+2.7 GB somebody installs themselves, and the shipped catalogue is three GoldSrc
+games plus a TF2 pack with no runtime configured.
+
+The goal this section serves: **a player installs one thing, sees servers, and
+plays.** An operator installs one thing and hosts. Neither reads a manual.
+
+### 13.1 Launch profiles — how a pack may say "start the game"
+
+A pack gains an optional `[launch]` block. It does **not** contain a command
+line.
+
+```toml
+[launch]
+# The engine family this game belongs to, an enum this build implements.
+kind = "goldsrc"
+# Where the player's own installed game lives, per platform, relative to a
+# Steam library the launcher already located. Never an absolute path the pack
+# chose.
+steam_app_id = 225840
+# Extra parameters, from a fixed vocabulary — see below.
+args = ["+connect {address}", "+password {password}"]
+```
+
+Four properties carry the safety, and each is a rule a later change could
+quietly break:
+
+1. **The executable is never named by the pack.** It comes from the player's own
+   game installation, located by the launcher (a Steam library, or a path the
+   player picked once) and confirmed by the player the first time. A pack that
+   could name a binary is a pack that can run one.
+2. **`args` is a template with typed substitution, not a string that is
+   shelled.** `{address}`, `{port}`, `{password}`, `{name}` are the whole
+   vocabulary; anything else fails to parse. The launcher builds an argument
+   **vector** and spawns it directly — no shell, ever, so `$(...)`, `;`, `|`,
+   `&&` and backticks are inert characters rather than syntax.
+3. **The values substituted in are the launcher's, not the pack's.** `{address}`
+   is the local port the launcher just bound. A pack cannot inject a value; it
+   can only choose where the launcher's own values land.
+4. **`kind` is an enum this build implements**, exactly like `QueryProtocol::A2s`
+   and the content drivers. It selects code that already exists. A `kind` this
+   build does not know fails to parse, loudly.
+
+Together these mean the worst an unreviewed `[launch]` block can do is start the
+player's own game with odd flags. That is the honest ceiling, and it is what
+makes a marketplace tenable — **not** the scanner.
+
+**On the node, nothing changes.** `GameRuntime.image` stays operator config and
+a pack still cannot name what a node executes (§8 phase 3). The two cases are
+not symmetrical and must never be unified: a launch profile affects the machine
+of the person who chose to install that pack, while a node runs code on someone
+else's hardware, for strangers.
+
+### 13.2 Why the marketplace is review and identity, not scanning
+
+The repository is worth building, but be precise about what it buys.
+
+**Scanning a command line for malicious intent does not work.** Intent is not
+in the syntax; `sh -c "$(curl …)"` is a well-formed string. Any scanner is a
+blocklist, and a blocklist against an adversary who can read it is a formality.
+Promising users "we scan uploads" would be selling a safety property the code
+does not have.
+
+What the repository does buy, all of it real:
+
+- **A key and a name behind each pack**, which §11.3 signing already provides.
+- **Human review before a pack is listed**, which catches the ordinary cases —
+  a wrong port, a wrong digest, a pack that points at a hostile mirror.
+- **Revocation by expiry.** §11.3's validity window means a listing that stops
+  being refreshed goes stale on its own, on every node, offline included.
+- **Reputation over time**, since a signer is an identity that persists.
+
+So: the repository reviews and signs; the *format* is what makes an unreviewed
+pack survivable. Defence in depth, in that order.
+
+### 13.3 Steps, in build order
+
+Each step is independently useful — none is a prerequisite for the platform
+working, and each shortens the distance between installing and playing.
+
+1. **Launch profiles (§13.1).** `[launch]` in the schema, the typed-substitution
+   argument builder, a `kind` enum starting with `goldsrc` and `source`, and
+   game-location detection. Ends at: the Join button starts the game.
+   *The test that matters:* an `args` entry containing shell metacharacters is
+   passed through as one inert argument, never interpreted.
+2. **Host from the launcher.** A Host tab: pick a game, name it, set max
+   players, start. Runs the same `BridgeSession` the CLI does — the launcher
+   already links `game-bridge` directly, so this is UI, not protocol. Ends at:
+   hosting needs no terminal.
+3. **Content in the launcher.** Progress, size, and the driver's own errors
+   surfaced where a person can see them, plus the `manual` driver saying exactly
+   what to put where. Ends at: a player is never left guessing why a game will
+   not start.
+4. **First run.** One screen: generate an identity, pick or auto-detect an
+   interface, confirm. Ends at: a fresh install reaches a server list without
+   editing a file.
+5. **Pack repository — the client half.** Browse listed packs in the launcher,
+   see the tier before importing (§11.4 already renders it), import with one
+   click into the pack directory. **Opt-in**: the launcher ships with no
+   repository configured, and a repository is a URL the user adds. An index is a
+   cache of the mesh; a repository is a cache of *packs*, and neither is ever
+   the source of truth (`DESIGN.md` §0).
+6. **Pack repository — the serving half.** A static, signed index of packs, plus
+   the submission and review flow of §13.2. Deliberately last: a marketplace
+   with nothing worth listing is furniture, and steps 1-4 are what make packs
+   worth sharing.
+
+### 13.4 What this does not change
+
+The zero-infrastructure baseline still has to work: two launchers, any shared
+Reticulum interface, no account, no index, **no repository**, no internet. Every
+step above is a convenience layered on that, and a user who never adds a
+repository must lose nothing except convenience. If a step cannot be built that
+way, it is the wrong step.
