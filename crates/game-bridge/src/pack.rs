@@ -42,6 +42,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::content::{ContentError, PackContent};
 use crate::profile::{GameProfile, GameTransport, ProfileError, QueryProtocol};
 
 /// Manifest schema version. Bumped when a field changes meaning, not when one
@@ -88,6 +89,14 @@ pub struct GamePack {
     /// a pack field — see the module docs.
     #[serde(default)]
     pub writable_paths: Vec<String>,
+    /// Where the game's files come from (`PLAN.md` §11.2).
+    ///
+    /// Absent means `manual`: an operator installs the content by hand, which
+    /// is what every pack did before this field existed. A driver names code
+    /// this build already carries and hands it typed parameters — it is not a
+    /// place to put a command; see `content.rs`.
+    #[serde(default)]
+    pub content: PackContent,
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
@@ -134,6 +143,8 @@ pub enum PackError {
     UnsupportedSchema { found: u32, supported: u32 },
     /// The pack parsed but describes an unusable game.
     Invalid(ProfileError),
+    /// The pack's `[content]` block is not usable.
+    InvalidContent(ContentError),
 }
 
 impl core::fmt::Display for PackError {
@@ -146,6 +157,7 @@ impl core::fmt::Display for PackError {
                 "pack schema_version {found} is not supported by this build (which implements {supported})"
             ),
             Self::Invalid(e) => write!(f, "pack describes an unusable game: {e}"),
+            Self::InvalidContent(e) => write!(f, "pack describes unusable content: {e}"),
         }
     }
 }
@@ -173,6 +185,10 @@ impl GamePack {
                 "svencoop/logs".to_string(),
                 "svencoop/scripts".to_string(),
             ],
+            // Sven Co-op's dedicated server is a Steam download an operator
+            // installs themselves. `manual` is the honest driver for it, not a
+            // gap waiting to be filled.
+            content: PackContent::default(),
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -192,6 +208,7 @@ impl GamePack {
         // Validate here, not at first use: a broken pack should fail when it is
         // loaded, with the file in hand, rather than when someone tries to host.
         pack.to_profile()?;
+        pack.content.validate().map_err(PackError::InvalidContent)?;
         Ok(pack)
     }
 
@@ -246,6 +263,12 @@ pub struct LoadedPacks {
     pub errors: Vec<(String, PackError)>,
 }
 
+impl From<ContentError> for PackError {
+    fn from(e: ContentError) -> Self {
+        Self::InvalidContent(e)
+    }
+}
+
 impl From<ProfileError> for PackError {
     fn from(e: ProfileError) -> Self {
         Self::Invalid(e)
@@ -255,6 +278,7 @@ impl From<ProfileError> for PackError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::ContentError;
 
     const SVEN_TOML: &str = include_str!("../../../packs/sven-coop.toml");
 
@@ -313,6 +337,40 @@ mod tests {
         let loaded = GamePack::load_dir(&dir).unwrap();
         assert!(loaded.errors.is_empty(), "shipped packs must all load: {:?}", loaded.errors);
         assert!(loaded.packs.iter().any(|p| p.id == "sven-coop"));
+    }
+
+    /// Every pack written before `[content]` existed keeps working, and keeps
+    /// meaning what it always meant: the operator installs the files.
+    #[test]
+    fn a_pack_with_no_content_block_loads_as_manual() {
+        let pack = GamePack::parse(SVEN_TOML).unwrap();
+        assert_eq!(pack.content, PackContent::Manual { note: None });
+        assert!(!pack.content.is_automatic());
+    }
+
+    /// A broken `[content]` block fails with the file in hand, like every other
+    /// pack defect — not at deploy, on a node, in front of a user.
+    #[test]
+    fn a_bad_content_block_fails_at_load() {
+        let src = SVEN_TOML.to_string()
+            + "\n[content]\ndriver = \"archive\"\nurl = \"file:///etc/passwd\"\n\
+               sha256 = \"9f2c00000000000000000000000000000000000000000000000000000000abcd\"\n";
+        assert!(matches!(
+            GamePack::parse(&src),
+            Err(PackError::InvalidContent(ContentError::UnsupportedUrlScheme(_)))
+        ));
+    }
+
+    #[test]
+    fn an_archive_content_block_round_trips_through_a_pack() {
+        let src = SVEN_TOML.to_string()
+            + "\n[content]\ndriver = \"archive\"\n\
+               url = \"https://example.org/sven.tar.xz\"\n\
+               sha256 = \"9f2c00000000000000000000000000000000000000000000000000000000abcd\"\n\
+               strip_components = 1\n";
+        let pack = GamePack::parse(&src).unwrap();
+        assert!(pack.content.is_automatic());
+        assert_eq!(pack.content.driver_name(), "archive");
     }
 
     /// The manifest understands `tcp`; the relay does not yet. So the pack
