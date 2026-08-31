@@ -544,6 +544,8 @@ function renderDetail() {
   }
   body.appendChild(probeSec);
 
+  body.appendChild(renderPackSection(a.game_id));
+
   pane.appendChild(body);
 
   // foot
@@ -558,6 +560,52 @@ function renderDetail() {
     foot.appendChild(m);
   }
   pane.appendChild(foot);
+}
+
+// PLAN.md §11.4: a pack's provenance is shown at the moment it matters, not
+// buried. Here that moment is joining — a pack is what tells this machine how
+// to talk to the server, so the tier belongs beside the Join button. The
+// launcher shows and never refuses: no code runs here because of a pack.
+const TRUST_CLASS = {
+  'first-party': 'trust-ok',
+  'built in': 'trust-ok',
+  'signed community': 'trust-ok',
+  'signed by an unknown key': 'trust-warn',
+  'unsigned local': 'trust-warn',
+};
+
+function renderPackSection(gameId) {
+  const sec = el('div', 'section');
+  sec.appendChild(el('h3', '', 'Game pack'));
+  const pack = gameId ? state.games.find(g => g.id === gameId) : null;
+
+  if (!pack) {
+    const p = el('p', 'pack-none');
+    p.textContent = gameId
+      ? 'You have no pack for ' + gameId + ', so this launcher cannot tell your game where to connect. Install one to join.'
+      : 'This server did not say what game it runs, so no pack can be matched to it.';
+    sec.appendChild(p);
+    return sec;
+  }
+
+  const line = el('div', 'pack-line');
+  line.appendChild(el('span', 'pack-name', pack.display_name || pack.id));
+  line.appendChild(el('span', 'badge ' + (TRUST_CLASS[pack.trust] || 'trust-warn'), pack.trust));
+  sec.appendChild(line);
+  sec.appendChild(el('p', 'pack-detail', pack.trust_detail || ''));
+
+  if (pack.signer) {
+    const kv = el('div', 'kv');
+    kvRow(kv, 'Signed by', pack.signer, null);
+    if (pack.signature_expires_at != null) {
+      // Seconds from now, floored at 0: a signature already past its window
+      // would not have loaded at all, but never render a negative countdown.
+      const left = Math.max(0, pack.signature_expires_at - Math.floor(Date.now() / 1000));
+      kvRow(kv, 'Signature valid for', fmtDuration(left) + ' more', null);
+    }
+    sec.appendChild(kv);
+  }
+  return sec;
 }
 
 function kvRow(parent, k, v, fallback, unknown) {

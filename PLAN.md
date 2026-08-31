@@ -806,7 +806,20 @@ prefix prevents boundary shifting; `read_signature_beside` treats
 present-but-unreadable as an error, not as unsigned; crypto-checked-before-clock
 in `verify` so a forged-and-stale signature reports as forged.
 
-**Still not wired:** the launcher shows no tier. §11.4 wants the tier shown at
-import as well as enforced at deploy, and `launcher-core` still loads packs
-through the unsigned `GamePack::load_dir`. That is presentation, and it changes
-the frontend contract, so it is its own change.
+**The launcher shows the tier (2026-08-31).** `GameSummary` carries `trust`,
+`trust_detail`, `signer` and `signature_expires_at`, and the detail pane renders
+them in a "Game pack" section beside the Join button — the moment a pack stops
+being a file and starts deciding how this machine talks to a server.
+
+**The launcher shows and never gates.** A pack there does not put code on a
+host; it tells a client where to point. Refusing to load an unsigned one would
+stop a user browsing with a file they wrote and protect nothing, so
+`from_pack_dir` uses `allowing_unsigned`. What still holds is the rule that a
+signature which *fails* is an error: such a pack is skipped, not shown as
+unsigned. Pinned by `a_pack_with_a_broken_signature_is_skipped_not_shown_as_unsigned`.
+
+A fifth tier was needed: **`PackTrust::BuiltIn`**, for `GamePack::sven_coop()`.
+§11.4's three tiers all describe a pack that arrived from somewhere, and the
+built-in one did not — it is part of the binary. "Unsigned local" would invent a
+provenance question about a file that does not exist, and a policy refusing it
+would be the program refusing itself, so `may_deploy` allows it unconditionally.

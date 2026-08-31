@@ -282,6 +282,14 @@ pub enum PackTrust {
     SignedUnknown { signer: IdentityHash },
     /// No signature file at all. A file someone wrote.
     UnsignedLocal,
+    /// Compiled into the program that is running — `GamePack::sven_coop()`,
+    /// not a file on disk at all.
+    ///
+    /// §11.4's three tiers all describe a pack that arrived from somewhere. A
+    /// built-in one did not: it is part of the binary, so calling it "unsigned
+    /// local" would claim a provenance question exists where none does, and a
+    /// policy that refused it would be refusing the program to itself.
+    BuiltIn,
 }
 
 impl PackTrust {
@@ -292,6 +300,7 @@ impl PackTrust {
             Self::SignedCommunity { .. } => "signed community",
             Self::SignedUnknown { .. } => "signed by an unknown key",
             Self::UnsignedLocal => "unsigned local",
+            Self::BuiltIn => "built in",
         }
     }
 
@@ -306,6 +315,9 @@ impl PackTrust {
             Self::UnsignedLocal => {
                 "nobody signed this; it is a file someone wrote, trusted only as far as its author is."
             }
+            Self::BuiltIn => {
+                "shipped inside the program you are running, and exactly as trustworthy as it is."
+            }
         }
     }
 
@@ -314,7 +326,7 @@ impl PackTrust {
             Self::FirstParty { signer }
             | Self::SignedCommunity { signer }
             | Self::SignedUnknown { signer } => Some(*signer),
-            Self::UnsignedLocal => None,
+            Self::UnsignedLocal | Self::BuiltIn => None,
         }
     }
 }
@@ -374,7 +386,11 @@ impl TrustPolicy {
     /// node.
     pub fn may_deploy(&self, trust: &PackTrust) -> bool {
         match trust {
-            PackTrust::FirstParty { .. } | PackTrust::SignedCommunity { .. } => true,
+            // `BuiltIn` is unconditional: the pack is part of the binary making
+            // the decision, so refusing it is the program refusing itself.
+            PackTrust::FirstParty { .. }
+            | PackTrust::SignedCommunity { .. }
+            | PackTrust::BuiltIn => true,
             PackTrust::SignedUnknown { .. } | PackTrust::UnsignedLocal => self.allow_unsigned,
         }
     }

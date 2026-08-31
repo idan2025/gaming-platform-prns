@@ -169,6 +169,13 @@ Rules there:
   Deliberate while there is no first-party key and every shipped pack is
   unsigned; a strict default would be deleted rather than satisfied. Inside a
   section that exists, `allow_unsigned` defaults to false.
+- **The agent gates; the launcher only shows.** `launcher-core` loads with
+  `allowing_unsigned` and renders the tier in the detail pane, because a pack
+  there tells a client where to point and runs no code. A pack whose signature
+  *failed* is still skipped there, never shown as unsigned.
+- **`PackTrust::BuiltIn` is not `UnsignedLocal`.** `GamePack::sven_coop()` comes
+  out of the binary, so there is no provenance question to ask about it and
+  `may_deploy` allows it unconditionally.
 
 **The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
 `cargo fmt --all` — it reformats every file, in a style the tree was not written

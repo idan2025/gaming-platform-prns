@@ -78,7 +78,14 @@ function makeInvoke(scenario) {
       case 'list_servers':
         return scenario.rows(args?.query ?? {});
       case 'list_games':
-        return [{ id: 'sven-coop', display_name: 'Sven Co-op' }];
+        return scenario.games ?? [{
+          id: 'sven-coop',
+          display_name: 'Sven Co-op',
+          trust: 'built in',
+          trust_detail: 'shipped inside the program you are running, and exactly as trustworthy as it is.',
+          signer: null,
+          signature_expires_at: null,
+        }];
       case 'server_details':
         return scenario.details ?? details;
       case 'start_browse':
@@ -194,6 +201,66 @@ await run('join', {
   // the address it hands back is the whole product of a join.
   check('a join tells the player where to point their game', t.includes('127.0.0.1:27015'), t.slice(-300));
   check('no undefined after a join', !t.includes('undefined'), t.slice(-300));
+});
+
+// PLAN.md §11.4: the tier is shown, not buried. These three scenarios are the
+// three answers a user can get — vouched for, nobody vouched for it, and no
+// pack at all — and the last is the one that reads as undefined if the frontend
+// ever assumes a pack exists for every announced game.
+await run('pack provenance: a signed pack names its signer', {
+  status: running,
+  rows: () => [row()],
+  games: [{
+    id: 'sven-coop',
+    display_name: 'Sven Co-op',
+    trust: 'signed community',
+    trust_detail: "signed by a key this node's operator trusts.",
+    signer: 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6',
+    signature_expires_at: Math.floor(Date.now() / 1000) + 7200,
+  }],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const t = doc.querySelector('#detail').textContent;
+  check('the pane shows the pack tier', t.includes('signed community'), t.slice(-400));
+  check('the pane names the signing key', t.includes('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6'), t.slice(-400));
+  check('the pane counts down to the signature going stale', /valid for/i.test(t), t.slice(-400));
+  check('no undefined in the pack section', !t.includes('undefined'), t.slice(-400));
+});
+
+await run('pack provenance: an unsigned pack is shown as such, not hidden', {
+  status: running,
+  rows: () => [row()],
+  games: [{
+    id: 'sven-coop',
+    display_name: 'Sven Co-op',
+    trust: 'unsigned local',
+    trust_detail: 'nobody signed this; it is a file someone wrote.',
+    signer: null,
+    signature_expires_at: null,
+  }],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const pane = doc.querySelector('#detail');
+  const t = pane.textContent;
+  check('an unsigned pack is labelled rather than omitted', t.includes('unsigned local'), t.slice(-400));
+  check('an unsigned pack is badged as unvouched, not as trusted',
+    !!pane.querySelector('.badge.trust-warn'), t.slice(-400));
+  check('a pack with no signer shows no signer row', !/Signed by/i.test(t), t.slice(-400));
+  check('no undefined for a pack with null signer fields', !t.includes('undefined'), t.slice(-400));
+});
+
+await run('pack provenance: no pack for this game', {
+  status: running,
+  rows: () => [row({ game_id: 'quake-3' })],
+  games: [],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const t = doc.querySelector('#detail').textContent;
+  check('a game with no installed pack says so', /no pack for quake-3/i.test(t), t.slice(-400));
+  check('no undefined when no pack matches', !t.includes('undefined'), t.slice(-400));
 });
 
 await run('nothing heard yet', {

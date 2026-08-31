@@ -292,6 +292,17 @@ input:focus-visible, select:focus-visible {
 .badge.pw { background: var(--warn-bg); color: var(--warn); }
 .badge.lock { background: var(--error-bg); color: var(--error); }
 .badge.ded { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+/* Pack provenance (PLAN.md §11.4). Two colours, not four: the tiers a user has
+   a reason to trust, and the ones nobody has vouched for. A gradient of five
+   shades would read as a score rather than as a question of who signed it. */
+.badge.trust-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.badge.trust-warn { background: var(--warn-bg); color: var(--warn); }
+
+.pack-line { display: flex; align-items: center; gap: 2px; }
+.pack-name { font-weight: 600; }
+.pack-detail { color: var(--fg-muted); margin: 4px 0 0; }
+.pack-none { color: var(--fg-muted); font-style: italic; margin: 0; }
+.pack-line + .kv, .pack-detail + .kv { margin-top: 6px; }
 
 .empty {
   padding: 40px 24px;

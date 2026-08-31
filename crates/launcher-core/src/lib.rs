@@ -26,7 +26,9 @@ use game_bridge::announce::AnnounceInfo;
 use game_bridge::browse::{BrowseFilter, SortBy};
 use game_bridge::config::{BrowserArgs, ClientArgs};
 use game_bridge::details::StatsSource;
+use game_bridge::pack::TrustedPack;
 use game_bridge::profile::GameProfile;
+use game_bridge::signing::{PackTrust, TrustPolicy};
 use game_bridge::{BridgeSession, GamePack};
 use personal_rns::prelude::DestinationHash;
 use serde::{Deserialize, Serialize};
@@ -108,10 +110,27 @@ impl BrowseQueryInput {
 }
 
 /// A game the launcher knows how to name, from the loaded packs.
+///
+/// The trust fields are `PLAN.md` §11.4's "shown rather than buried" half. The
+/// launcher **shows and never gates**: it is a client, not a node, so a pack
+/// here decides how this machine talks to a server, not what code some host
+/// runs. The refusing is the agent's job (`platform-agent/src/packs.rs`). What
+/// the launcher owes a user is the tier at the moment they act on it.
 #[derive(Debug, Clone, Serialize)]
 pub struct GameSummary {
     pub id: String,
     pub display_name: String,
+    /// §11.4's words, verbatim — "first-party", "signed community", "signed by
+    /// an unknown key", "unsigned local", "built in".
+    pub trust: String,
+    /// The one-line explanation that goes with the label.
+    pub trust_detail: String,
+    /// The signer's identity hash, hex, when there is one.
+    pub signer: Option<String>,
+    /// Unix seconds this pack's signature goes stale, when it has one. Shown
+    /// so a signature can be refreshed before it lapses rather than at the
+    /// moment something stops working.
+    pub signature_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,7 +200,7 @@ pub struct JoinResult {
 /// The launcher's whole state.
 pub struct Launcher {
     inner: Arc<Mutex<Inner>>,
-    packs: Vec<GamePack>,
+    packs: Vec<TrustedPack>,
 }
 
 struct Inner {
@@ -190,26 +209,60 @@ struct Inner {
 }
 
 impl Launcher {
-    /// Build a launcher over the given packs, falling back to the built-in
-    /// Sven Co-op pack so a fresh install with no pack directory still works.
-    pub fn new(mut packs: Vec<GamePack>) -> Self {
+    /// Build a launcher over packs of unestablished provenance, falling back to
+    /// the built-in Sven Co-op pack so a fresh install with no pack directory
+    /// still works.
+    ///
+    /// Every pack passed here reads as `UnsignedLocal`, because that is what a
+    /// `GamePack` with no signature beside it is. The fallback is `BuiltIn`
+    /// instead: it came out of this binary, not off a disk.
+    pub fn new(packs: Vec<GamePack>) -> Self {
+        let mut packs: Vec<TrustedPack> = packs
+            .into_iter()
+            .map(|pack| TrustedPack {
+                pack,
+                trust: PackTrust::UnsignedLocal,
+                file: String::new(),
+                expires_at: None,
+            })
+            .collect();
         if packs.is_empty() {
-            packs.push(GamePack::sven_coop());
+            packs.push(TrustedPack {
+                pack: GamePack::sven_coop(),
+                trust: PackTrust::BuiltIn,
+                file: String::new(),
+                expires_at: None,
+            });
         }
-        Self {
-            inner: Arc::new(Mutex::new(Inner { browse: None, client: None })),
-            packs,
-        }
+        Self { inner: Arc::new(Mutex::new(Inner { browse: None, client: None })), packs }
     }
 
-    /// Load packs from a directory, ignoring individual broken ones.
+    /// Build a launcher over packs whose provenance is already established.
+    pub fn from_verified(packs: Vec<TrustedPack>) -> Self {
+        if packs.is_empty() {
+            return Self::new(Vec::new());
+        }
+        Self { inner: Arc::new(Mutex::new(Inner { browse: None, client: None })), packs }
+    }
+
+    /// Load packs from a directory, ignoring individual broken ones, and
+    /// establish each one's trust tier (`PLAN.md` §11.4).
+    ///
+    /// The policy is `allowing_unsigned`, and deliberately so: **the launcher
+    /// shows a tier, it does not enforce one.** Refusing to load an unsigned
+    /// pack here would stop a user browsing with the file they wrote, while
+    /// protecting nothing — no code runs on this machine because of a pack. A
+    /// pack whose signature *failed* is still skipped, because a failed
+    /// signature is an error and never a demotion to unsigned; that rule holds
+    /// wherever packs are read.
     pub fn from_pack_dir(dir: &std::path::Path) -> Self {
-        match GamePack::load_dir(dir) {
+        let policy = TrustPolicy::allowing_unsigned();
+        match GamePack::load_dir_verified(dir, &policy, std::time::SystemTime::now()) {
             Ok(loaded) => {
                 for (path, e) in &loaded.errors {
                     tracing::warn!(path = %path, error = %e, "skipping an unreadable game pack");
                 }
-                Self::new(loaded.packs)
+                Self::from_verified(loaded.packs)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "no game pack directory; using the built-in pack");
@@ -221,15 +274,22 @@ impl Launcher {
     pub fn list_games(&self) -> Vec<GameSummary> {
         self.packs
             .iter()
-            .map(|p| GameSummary { id: p.id.clone(), display_name: p.display_name.clone() })
+            .map(|p| GameSummary {
+                id: p.pack.id.clone(),
+                display_name: p.pack.display_name.clone(),
+                trust: p.trust.label().to_string(),
+                trust_detail: p.trust.explanation().to_string(),
+                signer: p.trust.signer().map(|s| hex::encode(s.as_bytes())),
+                signature_expires_at: p.expires_at,
+            })
             .collect()
     }
 
     fn profile_for(&self, game_id: &str) -> Option<GameProfile> {
         self.packs
             .iter()
-            .find(|p| p.id == game_id)
-            .and_then(|p| p.to_profile().ok())
+            .find(|p| p.pack.id == game_id)
+            .and_then(|p| p.pack.to_profile().ok())
     }
 
     pub async fn start_browse(&self, opts: BrowseOpts) -> Result<()> {
@@ -338,7 +398,7 @@ impl Launcher {
             // With no game named, fall back to the only pack, if there is only
             // one. Guessing among several would be picking a wire protocol for
             // the user.
-            None if self.packs.len() == 1 => self.packs[0].id.clone(),
+            None if self.packs.len() == 1 => self.packs[0].pack.id.clone(),
             None => {
                 return Err(anyhow!(
                     "this server did not say which game it runs, so a game must be chosen"
@@ -518,6 +578,80 @@ mod tests {
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].id, "sven-coop");
     }
+
+    /// The fallback pack comes out of this binary, so it is `BuiltIn`, not
+    /// `UnsignedLocal`. Labelling it "unsigned local" would invent a
+    /// provenance question about a file that does not exist.
+    #[test]
+    fn the_fallback_pack_is_built_in_not_an_unsigned_file() {
+        let games = Launcher::new(Vec::new()).list_games();
+        assert_eq!(games[0].trust, "built in");
+        assert!(games[0].signer.is_none());
+        assert!(games[0].signature_expires_at.is_none());
+    }
+
+    /// A pack handed in as a bare `GamePack` has no signature beside it and
+    /// nothing has verified it, so it reads as unsigned — never as first-party
+    /// because it came through an internal constructor.
+    #[test]
+    fn a_pack_passed_in_without_provenance_reads_as_unsigned() {
+        let games = Launcher::new(vec![GamePack::sven_coop()]).list_games();
+        assert_eq!(games[0].trust, "unsigned local");
+    }
+
+    /// §11.4 wants the tier shown, so it has to reach the UI. These are the
+    /// keys the detail pane reads by name.
+    #[test]
+    fn game_summary_json_keys_are_the_frontend_contract() {
+        let games = Launcher::new(Vec::new()).list_games();
+        let v = serde_json::to_value(&games[0]).unwrap();
+        for key in ["id", "display_name", "trust", "trust_detail", "signer", "signature_expires_at"]
+        {
+            assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
+        }
+        assert!(v["signer"].is_null());
+        assert!(!v["trust_detail"].as_str().unwrap().is_empty());
+    }
+
+    /// The launcher shows a tier; it does not enforce one. A pack nobody
+    /// signed must still load, or a user could not browse with a file they
+    /// wrote themselves — and nothing on this machine runs because of a pack.
+    #[test]
+    fn an_unsigned_pack_on_disk_still_loads_in_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("g.toml"), PACK_TOML).unwrap();
+        let games = Launcher::from_pack_dir(dir.path()).list_games();
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].id, "test-game");
+        assert_eq!(games[0].trust, "unsigned local");
+    }
+
+    /// But a signature that is present and does not verify is an error, so the
+    /// pack is skipped rather than shown as unsigned. An empty directory then
+    /// falls back to the built-in pack, which is why the assertion is on the
+    /// id rather than on the count.
+    #[test]
+    fn a_pack_with_a_broken_signature_is_skipped_not_shown_as_unsigned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("g.toml"), PACK_TOML).unwrap();
+        std::fs::write(dir.path().join("g.toml.sig"), "not a signature file").unwrap();
+        let games = Launcher::from_pack_dir(dir.path()).list_games();
+        assert!(
+            games.iter().all(|g| g.id != "test-game"),
+            "a pack whose signature failed must not appear as an unsigned one"
+        );
+    }
+
+    const PACK_TOML: &str = r#"
+schema_version = 1
+id = "test-game"
+display_name = "Test Game"
+app_name = "test-game"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+query = "a2s"
+"#;
 
     #[tokio::test]
     async fn listing_before_the_browse_node_starts_is_empty_not_an_error() {
