@@ -11,6 +11,7 @@ const state = {
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
+  interfaces: [],        // array of live mesh interface objects
   rows: new Map(),       // instance_id -> <tr>
   inFlight: 0,           // mutating requests in flight; polling pauses while > 0
   pollTimer: null,
@@ -647,17 +648,160 @@ async function onRemove(instanceId, name) {
   }
 }
 
+// ---------- mesh interfaces ----------
+
+// Format a byte count compactly for the RX/TX columns.
+function formatBytes(n) {
+  if (n === null || n === undefined) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = Number(n), i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + " " + units[i];
+}
+
+// Fetch the interface status and render it. Handles the three states: no uplink
+// (501), uplink up with interfaces, and uplink up but empty. A poll error is
+// surfaced in the banner rather than silently leaving a stale list.
+async function loadInterfaces() {
+  const offline = $("mesh-offline");
+  const online = $("mesh-online");
+  try {
+    const status = await api("GET", "/interfaces");
+    state.interfaces = Array.isArray(status.interfaces) ? status.interfaces : [];
+    $("mesh-destination").textContent = status.destination || "unknown";
+    offline.classList.add("hidden");
+    online.classList.remove("hidden");
+    renderInterfaces();
+  } catch (e) {
+    if (e && e.__auth) return;
+    // 501 with no manager: the agent has no uplink. Show the offline note and
+    // hide the controls rather than an error banner — it is a configuration
+    // fact, not a failure.
+    if (e && e.error && /uplink/i.test(e.error)) {
+      offline.classList.remove("hidden");
+      online.classList.add("hidden");
+      return;
+    }
+    showError((e && e.error) || "Could not read mesh interfaces.");
+  }
+}
+
+function renderInterfaces() {
+  const tbody = $("interfaces-tbody");
+  const empty = $("interfaces-empty");
+  tbody.textContent = "";
+  const list = state.interfaces || [];
+  if (list.length === 0) { empty.classList.remove("hidden"); return; }
+  empty.classList.add("hidden");
+  for (const iface of list) {
+    const tr = el("tr");
+    tr.append(
+      el("td", null, iface.name || "—"),
+      el("td", null, iface.mode || "—"),
+      el("td", null, iface.connection || "—"),
+      el("td", null, formatBytes(iface.rx_bytes)),
+      el("td", null, formatBytes(iface.tx_bytes)),
+      el("td", null, String(iface.links != null ? iface.links : 0)),
+    );
+    const actions = el("td", "actions-col cell-actions");
+    const renameBtn = el("button", "quiet", "Rename");
+    renameBtn.type = "button";
+    renameBtn.addEventListener("click", () => onRenameInterface(iface.id, iface.name));
+    const removeBtn = el("button", "quiet danger", "Remove");
+    removeBtn.type = "button";
+    removeBtn.addEventListener("click", () => onRemoveInterface(iface.id, iface.name));
+    actions.append(renameBtn, removeBtn);
+    tr.append(actions);
+    // The hex id is long and not useful in a column; keep it as a tooltip on the
+    // row so an operator can still see exactly what they are acting on.
+    tr.title = "interface id: " + iface.id;
+    tbody.append(tr);
+  }
+}
+
+async function onAddInterface() {
+  const kind = $("iface-kind").value;
+  const ifacOn = $("iface-ifac-toggle").checked;
+  const ifac_name = ifacOn ? ($("iface-ifac-name").value.trim() || null) : null;
+  const ifac_passphrase = ifacOn ? ($("iface-ifac-pass").value || null) : null;
+  let body;
+  if (kind === "tcp") {
+    const addr = $("iface-addr").value.trim();
+    if (!addr) { showError("A TCP interface needs a host:port address."); return; }
+    body = { kind: "tcp", addr, ifac_name, ifac_passphrase };
+  } else {
+    body = { kind: "auto", ifac_name, ifac_passphrase };
+  }
+  const submitBtn = $("iface-form").querySelector("button.primary");
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "Adding…"; }
+  try {
+    await withInFlight(api("POST", "/interfaces", body));
+    clearError();
+    // Reset the form's inputs but keep the kind selection.
+    $("iface-addr").value = "";
+    $("iface-ifac-name").value = "";
+    $("iface-ifac-pass").value = "";
+    $("iface-ifac-toggle").checked = false;
+    $("iface-ifac-wrap").classList.add("hidden");
+    loadInterfaces();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Failed to add interface.");
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = "Add interface"; }
+  }
+}
+
+async function onRemoveInterface(id, name) {
+  const confirmed = confirm(
+    'Remove the interface "' + (name || id) + '"?\n\n' +
+    "This detaches it from the mesh and forgets it, so it will not come back on restart."
+  );
+  if (!confirmed) return;
+  try {
+    await withInFlight(api("DELETE", "/interfaces/" + encodeURIComponent(id)));
+    clearError();
+    loadInterfaces();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Failed to remove interface.");
+  }
+}
+
+async function onRenameInterface(id, current) {
+  const name = prompt("New name for this interface:", current || "");
+  if (name === null) return; // cancelled
+  const trimmed = name.trim();
+  if (!trimmed) { showError("An interface name cannot be empty."); return; }
+  try {
+    await withInFlight(api("POST", "/interfaces/" + encodeURIComponent(id) + "/rename", { name: trimmed }));
+    clearError();
+    loadInterfaces();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Failed to rename interface.");
+  }
+}
+
 // ---------- tabs ----------
 
+const TABS = ["servers", "games", "interfaces"];
+
 function setActiveTab(name) {
+  if (!TABS.includes(name)) name = "servers";
   state.activeTab = name;
-  const servers = $("tab-servers"), games = $("tab-games");
-  const pS = $("tab-panel-servers"), pG = $("tab-panel-games");
-  const on = name === "games";
-  servers.classList.toggle("active", !on); servers.setAttribute("aria-selected", String(!on));
-  games.classList.toggle("active", on); games.setAttribute("aria-selected", String(on));
-  pS.classList.toggle("hidden", on);
-  pG.classList.toggle("hidden", !on);
+  for (const t of TABS) {
+    const btn = $("tab-" + t);
+    const panel = $("tab-panel-" + t);
+    const on = t === name;
+    if (btn) { btn.classList.toggle("active", on); btn.setAttribute("aria-selected", String(on)); }
+    if (panel) panel.classList.toggle("hidden", !on);
+  }
+  // The interface list is only meaningful while the tab is open, and adding one
+  // is rare, so it is fetched on entry rather than polled on the 5s timer with
+  // the instance list. A fresh read every time the operator opens the tab is
+  // both cheaper and never stale when it matters.
+  if (name === "interfaces") loadInterfaces();
 }
 
 // ---------- top-level render ----------
@@ -689,6 +833,7 @@ document.addEventListener("DOMContentLoaded", () => {
     state.capacity = null;
     state.instances = [];
     state.games = [];
+    state.interfaces = [];
     state.rows.forEach(r => r.remove());
     state.rows.clear();
     state.openForms.clear();
@@ -703,7 +848,22 @@ document.addEventListener("DOMContentLoaded", () => {
   // Tabs.
   $("tab-servers").addEventListener("click", () => setActiveTab("servers"));
   $("tab-games").addEventListener("click", () => setActiveTab("games"));
+  $("tab-interfaces").addEventListener("click", () => setActiveTab("interfaces"));
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
+
+  // Mesh interface form: the address field only applies to TCP, and the IFAC
+  // fields only when the operator opts in — mirror that in what is shown.
+  $("iface-kind").addEventListener("change", () => {
+    const tcp = $("iface-kind").value === "tcp";
+    $("iface-addr-wrap").classList.toggle("hidden", !tcp);
+  });
+  $("iface-ifac-toggle").addEventListener("change", () => {
+    $("iface-ifac-wrap").classList.toggle("hidden", !$("iface-ifac-toggle").checked);
+  });
+  $("iface-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    onAddInterface();
+  });
 
   // Track focus within start forms so we can restore it after re-render.
   document.addEventListener("focusin", (e) => {
