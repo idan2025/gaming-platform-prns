@@ -48,22 +48,24 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      # The engine is a git dependency whose tree contains benchmark result
-      # files with very long names, and Windows still refuses paths over 260
-      # characters by default:
-      #   path too long: '.../benchmark-wire-driver--rns-1.4.0-compiled--benchmark-wire-driver.jsonl'
-      # `core.longpaths` fixes the checkout, and fetching with the git CLI is
-      # what makes cargo honour it.
+      # See the launcher job's copy of this step for the measurement and why
+      # `core.longpaths` alone is not enough. The CLI job has passed on Windows
+      # without it, but only because a warm rust-cache already held the engine
+      # checkout — a cold run would fail the same way, so it does not get to
+      # depend on that.
       - name: Windows long paths
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           git config --global core.longpaths true
           "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_HOME=C:\cg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\cg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          New-Item -ItemType Directory -Force -Path C:\cg | Out-Null
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       # game-bridge, platform-agent, platform-index. The launcher is a separate
       # job because it needs a webview toolchain.
@@ -120,6 +122,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The engine is a git dependency whose tree carries benchmark result files
+      # with very long names, and Windows refuses paths over 260 characters:
+      #   path too long: '.../benchmark-wire-driver--rns-1.4.0-compiled--benchmark-wire-driver.jsonl'
+      #
+      # `core.longpaths` alone is not enough, and this is what silently cost the
+      # v0.1.0 release its Windows launcher. Cargo *fetches* with the git CLI
+      # when told to, but it *checks out* into CARGO_HOME with libgit2, which
+      # fails with `class=Filesystem (30)` before any of that applies. So the
+      # fix is to make the path shorter than the limit rather than to ask
+      # Windows to lift it.
+      #
+      # The measurement, so a later engine bump has a tripwire rather than a
+      # mystery: the longest path inside the fork is 198 characters, and
+      # `C:/cg/git/checkouts/prns-<hash>/<rev>/` is 49, for 247 — thirteen
+      # characters of headroom under 260. The default CARGO_HOME
+      # (`C:/Users/runneradmin/.cargo`) makes the same path 266 and fails.
+      #
+      # This must run **before** rust-cache, or the cache is restored into the
+      # CARGO_HOME this step is about to abandon.
+      - name: Windows long paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_HOME=C:\cg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\cg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          New-Item -ItemType Directory -Force -Path C:\cg | Out-Null
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: launcher/src-tauri
@@ -134,19 +165,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev patchelf file rpm
-
-      # The engine is a git dependency whose tree contains benchmark result
-      # files with very long names, and Windows still refuses paths over 260
-      # characters by default:
-      #   path too long: '.../benchmark-wire-driver--rns-1.4.0-compiled--benchmark-wire-driver.jsonl'
-      # `core.longpaths` fixes the checkout, and fetching with the git CLI is
-      # what makes cargo honour it.
-      - name: Windows long paths
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          git config --global core.longpaths true
-          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked

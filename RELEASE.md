@@ -68,6 +68,24 @@ and declares `libwebkit2gtk-4.1-0, libgtk-3-0`.
 is a name any project could claim, and this repo already refuses to manage
 containers by name prefix for the same reason.
 
+**The Windows launcher did not ship in v0.1.0, and the release did not say so.**
+`cargo tauri build` failed on the runner with
+
+    path too long: '.../benchmark-wire-driver--rns-1.4.0-compiled--benchmark-wire-driver.jsonl'; class=Filesystem (30)
+
+The engine fork carries benchmark result files whose paths run to 198
+characters, and the default Windows `CARGO_HOME` puts the checkout at 266 — over
+the 260-character limit. `core.longpaths` does not fix it: cargo *fetches* with
+the git CLI when told to, but *checks out* with libgit2, which fails first. The
+fix is `CARGO_HOME=C:\cg`, which brings the same path to 247. That step must run
+**before** `rust-cache`, or the cache restores into the CARGO_HOME it is about
+to abandon.
+
+The release still published, because the launcher matrix has `fail-fast: false`
+and every other target succeeded. **Check the assets, not the run's colour:** a
+release is short a platform whenever a bundle is missing, and nothing else says
+so. The checklist below now asks for it explicitly.
+
 **AppImage needs two things this host did not have**, and it is the only target
 that fails without them:
 
@@ -114,6 +132,10 @@ double every engine-pin bump in review.
       ones that cover multi-node.
 - [ ] `cargo clippy --workspace --all-targets` clean.
 - [ ] `launcher/uicheck` passes.
+- [ ] **Every platform's launcher bundle is actually attached to the release.**
+      Linux `.deb`/`.rpm`/`.AppImage`, macOS `.dmg`, Windows `.msi` or `.exe`.
+      A missing one is a platform with no GUI at all, and the workflow goes
+      green without it.
 - [ ] `cargo tauri build` produces a bundle, and the installed binary is
       `mesh-game-servers`.
 - [ ] `python3 scripts/live_roundtrip.py` passes: the shipped `game-bridge`
