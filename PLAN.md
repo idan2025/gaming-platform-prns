@@ -509,7 +509,9 @@ bridge.
   multi-node, and neither changes the auth model.
 
 - **Pack distribution — after phase 4, before it matters.** §11: `[content]`
-  drivers, signing with expiry, trust tiers. Turns "write a TOML yourself" into
+  drivers, signing with expiry, trust tiers. **`manual` and `archive` drivers
+  are built (2026-08-31);** `steamcmd`, `oci`, and the signing/trust half are
+  not. Turns "write a TOML yourself" into
   "import one somebody curated". Note the bigger lever for breadth is
   `StreamRelay` (TCP), without which no config file can describe Minecraft or
   Terraria — signing a pack for a game the bridge cannot run helps nobody.
@@ -623,6 +625,25 @@ Drivers to build, in order: `manual` (name what already happens), `archive`
 (fetch, **verify the digest**, extract — a hijacked mirror gets nothing),
 `steamcmd` (anonymous app ids only), `oci` (pull an image the *operator*
 allowlisted). Each takes typed fields and nothing else.
+
+**`manual` and `archive` are built (2026-08-31.)** The schema is
+`crates/game-bridge/src/content.rs`; the half that touches a disk is
+`crates/platform-agent/src/content.rs`. Absent `[content]` means `manual`, so
+every pack written before the field keeps its meaning. Three properties carry
+the safety, each pinned by a test: the digest decides rather than the URL and
+mismatched bytes never reach the content tree; archive entry paths are rejected
+rather than repaired, links included, because a symlink to `/` is a path escape
+with extra steps; and extraction stages beside the destination and renames into
+place, so an interrupted run cannot leave a partial tree that `plan_and_check`
+reads as a complete install.
+
+Two node-operator decisions sit on top of it. Installing is its own step
+(`POST /content/:game`), not a side effect of create — a create request that
+silently became a gigabyte download would time out. And fetching is **off
+unless the operator turns it on** (`allow_content_fetch`): the digest keeps the
+bytes honest, but until §11.3 exists nothing says the operator wanted those
+bytes at all. `steamcmd` and `oci` are additive variants; a pack naming one
+today fails to parse, loudly.
 
 Only anonymous-steamcmd titles can be fetched unattended (`GAMES.md` §5).
 Anything needing credentials stays `manual`, which is the honest answer rather
