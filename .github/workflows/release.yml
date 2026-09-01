@@ -108,11 +108,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The workflow is triggered by a tag, so make the tag enough. It used
+          # to only *upload*, which meant a tag with no hand-made Release
+          # failed every job with "release not found" — the artifacts were all
+          # built and then thrown away. Creating it here is idempotent and
+          # races safely: several jobs may try at once and all but one get a
+          # harmless "already exists".
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --generate-notes \
+            || true
           # nullglob, because only one of the two archive shapes exists per OS
           # and bash otherwise hands `gh` the literal pattern.
           shopt -s nullglob
           files=(dist/*.tar.gz dist/*.zip dist/*.sha256)
-          gh release upload "${{ inputs.tag || github.ref_name }}" "${files[@]}" --clobber
+          gh release upload "$tag" "${files[@]}" --clobber
 
   launcher:
     name: launcher ${{ matrix.os }}
@@ -195,10 +205,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The workflow is triggered by a tag, so make the tag enough. It used
+          # to only *upload*, which meant a tag with no hand-made Release
+          # failed every job with "release not found" — the artifacts were all
+          # built and then thrown away. Creating it here is idempotent and
+          # races safely: several jobs may try at once and all but one get a
+          # harmless "already exists".
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --generate-notes \
+            || true
           shopt -s nullglob
           files=(dist/*)
           if [ ${#files[@]} -eq 0 ]; then
             echo "no bundles were produced" >&2
             exit 1
           fi
-          gh release upload "${{ inputs.tag || github.ref_name }}" "${files[@]}" --clobber
+          gh release upload "$tag" "${files[@]}" --clobber

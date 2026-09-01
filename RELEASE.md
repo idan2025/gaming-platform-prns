@@ -68,6 +68,12 @@ and declares `libwebkit2gtk-4.1-0, libgtk-3-0`.
 is a name any project could claim, and this repo already refuses to manage
 containers by name prefix for the same reason.
 
+**A tag alone used to build nothing.** The workflow only *uploaded* to a
+release, so a tag with no hand-made GitHub Release failed every job with
+`release not found` — after building every artifact. v0.1.0 hid this because its
+release had been created by hand. The upload steps now create the release if it
+is missing, which makes pushing a tag sufficient on its own.
+
 ## v0.2.0
 
 The first release with a Windows launcher, and the first where a hosted server
