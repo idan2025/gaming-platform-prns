@@ -71,8 +71,15 @@ jobs:
 
       - name: Export the digest
         run: |
+          set -euo pipefail
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          # The `sha256:` prefix is stripped because it is the *filename* here,
+          # and `upload-artifact` refuses a colon: "The path for one of the
+          # files in artifact is not valid". The manifest job puts the prefix
+          # back. The build itself had already pushed by digest when this
+          # failed, which is why the error arrived after a successful compile.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -111,6 +118,21 @@ jobs:
 
       - name: Create the multi-arch tag
         working-directory: /tmp/digests
+        env:
+          # Newline-separated, which is what metadata-action's `tags` output is.
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+          set -euo pipefail
+          # Built with shell rather than jq over DOCKER_METADATA_OUTPUT_JSON:
+          # one less tool this step depends on, and `tags` is already the list
+          # wanted. Each digest file is named by its bare hex, so the `sha256:`
+          # the reference needs is put back here.
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "$TAGS"
+          for digest in *; do
+            args+=("ghcr.io/${{ github.repository }}@sha256:${digest}")
+          done
+          echo "docker buildx imagetools create ${args[*]}"
+          docker buildx imagetools create "${args[@]}"
