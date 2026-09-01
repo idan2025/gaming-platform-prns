@@ -18,13 +18,79 @@ permissions:
   packages: write
 
 jobs:
-  image:
-    name: image
-    runs-on: ubuntu-24.04
+  # One job per architecture, each on a runner of that architecture. arm64 used
+  # to be cross-built under QEMU on an amd64 runner, which works and took 33
+  # minutes — compiling Rust through an instruction emulator is as slow as it
+  # sounds. Native runners are free for public repositories, so the emulation
+  # bought nothing but time.
+  #
+  # Each job pushes an untagged image by digest; `manifest` below joins them
+  # into one multi-arch tag. That is the standard shape for this, and it is what
+  # lets the two architectures build at once instead of one after the other.
+  build:
+    name: image ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    outputs:
+      image: ${{ steps.meta.outputs.images }}
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          # Per-architecture cache keys: one shared key would have each
+          # architecture evicting the other's layers every run.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export the digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # The tag a person actually pulls. Nothing is tagged until both architectures
+  # exist, so `:latest` never briefly means "amd64 only".
+  manifest:
+    name: manifest
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -41,15 +107,8 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # arm64 is emulated here, which is slow but honest: Reticulum runs on
-      # single-board machines and an image that only exists for amd64 excludes
-      # them.
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create the multi-arch tag
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
