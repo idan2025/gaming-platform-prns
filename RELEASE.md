@@ -68,6 +68,27 @@ and declares `libwebkit2gtk-4.1-0, libgtk-3-0`.
 is a name any project could claim, and this repo already refuses to manage
 containers by name prefix for the same reason.
 
+## v0.2.0
+
+The first release with a Windows launcher, and the first where a hosted server
+is reachable over the mesh rather than only on the node's LAN.
+
+- **Game servers are announced on Reticulum.** One bridge per instance, its own
+  identity, stable across restarts. Verified with an independent browse node.
+- **A host-side web UI**, served by the agent: install a pack, start a server,
+  stop, restart, and watch players. Token-authenticated, so it can be reached
+  from another machine.
+- **A Play button in the launcher**, with the game located from a saved path or
+  a Steam library. A pack says how to point a game at a server and still cannot
+  name a program to run.
+- **Mesh interfaces configurable from both UIs**, IFAC included, persisted.
+- Pack signing reachable from the command line (`game-bridge sign` / `verify`),
+  the trust gate wired into the node, idle reaping actually running, and
+  capacity-aware placement.
+- A bare Sven Co-op dedicated-server image (`images/sven-coop`), because the
+  standalone product's image runs its own controller and was never going to be
+  driven by an agent.
+
 **The Windows launcher did not ship in v0.1.0, and the release did not say so.**
 `cargo tauri build` failed on the runner with
 
