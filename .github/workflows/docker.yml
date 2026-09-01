@@ -38,8 +38,6 @@ jobs:
           - arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
-    outputs:
-      image: ${{ steps.meta.outputs.images }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -61,7 +59,11 @@ jobs:
           context: .
           platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          # `name=` is spelled out because this build carries no tags — the
+          # manifest job applies those. Without it buildx has nothing to push
+          # under and fails with "tag is needed when pushing to registry",
+          # which reads like a missing tag but is a missing *name*.
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
           # Per-architecture cache keys: one shared key would have each
           # architecture evicting the other's layers every run.
           cache-from: type=gha,scope=${{ matrix.arch }}
