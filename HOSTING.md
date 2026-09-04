@@ -59,29 +59,44 @@ xdg-open http://localhost:4750
   Docker decides at *create* whether a container has stdin, and it cannot be
   added afterwards. Recreate the server once and it will accept map changes.
 
-### UDP mesh interfaces serve one instance per node
+### One node owns the interfaces; every server shares it
 
-A TCP mesh interface *dials out*, so every instance on the node can have its
-own. A **UDP one binds a local port**, and every instance is its own Reticulum
-node — so the first instance to start gets the port and the rest cannot have it.
-Those instances still run, still announce, and are still joinable over the
-node's other interfaces; they are simply absent from that one link.
+A node runs **one** Reticulum node — a hub — that holds every interface, and
+each game server joins it as a *shared instance*. This is the engine's own
+model, the same one `rnsd` uses to let several programs on a machine share one
+mesh connection.
 
-The agent reports it per instance in the Mesh panel rather than only in its log,
-because nothing about the affected server looks wrong from the outside. If you
-run several servers and want all of them on one link, use TCP.
+It is not tidiness. **Interfaces are scarce per host in a way destinations are
+not**: a point-to-point UDP interface binds one local port, a TCP server binds
+one, an RNode owns one serial device. Destinations cost nothing — a machine can
+announce as many as it likes. So a node running six servers must not be six
+Reticulum nodes each wanting its own copy of the same link.
 
-There is a second half of this worth knowing, because it wastes an evening
-otherwise: **a containerised peer must publish the UDP port**. An outbound
-datagram leaves a container through NAT whether or not a port is published, so a
-one-way flow looks like a healthy interface from the sending side while nothing
-can arrive. If a UDP interface is configured correctly at both ends and carries
-no announces, check `docker ps` for `<port>/udp` before touching either config.
+Before this, it was exactly that, and the failure was quiet: the first server to
+start got the UDP port and the rest got `AddrInUse`, kept running, kept
+announcing over whatever else they had, and simply were not on that link. The
+server looked healthy from every angle except the one that mattered.
 
-One thing this limit is *not*: a cap on connections. A Reticulum interface is a
-transport link, not a per-connection socket — one UDP interface multiplexes
-every destination, every link and every player on it. The limit is instances per
-node, not players per instance.
+The hub is a **relay** session — interfaces and a transport identity, no game
+and no destination of its own. It has to forward, because a bridge joined to it
+holds no interfaces and every packet in either direction crosses it.
+`shared_instance_port` in `[mesh]` is the loopback port it serves on; it
+defaults to 37429 rather than RNS's own 37428, so a node sharing a machine with
+`rnsd` does not quietly take over that machine's mesh.
+
+Interfaces added at runtime go straight onto the hub, so running servers pick
+them up with no restart.
+
+**A containerised peer must publish the UDP port** — worth knowing because it
+wastes an evening otherwise. An outbound datagram leaves a container through NAT
+whether or not a port is published, so a one-way flow looks like a healthy
+interface from the sending side while nothing can arrive. If a UDP interface is
+configured correctly at both ends and carries no announces, check `docker ps`
+for `<port>/udp` before touching either config.
+
+None of this caps connections. A Reticulum interface is a transport link, not a
+per-connection socket: one interface multiplexes every destination, every link
+and every player on it.
 
 ## Three things worth understanding before you run it
 

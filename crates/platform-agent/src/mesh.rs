@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use game_bridge::config::{AnnounceFormat, ServerArgs};
+use game_bridge::config::{AnnounceFormat, RelayArgs, ServerArgs};
 use game_bridge::profile::GameProfile;
 use game_bridge::BridgeSession;
 use serde::{Deserialize, Serialize};
@@ -70,15 +70,42 @@ pub struct MeshConfig {
     /// Seconds between announces. The default matches the bridge's own.
     #[serde(default = "default_announce_interval")]
     pub announce_interval: u64,
+    /// Loopback port this node's **shared instance** is served on.
+    ///
+    /// One node on this machine owns the interfaces and every game server
+    /// reaches the mesh through it. That is the engine's own model, and it is
+    /// what lets a node run many servers: interfaces are scarce per host in a
+    /// way destinations are not — a point-to-point UDP interface binds one
+    /// local port, a TCP server binds one, an RNode owns one serial device.
+    /// Before this, each server was its own node with its own interface set,
+    /// so the second server on a node silently lost any interface that binds.
+    ///
+    /// Loopback only, and not configurable to anything else: this is a bus
+    /// between processes on one machine, and a routable one would be an
+    /// unauthenticated way onto this node's mesh.
+    #[serde(default = "default_shared_instance_port")]
+    pub shared_instance_port: u16,
 }
 
 fn default_announce_interval() -> u64 {
     30
 }
 
+/// Deliberately not RNS's own default (37428): a node may be sharing a machine
+/// with a `rnsd` that already serves one, and quietly binding its port would
+/// take over that machine's mesh instead of forming this node's own.
+fn default_shared_instance_port() -> u16 {
+    37429
+}
+
 impl Default for MeshConfig {
     fn default() -> Self {
-        Self { tcp: None, auto: false, announce_interval: default_announce_interval() }
+        Self {
+            tcp: None,
+            auto: false,
+            announce_interval: default_announce_interval(),
+            shared_instance_port: default_shared_instance_port(),
+        }
     }
 }
 
@@ -277,6 +304,20 @@ pub struct MeshAnnounce<'a> {
 /// Every instance's mesh bridge, by instance id.
 pub struct MeshBridges {
     config: Option<MeshConfig>,
+    /// The one node on this machine that owns the interfaces.
+    ///
+    /// A `Relay` session: interfaces and a transport identity, no game and no
+    /// destination of its own. Every game bridge joins it as a shared instance
+    /// and binds nothing, so a node can run as many servers as it likes without
+    /// them competing for the same local ports.
+    ///
+    /// Started on demand rather than at construction, because a node with no
+    /// `[mesh]` section has no interfaces to own and should not hold a
+    /// Reticulum node at all.
+    hub: Mutex<Option<BridgeSession>>,
+    /// Where the hub's identity lives. A transport node's identity is stable so
+    /// the paths through it stay stable across restarts.
+    hub_identity: Option<PathBuf>,
     bridges: Mutex<BTreeMap<String, Bridge>>,
     /// Interfaces added at runtime, applied to every bridge and persisted so a
     /// restart does not quietly take the node off a relay it was using.
@@ -288,6 +329,8 @@ impl MeshBridges {
     pub fn new(config: Option<MeshConfig>) -> Arc<Self> {
         Arc::new(Self {
             config,
+            hub: Mutex::new(None),
+            hub_identity: None,
             bridges: Mutex::new(BTreeMap::new()),
             extra: Mutex::new(Vec::new()),
             extra_path: None,
@@ -301,12 +344,65 @@ impl MeshBridges {
             .ok()
             .and_then(|s| serde_json::from_str::<Vec<MeshInterface>>(&s).ok())
             .unwrap_or_default();
+        // The hub's identity sits beside the interface store, in the node's own
+        // state directory.
+        let hub_identity = path.parent().map(|d| d.join("mesh-hub.identity"));
         Arc::new(Self {
             config,
+            hub: Mutex::new(None),
+            hub_identity,
             bridges: Mutex::new(BTreeMap::new()),
             extra: Mutex::new(extra),
             extra_path: Some(path),
         })
+    }
+
+    /// The node that owns this machine's interfaces, started if it is not
+    /// already running.
+    ///
+    /// A `Relay` session and not a `Browse` one, because the hub has to
+    /// **forward**: a game bridge joined to it holds no interfaces, so every
+    /// packet in either direction crosses the hub. Forwarding needs a transport
+    /// identity, and `Browse` deliberately holds none (`PLAN.md` §4 — browsing
+    /// a list is not consent to carry strangers' traffic). Here the traffic
+    /// being carried is this node's own servers'.
+    async fn ensure_hub(&self) -> Result<u16> {
+        let config = self.config.as_ref().ok_or_else(|| anyhow!("this node runs its games LAN-only"))?;
+        let port = config.shared_instance_port;
+        let mut hub = self.hub.lock().await;
+        if hub.is_some() {
+            return Ok(port);
+        }
+
+        let identity = self
+            .hub_identity
+            .clone()
+            .ok_or_else(|| anyhow!("this node has nowhere to keep its mesh identity"))?;
+        if let Some(parent) = identity.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut args = RelayArgs::new();
+        args.identity = identity;
+        args.tcp = config.tcp.clone();
+        args.auto = config.auto;
+        let session = BridgeSession::start_relay(args)
+            .await
+            .map_err(|e| anyhow!("starting this node's mesh hub: {e}"))?;
+        session.serve_shared_instance(port).await?;
+
+        // Runtime interfaces belong to the hub and to nothing else. This is the
+        // whole point of the arrangement: one owner for every link, so a second
+        // server cannot fail to bind what the first one took.
+        for iface in self.extra.lock().await.iter() {
+            if let Some(note) = iface.attach_to(&session).await {
+                tracing::warn!(note = %note, "an interface did not attach to this node's mesh hub");
+            }
+        }
+
+        tracing::info!(port, "this node's mesh hub is up; game servers will share it");
+        *hub = Some(session);
+        Ok(port)
     }
 
     /// The runtime interfaces, without their IFAC secrets.
@@ -326,12 +422,12 @@ impl MeshBridges {
                  interface to. Add a [mesh] section to its config and restart"
             ));
         }
-        {
-            let mut bridges = self.bridges.lock().await;
-            for bridge in bridges.values_mut() {
-                if let Some(note) = iface.attach_to(&bridge.session).await {
-                    bridge.status.interface_notes.push(note);
-                }
+        // Straight onto the hub: it is the only node here that holds interfaces,
+        // and every running bridge already reaches the mesh through it, so they
+        // pick this up with no restart and nothing to re-attach.
+        if let Some(session) = self.hub.lock().await.as_ref() {
+            if let Some(note) = iface.attach_to(session).await {
+                return Err(anyhow!("{note}"));
             }
         }
         let mut extra = self.extra.lock().await;
@@ -410,12 +506,21 @@ impl MeshBridges {
             std::fs::create_dir_all(parent)?;
         }
 
+        // The hub owns the interfaces; make sure it is up before a bridge that
+        // depends on it exists.
+        let shared_port = self.ensure_hub().await?;
+
         let mut args = ServerArgs::new(profile.clone());
         args.game_host = game_addr.0.to_string();
         args.game_port = game_addr.1;
         args.identity = identity_path.to_path_buf();
-        args.tcp = config.tcp.clone();
-        args.auto = config.auto;
+        // **No interfaces of its own.** A game bridge reaches the mesh through
+        // this node's hub, so it binds nothing: no TCP port, no UDP local port,
+        // no auto-discovery socket. That is what lets a node run more than one
+        // server — before this, every bridge was a node with its own interface
+        // set and the second one silently lost anything that binds.
+        args.tcp = None;
+        args.auto = false;
         args.announce_interval = config.announce_interval;
         args.name = Some(announce.name.to_string());
         args.max_players = announce.max_players;
@@ -436,13 +541,18 @@ impl MeshBridges {
             .await
             .map_err(|e| anyhow!("starting the mesh bridge: {e}"))?;
 
-        // Everything added since startup, so a bridge born now reaches the same
-        // relays as the ones already running.
+        // One link, to the node's hub. Every real interface hangs off that, so
+        // a bridge needs nothing else and cannot collide with its siblings.
         let mut interface_notes = Vec::new();
-        for iface in self.extra.lock().await.iter() {
-            if let Some(note) = iface.attach_to(&session).await {
-                interface_notes.push(note);
-            }
+        if let Err(e) = session.join_shared_instance(shared_port).await {
+            // The server still runs and is still reachable on its published
+            // port; it is simply not on the mesh. Degraded, not broken — the
+            // same rule `Agent::create` follows.
+            interface_notes.push(format!(
+                "this server could not join the node's mesh hub on port {shared_port}, so it is \
+not announced: {e}"
+            ));
+            tracing::warn!(port = shared_port, error = %format!("{e:#}"), "a bridge did not join the mesh hub");
         }
 
         let status = MeshStatus {

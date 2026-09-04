@@ -12,7 +12,7 @@ description = "Optional announce indexer. A cache of the mesh with a front door,
 game-bridge = { path = "../game-bridge" }
 platform-agent = { path = "../platform-agent" }
 platform-auth = { path = "../platform-auth" }
-personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "wifi-auto"] }
+personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "wifi-auto", "shared-instance"] }
 prns-core = { workspace = true }
 anyhow = "1"
 axum = "0.7"

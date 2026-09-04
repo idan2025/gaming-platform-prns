@@ -10,7 +10,7 @@ description = "Launcher logic for the server browser: sessions, queries, and the
 
 [dependencies]
 game-bridge = { path = "../game-bridge" }
-personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "wifi-auto"] }
+personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "wifi-auto", "shared-instance"] }
 prns-core = { workspace = true }
 anyhow = "1"
 hex = "0.4"

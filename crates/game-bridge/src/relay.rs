@@ -53,6 +53,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use personal_rns::prelude::*;
+use personal_rns::shared_instance::{
+    connect_existing_shared_instance, SharedInstanceClientIntent, SharedInstanceTransport,
+};
 use personal_rns::{load_or_create_identity_secret, IdentitySecretFileError};
 use prns_core::engine::{SendToLink, SendToLinkPayload};
 use prns_core::identity::in_memory::InMemoryNodeIdentity;
@@ -374,6 +377,47 @@ impl BridgeSession {
     /// The engine handle — live interface add/remove/rename, introspection
     /// (routes, destination identities, link count), and link/path/announce
     /// commands. See `personal_rns::prelude::PrnsNodeHandle`.
+    /// Serve a **shared instance** on `port`, so other nodes on this machine
+    /// can reach the mesh through this one's interfaces instead of opening
+    /// their own.
+    ///
+    /// This is the engine's own mechanism, not something invented here: RNS
+    /// runs one node per machine and lets every other program on it attach
+    /// over a loopback bus. It exists because interfaces are *scarce per host*
+    /// in a way destinations are not — a point-to-point UDP interface binds one
+    /// local port, a TCP server binds one, an RNode owns one serial device. A
+    /// second node on the same machine cannot have any of them, however many
+    /// destinations it wants to announce.
+    ///
+    /// So a host that runs several game servers should not run several nodes
+    /// with several interface sets. It should run one node that owns the links
+    /// and let the servers share it.
+    pub async fn serve_shared_instance(&self, port: u16) -> Result<()> {
+        self.handle.supervise(SharedInstanceServer::with_port(port));
+        info!(port, "serving a shared instance for other nodes on this machine");
+        Ok(())
+    }
+
+    /// Join a shared instance served on `port` by another node on this machine,
+    /// reaching the mesh through *its* interfaces.
+    ///
+    /// The counterpart to [`serve_shared_instance`](Self::serve_shared_instance).
+    /// A session that joins one needs no interfaces of its own, which is the
+    /// entire point: it can still register a destination and announce it, but
+    /// it binds nothing and so cannot collide with its siblings.
+    pub async fn join_shared_instance(&self, port: u16) -> Result<()> {
+        let intent = SharedInstanceClientIntent {
+            bus_port: port,
+            transport: SharedInstanceTransport::Tcp,
+            policy: prns_core::interfaces::shared_instance::configured_policy(Default::default()),
+        };
+        connect_existing_shared_instance(&self.handle, intent)
+            .await
+            .map_err(|e| anyhow!("joining the shared instance on port {port}: {e:?}"))?;
+        info!(port, "joined this machine's shared instance");
+        Ok(())
+    }
+
     pub fn handle(&self) -> &PrnsNodeHandle {
         &self.handle
     }
