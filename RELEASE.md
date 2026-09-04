@@ -74,6 +74,54 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.7
+
+### The map in a server list was always "Unknown"
+
+`server_announce_bytes` ran **once**, before the announce loop, and the same
+bytes went out every interval forever. So a browser's row showed whatever the
+server started with and never anything else. For a node-hosted server that
+meant a permanently empty map — nothing sets `args.map` there — which the
+launcher renders as "Unknown", and a player count frozen at its initial value.
+
+The live A2S poller sitting beside it already read both from the game. This is
+the half that was missing: the record is rebuilt each tick, taking map and
+counts from the last live read. A `changelevel` now reaches the list.
+
+**The announce is the entire server-browser row** (`PLAN.md` §2 — 316 bytes of
+`app_data`), so a stale one is not cosmetic. It is the listing.
+
+A legacy announce is untouched: a bare name carries no map or counts, and §5
+freezes what a deployed v0.1.10 peer sees. A zero-slot reading is ignored
+rather than published — a game reporting no capacity is answering nonsense.
+
+### UDP interfaces
+
+TCP makes Reticulum ride a reliable ordered stream underneath a protocol that
+does its own retransmission and ordering; on a local network that duplicated
+machinery is latency for nothing. Both the mesh and the uplink now take a UDP
+interface. It needed the engine's `udp` feature, which no crate had enabled.
+
+**Point-to-point and not discovered**, so the far side needs the mirror of the
+entry with `local` and `peer` swapped. The web UI says so where it is
+configured, because an entry with no counterpart silently sends into nothing.
+
+**A containerised peer must publish the UDP port**, and this is the trap: an
+outbound datagram escapes a container through NAT whether or not a port is
+published, so a one-way flow looks like a working interface from the sending
+side. The receiving side sees nothing and says nothing. If a UDP interface is
+configured correctly at both ends and still carries no announces, check
+`docker ps` for `4790/udp` before touching either config.
+
+### Stats
+
+`InstanceStatus` gains `map_now`, read from the same A2S reply that already
+supplied `players_now` rather than a second query, and the agent's UI grows a
+Map column. `None` keeps its `players_now` meaning — "could not ask", not "no
+map" — and renders as a dash with the reason in its tooltip, never as a blank
+cell. Cells update in place; no row node is replaced, so a poll cannot steal
+focus or scroll.
+
 ## v0.2.6
 
 Two things a live node made obvious, once joining actually worked.
