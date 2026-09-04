@@ -42,17 +42,31 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
+          # Intel macOS is **cross-built on an Apple Silicon runner**, which is
+          # a different claim from the one the ARM Linux entry above refuses to
+          # make. `macos-13` was retired by GitHub, and a job asking for a
+          # retired label is not failed — it queues, forever. That is what left
+          # every release run since v0.1.0 hanging with one job outstanding,
+          # and why no release has ever carried an Intel-mac asset.
+          #
+          # Cross-compiling here is honest because it is the same OS and the
+          # same Apple SDK, which ships both architectures; nothing
+          # third-party links this. It is still a binary nobody has run, so it
+          # is a CLI target and not the launcher's.
+          - os: macos-14
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       # See the launcher job's copy of this step for the measurement and why
       # `core.longpaths` alone is not enough. The CLI job has passed on Windows
@@ -75,8 +89,11 @@ jobs:
 
       # game-bridge, platform-agent, platform-index. The launcher is a separate
       # job because it needs a webview toolchain.
+      # `--target` on every entry, native ones included, so the output path is
+      # the same shape everywhere and the packaging steps below need no
+      # special case for the cross-built one.
       - name: Build
-        run: cargo build --release --bins
+        run: cargo build --release --bins --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -84,7 +101,8 @@ jobs:
           set -euo pipefail
           name="gaming-platform-prns-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp target/release/game-bridge target/release/platform-agent target/release/platform-index "dist/$name/"
+          out="target/${{ matrix.target }}/release"
+          cp "$out/game-bridge" "$out/platform-agent" "$out/platform-index" "dist/$name/"
           cp -r packs "dist/$name/packs"
           cp README.md RELEASE.md ENGINE.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
@@ -96,7 +114,8 @@ jobs:
         run: |
           $name = "gaming-platform-prns-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item target/release/game-bridge.exe,target/release/platform-agent.exe,target/release/platform-index.exe "dist/$name/"
+          $out = "target/${{ matrix.target }}/release"
+          Copy-Item "$out/game-bridge.exe","$out/platform-agent.exe","$out/platform-index.exe" "dist/$name/"
           Copy-Item -Recurse packs "dist/$name/packs"
           Copy-Item README.md,RELEASE.md,ENGINE.md "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
@@ -125,18 +144,46 @@ jobs:
           gh release upload "$tag" "${files[@]}" --clobber
 
   launcher:
-    name: launcher ${{ matrix.os }}
+    name: launcher ${{ matrix.label }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-14, macos-13, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            label: ubuntu-22.04
+          - os: ubuntu-24.04-arm
+            label: ubuntu-24.04-arm
+          # The proven macOS bundle: native, Apple Silicon. Kept exactly as it
+          # was, because it is the only mac artifact any release has ever
+          # carried and the universal entry below is not yet evidence of
+          # anything.
+          - os: macos-14
+            label: macos-14
+            args: ""
+          # Intel Macs, via one universal binary rather than the retired
+          # `macos-13` runner — see the cli job for why that label hangs
+          # instead of failing. `fail-fast: false` is what makes adding this
+          # safe: if it does not build, every other bundle still publishes and
+          # the release is no worse off than it has been since v0.1.0.
+          #
+          # Once this has gone green on a release, the native entry above is
+          # redundant and should be dropped: a universal dmg runs on both.
+          - os: macos-14
+            label: macos-14-universal
+            args: "--target universal-apple-darwin"
+            rust-targets: "x86_64-apple-darwin,aarch64-apple-darwin"
+          - os: windows-latest
+            label: windows-latest
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets || '' }}
 
       # The engine is a git dependency whose tree carries benchmark result files
       # with very long names, and Windows refuses paths over 260 characters:
@@ -170,7 +217,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: launcher/src-tauri
-          key: launcher-${{ matrix.os }}
+          key: launcher-${{ matrix.label }}
 
       # WebKitGTK and the AppImage tooling. librsvg2-dev is not optional:
       # without it linuxdeploy's gtk plugin fails after the deb and rpm have
@@ -187,14 +234,18 @@ jobs:
 
       - name: Bundle
         working-directory: launcher/src-tauri
-        run: cargo tauri build
+        run: cargo tauri build ${{ matrix.args || '' }}
 
       - name: Collect bundles
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          find launcher/src-tauri/target/release/bundle -maxdepth 2 \
+          # A `--target` build lands under target/<triple>/release/bundle, a
+          # native one under target/release/bundle. Matching on the path
+          # covers both without branching, and without a nested find whose
+          # own `{}` would fight this one's.
+          find launcher/src-tauri/target -type f -path '*/bundle/*' \
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) \
             -exec cp {} dist/ \;
           ls -la dist

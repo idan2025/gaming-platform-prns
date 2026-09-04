@@ -256,10 +256,39 @@ here either.
 Two jobs, both uploading to the tag's release with `gh release upload --clobber`:
 
 - **cli** — `game-bridge`, `platform-agent`, `platform-index` for
-  `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` and
-  `x86_64-pc-windows-msvc`, packaged with `packs/`.
-- **launcher** — `cargo tauri build` on ubuntu-22.04, macos-14, macos-13 and
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `aarch64-apple-darwin`, `x86_64-apple-darwin` and `x86_64-pc-windows-msvc`,
+  packaged with `packs/`. Every entry builds with an explicit `--target`, even
+  the native ones, so one packaging step serves all of them.
+- **launcher** — `cargo tauri build` on ubuntu-22.04, ubuntu-24.04-arm,
+  macos-14 (native, and again as `universal-apple-darwin`) and
   windows-latest.
+
+### `macos-13` is retired, and a retired label queues forever
+
+This cost every release from v0.1.0 to v0.2.3 the same way, and it is worth
+recognising quickly because the symptom does not look like a failure. GitHub
+removed the Intel macOS runners. A job that asks for a label with no runner
+behind it is **not** failed and not reported: it sits in `queued`, and the run
+never completes. v0.2.1's release run was still queued more than two hours
+after every other job had succeeded.
+
+So no release has ever carried an Intel-mac asset, and the runs that "had not
+finished yet" were never going to. `ci.yml` was unaffected throughout because
+it only ever named `macos-14` — which is why CI stayed green while releases
+hung, and why the difference between the two files was the thing to look at.
+
+Intel Macs are now served from Apple Silicon runners instead: the CLI target is
+cross-compiled (same OS, same SDK, nothing third-party in the link), and the
+launcher gets a `universal-apple-darwin` bundle that runs on both. Both matrices
+also carry `timeout-minutes`, so a build that hangs for another reason fails
+rather than waiting out the six-hour default.
+
+The universal launcher entry is additive on purpose: the native `macos-14`
+bundle is the only mac artifact any release has ever produced, and
+`fail-fast: false` means a universal build that does not work costs nothing.
+**Once a release ships a universal dmg, drop the native macos-14 entry** — a
+universal binary covers both and two mac dmgs in one release is just confusing.
 
 It fires on a `v*` tag push, and takes a `tag` input for `workflow_dispatch`
 when the tag already exists:
