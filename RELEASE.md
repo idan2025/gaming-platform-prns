@@ -74,6 +74,59 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.9
+
+**The launcher remembers servers, and asks the mesh where they are.** If you
+have ever opened the launcher and seen an empty list while a server was plainly
+running, this is that.
+
+### Why an empty list was correct behaviour
+
+A transport node floods an announce when a destination is **new** and suppresses
+the repeats once it holds a path. It has to — otherwise announces would
+re-flood the mesh forever. But a browser is passive: it learns of a server only
+when that server next announces. So a launcher started *after* a server was
+already running never hears about it, no matter how often the server announces.
+
+Measured on a live mesh, one browse session, two servers on the same node
+sharing the same link and the same 15-second timer:
+
+| destination | state during the browse | seen |
+| --- | --- | --- |
+| new one | created 12 s in | yes, at hops=2 |
+| existing one | already running | no, in 100 s |
+
+Novelty was the only difference between them. Lowering the announce interval
+does not help, because the repeats are precisely what is being suppressed.
+
+### What the launcher does now
+
+- **Remembers.** Every server heard is written to `launcher.json` by
+  destination hash, with its last name and game. Only a real change earns a
+  write; a list polled every two seconds must not rewrite the file every two
+  seconds.
+- **Asks.** On browse start, and from the **Find remembered** button, it issues
+  a path request per remembered server. **The answer to a path request is the
+  cached announce**, so rows fill in through the ordinary `AnnounceHeard` path
+  with real names, maps and counts — nothing is synthesised from memory.
+- **Forgets**, one or all, from the detail pane.
+
+No index, no account, no infrastructure — `DESIGN.md` §0 is intact. A
+destination hash is all a join needs, so a server seen once stays joinable from
+the player's own machine forever after.
+
+A path request rather than a probe on purpose: re-probing every remembered
+server over a Link would open a connection to each just to draw a list, which
+is exactly the traffic `PLAN.md` §3.4 says a decentralized browser must not
+generate.
+
+**The rule the UI must not break:** a remembered row is never dressed as a live
+one. Dimmed, badged, and every live field reads Unknown rather than a stale
+value — a stale player count shown as current is the one thing a server browser
+must not do. It is still joinable and says so. A remembered row is also not
+evidence: feeding one back into the recorder cannot refresh its own timestamp,
+or memory would keep itself alive and a dead server would never age out.
+
 ## v0.2.8
 
 **One shared Reticulum node per host, instead of one per game server.** If you
