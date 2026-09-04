@@ -74,6 +74,58 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.6
+
+Two things a live node made obvious, once joining actually worked.
+
+### The Sven Co-op sound cache could never be written
+
+A server writes `svencoop/maps/soundcache/<map>.txt` on every map load, and
+that path sits inside the read-only content mount, so every attempt failed:
+
+```
+[Sound Engine] - Failed to write sound cache "crystal.txt" - Error #30
+```
+
+Errno 30 is `EROFS`. The cache is what lets a map skip re-scanning its sounds,
+so a server that can never write it re-precaches from scratch at every
+`changelevel` — which an operator sees as the server looping on precache.
+
+`svencoop/maps/soundcache` is now in `writable_paths`, and it is safe there for
+**two reasons that must both keep holding**:
+
+1. a steamcmd install **ships the directory**, so the nested writable bind has
+   a mountpoint. One cannot create its own under a read-only mount, and
+   `plan_and_check` refuses rather than letting runc fail with `mkdirat ...
+   read-only file system`. The `uplink_roundtrip` fixture proved this the
+   instant its fake content tree lacked the directory;
+2. it ships that directory **empty**, so an empty per-instance directory
+   mounted over it hides nothing.
+
+Listing the parent, `svencoop/maps`, once hid all 108 shipped maps. This sits
+just inside that rule, and a test pins both halves. **If a future content
+version starts shipping files under `soundcache`, this entry becomes the same
+bug and must go.**
+
+### A map is chosen from a list, not typed from memory
+
+Packs gain `maps_dir` — a relative path to where a game keeps its maps
+(`svencoop/maps`, `valve/maps`, `cstrike/maps`, `tf/maps`) — and the agent
+answers `GET /games/:game/maps` by listing the `.bsp` files in the content copy
+it actually has. 108 for a full Sven Co-op install.
+
+The pack names a **directory** and never a map. The path is validated with the
+same rule as `writable_paths` before anything is read, and the node only ever
+lists it: a pack cannot reach outside the content copy, and listing a directory
+runs nothing. What is installed is a fact about the machine, so the node
+answers rather than the manifest — a node with partial content, or with maps an
+operator added by hand, reports what is there.
+
+The web UI offers them on the start form and replaces the change-map
+`prompt()` with a picker. Deliberately a `datalist` and a scrolled list of every
+map, not a `select` and not a truncated one: the node lists what it has
+installed, and an operator may know about a map it does not.
+
 ## v0.2.5
 
 **A join could not reach anything, and this is the release that fixes it.** If
