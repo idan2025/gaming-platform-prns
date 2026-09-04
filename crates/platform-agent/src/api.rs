@@ -114,6 +114,7 @@ pub fn router_full(
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content).get(install_status))
         .route("/games", get(games))
+        .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
         // Configuring the mesh interfaces binds sockets and joins meshes, so it
         // rides behind the same token gate as every container-creating route
@@ -474,6 +475,23 @@ async fn restart(
         .restart(&id)
         .await
         .map(|_| Json(json!({ "instance_id": id, "restarted": true })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// The maps this node has installed for one game, so a person picks from a
+/// list instead of remembering a name.
+///
+/// Read off the content copy, not the pack: what is installed is a fact about
+/// this machine. An empty list means the content is not here yet.
+async fn game_maps(
+    State(state): State<ApiState>,
+    Path(game): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .available_maps(&game)
+        .await
+        .map(|maps| Json(json!({ "game_id": game, "maps": maps })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 

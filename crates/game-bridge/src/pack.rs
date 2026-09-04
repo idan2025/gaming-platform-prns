@@ -110,6 +110,17 @@ pub struct GamePack {
     /// naming what runs.
     #[serde(default)]
     pub extra_ports: Vec<PackPort>,
+    /// Where this game's maps live, relative to its install directory —
+    /// `"svencoop/maps"`, `"valve/maps"`. Absent means a node cannot offer a
+    /// list of maps for this game and a person types the name instead.
+    ///
+    /// **Data the node checks, never an instruction it obeys**, exactly like
+    /// [`writable_paths`](Self::writable_paths): the agent validates it as a
+    /// relative path that cannot escape the install before it reads anything,
+    /// and only ever *lists* it. A pack still cannot reach outside the content
+    /// copy, and listing a directory is not running anything.
+    #[serde(default)]
+    pub maps_dir: Option<String>,
     /// Which console a node may talk to this game's running server through, so
     /// an operator can change the map without restarting it (`console.rs`).
     /// Absent means the node cannot: it will say so rather than guess a
@@ -268,13 +279,25 @@ impl GamePack {
             // install ships files at hides them — `svencoop/maps` used to be
             // here and masked all 108 shipped maps. Kept in step with
             // `packs/sven-coop.toml`.
-            writable_paths: vec!["svencoop/logs".to_string()],
+            // `svencoop/maps/soundcache` is writable because the server writes
+            // `<map>.txt` there on every map load and cannot under a read-only
+            // mount (`Error #30`, EROFS) — which makes it re-precache from
+            // scratch at every changelevel. Safe to list only because a
+            // steamcmd install ships the directory and ships it *empty*: the
+            // mountpoint exists, and nothing is hidden by mounting over it.
+            writable_paths: vec![
+                "svencoop/logs".to_string(),
+                "svencoop/maps/soundcache".to_string(),
+            ],
             // App 276060 is the Sven Co-op Dedicated Server and it fetches
             // anonymously, which is what `steamcmd` requires. Kept in step with
             // `packs/sven-coop.toml`, which
             // `shipped_sven_pack_matches_the_builtin` enforces.
             content: PackContent::Steamcmd { app_id: 276060 },
             extra_ports: Vec::new(),
+            // Where the 108 shipped maps are, so a node can offer them as a
+            // list instead of asking someone to remember a name.
+            maps_dir: Some("svencoop/maps".to_string()),
             // GoldSrc, so a node can `changelevel` a live server. Kept in step
             // with `packs/sven-coop.toml`.
             console: Some(PackConsole::Goldsrc),
@@ -488,6 +511,32 @@ query = "a2s"
     #[test]
     fn shipped_sven_pack_matches_the_builtin() {
         assert_eq!(GamePack::parse(SVEN_TOML).unwrap(), GamePack::sven_coop());
+    }
+
+    /// A Sven Co-op server writes `maps/soundcache/<map>.txt` on every map
+    /// load. Under a read-only content mount that fails with `Error #30`
+    /// (EROFS) and the server re-precaches its sounds from scratch at every
+    /// changelevel — observed on a live node as an apparent precache loop.
+    ///
+    /// The path is only safe to make writable because a steamcmd install ships
+    /// the directory and ships it **empty**: a writable path is an empty
+    /// directory mounted *over* the content, so listing one that has files in
+    /// it hides them. That is what listing `svencoop/maps` did to 108 shipped
+    /// maps. If a future content version starts shipping files under
+    /// `soundcache`, this entry becomes the same bug and must go.
+    #[test]
+    fn the_sound_cache_is_writable_or_every_map_change_re_precaches() {
+        let pack = GamePack::sven_coop();
+        assert!(
+            pack.writable_paths.iter().any(|p| p == "svencoop/maps/soundcache"),
+            "writable_paths were {:?}",
+            pack.writable_paths
+        );
+        // The rule that keeps it safe: never the parent, which ships the maps.
+        assert!(
+            !pack.writable_paths.iter().any(|p| p == "svencoop/maps"),
+            "making svencoop/maps writable hides every shipped map"
+        );
     }
 
     /// The pack's app_name is the destination hash, and §5 freezes it.

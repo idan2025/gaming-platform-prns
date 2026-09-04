@@ -134,6 +134,12 @@ async fn two_nodes(trusted: impl FnOnce(&str) -> Vec<String>) -> Option<TwoNodes
     std::fs::create_dir_all(content.join("maps")).ok()?;
     std::fs::create_dir_all(content.join("logs")).ok()?;
     std::fs::create_dir_all(content.join("scripts")).ok()?;
+    // A real steamcmd install ships this, empty, and the pack declares it
+    // writable so the server can write its per-map sound cache. A writable
+    // bind cannot create its own mountpoint under a read-only one, so the
+    // fixture has to contain every directory the pack lists — which is exactly
+    // what `plan_and_check` refuses without, and how this fixture found out.
+    std::fs::create_dir_all(content.join("maps/soundcache")).ok()?;
 
     let agent_cfg = AgentConfig::parse(&agent_config_toml(dir.path())).ok()?;
     let agent = Agent::new(agent_cfg, vec![game_bridge::GamePack::sven_coop()])

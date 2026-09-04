@@ -17,6 +17,7 @@ const state = {
   games: [],             // array of game defs
   instances: [],         // array of instance objects
   interfaces: [],        // array of live mesh interface objects
+  maps: new Map(),       // game_id -> [map names] this node has installed
   rows: new Map(),       // instance_id -> <tr>
   inFlight: 0,           // mutating requests in flight; polling pauses while > 0
   pollTimer: null,
@@ -267,6 +268,9 @@ function renderInstances() {
       stopBtn.addEventListener("click", () => onStop(inst.instance_id));
       if (restartBtn) restartBtn.addEventListener("click", () => onRestart(inst.instance_id));
       if (mapBtn) mapBtn.addEventListener("click", () => onChangeMap(inst.instance_id, inst.game_id));
+      // Ask for this game's maps as soon as a row for it exists, so the dialog
+      // opens with the list already there rather than empty for a moment.
+      ensureMaps(inst.game_id);
       removeBtn.addEventListener("click", () => onRemove(inst.instance_id, inst.name));
       tbody.appendChild(row);
       state.rows.set(inst.instance_id, row);
@@ -458,6 +462,43 @@ function refreshCardDynamic(g) {
   }
 }
 
+// ---------- maps ----------
+
+// What this node actually has for a game, read off its content copy. Asked for
+// once per game and cached: it is a directory listing that only changes when
+// content is installed.
+//
+// Fire-and-forget by design — the field is usable as free text the whole time,
+// so a node that cannot answer (no content yet, a pack with no `maps_dir`)
+// costs the operator nothing but the list.
+async function ensureMaps(gameId, onLoaded) {
+  if (!gameId || state.maps.has(gameId)) return;
+  state.maps.set(gameId, null); // in flight; do not ask twice
+  try {
+    const body = await api("GET", "/games/" + encodeURIComponent(gameId) + "/maps");
+    state.maps.set(gameId, (body && body.maps) || []);
+  } catch (e) {
+    state.maps.set(gameId, []);
+  }
+  if (onLoaded) onLoaded(state.maps.get(gameId));
+}
+
+// A <datalist> rather than a <select>: the node lists what it has, and an
+// operator can still type a name it does not know about — a map added by hand
+// after the last listing, say. A select would make the node's view the only
+// possibility, which it is not.
+function mapDatalist(id, gameId) {
+  const dl = el("datalist");
+  dl.id = id;
+  const maps = state.maps.get(gameId);
+  (maps || []).forEach(m => {
+    const o = el("option");
+    o.value = m;
+    dl.appendChild(o);
+  });
+  return dl;
+}
+
 // ---------- start form ----------
 
 function onOpenStartForm(gameId) {
@@ -505,8 +546,16 @@ function renderStartForm(gameId) {
   mapInput.value = f.map || "";
   mapInput.placeholder = "leave blank for the game's default";
   mapInput.addEventListener("input", () => { f.map = mapInput.value; });
+  // The list of maps this node has, offered as suggestions on the same field.
+  const listId = "sf-maplist-" + gameId;
+  mapInput.setAttribute("list", listId);
+  const mapList = mapDatalist(listId, gameId);
+  ensureMaps(gameId, () => { if (state.openForms.has(gameId)) renderStartForm(gameId); });
+  const known = state.maps.get(gameId);
   const mapHint = el("p", "muted small",
-    "The map name as the game knows it — svencoop1, de_dust2, cp_dustbowl. " +
+    (known && known.length
+      ? "Click the field for the " + known.length + " maps installed here, or type any name. "
+      : "The map name as the game knows it — svencoop1, de_dust2, cp_dustbowl. ") +
     "Letters, digits, '_', '-', '.' and '/' only.");
 
   const advLabel = el("label", "checkbox-row");
@@ -536,7 +585,7 @@ function renderStartForm(gameId) {
   cancelBtn.addEventListener("click", () => closeStartForm(gameId));
   actions.append(startBtn, cancelBtn);
 
-  form.append(nameLabel, nameInput, mpLabel, mpInput, mapLabel, mapInput, mapHint, advLabel, advancedWrap, actions);
+  form.append(nameLabel, nameInput, mpLabel, mpInput, mapLabel, mapInput, mapList, mapHint, advLabel, advancedWrap, actions);
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     onStartSubmit(gameId);
@@ -743,32 +792,93 @@ async function onRestart(instanceId) {
 // Change the map on a live server. Not a restart: `changelevel` keeps every
 // player connected, which is the whole difference between this and recreating
 // the container with a different starting map.
-async function onChangeMap(instanceId, gameId) {
-  const map = prompt(
-    "New map for this " + gameId + " server:\n\n" +
-    "The name as the game knows it — svencoop1, de_dust2, cp_dustbowl. " +
-    "Players stay connected; the server changes level.",
-    "");
-  if (map == null) return;
-  const trimmed = map.trim();
-  if (trimmed === "") return;
-  if (!MAP_NAME_RE.test(trimmed)) {
-    showError("A map name may only contain letters, digits, '_', '-', '.' and '/'.");
-    return;
+//
+// A picker rather than the `prompt()` this used to be. A Sven Co-op install
+// ships 108 maps, and asking someone to recall an exact name — then refusing
+// what they typed — is not a way to choose one. The field still accepts a name
+// the node did not list, because the node lists what it has installed and an
+// operator may know better.
+function onChangeMap(instanceId, gameId) {
+  ensureMaps(gameId, () => renderMapDialog(instanceId, gameId));
+  renderMapDialog(instanceId, gameId);
+}
+
+function renderMapDialog(instanceId, gameId) {
+  let back = $("map-dialog");
+  if (back) back.remove();
+  back = el("div", "modal-back");
+  back.id = "map-dialog";
+  const box = el("div", "modal");
+
+  box.appendChild(el("h3", null, "Change map"));
+  const maps = state.maps.get(gameId);
+  box.appendChild(el("p", "muted small",
+    maps === null || maps === undefined
+      ? "Reading the maps installed on this node…"
+      : (maps.length
+        ? maps.length + " maps installed for " + gameId + ". Players stay connected; the server changes level."
+        : "This node lists no maps for " + gameId + ". Type a name; players stay connected.")));
+
+  const label = el("label", null, "Map");
+  label.htmlFor = "map-dialog-input";
+  const input = el("input");
+  input.type = "text";
+  input.id = "map-dialog-input";
+  input.placeholder = "map name";
+  input.setAttribute("list", "map-dialog-list");
+  box.append(label, input, mapDatalist("map-dialog-list", gameId));
+
+  // The whole list, clickable, for the common case of browsing rather than
+  // recalling. Kept short in height by CSS and scrolled, not truncated: a map
+  // missing from the list would look like a map the node does not have.
+  if (maps && maps.length) {
+    const list = el("div", "map-list");
+    maps.forEach(m => {
+      const b = el("button", "map-choice", m);
+      b.type = "button";
+      b.addEventListener("click", () => {
+        input.value = m;
+        list.querySelectorAll(".map-choice").forEach(x => x.classList.remove("chosen"));
+        b.classList.add("chosen");
+      });
+      list.appendChild(b);
+    });
+    box.appendChild(list);
   }
-  const row = state.rows.get(instanceId);
-  const btn = row ? row.querySelector(".map-btn") : null;
-  if (btn) { btn.disabled = true; btn.textContent = "…"; }
-  try {
-    await withInFlight(api("POST", "/instances/" + encodeURIComponent(instanceId) + "/map", { map: trimmed }));
-    clearError();
-    poll();
-  } catch (e) {
-    if (e && e.__auth) return;
-    showError((e && e.error) || "Failed to change the map.");
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "Change map"; }
-  }
+
+  const actions = el("div", "form-actions");
+  const go = el("button", "primary", "Change map");
+  go.type = "button";
+  const cancel = el("button", "quiet", "Cancel");
+  cancel.type = "button";
+  const close = () => { const d = $("map-dialog"); if (d) d.remove(); };
+  cancel.addEventListener("click", close);
+  go.addEventListener("click", async () => {
+    const trimmed = (input.value || "").trim();
+    if (trimmed === "") { input.focus(); return; }
+    if (!MAP_NAME_RE.test(trimmed)) {
+      showError("A map name may only contain letters, digits, '_', '-', '.' and '/'.");
+      return;
+    }
+    go.disabled = true; go.textContent = "Changing…";
+    try {
+      await withInFlight(api("POST", "/instances/" + encodeURIComponent(instanceId) + "/map", { map: trimmed }));
+      clearError();
+      close();
+      poll();
+    } catch (e) {
+      if (e && e.__auth) { close(); return; }
+      showError((e && e.error) || "Failed to change the map.");
+      go.disabled = false; go.textContent = "Change map";
+    }
+  });
+  actions.append(go, cancel);
+  box.appendChild(actions);
+
+  back.appendChild(box);
+  back.addEventListener("click", e => { if (e.target === back) close(); });
+  document.body.appendChild(back);
+  input.focus();
 }
 
 async function onStop(instanceId) {

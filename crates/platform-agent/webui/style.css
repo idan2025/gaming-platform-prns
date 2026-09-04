@@ -185,3 +185,45 @@ button.danger:hover:not(:disabled) { background: #2a1518; border-color: var(--da
 /* Same reasoning as `color-scheme` above, for browsers that give the popup the
    page's colours instead of the UA's. */
 option, optgroup { background: var(--bg-elev); color: var(--text); }
+
+/* The map picker. A modal because the list is long: 108 maps is a thing you
+   browse, not something a row in a table can hold. */
+.modal-back {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.modal {
+  background: var(--bg-elev, #fff);
+  color: inherit;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 8px;
+  padding: 16px 18px;
+  width: min(520px, 100%);
+  max-height: min(80vh, 640px);
+  overflow-y: auto;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+}
+.modal h3 { margin: 0 0 6px; }
+.modal input[type="text"] { width: 100%; margin-bottom: 10px; }
+/* Scrolled rather than truncated: a map missing from the list would read as a
+   map this node does not have. */
+.map-list {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 12px;
+}
+.map-choice {
+  font: inherit; font-size: 11px;
+  padding: 3px 7px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 999px;
+  background: transparent; color: inherit;
+  cursor: pointer;
+}
+.map-choice:hover { border-color: currentColor; }
+.map-choice.chosen { background: var(--bg-selected, #dde9f5); border-color: currentColor; font-weight: 600; }

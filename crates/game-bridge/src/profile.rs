@@ -221,8 +221,19 @@ impl GameProfile {
             query: Some(QueryProtocol::A2s),
             // Only what a server writes. A writable path is an empty
             // directory mounted *over* the content, so listing `svencoop/maps`
-            // hid all 108 shipped maps — see `pack.rs`.
-            writable_paths: vec!["svencoop/logs".to_string()],
+            // hid all 108 shipped maps — see `pack.rs`. `maps/soundcache` is
+            // safe to list where `maps` is not, because a steamcmd install
+            // ships that directory *empty*: there is nothing under it to hide,
+            // and the server needs to write `<map>.txt` there on every map
+            // load or it re-precaches from scratch each time.
+            //
+            // Not part of the wire contract — only `app_name` derives the
+            // destination hash, which `destination_hash_matches_deployed_sven`
+            // freezes.
+            writable_paths: vec![
+                "svencoop/logs".to_string(),
+                "svencoop/maps/soundcache".to_string(),
+            ],
             // GoldSrc plays and answers A2S on one port. Nothing to multiplex,
             // so it announces framing generation 1 like every deployed peer.
             extra_ports: Vec::new(),

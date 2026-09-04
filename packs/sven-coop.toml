@@ -20,6 +20,12 @@ query = "a2s"
 # the pack does not and cannot write the command. A pack that could write a
 # console line could type anything at a dedicated server's console on somebody
 # else's node.
+# Where this game's maps live, relative to its install directory, so a node can
+# offer them as a list instead of asking someone to remember a name. Data the
+# node validates as a relative path and only ever *lists*; a pack cannot reach
+# outside the content copy, and listing a directory runs nothing.
+maps_dir = "svencoop/maps"
+
 console = "goldsrc"
 
 # Paths Sven Co-op writes to, relative to its install directory. A node shares
@@ -37,7 +43,24 @@ console = "goldsrc"
 #
 # So list only what the server genuinely writes and the install does not ship.
 # A dedicated server writes its log; it reads maps and scripts.
-writable_paths = ["svencoop/logs"]
+#
+# `svencoop/maps/soundcache` is the exception that proves the rule above, and
+# it is safe for exactly two reasons that must both stay true:
+#
+#   1. the directory **already exists** in a steamcmd install, so the writable
+#      bind has a mountpoint — a nested bind cannot create its own under a
+#      read-only mount, and a path listed here that the install does not ship
+#      fails the instance at start;
+#   2. the install ships it **empty** (0 files at 5.26), so an empty
+#      per-instance directory mounted over it hides nothing.
+#
+# Without it the server cannot write `maps/soundcache/<map>.txt` and logs
+# `[Sound Engine] - Failed to write sound cache ... - Error #30` on every map
+# load — errno 30 is EROFS. The cache is what lets a map skip re-scanning its
+# sounds, so a server that can never write it re-precaches from scratch at
+# every changelevel. Derived data, so regenerating it per instance costs
+# nothing but the first load.
+writable_paths = ["svencoop/logs", "svencoop/maps/soundcache"]
 
 notes = "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns v0.1.10 servers announce under it."
 

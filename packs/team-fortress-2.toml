@@ -27,6 +27,12 @@ query = "a2s"
 # the pack does not and cannot write the command. A pack that could write a
 # console line could type anything at a dedicated server's console on somebody
 # else's node.
+# Where this game's maps live, relative to its install directory, so a node can
+# offer them as a list instead of asking someone to remember a name. Data the
+# node validates as a relative path and only ever *lists*; a pack cannot reach
+# outside the content copy, and listing a directory runs nothing.
+maps_dir = "tf/maps"
+
 console = "source"
 
 # Tier 2, not tier 1 (GAMES.md §4). Source sustains several times a GoldSrc

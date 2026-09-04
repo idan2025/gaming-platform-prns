@@ -573,6 +573,73 @@ impl Agent {
         self.docker.stop(instance_id).await
     }
 
+    /// The maps this node actually has for a game, read off the content copy.
+    ///
+    /// Two reasons this is the node's answer and not the pack's: a pack lists
+    /// no maps (it says only which *directory* they live in), and what is
+    /// installed is a property of this machine — a node with partial content,
+    /// or with maps an operator added by hand, must report what is there rather
+    /// than what a manifest claims.
+    ///
+    /// **The pack's `maps_dir` is validated before anything is read**, with the
+    /// same rule that governs `writable_paths`: a relative path with no `..`,
+    /// no absolute root, no backslash. So a pack can point this at a directory
+    /// inside the game's own install and nowhere else, and the worst it can do
+    /// is name a directory that does not exist.
+    ///
+    /// An empty list is a fine answer — no content yet, or a game whose maps
+    /// are not files. Absence of `maps_dir` is an error, because a caller that
+    /// asked deserves to know the difference between "no maps" and "this game
+    /// cannot be asked".
+    pub async fn available_maps(&self, game_id: &str) -> Result<Vec<String>> {
+        let packs = self.packs.read().await;
+        let pack = packs
+            .get(game_id)
+            .ok_or_else(|| anyhow!("no game pack installed for {game_id:?}"))?;
+        let maps_dir = pack.maps_dir.clone().ok_or_else(|| {
+            anyhow!("the {game_id:?} pack does not say where its maps live")
+        })?;
+        let runtime = self.config.runtime_for(game_id).ok_or_else(|| {
+            anyhow!("this node has no runtime configured for {game_id:?}")
+        })?;
+        let version = runtime.content_version.clone();
+        drop(packs);
+
+        crate::store::validate_writable_path(&maps_dir)
+            .map_err(|e| anyhow!("the {game_id:?} pack's maps_dir is not usable: {e}"))?;
+
+        let content = ContentRef { game_id: game_id.to_string(), version };
+        let dir = self
+            .layout
+            .content_dir(&content)
+            .map_err(|e| anyhow!("{e}"))?
+            .join(&maps_dir);
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // Not installed yet is "no maps", not a failure: the UI asks for
+            // this before a game has necessarily been downloaded.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut maps: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                // A map is its file name without the extension. Case-insensitive
+                // because GoldSrc installs are not consistent about it.
+                let stem = name.strip_suffix(".bsp").or_else(|| name.strip_suffix(".BSP"))?;
+                // The same rule the map name has to pass to be used at all, so
+                // the list can never offer something the server would refuse.
+                game_bridge::console::validate_map_name(stem).ok()?;
+                Some(stem.to_string())
+            })
+            .collect();
+        maps.sort_by_key(|m| m.to_ascii_lowercase());
+        maps.dedup();
+        Ok(maps)
+    }
+
     /// Change a running server's map, without restarting it.
     ///
     /// The distinction is the whole feature: recreating the container with a
