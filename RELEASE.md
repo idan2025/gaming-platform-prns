@@ -74,6 +74,35 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.1
+
+A join that could not work on an installed launcher, and map control on a node.
+
+- **The launcher's client identity is no longer written to the working
+  directory.** `ClientArgs::new` defaults it to
+  `./game-bridge-client.identity`, which suits the CLI and not a desktop app:
+  a `.desktop` entry starts the launcher in `/`, and macOS starts it in the
+  bundle. Every Join ended in `loading identity at
+  ./game-bridge-client.identity`. It now sits beside `launcher.json`. This
+  affects **installed** 0.2.0 users, not developers running from a checkout,
+  which is why it went unnoticed.
+- **A server whose announce names no game can be joined.** Deployed
+  `svencoop-prns` v0.1.10 peers announce a bare name, so `browse.rs` shows them
+  only under "Any game" and no pack could be matched to them. The detail pane
+  now offers a game picker and Join stays disabled until one is chosen; the
+  launcher still never guesses a wire protocol.
+- **A starting map, and a live map change.** `InstanceSpec.map` reaches the
+  container as `GPP_MAP`; `POST /instances/:id/map` runs `changelevel` on the
+  running server, so players stay connected. A pack declares which console its
+  game speaks (`console = "goldsrc" | "source"`) and never the command itself.
+
+**Nodes upgrading from 0.2.0 must recreate their servers to use map changes.**
+Docker decides at *create* whether a container has stdin, and it answers an
+attach to one that does not with `200 OK` while discarding every byte. The
+agent inspects `Config.OpenStdin` and refuses rather than reporting a map
+change that never happened — but `docker restart` does not fix such a
+container. Remove the instance and start it again.
+
 ## v0.2.0
 
 The first release with a Windows launcher, and the first where a hosted server
