@@ -61,6 +61,16 @@ pub struct LauncherSettings {
     /// once is joinable forever after without anyone hosting an index.
     #[serde(default)]
     pub known_servers: BTreeMap<String, KnownServer>,
+    /// Indexes this launcher may ask for a server list, as hex destination
+    /// hashes.
+    ///
+    /// **Empty by default, and the launcher is complete with it empty.** An
+    /// index is a cache of the mesh, never the source of truth (`DESIGN.md`
+    /// §0): browsing works with none configured, and adding one is a player
+    /// deciding to trust somebody's list, not the platform acquiring a
+    /// dependency.
+    #[serde(default)]
+    pub indexes: Vec<String>,
     /// How this launcher reaches the mesh, remembered between runs.
     ///
     /// Reticulum has no global directory: a node gets an interface from LAN

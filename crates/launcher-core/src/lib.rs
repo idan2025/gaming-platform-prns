@@ -73,6 +73,12 @@ pub struct ServerRow {
     /// current one is the one thing a server browser must not do. It is still
     /// **joinable**: a destination hash is all a join needs.
     pub remembered: bool,
+    /// True for a row an index reported rather than one this launcher heard.
+    ///
+    /// Shown, not hidden. An index is a cache of the mesh (`DESIGN.md` §0), so
+    /// its rows are somebody else's sightings — real, but second-hand, and
+    /// `hops` is the distance from the index rather than from here.
+    pub from_index: bool,
 }
 
 /// A remembered server, as the UI lists it for forgetting or refreshing.
@@ -120,6 +126,45 @@ fn remembered_row(hash: &str, k: &KnownServer) -> ServerRow {
         last_seen_secs: unix_now().saturating_sub(k.last_seen_unix),
         legacy: false,
         remembered: true,
+        from_index: false,
+    }
+}
+
+/// A row an index reported, rather than one this launcher heard.
+///
+/// Marked, because the difference matters: an index is a cache of the mesh and
+/// its row is somebody else's sighting, possibly of a server this launcher has
+/// no route to at all. The numbers are real — they came from a real announce —
+/// but the evidence is second-hand, and `hops` is the distance from the
+/// *index*, not from here.
+fn index_row(hash: &str, hops: u8, info: &AnnounceInfo) -> ServerRow {
+    let record = match info {
+        AnnounceInfo::Record(r) => Some(r),
+        AnnounceInfo::Legacy { .. } => None,
+    };
+    let name = match info {
+        AnnounceInfo::Record(r) => Some(r.name.clone()).filter(|n| !n.is_empty()),
+        AnnounceInfo::Legacy { name } => name.clone(),
+    };
+    ServerRow {
+        destination_hash: hash.to_string(),
+        name,
+        game_id: record.map(|r| r.game_id.clone()).filter(|g| !g.is_empty()),
+        map: record.map(|r| r.map.clone()).filter(|m| !m.is_empty()),
+        players: record.map(|r| r.players),
+        max_players: record.map(|r| r.max_players),
+        hops,
+        interface_label: String::new(),
+        min_link_class: record.map(|r| r.min_link_class),
+        passworded: record.map(|r| r.flags.passworded),
+        allowlisted: record.map(|r| r.flags.allowlisted),
+        dedicated: record.map(|r| r.flags.dedicated),
+        transport_mode: record.map(|r| r.flags.transport_mode),
+        // An index reports what it last heard; it does not timestamp it for us.
+        last_seen_secs: 0,
+        legacy: record.is_none(),
+        remembered: false,
+        from_index: true,
     }
 }
 
@@ -640,6 +685,16 @@ impl Launcher {
         // Everything heard is worth remembering: the mesh will not repeat it.
         self.remember_heard(&out).await;
 
+        // Then whatever the configured indexes know that we did not hear. A
+        // cache loses every tie: a row heard directly is this launcher's own
+        // evidence, an index row only fills a gap.
+        {
+            let heard: std::collections::HashSet<String> =
+                out.iter().map(|r| r.destination_hash.clone()).collect();
+            let from_indexes = self.query_indexes(&input).await;
+            out.extend(from_indexes.into_iter().filter(|r| !heard.contains(&r.destination_hash)));
+        }
+
         // Then add back the ones we know about but have not heard this run,
         // flagged so nothing about them reads as live. They are joinable —
         // a destination hash is all a join needs — and that is the whole
@@ -657,6 +712,77 @@ impl Launcher {
             .collect();
         out.extend(remembered);
         Ok(out)
+    }
+
+    /// Indexes this launcher is willing to ask, newest last.
+    pub async fn indexes(&self) -> Vec<String> {
+        self.settings.lock().await.indexes.clone()
+    }
+
+    /// Trust one more index. A hash that is not one is refused here, where the
+    /// person typing it can see the complaint.
+    pub async fn add_index(&self, destination_hash: &str) -> Result<()> {
+        let hash = destination_hash.trim().to_ascii_lowercase();
+        parse_hash(&hash).map_err(|e| anyhow!("that is not an index address: {e}"))?;
+        let mut settings = self.settings.lock().await;
+        if !settings.indexes.contains(&hash) {
+            settings.indexes.push(hash);
+        }
+        self.persist(&settings)
+    }
+
+    pub async fn remove_index(&self, destination_hash: &str) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        settings.indexes.retain(|i| i != destination_hash);
+        self.persist(&settings)
+    }
+
+    /// Ask every configured index for a list, and merge what they say.
+    ///
+    /// **An index is a cache, so it loses every tie.** A row heard directly is
+    /// the launcher's own evidence and wins; an index row fills a gap, and is
+    /// marked so a person can see which is which. That ordering is the whole
+    /// difference between using an index and depending on one.
+    ///
+    /// One index failing is not an error: a list from the others, or from the
+    /// mesh alone, is still a list. Indexes are asked in order and the first
+    /// answer for a destination wins.
+    async fn query_indexes(&self, input: &BrowseQueryInput) -> Vec<ServerRow> {
+        let indexes = self.settings.lock().await.indexes.clone();
+        if indexes.is_empty() {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().await;
+        let Some(session) = inner.browse.as_ref() else { return Vec::new() };
+        let handle = session.handle().clone();
+        drop(inner);
+
+        let query = index_client::wire::IndexQuery {
+            game_id: input.game_id.clone().unwrap_or_default(),
+            max_hops: input.max_hops,
+            has_players: input.has_players,
+            include_legacy: input.include_legacy,
+        };
+
+        let mut out: Vec<ServerRow> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for index in &indexes {
+            let Ok(dest) = parse_hash(index) else { continue };
+            match index_client::client::query_index(&handle, dest, &query).await {
+                Ok(result) => {
+                    for row in result.rows {
+                        let hash = hex::encode(row.destination_hash);
+                        if seen.insert(hash.clone()) {
+                            out.push(index_row(&hash, row.hops, &row.info));
+                        }
+                    }
+                }
+                // An index that cannot be reached is one source short, not a
+                // failure to browse.
+                Err(e) => tracing::debug!(index = %index, error = %format!("{e:#}"), "an index did not answer"),
+            }
+        }
+        out
     }
 
     /// Whether the server answers right now, or `None` if there was no browse
@@ -1251,6 +1377,7 @@ fn row_view(row: &game_bridge::DiscoveredServer) -> ServerRow {
         legacy: matches!(row.info, AnnounceInfo::Legacy { .. }),
         // Heard this run, from a real announce.
         remembered: false,
+        from_index: false,
     }
 }
 
@@ -1357,12 +1484,14 @@ mod tests {
             last_seen_secs: 3,
             legacy: true,
             remembered: false,
+            from_index: false,
         };
         let v: serde_json::Value = serde_json::to_value(&row).unwrap();
         for key in [
             "destination_hash", "name", "game_id", "map", "players", "max_players",
             "hops", "interface_label", "min_link_class", "passworded", "allowlisted",
             "dedicated", "transport_mode", "last_seen_secs", "legacy", "remembered",
+            "from_index",
         ] {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
         }
@@ -1909,6 +2038,7 @@ query = "a2s"
             last_seen_secs: 1,
             legacy: false,
             remembered: false,
+            from_index: false,
         }
     }
 

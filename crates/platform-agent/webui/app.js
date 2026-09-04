@@ -1291,8 +1291,9 @@ function wireMeshInterfaceForm() {
   const udpWrap = $("mesh-iface-udp");
   const syncKind = () => {
     const k = kind.value;
-    addr.disabled = k !== "tcp";
-    addr.classList.toggle("hidden", k !== "tcp");
+    const usesAddr = k === "tcp" || k === "backbone";
+    addr.disabled = !usesAddr;
+    addr.classList.toggle("hidden", !usesAddr);
     if (udpWrap) udpWrap.classList.toggle("hidden", k !== "udp");
   };
   kind.addEventListener("change", syncKind);
@@ -1300,9 +1301,9 @@ function wireMeshInterfaceForm() {
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const body = { kind: kind.value };
-    if (kind.value === "tcp") {
+    if (kind.value === "tcp" || kind.value === "backbone") {
       const a = addr.value.trim();
-      if (!a) { showError("A TCP interface needs an address, like hub.example.org:4789."); return; }
+      if (!a) { showError("That interface needs an address, like hub.example.org:4789."); return; }
       body.addr = a;
     } else if (kind.value === "udp") {
       const local = ($("mesh-iface-local").value || "").trim();

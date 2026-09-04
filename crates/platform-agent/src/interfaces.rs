@@ -56,7 +56,9 @@ use std::sync::Arc;
 
 use personal_rns::prelude::*;
 use prns_core::interfaces::udp::UDP_BITRATE_ESTIMATE;
-use prns_core::interfaces::{IfacContext, InterfaceId, DEFAULT_IFAC_SIZE};
+use prns_core::interfaces::{
+    IfacContext, InterfaceId, DEFAULT_IFAC_SIZE, LOCAL_INTERFACE_BITRATE_ESTIMATE,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -193,6 +195,21 @@ pub enum AddInterface {
     /// a TCP **server** (a relay others dial), any other host connects as a TCP
     /// **client** (dialing a relay).
     Tcp {
+        addr: String,
+        #[serde(default)]
+        ifac_name: Option<String>,
+        #[serde(default)]
+        ifac_passphrase: Option<String>,
+    },
+    /// A **Backbone** client: dial `addr`, a `host:port` running a Reticulum
+    /// BackboneInterface.
+    ///
+    /// The right interface for a fast, reliable hop to a hub that offers one.
+    /// RNS's own BackboneInterface declares a 1 MB frame size and a gigabit
+    /// rate, where its UDPInterface declares 1064 bytes and guesses 10 Mbps —
+    /// and a plain TCP client, while it works against a backbone listener, is
+    /// not the protocol that listener is for.
+    Backbone {
         addr: String,
         #[serde(default)]
         ifac_name: Option<String>,
@@ -362,6 +379,22 @@ impl InterfaceManager {
                 InterfaceDescriptor {
                     id,
                     kind: "tcp".to_string(),
+                    addr: Some(addr),
+                    ifac_name,
+                    ifac_passphrase,
+                }
+            }
+            AddInterface::Backbone { addr, ifac_name, ifac_passphrase } => {
+                let id = attach_backbone(
+                    handle,
+                    &addr,
+                    ifac_name.as_deref(),
+                    ifac_passphrase.as_deref(),
+                )
+                .await?;
+                InterfaceDescriptor {
+                    id,
+                    kind: "backbone".to_string(),
                     addr: Some(addr),
                     ifac_name,
                     ifac_passphrase,
@@ -540,6 +573,42 @@ pub(crate) async fn attach_tcp(
     } else {
         return Err(InterfaceError::BadAddress(addr.to_string()));
     }
+    Ok(new_interface_id(handle, &before))
+}
+
+/// Attach a Backbone client interface and return its captured id.
+///
+/// `bitrate` is declared, not measured, and the engine derives its frame size
+/// from it — so a hop across a local network should say so rather than let a
+/// conservative guess cap what it will carry.
+pub(crate) async fn attach_backbone(
+    handle: &PrnsNodeHandle,
+    addr: &str,
+    ifac_name: Option<&str>,
+    ifac_passphrase: Option<&str>,
+) -> Result<Option<String>, InterfaceError> {
+    let before = interface_ids(handle);
+    if addr.parse::<std::net::SocketAddr>().is_err() && !addr.contains(':') {
+        return Err(InterfaceError::BadAddress(format!(
+            "backbone address {addr:?} must be host:port"
+        )));
+    }
+    let ifac = IfacContext::derive(ifac_name, ifac_passphrase, DEFAULT_IFAC_SIZE);
+    let ifac_set = ifac.is_some();
+    let iface = BackboneClientInterface::new(
+        addr.to_string(),
+        LOCAL_INTERFACE_BITRATE_ESTIMATE,
+        ReconnectPolicy::STANDARD,
+    );
+    match ifac {
+        Some(ifac) => {
+            handle.add_interface_with_ifac_name(iface, ifac, ifac_name.map(String::from));
+        }
+        None => {
+            handle.add_interface(iface);
+        }
+    }
+    info!(backbone = %addr, ifac = ifac_set, "attached Backbone client interface");
     Ok(new_interface_id(handle, &before))
 }
 

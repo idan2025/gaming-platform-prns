@@ -4,10 +4,14 @@
 //! about the code and not just an intention.
 
 pub mod agent_client;
-pub mod client;
 pub mod hosting;
 pub mod http;
 pub mod node;
 pub mod quota;
-pub mod wire;
 pub mod registry;
+
+// The codec and the query call live in `index-client`, so a launcher can ask an
+// index without depending on one. Re-exported rather than duplicated: both ends
+// must agree on the format byte for byte, and two copies are two things to
+// drift.
+pub use index_client::{client, wire};

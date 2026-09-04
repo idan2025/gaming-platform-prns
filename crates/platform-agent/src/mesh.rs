@@ -152,6 +152,21 @@ pub enum MeshInterface {
         #[serde(default)]
         ifac_passphrase: Option<String>,
     },
+    /// A Backbone client to `addr`, a `host:port` running a Reticulum
+    /// BackboneInterface.
+    ///
+    /// Preferred over both TCP and UDP where the far end offers one. RNS's
+    /// BackboneInterface declares a 1 MB frame size and a gigabit rate; its
+    /// UDPInterface declares 1064 bytes, which is smaller than this platform's
+    /// own link plaintext of 1967 (`ENGINE.md`) and therefore cannot carry a
+    /// game.
+    Backbone {
+        addr: String,
+        #[serde(default)]
+        ifac_name: Option<String>,
+        #[serde(default)]
+        ifac_passphrase: Option<String>,
+    },
     /// Point-to-point UDP: bind `local`, send to `peer`, both `host:port`.
     ///
     /// Symmetric and not discovered — the far side needs the mirror image of
@@ -183,6 +198,7 @@ impl MeshInterface {
     pub fn id(&self) -> String {
         match self {
             Self::Tcp { addr, .. } => format!("tcp:{addr}"),
+            Self::Backbone { addr, .. } => format!("backbone:{addr}"),
             // Both halves, because one node may hold several UDP links that
             // share a local port and differ only in peer.
             Self::Udp { local, peer, .. } => format!("udp:{local}->{peer}"),
@@ -197,6 +213,10 @@ impl MeshInterface {
         match self {
             Self::Tcp { addr, ifac_name, .. } => serde_json::json!({
                 "id": self.id(), "kind": "tcp", "addr": addr,
+                "ifac_name": ifac_name, "ifac": ifac_name.is_some(),
+            }),
+            Self::Backbone { addr, ifac_name, .. } => serde_json::json!({
+                "id": self.id(), "kind": "backbone", "addr": addr,
                 "ifac_name": ifac_name, "ifac": ifac_name.is_some(),
             }),
             Self::Udp { local, peer, ifac_name, .. } => serde_json::json!({
@@ -230,6 +250,19 @@ impl MeshInterface {
                 {
                     Ok(_) => None,
                     Err(e) => Some(format!("TCP {addr}: {e}")),
+                }
+            }
+            Self::Backbone { addr, ifac_name, ifac_passphrase } => {
+                match crate::interfaces::attach_backbone(
+                    handle,
+                    addr,
+                    ifac_name.as_deref(),
+                    ifac_passphrase.as_deref(),
+                )
+                .await
+                {
+                    Ok(_) => None,
+                    Err(e) => Some(format!("Backbone {addr}: {e}")),
                 }
             }
             Self::Udp { local, peer, ifac_name, ifac_passphrase } => {

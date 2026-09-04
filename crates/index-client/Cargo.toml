@@ -1,0 +1,15 @@
+[package]
+name = "index-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Asking an index for a server list, and the wire format both ends speak"
+
+[dependencies]
+game-bridge = { path = "../game-bridge" }
+personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "backbone", "wifi-auto", "shared-instance"] }
+prns-core = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
