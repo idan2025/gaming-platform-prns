@@ -74,6 +74,49 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.8
+
+**One shared Reticulum node per host, instead of one per game server.** If you
+run more than one server on a node, take this release: on 0.2.7 and earlier the
+second and later servers silently lost every interface that binds.
+
+A node used to run a Reticulum node *per server*, each with its own copy of the
+node's interfaces. That is backwards. **Interfaces are scarce per host in a way
+destinations are not**: a point-to-point UDP interface binds one local port, a
+TCP server binds one, an RNode owns one serial device — while a machine can
+announce as many destinations as it likes. Six servers were six nodes each
+wanting its own copy of the same link, and only the first could have it.
+
+The failure was quiet, which is why it took a live node to find. The first
+server to start got the port; the rest got `AddrInUse`, kept running, kept
+announcing over whatever else they had, and were simply absent from that link.
+Healthy from every angle except the one that mattered. Note that
+`tcp = "0.0.0.0:PORT"` in `[mesh]` binds too, so this was never only about UDP.
+
+Now the agent runs one **hub** and each bridge joins it as a shared instance and
+binds nothing. This is the engine's own mechanism — the same one `rnsd` uses to
+let several programs on a machine share one mesh connection — and it needed the
+`shared-instance` feature, which no crate had enabled.
+
+Two decisions inside it that are load-bearing:
+
+- **The hub is a `Relay` session, not a `Browse` one.** It has to forward: a
+  bridge joined to it holds no interfaces, so every packet in either direction
+  crosses the hub, and forwarding needs a transport identity. `Browse`
+  deliberately holds none — browsing a list is not consent to carry strangers'
+  traffic (`PLAN.md` §4) — and what the hub carries is this node's own servers'.
+- **`shared_instance_port` defaults to 37429, not RNS's 37428.** A node sharing
+  a machine with `rnsd` would otherwise bind that machine's shared-instance bus
+  and quietly take over its mesh instead of forming its own.
+
+Runtime interfaces now attach to the hub alone, so a running server picks up a
+newly added relay with no restart and nothing to re-attach.
+
+Verified on a live node: two servers over one UDP leg, both announced with their
+own live map, 8/8 A2S round trips to each concurrently at a median of 12 ms, and
+the whole thing surviving an agent restart. Before this the second server had no
+UDP at all.
+
 ## v0.2.7
 
 ### The map in a server list was always "Unknown"
