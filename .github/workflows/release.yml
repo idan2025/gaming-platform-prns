@@ -153,21 +153,15 @@ jobs:
             label: ubuntu-22.04
           - os: ubuntu-24.04-arm
             label: ubuntu-24.04-arm
-          # The proven macOS bundle: native, Apple Silicon. Kept exactly as it
-          # was, because it is the only mac artifact any release has ever
-          # carried and the universal entry below is not yet evidence of
-          # anything.
-          - os: macos-14
-            label: macos-14
-            args: ""
-          # Intel Macs, via one universal binary rather than the retired
-          # `macos-13` runner — see the cli job for why that label hangs
-          # instead of failing. `fail-fast: false` is what makes adding this
-          # safe: if it does not build, every other bundle still publishes and
-          # the release is no worse off than it has been since v0.1.0.
+          # One macOS bundle, universal, covering Intel and Apple Silicon —
+          # rather than the retired `macos-13` runner, which does not fail but
+          # queues forever (see the cli job).
           #
-          # Once this has gone green on a release, the native entry above is
-          # redundant and should be dropped: a universal dmg runs on both.
+          # This replaced a native Apple-Silicon-only entry once the universal
+          # build had proven itself on a real release: v0.2.1 and v0.2.2 each
+          # published both, and the universal dmg came out at 10.4 MB against
+          # the native 5.3 MB. That size is the evidence it is genuinely a fat
+          # binary and not a single-arch build wearing the name.
           - os: macos-14
             label: macos-14-universal
             args: "--target universal-apple-darwin"

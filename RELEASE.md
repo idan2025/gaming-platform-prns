@@ -261,8 +261,7 @@ Two jobs, both uploading to the tag's release with `gh release upload --clobber`
   packaged with `packs/`. Every entry builds with an explicit `--target`, even
   the native ones, so one packaging step serves all of them.
 - **launcher** — `cargo tauri build` on ubuntu-22.04, ubuntu-24.04-arm,
-  macos-14 (native, and again as `universal-apple-darwin`) and
-  windows-latest.
+  macos-14 (as `universal-apple-darwin`) and windows-latest.
 
 ### `macos-13` is retired, and a retired label queues forever
 
@@ -284,11 +283,14 @@ launcher gets a `universal-apple-darwin` bundle that runs on both. Both matrices
 also carry `timeout-minutes`, so a build that hangs for another reason fails
 rather than waiting out the six-hour default.
 
-The universal launcher entry is additive on purpose: the native `macos-14`
-bundle is the only mac artifact any release has ever produced, and
-`fail-fast: false` means a universal build that does not work costs nothing.
-**Once a release ships a universal dmg, drop the native macos-14 entry** — a
-universal binary covers both and two mac dmgs in one release is just confusing.
+The universal launcher entry started out additive, beside the native
+Apple-Silicon one, because that native bundle was the only mac artifact any
+release had ever produced and an unproven replacement was not worth a
+regression. It has since proven itself and the native entry is gone: v0.2.1 and
+v0.2.2 each published both, and the universal dmg came out at **10.4 MB against
+the native 5.3 MB** — roughly double, which is what a fat binary should be and
+the reason to believe the label. A green job is not by itself evidence that an
+artifact contains what it claims; the size was.
 
 It fires on a `v*` tag push, and takes a `tag` input for `workflow_dispatch`
 when the tag already exists:
