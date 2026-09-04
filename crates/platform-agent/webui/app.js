@@ -1227,6 +1227,14 @@ async function renderMeshGames() {
     if (s.destination) makeCopyable(dest, s.destination, "destination");
     row.appendChild(dest);
     list.appendChild(row);
+    // Interfaces this server was configured with but could not attach. Shown
+    // here rather than left in the log: the server is listed, joinable and
+    // announcing on everything else, so nothing about it looks wrong — which
+    // is exactly why a missing link is invisible without saying so.
+    (s.interface_notes || []).forEach(n => {
+      const w = el("div", "mesh-row-note", n);
+      list.appendChild(w);
+    });
   }
 }
 

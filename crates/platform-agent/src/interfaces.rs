@@ -241,6 +241,7 @@ pub enum InterfaceError {
     RenameFailed(String),
     /// Persisting the sidecar file failed.
     Persist(String),
+
 }
 
 impl core::fmt::Display for InterfaceError {
@@ -258,6 +259,25 @@ impl core::fmt::Display for InterfaceError {
             Self::NoSuchInterface(id) => write!(f, "no interface with id {id}"),
             Self::RenameFailed(id) => write!(f, "the engine refused to rename interface {id}"),
             Self::Persist(e) => write!(f, "saving the interface list failed: {e}"),
+        }
+    }
+}
+
+impl InterfaceError {
+    /// Whether this is "the local port is already taken".
+    ///
+    /// Worth distinguishing because it is the one failure whose *cause* is not
+    /// readable from the message: every instance on a node is its own Reticulum
+    /// node, so each tries to bind the same local port for a point-to-point
+    /// interface, and only the first can. "Address already in use" alone sends
+    /// an operator looking for another program.
+    pub fn is_address_in_use(&self) -> bool {
+        match self {
+            Self::Bind(msg) => {
+                let m = msg.to_ascii_lowercase();
+                m.contains("addrinuse") || m.contains("address already in use")
+            }
+            _ => false,
         }
     }
 }

@@ -227,3 +227,14 @@ option, optgroup { background: var(--bg-elev); color: var(--text); }
 }
 .map-choice:hover { border-color: currentColor; }
 .map-choice.chosen { background: var(--bg-selected, #dde9f5); border-color: currentColor; font-weight: 600; }
+
+/* An interface a hosted server could not attach. Warning-coloured but not an
+   error: the server runs and announces on whatever else it has. */
+.mesh-row-note {
+  margin: 2px 0 8px 12px;
+  padding: 6px 8px;
+  border-left: 3px solid #c88a2e;
+  background: rgba(200, 138, 46, 0.10);
+  font-size: 11px;
+  line-height: 1.45;
+}

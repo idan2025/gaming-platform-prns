@@ -59,6 +59,30 @@ xdg-open http://localhost:4750
   Docker decides at *create* whether a container has stdin, and it cannot be
   added afterwards. Recreate the server once and it will accept map changes.
 
+### UDP mesh interfaces serve one instance per node
+
+A TCP mesh interface *dials out*, so every instance on the node can have its
+own. A **UDP one binds a local port**, and every instance is its own Reticulum
+node — so the first instance to start gets the port and the rest cannot have it.
+Those instances still run, still announce, and are still joinable over the
+node's other interfaces; they are simply absent from that one link.
+
+The agent reports it per instance in the Mesh panel rather than only in its log,
+because nothing about the affected server looks wrong from the outside. If you
+run several servers and want all of them on one link, use TCP.
+
+There is a second half of this worth knowing, because it wastes an evening
+otherwise: **a containerised peer must publish the UDP port**. An outbound
+datagram leaves a container through NAT whether or not a port is published, so a
+one-way flow looks like a healthy interface from the sending side while nothing
+can arrive. If a UDP interface is configured correctly at both ends and carries
+no announces, check `docker ps` for `<port>/udp` before touching either config.
+
+One thing this limit is *not*: a cap on connections. A Reticulum interface is a
+transport link, not a per-connection socket — one UDP interface multiplexes
+every destination, every link and every player on it. The limit is instances per
+node, not players per instance.
+
 ## Three things worth understanding before you run it
 
 ### `data_root` must be the same path on both sides

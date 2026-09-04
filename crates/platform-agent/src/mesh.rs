@@ -90,6 +90,16 @@ pub struct MeshStatus {
     pub destination: Option<String>,
     pub game_id: String,
     pub name: String,
+    /// Interfaces this instance's bridge was configured with but could not
+    /// attach, one sentence each.
+    ///
+    /// **Carried on the status rather than left in the log**, because the
+    /// failure is per-instance and silent everywhere else. A bridge that loses
+    /// an interface still runs and still announces on the ones it has, so
+    /// nothing looks wrong: the server is listed, it is joinable, and it is
+    /// simply absent from one link. That is exactly the shape of problem an
+    /// operator cannot find by looking at the thing that seems broken.
+    pub interface_notes: Vec<String>,
 }
 
 struct Bridge {
@@ -174,23 +184,29 @@ impl MeshInterface {
         }
     }
 
-    async fn attach_to(&self, session: &BridgeSession) {
+    /// Attach this interface to a bridge. Returns a sentence when it could not
+    /// be attached, for the instance's `interface_notes`.
+    async fn attach_to(&self, session: &BridgeSession) -> Option<String> {
         let handle = session.handle();
         match self {
             Self::Tcp { addr, ifac_name, ifac_passphrase } => {
                 // The id it captures is not needed here: this set is keyed by
                 // address, and the engine cannot detach a live interface
                 // anyway.
-                let _ = crate::interfaces::attach_tcp(
+                match crate::interfaces::attach_tcp(
                     handle,
                     addr,
                     ifac_name.as_deref(),
                     ifac_passphrase.as_deref(),
                 )
-                .await;
+                .await
+                {
+                    Ok(_) => None,
+                    Err(e) => Some(format!("TCP {addr}: {e}")),
+                }
             }
             Self::Udp { local, peer, ifac_name, ifac_passphrase } => {
-                if let Err(e) = crate::interfaces::attach_udp(
+                match crate::interfaces::attach_udp(
                     handle,
                     local,
                     peer,
@@ -199,18 +215,42 @@ impl MeshInterface {
                 )
                 .await
                 {
-                    // A bind that fails leaves the bridge on whatever other
-                    // interfaces it has rather than failing the server: LAN-only
-                    // is degraded, not broken. Same rule as `Agent::create`.
-                    tracing::warn!(local = %local, peer = %peer, error = %e, "UDP mesh interface did not attach");
+                    Ok(_) => None,
+                    Err(e) => {
+                        // A bind that fails leaves the bridge on whatever other
+                        // interfaces it has rather than failing the server:
+                        // fewer links is degraded, not broken. Same rule as
+                        // `Agent::create`.
+                        let note = if e.is_address_in_use() {
+                            // The one that actually happens, and the one whose
+                            // cause is not guessable from "address in use".
+                            // Every instance is its own Reticulum node, so each
+                            // tries to bind this same local port; the first
+                            // instance on the node gets it and the rest cannot.
+                            // A point-to-point UDP interface has one local port
+                            // by definition, so this is a property of the
+                            // transport, not a bug to retry around.
+                            format!(
+                                "UDP {local} -> {peer}: local port already in use by another \
+instance on this node. A point-to-point UDP interface can serve one instance \
+per node; the others reach the mesh over this node's other interfaces. Use TCP \
+if every instance needs this link."
+                            )
+                        } else {
+                            format!("UDP {local} -> {peer}: {e}")
+                        };
+                        tracing::warn!(local = %local, peer = %peer, error = %e, "UDP mesh interface did not attach");
+                        Some(note)
+                    }
                 }
             }
             Self::Auto { ifac_name, ifac_passphrase } => {
-                let _ = crate::interfaces::attach_auto(
+                crate::interfaces::attach_auto(
                     handle,
                     ifac_name.as_deref(),
                     ifac_passphrase.as_deref(),
                 );
+                None
             }
         }
     }
@@ -287,9 +327,11 @@ impl MeshBridges {
             ));
         }
         {
-            let bridges = self.bridges.lock().await;
-            for bridge in bridges.values() {
-                iface.attach_to(&bridge.session).await;
+            let mut bridges = self.bridges.lock().await;
+            for bridge in bridges.values_mut() {
+                if let Some(note) = iface.attach_to(&bridge.session).await {
+                    bridge.status.interface_notes.push(note);
+                }
             }
         }
         let mut extra = self.extra.lock().await;
@@ -396,8 +438,11 @@ impl MeshBridges {
 
         // Everything added since startup, so a bridge born now reaches the same
         // relays as the ones already running.
+        let mut interface_notes = Vec::new();
         for iface in self.extra.lock().await.iter() {
-            iface.attach_to(&session).await;
+            if let Some(note) = iface.attach_to(&session).await {
+                interface_notes.push(note);
+            }
         }
 
         let status = MeshStatus {
@@ -405,6 +450,7 @@ impl MeshBridges {
             destination: session.own_hash().map(|h| hex::encode(h.as_bytes())),
             game_id: profile.id.clone(),
             name: announce.name.to_string(),
+            interface_notes,
         };
         tracing::info!(
             instance = %instance_id,
@@ -451,6 +497,40 @@ pub fn identity_path(data_root: &Path, instance_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// A bridge that could not attach an interface must say so on its status.
+    ///
+    /// The failure is invisible otherwise: the server runs, announces and is
+    /// joinable over whatever interfaces it did get, so nothing looks wrong
+    /// while one link is simply missing.
+    #[test]
+    fn a_mesh_status_carries_the_interfaces_that_did_not_attach() {
+        let status = MeshStatus {
+            instance_id: "i1".into(),
+            destination: Some("aa".repeat(16)),
+            game_id: "sven-coop".into(),
+            name: "Test".into(),
+            interface_notes: vec!["UDP 0.0.0.0:4790 -> h:4790: local port already in use".into()],
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert!(v.get("interface_notes").is_some(), "the UI reads this key");
+        assert_eq!(v["interface_notes"].as_array().unwrap().len(), 1);
+    }
+
+    /// A UDP local port taken by another instance is the failure that actually
+    /// happens on a multi-instance node, and the only one whose cause cannot be
+    /// read off the message. If this stops being recognised, the operator gets
+    /// "address already in use" and goes looking for another program.
+    #[test]
+    fn an_address_in_use_bind_is_recognised_as_such() {
+        use crate::interfaces::InterfaceError;
+        let e = InterfaceError::Bind(
+            "Os { code: 98, kind: AddrInUse, message: \"Address already in use\" }".into(),
+        );
+        assert!(e.is_address_in_use());
+        assert!(!InterfaceError::Bind("permission denied".into()).is_address_in_use());
+        assert!(!InterfaceError::NoUplink.is_address_in_use());
+    }
     use super::*;
 
     #[tokio::test]
