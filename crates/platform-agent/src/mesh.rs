@@ -430,6 +430,17 @@ impl MeshBridges {
                 return Err(anyhow!("{note}"));
             }
         }
+        // A new link means new peers who have never heard of this node's
+        // servers, and a browser is passive — it learns of a server only when
+        // that server next announces. Waiting out the interval would leave a
+        // freshly added relay showing an empty list for up to that long.
+        //
+        // A request, not a broadcast decision: each announcer keeps its own
+        // floor, so adding several interfaces quickly cannot become a storm on
+        // somebody's slow link.
+        for bridge in self.bridges.lock().await.values() {
+            bridge.session.request_announce();
+        }
         let mut extra = self.extra.lock().await;
         let id = iface.id();
         extra.retain(|i| i.id() != id);

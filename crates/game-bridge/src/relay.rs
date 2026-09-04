@@ -310,9 +310,25 @@ pub struct BridgeSession {
     own_hash: Option<DestinationHash>,
     role: BridgeRole,
     relay_transit: bool,
+    /// Asks the announcer for an extra announce, outside its timer. `None` for
+    /// roles that announce nothing.
+    announce_tx: Option<mpsc::UnboundedSender<()>>,
     stop_tx: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<()>>,
 }
+
+/// When a freshly started server announces before settling into its interval.
+///
+/// Deliberately few and spread out. Every announce is a broadcast on every
+/// interface, and the slowest one sets the real cost: an RNode link configured
+/// for one announce per destination per hour will hold the extras rather than
+/// send them, so a longer burst buys nothing and spends someone's airtime
+/// allowance.
+const EARLY_ANNOUNCE_DELAYS_SECS: [u64; 3] = [2, 6, 14];
+
+/// Floor between announces asked for by [`BridgeSession::announce_now`], so a
+/// flapping interface cannot turn into an announce storm.
+const MIN_ANNOUNCE_GAP: Duration = Duration::from_secs(10);
 
 /// A discovered `<app_name>.server` destination heard via announce.
 #[derive(Debug, Clone)]
@@ -418,6 +434,24 @@ impl BridgeSession {
         Ok(())
     }
 
+    /// Announce once now, without waiting for the next interval.
+    ///
+    /// For the moments when a server's reachability has just changed and the
+    /// timer does not know it — a relay was added, an interface came back. It
+    /// is a *request*: the announcer keeps its own minimum gap so a flapping
+    /// link cannot turn into an announce storm.
+    ///
+    /// **An announce is a broadcast on every interface**, including ones that
+    /// are deliberately slow. A LoRa link may be configured to accept one
+    /// announce per destination per hour; asking for extra ones cheaply here
+    /// spends someone else's airtime there. Hence the floor, and hence this
+    /// being driven by events rather than by a shorter timer.
+    pub fn request_announce(&self) {
+        if let Some(tx) = &self.announce_tx {
+            let _ = tx.send(());
+        }
+    }
+
     pub fn handle(&self) -> &PrnsNodeHandle {
         &self.handle
     }
@@ -520,7 +554,8 @@ impl BridgeSession {
             .map_err(|e| anyhow!("invalid destination name: {e:?}"))?
         };
 
-        spawn_bridge_node(BridgeRole::Server, Some(precomputed_hash), args.relay_transit, move |discovered, connected_clients| async move {
+        let (announce_tx, announce_rx) = mpsc::unbounded_channel::<()>();
+        let mut session = spawn_bridge_node(BridgeRole::Server, Some(precomputed_hash), args.relay_transit, move |discovered, connected_clients| async move {
             let identity = load_identity(&args.identity)?;
             let app_name = args.profile.app_name.clone();
             let game_id = args.profile.id.clone();
@@ -660,11 +695,48 @@ impl BridgeSession {
             let base_record = server_announce_record(&args);
             let fallback_name = args.name.clone();
             let announce_state = state.clone();
+            let mut announce_rx = announce_rx;
             let _announce_task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval.max(1)));
                 ticker.tick().await;
+                // Early announces, so a server that has just come up is
+                // discoverable in seconds instead of after a whole interval.
+                // A browser is passive — it learns of a server only when that
+                // server next announces — so the first minute after a start is
+                // where the wait is felt.
+                //
+                // Three, not a stream of them: every announce is a broadcast on
+                // every interface, and a slow one pays for it. A LoRa link may
+                // be configured for one announce per destination per hour, and
+                // RNS holds the excess there rather than sending it — so an
+                // eager burst does not reach those peers anyway, it only spends
+                // their allowance.
+                let mut early = EARLY_ANNOUNCE_DELAYS_SECS.iter().copied();
+                let mut last_sent: Option<Instant> = None;
                 loop {
-                    ticker.tick().await;
+                    match early.next() {
+                        Some(delay) => {
+                            tokio::time::sleep(Duration::from_secs(delay)).await;
+                        }
+                        None => {
+                            tokio::select! {
+                                _ = ticker.tick() => {}
+                                got = announce_rx.recv() => {
+                                    if got.is_none() {
+                                        return;
+                                    }
+                                    // A requested announce respects a floor, so
+                                    // a flapping interface cannot become a
+                                    // storm on somebody's slow link.
+                                    if last_sent
+                                        .is_some_and(|t| t.elapsed() < MIN_ANNOUNCE_GAP)
+                                    {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let app_data = current_announce_app_data(
                         announce_format,
                         &base_record,
@@ -681,6 +753,7 @@ impl BridgeSession {
                     {
                         return;
                     }
+                    last_sent = Some(Instant::now());
                 }
             });
 
@@ -841,7 +914,12 @@ impl BridgeSession {
             info!("server node running");
             Ok((handle, async move { let _ = node.run().await; }))
         })
-        .await
+        .await?;
+        // The announcer lives in the node thread; this is the handle to it, so
+        // a caller whose reachability has changed can ask for an announce
+        // without waiting out the interval.
+        session.announce_tx = Some(announce_tx);
+        Ok(session)
     }
 
     pub async fn start_client(args: ClientArgs) -> Result<Self> {
@@ -1850,6 +1928,7 @@ where
         own_hash,
         role,
         relay_transit,
+        announce_tx: None,
         stop_tx: Some(stop_tx),
         done: Some(done_rx),
     })
@@ -1908,6 +1987,27 @@ enum BridgeEvent {
 
 fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
     match event {
+        // The mesh refused to carry an announce — almost always an interface
+        // enforcing its own announce rate. Logged rather than swallowed
+        // because it is otherwise indistinguishable from a server that never
+        // announced: the list is simply missing a row, on that interface only,
+        // with nothing anywhere saying why.
+        //
+        // A slow link holding most announces is correct, not a fault. An RNode
+        // configured for one announce per destination per hour will hold a
+        // 15-second announcer's output almost entirely, and should.
+        PrnsEvent::Diagnostic(Diagnostic::AnnounceHeldDropped {
+            destination,
+            source_interface,
+            cause,
+        }) => {
+            debug!(
+                destination = ?destination.as_bytes(),
+                interface = ?source_interface,
+                cause = ?cause,
+                "an announce was held by the mesh rather than carried"
+            );
+        }
         PrnsEvent::Diagnostic(Diagnostic::AnnounceHeard {
             destination,
             hops,
