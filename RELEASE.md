@@ -74,6 +74,23 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.3
+
+One fix, for the field 0.2.2 added.
+
+- **The detail pane keeps its scroll position and the caret across a
+  re-render.** It redraws on every poll because it shows "Last seen: 3s ago",
+  and it rebuilt itself wholesale — including `.detail-body`, the element that
+  actually scrolls — so the offset went back to zero several times a minute.
+  0.2.2's local-port field sits near the bottom of that pane and so was the
+  first control anyone had to scroll to: scrolling down bounced back up.
+
+  The offset and the focused control are now carried across by hand, scroll
+  restored before focus (with `preventScroll`, or focusing an element the
+  browser thinks is off-screen undoes the restore). Every control in the pane
+  has a stable id, because that is what the restore looks itself up by.
+  `launcher/uicheck` has a scenario for it, checked to fail without the fix.
+
 ## v0.2.2
 
 The local port a join binds is now the player's to choose.
