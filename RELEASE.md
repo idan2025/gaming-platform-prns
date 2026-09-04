@@ -74,6 +74,32 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.4
+
+**No change to the shipped software.** The binaries and the launcher are
+byte-for-byte what v0.2.3 does; the diff between the two tags is
+`release.yml` and this file. It is a release because the *pipeline* changed,
+and because a version number is the honest way to say which artifacts came out
+of the fixed one.
+
+- **`macos-13` is gone from the matrix.** GitHub retired the Intel macOS
+  runners, and a job naming a label with no runner behind it is not failed and
+  not reported — it queues, indefinitely, and the run never completes. Every
+  release from v0.1.0 to v0.2.3 hung that way, which is why none of them ever
+  carried an Intel-mac asset. `ci.yml` was never affected because it only ever
+  named `macos-14`; that difference between the two files was the whole answer.
+- **Intel Macs are served from Apple Silicon runners now.** The CLI target
+  cross-builds (same OS, same Apple SDK, nothing third-party in the link) and
+  the launcher ships one `universal-apple-darwin` dmg covering both
+  architectures.
+- Both matrices carry `timeout-minutes`, so a build that hangs for some other
+  reason fails rather than waiting out the six-hour default.
+
+v0.2.1 and v0.2.2 were re-dispatched against the fixed workflow and now carry
+their full asset sets, Intel-mac included. **v0.2.4 is the first release built
+from a tag push end to end** rather than a hand-dispatched re-run, and the
+first with a single mac dmg rather than two.
+
 ## v0.2.3
 
 One fix, for the field 0.2.2 added.
