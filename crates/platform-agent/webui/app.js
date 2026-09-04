@@ -6,6 +6,11 @@
 const TOKEN_KEY = "agent_token";
 const POLL_MS = 5000;
 
+// The map-name alphabet, kept in step with `validate_map_name` in
+// crates/game-bridge/src/console.rs. The node is the authority — this only
+// saves a round trip and gives a better sentence than a 400 would.
+const MAP_NAME_RE = /^[A-Za-z0-9_.\/-]+$/;
+
 const state = {
   token: null,
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
@@ -257,9 +262,11 @@ function renderInstances() {
       // Wire row action buttons once.
       const stopBtn = row.querySelector(".stop-btn");
       const restartBtn = row.querySelector(".restart-btn");
+      const mapBtn = row.querySelector(".map-btn");
       const removeBtn = row.querySelector(".remove-btn");
       stopBtn.addEventListener("click", () => onStop(inst.instance_id));
       if (restartBtn) restartBtn.addEventListener("click", () => onRestart(inst.instance_id));
+      if (mapBtn) mapBtn.addEventListener("click", () => onChangeMap(inst.instance_id, inst.game_id));
       removeBtn.addEventListener("click", () => onRemove(inst.instance_id, inst.name));
       tbody.appendChild(row);
       state.rows.set(inst.instance_id, row);
@@ -272,6 +279,23 @@ function renderInstances() {
     statePill.className = "state-pill " + stateClass(inst.state);
 
     row.querySelector(".cell-port").textContent = (inst.port != null ? String(inst.port) : "—");
+
+    // Changing the map talks to the *running* process's console, so it needs
+    // both a running server and a pack that says which console this game
+    // speaks. Say which one is missing rather than offering a button that
+    // fails.
+    const mapBtn = row.querySelector(".map-btn");
+    if (mapBtn) {
+      const game = state.games.find(g => g.id === inst.game_id);
+      const running = inst.state === "running";
+      const speaks = !game || game.console !== false;
+      mapBtn.disabled = !running || !speaks;
+      mapBtn.title = !running
+        ? "The server has to be running to be told anything."
+        : (!speaks
+          ? "The " + inst.game_id + " pack declares no console, so this node cannot change its map without restarting it."
+          : "Change the map without restarting — players stay connected.");
+    }
 
     // The mesh destination is the address a player actually joins from a
     // launcher. Its absence is not a detail: it means this server exists on
@@ -438,7 +462,7 @@ function refreshCardDynamic(g) {
 
 function onOpenStartForm(gameId) {
   if (!state.openForms.has(gameId)) {
-    state.openForms.set(gameId, { name: "", maxPlayers: 16, advanced: false, fixedPort: "" });
+    state.openForms.set(gameId, { name: "", maxPlayers: 16, map: "", advanced: false, fixedPort: "" });
   }
   const opening = state.openForms.get(gameId);
   if (opening) opening._opened = true;
@@ -471,6 +495,20 @@ function renderStartForm(gameId) {
   mpInput.required = true;
   mpInput.addEventListener("input", () => { const v = parseInt(mpInput.value, 10); f.maxPlayers = isNaN(v) ? 16 : v; });
 
+  // Starting map. A main-form field rather than an advanced one: which map a
+  // server comes up on is the second thing an operator cares about after its
+  // name, and leaving it blank keeps exactly the old behaviour — the image's
+  // own default.
+  const mapLabel = el("label", null, "Starting map");
+  mapLabel.htmlFor = "sf-map-" + gameId;
+  const mapInput = el("input"); mapInput.type = "text"; mapInput.id = "sf-map-" + gameId;
+  mapInput.value = f.map || "";
+  mapInput.placeholder = "leave blank for the game's default";
+  mapInput.addEventListener("input", () => { f.map = mapInput.value; });
+  const mapHint = el("p", "muted small",
+    "The map name as the game knows it — svencoop1, de_dust2, cp_dustbowl. " +
+    "Letters, digits, '_', '-', '.' and '/' only.");
+
   const advLabel = el("label", "checkbox-row");
   const advInput = el("input"); advInput.type = "checkbox"; advInput.id = "sf-adv-" + gameId;
   advInput.checked = f.advanced;
@@ -498,7 +536,7 @@ function renderStartForm(gameId) {
   cancelBtn.addEventListener("click", () => closeStartForm(gameId));
   actions.append(startBtn, cancelBtn);
 
-  form.append(nameLabel, nameInput, mpLabel, mpInput, advLabel, advancedWrap, actions);
+  form.append(nameLabel, nameInput, mpLabel, mpInput, mapLabel, mapInput, mapHint, advLabel, advancedWrap, actions);
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     onStartSubmit(gameId);
@@ -536,6 +574,15 @@ async function onStartSubmit(gameId) {
   if (!name) { showError("Server name is required."); return; }
   const maxPlayers = f.maxPlayers;
   if (!(maxPlayers >= 1 && maxPlayers <= 64)) { showError("Max players must be a number between 1 and 64."); return; }
+  // Blank means "say nothing about the map", which is not the same as an empty
+  // one: the node only sets GPP_MAP when it was given a name, so a blank field
+  // leaves the image's default alone. The node validates the name properly
+  // (crates/game-bridge/src/console.rs); this only saves a round trip.
+  const map = (f.map || "").trim();
+  if (map !== "" && !MAP_NAME_RE.test(map)) {
+    showError("A map name may only contain letters, digits, '_', '-', '.' and '/'.");
+    return;
+  }
   let port = null;
   if (f.advanced) {
     const pv = (f.fixedPort || "").trim();
@@ -560,6 +607,7 @@ async function onStartSubmit(gameId) {
     max_players: maxPlayers,
     port,
     extra_ports: {},
+    map: map === "" ? null : map,
     owner: null,
   };
 
@@ -689,6 +737,37 @@ async function onRestart(instanceId) {
     showError((e && e.error) || "Failed to restart the server.");
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = "Restart"; }
+  }
+}
+
+// Change the map on a live server. Not a restart: `changelevel` keeps every
+// player connected, which is the whole difference between this and recreating
+// the container with a different starting map.
+async function onChangeMap(instanceId, gameId) {
+  const map = prompt(
+    "New map for this " + gameId + " server:\n\n" +
+    "The name as the game knows it — svencoop1, de_dust2, cp_dustbowl. " +
+    "Players stay connected; the server changes level.",
+    "");
+  if (map == null) return;
+  const trimmed = map.trim();
+  if (trimmed === "") return;
+  if (!MAP_NAME_RE.test(trimmed)) {
+    showError("A map name may only contain letters, digits, '_', '-', '.' and '/'.");
+    return;
+  }
+  const row = state.rows.get(instanceId);
+  const btn = row ? row.querySelector(".map-btn") : null;
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  try {
+    await withInFlight(api("POST", "/instances/" + encodeURIComponent(instanceId) + "/map", { map: trimmed }));
+    clearError();
+    poll();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Failed to change the map.");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Change map"; }
   }
 }
 

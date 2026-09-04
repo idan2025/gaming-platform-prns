@@ -21,6 +21,14 @@ transport = "udp"
 min_link_class = 2
 query = "a2s"
 
+# Which console a node may talk to this game's running server through, so an
+# operator can change the map without restarting it and dropping everyone.
+# `source` selects words the build already carries (crates/game-bridge/src/console.rs);
+# the pack does not and cannot write the command. A pack that could write a
+# console line could type anything at a dedicated server's console on somebody
+# else's node.
+console = "source"
+
 # Tier 2, not tier 1 (GAMES.md §4). Source sustains several times a GoldSrc
 # server's rate per player and its map/asset transfer on join is a burst, so a
 # link that carries Sven Co-op comfortably is not evidence this will play. The

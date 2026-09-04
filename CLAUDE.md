@@ -204,6 +204,40 @@ Rules there:
   out of the binary, so there is no provenance question to ask about it and
   `may_deploy` allows it unconditionally.
 
+**Maps are pickable and changeable** (2026-09-04): `InstanceSpec.map` reaches a
+container as `GPP_MAP` (which `images/sven-coop/entrypoint.sh` had read since it
+was written — the agent simply never set it), and
+`Agent::change_map` changes a **running** server's map without dropping anyone.
+Rules a later change could quietly break:
+- **A pack names a console protocol, never a command.** `console = "goldsrc"`
+  selects words in `crates/game-bridge/src/console.rs`; a pack that could write
+  the console line could type anything at a dedicated server's console on
+  someone else's node — `rcon_password`, `exec`, `quit` — which is naming what
+  runs by another route. Same rule as content drivers and `launch.kind`.
+- **The map name is validated as data before it is anything else.** It reaches a
+  console line *and* a container's environment, so `validate_map_name` is an
+  allowlist and a failing name is refused, never rewritten. The one that matters
+  is the newline: a console reads one command per line. Caught by
+  `a_newline_can_never_reach_a_console_line`.
+- **Docker answers an attach to a container with no stdin `200 OK` and discards
+  the bytes.** Verified against the daemon. So `send_console_line` inspects
+  `Config.OpenStdin` and refuses; without that, a map change on any instance
+  created before this feature reports success and does nothing. `docker restart`
+  does not fix such a container — stdin is decided at create. Pinned by
+  `a_server_started_without_a_console_is_refused_rather_than_silently_ignored`.
+- **Stdin, not RCON.** RCON needs a password, and a password belongs neither in
+  a pack (a credentials leak with a schema — `content.rs` refuses a `login`
+  field for the same reason) nor as one more thing an operator must set. The
+  agent started the process, so the server's stdin is already its own.
+
+**The launcher's client identity is not CWD-relative** (2026-09-04):
+`ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
+for the CLI and wrong for a desktop app whose working directory is `/` or the
+app bundle — the join failed with `loading identity at
+./game-bridge-client.identity`. `Launcher::client_identity_path` puts it beside
+the settings file. Pinned by
+`the_client_identity_never_lands_in_the_working_directory`.
+
 **The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
 `cargo fmt --all` — it reformats every file, in a style the tree was not written
 in. Format new files with `rustfmt --config use_small_heuristics=Max <file>`,

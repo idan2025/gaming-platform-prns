@@ -15,6 +15,14 @@ transport = "udp"
 min_link_class = 1
 query = "a2s"
 
+# Which console a node may talk to this game's running server through, so an
+# operator can change the map without restarting it and dropping everyone.
+# `goldsrc` selects words the build already carries (crates/game-bridge/src/console.rs);
+# the pack does not and cannot write the command. A pack that could write a
+# console line could type anything at a dedicated server's console on somebody
+# else's node.
+console = "goldsrc"
+
 # GoldSrc, same engine family as Sven Co-op: one UDP port, A2S on that same
 # port, tier 1 (`GAMES.md` §4).
 writable_paths = ["cstrike/maps", "cstrike/logs"]

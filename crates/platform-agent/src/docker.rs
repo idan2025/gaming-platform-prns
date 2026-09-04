@@ -21,11 +21,13 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, RestartContainerOptions, StopContainerOptions, WaitContainerOptions,
+    AttachContainerOptions, Config, CreateContainerOptions, ListContainersOptions, LogOutput,
+    LogsOptions, RemoveContainerOptions, RestartContainerOptions, StopContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
+use tokio::io::AsyncWriteExt;
 
 use game_bridge::framing::CHANNEL_GAME;
 use game_bridge::profile::GameTransport;
@@ -378,6 +380,14 @@ impl DockerRuntime {
         if let Some(port) = game_port {
             env.push(format!("GPP_PORT={port}"));
         }
+        // The map the operator picked, when they picked one. Absent leaves the
+        // image's own default alone — `images/sven-coop/entrypoint.sh` has read
+        // `GPP_MAP` since it was written, so this is filling in a contract the
+        // agent was already half of. Validated as a map name by
+        // `InstanceSpec::validate` before it ever gets here.
+        if let Some(map) = &spec.map {
+            env.push(format!("GPP_MAP={map}"));
+        }
 
         let host_config = HostConfig {
             binds: Some(binds),
@@ -396,6 +406,20 @@ impl DockerRuntime {
             env: if env.is_empty() { None } else { Some(env) },
             exposed_ports: Some(exposed),
             host_config: Some(host_config),
+            // Keep stdin open so the server's console can be reached later —
+            // this is what `send_console_line` writes to, and it is decided
+            // *here*, at create, because Docker cannot open the stdin of a
+            // container that was started without it. A container created by an
+            // older build therefore cannot be told anything, and
+            // `send_console_line` says so rather than appearing to succeed.
+            //
+            // No TTY: a pseudo-terminal would make the game's output a stream
+            // of escape sequences in `docker logs` and buys nothing here.
+            open_stdin: Some(true),
+            // Without this the first writer to close stdin closes it for good,
+            // so one map change would be the last thing this server ever heard.
+            stdin_once: Some(false),
+            tty: Some(false),
             ..Default::default()
         };
 
@@ -569,6 +593,105 @@ impl DockerRuntime {
             .restart_container(&name, Some(RestartContainerOptions { t: STOP_TIMEOUT_SECS as isize }))
             .await
             .with_context(|| format!("restarting container {name}"))?;
+        Ok(())
+    }
+
+    /// Write one line to the container's stdin — the dedicated server's own
+    /// console.
+    ///
+    /// # Why stdin and not RCON
+    ///
+    /// RCON needs a password, and a password would have to live in the node's
+    /// config or in the pack. In the pack it is a credentials leak with a
+    /// schema (`content.rs` refuses a `login` field for the same reason); in
+    /// the config it is one more thing an operator must set before their server
+    /// can be told anything. The server's stdin is already ours: the agent
+    /// started the process, so it is the process's parent, and a GoldSrc or
+    /// Source dedicated server reads console commands from stdin exactly as it
+    /// reads them from a terminal.
+    ///
+    /// # What this refuses
+    ///
+    /// * A container this agent did not create (`assert_managed`, as everywhere).
+    /// * A container that is not running — writing into a stopped server's
+    ///   stdin succeeds at the socket and does nothing at the game, which would
+    ///   report a map change that never happened.
+    /// * A container created without stdin. **Docker answers this attach with
+    ///   `200 OK` and discards every byte** (verified against the daemon on
+    ///   2026-09-04: attaching `stdin=1&stream=1` to a container whose
+    ///   `Config.OpenStdin` is false returns 200 and the process reads
+    ///   nothing). Without the check below, telling such a server to change map
+    ///   would report success and change nothing, which is the worst answer
+    ///   available. Every container this agent created before it learned to
+    ///   talk to consoles is in exactly that state, and `docker restart` does
+    ///   not fix it: stdin is decided at create.
+    /// * A line containing a newline of its own. The caller has already
+    ///   validated its parameters (`console.rs`), and this is the backstop at
+    ///   the last point before the bytes leave: one call, one command.
+    pub async fn send_console_line(&self, spec_id: &str, line: &str) -> Result<()> {
+        if line.contains('\n') || line.contains('\r') {
+            return Err(anyhow!(
+                "a console line must be one line; refusing to send {line:?}"
+            ));
+        }
+        let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
+        self.assert_managed(&name).await?;
+        if self.state_of(spec_id).await? != InstanceState::Running {
+            return Err(anyhow!(
+                "{spec_id} is not running, so there is no console to talk to"
+            ));
+        }
+        let open_stdin = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .with_context(|| format!("inspecting container {name}"))?
+            .config
+            .and_then(|c| c.open_stdin)
+            .unwrap_or(false);
+        if !open_stdin {
+            return Err(anyhow!(
+                "{spec_id} was started with no console attached, so it cannot be told                  anything — Docker would accept the message and discard it. Stdin is                  decided when a container is created, so a restart will not help: remove                  this server and start it again, and it will accept map changes"
+            ));
+        }
+
+        let mut attached = self
+            .docker
+            .attach_container(
+                &name,
+                Some(AttachContainerOptions::<String> {
+                    stdin: Some(true),
+                    // Attaching to the output streams as well would make this
+                    // call wait on a game server's log forever. The console
+                    // answer, if there is one, shows up in `docker logs`.
+                    stdout: Some(false),
+                    stderr: Some(false),
+                    stream: Some(true),
+                    logs: Some(false),
+                    detach_keys: None,
+                }),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "attaching to {name}. A container created before this agent learned to                      talk to consoles was started with no stdin; restart the server once and                      it will accept commands"
+                )
+            })?;
+
+        attached
+            .input
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .with_context(|| format!("writing to {name}'s console"))?;
+        attached
+            .input
+            .flush()
+            .await
+            .with_context(|| format!("flushing {name}'s console"))?;
+        // Deliberately *not* `shutdown()`: closing this half would close the
+        // server's stdin, and a dedicated server that reaches EOF on its
+        // console treats it as the end of input. The attachment is dropped
+        // instead, which closes only this HTTP connection.
         Ok(())
     }
 

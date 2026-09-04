@@ -186,6 +186,12 @@ pub struct DeployRequest {
     pub name: String,
     #[serde(default = "default_max_players")]
     pub max_players: u8,
+    /// Which map to start on. Absent leaves it to the node's image default.
+    /// Passed through untouched: the **node** validates it, because the node is
+    /// where it becomes a container's environment, and an index that judged it
+    /// here would be a second place the rule could drift.
+    #[serde(default)]
+    pub map: Option<String>,
 }
 
 fn default_max_players() -> u8 {
@@ -386,6 +392,7 @@ impl Hosting {
                 // machine: only the node knows what is free there.
                 port: None,
                 extra_ports: Default::default(),
+                map: request.map.clone(),
                 owner: None,
             };
             let created = client
@@ -413,6 +420,7 @@ impl Hosting {
             "game_id": request.game_id,
             "name": request.name,
             "max_players": request.max_players,
+            "map": request.map,
             "owner": account.0,
         });
         let response = self
@@ -720,6 +728,7 @@ mod tests {
                     game_id: "minecraft".into(),
                     name: "nope".into(),
                     max_players: 8,
+                    map: None,
                 },
                 std::time::SystemTime::now(),
             )
@@ -740,6 +749,7 @@ mod tests {
                     game_id: "sven-coop".into(),
                     name: "x".into(),
                     max_players: 8,
+                    map: None,
                 },
                 std::time::SystemTime::now(),
             )

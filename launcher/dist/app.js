@@ -21,6 +21,13 @@ const state = {
   startingBrowse: false,
   interfaces: [],
   savedOpts: {},
+  // Destination hash -> game id the player picked for a server whose announce
+  // names no game. A legacy v0.1.10 announce carries a name and nothing else
+  // (`PLAN.md` §3.3), so the launcher cannot know its game and must not guess
+  // one: picking a wire protocol for the player is how a join silently talks
+  // nonsense at a server. Remembered per destination so the choice survives
+  // closing the detail pane.
+  chosenGame: new Map(),
 };
 
 const LINK_CLASS = { 1: 'Low-rate', 2: 'TCP / bursty', 3: 'High-bitrate' };
@@ -49,6 +56,13 @@ function fmtDuration(secs) {
   if (h > 0) return h + 'h ' + m + 'm';
   if (m > 0) return m + 'm ' + (secs % 60) + 's';
   return secs + 's';
+}
+// The game a join would use: what the announce said, else what the player
+// chose for this destination. `null` means neither, and nothing may join.
+function effectiveGameId(d) {
+  if (!d) return null;
+  if (d.announce && d.announce.game_id) return d.announce.game_id;
+  return state.chosenGame.get(d.hash) || null;
 }
 function shortHash(h) {
   if (!h || h.length < 12) return h || '';
@@ -584,7 +598,9 @@ function renderDetail() {
   }
   body.appendChild(probeSec);
 
-  body.appendChild(renderPackSection(a.game_id));
+  const gameId = effectiveGameId(d);
+  if (!a.game_id) body.appendChild(renderGamePicker(d));
+  body.appendChild(renderPackSection(gameId));
 
   pane.appendChild(body);
 
@@ -594,6 +610,14 @@ function renderDetail() {
   join.onclick = joinServer;
   if (d.joining) { join.disabled = true; join.textContent = 'Joining…'; }
   else if (d.joined) { join.textContent = 'Join again'; }
+  // No game, no join. Before the picker this button was live on a legacy row
+  // and failed in the error line instead of saying what was missing.
+  if (!gameId) {
+    join.disabled = true;
+    join.title = state.games.length
+      ? 'Choose which game this server runs first.'
+      : 'No game packs are installed, so nothing can be joined.';
+  }
   foot.appendChild(join);
 
   // The Play button (PLAN.md §13.3). It appears only once a join has bound a
@@ -609,7 +633,7 @@ function renderDetail() {
       foot.appendChild(play);
     } else {
       const locate = el('button', 'btn-locate', 'Locate game');
-      locate.onclick = () => locateGame((d.announce && d.announce.game_id) || null);
+      locate.onclick = () => locateGame(effectiveGameId(d));
       foot.appendChild(locate);
     }
   }
@@ -619,6 +643,55 @@ function renderDetail() {
     foot.appendChild(m);
   }
   pane.appendChild(foot);
+}
+
+// A server whose announce names no game — every deployed v0.1.10 peer, whose
+// app_data is a bare name (`PLAN.md` §3.3, §5) — cannot be matched to a pack,
+// and a pack is what tells this machine how to talk to it. The launcher must
+// not guess one: picking a wire protocol for the player is how a join ends up
+// talking nonsense at a server that looked fine.
+//
+// So the player picks, and the choice is remembered per destination. Until
+// they do, Join is disabled rather than failing in the error line, which is
+// what it did before: `this server did not say which game it runs`.
+function renderGamePicker(d) {
+  const sec = el('div', 'section');
+  sec.appendChild(el('h3', '', 'Which game is this?'));
+
+  if (!state.games.length) {
+    sec.appendChild(el('p', 'pack-none',
+      'This server did not say what game it runs, and no game packs are installed, ' +
+      'so there is nothing to match it to.'));
+    return sec;
+  }
+
+  sec.appendChild(el('p', 'pack-detail',
+    'This server announces only a name, which is what a pre-0.2 peer does. ' +
+    'Pick the game it runs and the launcher will remember it for this server.'));
+
+  const sel = el('select', 'game-picker');
+  sel.setAttribute('aria-label', 'Game this server runs');
+  const blank = el('option', '', 'Choose a game…');
+  blank.value = '';
+  sel.appendChild(blank);
+  state.games.forEach(g => {
+    const o = el('option', '', g.display_name || g.id);
+    o.value = g.id;
+    sel.appendChild(o);
+  });
+  sel.value = state.chosenGame.get(d.hash) || '';
+  sel.addEventListener('change', () => {
+    if (sel.value) state.chosenGame.set(d.hash, sel.value);
+    else state.chosenGame.delete(d.hash);
+    // A different game is a different bridge, so a previous join no longer
+    // describes what this button would do.
+    d.joined = false;
+    d.joinMsg = null;
+    d.joinErr = false;
+    renderDetail();
+  });
+  sec.appendChild(sel);
+  return sec;
 }
 
 // PLAN.md §11.4: a pack's provenance is shown at the moment it matters, not
@@ -723,6 +796,15 @@ async function stopBrowse() {
 async function joinServer() {
   const d = state.detail;
   if (!d || d.joining) return;
+  const gameId = effectiveGameId(d);
+  if (!gameId) {
+    d.joinErr = true;
+    d.joinMsg = state.games.length
+      ? 'Choose which game this server runs first.'
+      : 'No game packs are installed, so this launcher cannot join anything.';
+    renderDetail();
+    return;
+  }
   d.joining = true;
   d.joinMsg = null;
   d.joinErr = false;
@@ -730,7 +812,7 @@ async function joinServer() {
   try {
     const res = await invoke('join_server', {
       destinationHash: d.hash,
-      gameId: (d.announce && d.announce.game_id) || null,
+      gameId,
     });
     d.joined = true;
     d.listenAddr = res.listen_addr;

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use game_bridge::console::{validate_map_name, MapNameError};
 use game_bridge::profile::GameTransport;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,15 @@ pub struct InstanceSpec {
     /// is a spec choosing what the node exposes.
     #[serde(default)]
     pub extra_ports: BTreeMap<u8, u16>,
+    /// Which map the server starts on. `None` leaves it to the image's own
+    /// default, which is what every instance did before this field existed.
+    ///
+    /// A name, never a command: it is validated by
+    /// [`game_bridge::console::validate_map_name`] before it reaches either the
+    /// container's environment or a console line, and a name that does not pass
+    /// fails the create rather than being rewritten.
+    #[serde(default)]
+    pub map: Option<String>,
     /// Who asked for this, when something else is deploying on a user's behalf.
     /// An identity hash in hex; opaque to the agent.
     ///
@@ -139,6 +149,8 @@ pub enum SpecError {
     IdNotAllowed(String),
     EmptyGameId,
     EmptyName,
+    /// The requested starting map is not a usable map name.
+    BadMap(MapNameError),
 }
 
 impl core::fmt::Display for SpecError {
@@ -155,6 +167,7 @@ impl core::fmt::Display for SpecError {
             ),
             Self::EmptyGameId => write!(f, "spec names no game"),
             Self::EmptyName => write!(f, "spec has no display name"),
+            Self::BadMap(e) => write!(f, "{e}"),
         }
     }
 }
@@ -195,6 +208,12 @@ impl InstanceSpec {
         if self.name.trim().is_empty() {
             return Err(SpecError::EmptyName);
         }
+        // Judged here, with the rest of the spec, so a bad map name is refused
+        // at the API's front door rather than at the moment it is interpolated
+        // into a container's environment.
+        if let Some(map) = &self.map {
+            validate_map_name(map).map_err(SpecError::BadMap)?;
+        }
         Ok(())
     }
 
@@ -218,6 +237,7 @@ mod tests {
             max_players: 8,
             port: None,
             extra_ports: BTreeMap::new(),
+            map: None,
             owner: None,
         }
     }
@@ -247,6 +267,19 @@ mod tests {
         for good in ["a", "coop-1", "sven.coop_2", "0", "a-b_c.d"] {
             spec(good).validate().unwrap_or_else(|e| panic!("{good:?} was refused: {e}"));
         }
+    }
+
+    /// A map name reaches a container's environment and a console line, so the
+    /// spec is where a bad one stops — not the moment it is interpolated.
+    #[test]
+    fn a_spec_refuses_a_map_name_that_is_not_one() {
+        let mut s = spec("ok");
+        s.map = Some("de_dust2\nquit".to_string());
+        assert!(matches!(s.validate(), Err(SpecError::BadMap(_))));
+        s.map = Some("../../etc/passwd".to_string());
+        assert!(matches!(s.validate(), Err(SpecError::BadMap(_))));
+        s.map = Some("svencoop1".to_string());
+        s.validate().unwrap();
     }
 
     #[test]

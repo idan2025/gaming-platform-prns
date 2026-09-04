@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
+use game_bridge::console::ConsoleProtocol;
 use game_bridge::profile::GameProfile;
 use game_bridge::GamePack;
 use tokio::sync::{Mutex, RwLock};
@@ -570,6 +571,51 @@ impl Agent {
         // to a closed port — worse than not being listed at all.
         self.mesh.stop(instance_id).await;
         self.docker.stop(instance_id).await
+    }
+
+    /// Change a running server's map, without restarting it.
+    ///
+    /// The distinction is the whole feature: recreating the container with a
+    /// different `GPP_MAP` would also work, and would drop every player and
+    /// take the game's ports and mesh destination down with it. `changelevel`
+    /// keeps the connections.
+    ///
+    /// **The pack decides whether this is possible at all.** A game whose pack
+    /// declares no `console` is refused by name, because the alternative is
+    /// guessing a command and typing it at a stranger's dedicated server. The
+    /// pack supplies a protocol; `console.rs` supplies the words
+    /// (`crates/game-bridge/src/console.rs`).
+    pub async fn change_map(&self, instance_id: &str, map: &str) -> Result<String> {
+        let instances = self.list().await?;
+        let instance = instances
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
+
+        let packs = self.packs.read().await;
+        let pack = packs.get(&instance.game_id).ok_or_else(|| {
+            anyhow!(
+                "no game pack installed for {:?}, so this node cannot tell its server anything",
+                instance.game_id
+            )
+        })?;
+        let console: ConsoleProtocol = pack
+            .console
+            .ok_or_else(|| {
+                anyhow!(
+                    "the {:?} pack declares no console, so this node has no way to change its                      map without restarting the server",
+                    instance.game_id
+                )
+            })?
+            .into();
+        // The map name is judged before it becomes a line, and a name that does
+        // not pass is refused rather than rewritten: a silently corrected map
+        // name loads the wrong map and reads as a game bug.
+        let line = console.change_map(map).map_err(|e| anyhow!("{e}"))?;
+        drop(packs);
+
+        self.docker.send_console_line(instance_id, &line).await?;
+        Ok(line)
     }
 
     /// Restart an instance in place, and put it back on the mesh.

@@ -316,6 +316,9 @@ input:focus-visible, select:focus-visible {
 .pack-detail { color: var(--fg-muted); margin: 4px 0 0; }
 .pack-none { color: var(--fg-muted); font-style: italic; margin: 0; }
 .pack-line + .kv, .pack-detail + .kv { margin-top: 6px; }
+/* The picker for a server whose announce names no game. Full width so it does
+   not read as an afterthought: nothing can be joined until it is answered. */
+.game-picker { width: 100%; margin-top: 6px; }
 
 .empty {
   padding: 40px 24px;

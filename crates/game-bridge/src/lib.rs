@@ -14,6 +14,7 @@ pub mod a2s;
 pub mod announce;
 pub mod browse;
 pub mod config;
+pub mod console;
 pub mod content;
 pub mod details;
 pub mod framing;

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use game_bridge::announce::AnnounceInfo;
 use game_bridge::browse::{BrowseFilter, SortBy};
 use game_bridge::config::{BrowserArgs, ClientArgs};
@@ -556,6 +556,32 @@ impl Launcher {
         }
     }
 
+    /// Where the client bridge keeps its Reticulum identity.
+    ///
+    /// **Never the process's working directory.** `ClientArgs::new` defaults to
+    /// `./game-bridge-client.identity`, which is right for the CLI — someone
+    /// ran it from a directory they chose — and wrong for a desktop app, whose
+    /// working directory is whatever started it: `/` from a `.desktop` entry,
+    /// the app bundle on macOS, `C:\Windows\system32` from some shortcuts.
+    /// None of those are writable, and the join failed with
+    /// `loading identity at ./game-bridge-client.identity`
+    /// (`crates/game-bridge/src/relay.rs:2049`) rather than saying so.
+    ///
+    /// So it goes beside the settings file, in the one directory this launcher
+    /// already owns and already writes. With no config directory at all the
+    /// temp directory is the degraded fallback: a client identity that does not
+    /// survive a reboot still joins, where an unwritable path never does.
+    fn client_identity_path(&self) -> PathBuf {
+        let dir = self
+            .settings_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join("client.identity")
+    }
+
     /// Start a client bridge pointed at one server. Does not launch a game.
     pub async fn join_server(&self, destination_hash: &str, game_id: Option<&str>) -> Result<JoinResult> {
         let hash = parse_hash(destination_hash)?;
@@ -578,6 +604,15 @@ impl Launcher {
         let listen_port = profile.default_port;
         let mut args = ClientArgs::new(profile);
         args.server_hash = Some(hex::encode(hash.as_bytes()));
+        // The identity file is created on first join, so its directory has to
+        // exist by then — the loader opens the path, it does not build the way
+        // to it.
+        let identity = self.client_identity_path();
+        if let Some(parent) = identity.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {} for the client identity", parent.display()))?;
+        }
+        args.identity = identity;
 
         // Whether Play can run for this game is settled before the session lock
         // is taken, so the two locks are never held at once.
@@ -1384,6 +1419,31 @@ query = "a2s"
         );
         assert!(view.launch_ready);
         assert!(view.steam_available && view.steam_installed);
+    }
+
+    /// The client identity must never land in the process's working directory.
+    ///
+    /// A desktop launcher does not choose its own CWD — `/` from a `.desktop`
+    /// entry, the bundle on macOS — and writing there fails, which is how a
+    /// join came back as `loading identity at ./game-bridge-client.identity`
+    /// instead of connecting. This is the test that fails if the relative
+    /// default from `ClientArgs::new` is ever allowed through again.
+    #[test]
+    fn the_client_identity_never_lands_in_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
+        let path = l.client_identity_path();
+        assert!(path.is_absolute(), "{} is relative", path.display());
+        assert_eq!(path.parent(), Some(dir.path()), "the identity belongs beside the settings");
+    }
+
+    /// No config directory at all is a degraded mode, not a failure: the
+    /// identity goes somewhere writable so a join still works.
+    #[test]
+    fn a_launcher_with_nowhere_to_persist_still_gets_a_writable_identity_path() {
+        let path = Launcher::new(Vec::new()).client_identity_path();
+        assert!(path.is_absolute(), "{} is relative", path.display());
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
     }
 
     /// Setting a game path persists it, and a fresh launcher loading the same

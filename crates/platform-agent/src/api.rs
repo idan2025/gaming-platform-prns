@@ -109,6 +109,7 @@ pub fn router_full(
         .route("/instances", get(list).post(create))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
+        .route("/instances/:id/map", post(change_map))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content).get(install_status))
@@ -226,6 +227,10 @@ struct GameOption {
     transport: String,
     default_port: u16,
     extra_ports: usize,
+    /// Whether this node can talk to a running server of this game, so the UI
+    /// can offer a live map change instead of offering one and then explaining
+    /// that the pack declares no console.
+    console: bool,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -363,6 +368,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 transport: format!("{:?}", pack.transport).to_ascii_lowercase(),
                 default_port: pack.default_port,
                 extra_ports: pack.extra_ports.len(),
+                console: pack.console.is_some(),
             }
         })
         .collect();
@@ -468,6 +474,33 @@ async fn restart(
         .restart(&id)
         .await
         .map(|_| Json(json!({ "instance_id": id, "restarted": true })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// What `POST /instances/:id/map` carries. A map name and nothing else: the
+/// command is this build's, never the caller's (`console.rs`).
+#[derive(serde::Deserialize)]
+struct ChangeMapReq {
+    map: String,
+}
+
+/// Change a running server's map in place. Not a restart — see
+/// [`Agent::change_map`]; the players stay connected.
+///
+/// A refusal is a 400 with the reason, because every way this fails is
+/// something the caller can act on: an unknown instance, a game whose pack
+/// declares no console, a map name that is not one, or a server that was
+/// started by a build that left it no console to talk to.
+async fn change_map(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChangeMapReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .change_map(&id, &req.map)
+        .await
+        .map(|command| Json(json!({ "instance_id": id, "map": req.map, "command": command })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 

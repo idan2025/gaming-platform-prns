@@ -40,10 +40,24 @@ xdg-open http://localhost:4750
 - **Add a game** — paste a pack or give a URL. It is installed and live without
   a restart. If your `[pack_trust]` policy refuses it, it lands on disk, does
   not run, and the UI says which and why.
-- **Start a server** — name, max players, optionally a fixed host port.
-  Otherwise the node picks from your `port_range`.
-- **Servers** — what is running, with players and uptime, and stop/remove.
-  "Players: —" means the game could not be asked, which is not the same as zero.
+- **Start a server** — name, max players, a starting map, and optionally a
+  fixed host port. Otherwise the node picks from your `port_range`. Leaving the
+  map blank keeps the image's own default; a name given here reaches the game as
+  `GPP_MAP`.
+- **Servers** — what is running, with players and uptime, and
+  change-map/restart/stop/remove. "Players: —" means the game could not be
+  asked, which is not the same as zero.
+- **Change map** — talks to the running server's own console, so the players
+  stay connected: it is `changelevel`, not a restart. It needs two things, and
+  the button says which is missing when it is greyed out: a server that is
+  actually running, and a pack that declares which console its game speaks
+  (`console = "goldsrc"` or `"source"`). A pack names the protocol and never the
+  command — the words live in `crates/game-bridge/src/console.rs`, for the same
+  reason a pack cannot name an image.
+
+  A server started by an agent older than this one has no console to talk to:
+  Docker decides at *create* whether a container has stdin, and it cannot be
+  added afterwards. Recreate the server once and it will accept map changes.
 
 ## Three things worth understanding before you run it
 

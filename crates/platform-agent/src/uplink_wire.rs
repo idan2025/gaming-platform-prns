@@ -276,6 +276,7 @@ mod tests {
             max_players: 8,
             port: None,
             extra_ports: Default::default(),
+            map: None,
             owner: None,
         }
     }

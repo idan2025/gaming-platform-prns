@@ -43,6 +43,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::console::ConsoleProtocol;
 use crate::content::{ContentError, PackContent};
 use crate::launch::{LaunchError, LaunchKind, LaunchProfile};
 use crate::profile::{GamePort, GameProfile, GameTransport, ProfileError, QueryProtocol};
@@ -109,6 +110,17 @@ pub struct GamePack {
     /// naming what runs.
     #[serde(default)]
     pub extra_ports: Vec<PackPort>,
+    /// Which console a node may talk to this game's running server through, so
+    /// an operator can change the map without restarting it (`console.rs`).
+    /// Absent means the node cannot: it will say so rather than guess a
+    /// command.
+    ///
+    /// **A protocol, never a command.** The variant selects words this build
+    /// already carries. A pack that could write the console line could type
+    /// anything at a dedicated server's console on somebody else's node, which
+    /// is naming what runs by another route — see the module docs.
+    #[serde(default)]
+    pub console: Option<PackConsole>,
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
@@ -160,6 +172,23 @@ pub enum PackTransport {
 #[serde(rename_all = "lowercase")]
 pub enum PackQuery {
     A2s,
+}
+
+/// The console a pack's game speaks, as it appears in a pack file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackConsole {
+    Goldsrc,
+    Source,
+}
+
+impl From<PackConsole> for ConsoleProtocol {
+    fn from(c: PackConsole) -> Self {
+        match c {
+            PackConsole::Goldsrc => ConsoleProtocol::Goldsrc,
+            PackConsole::Source => ConsoleProtocol::Source,
+        }
+    }
 }
 
 impl From<PackQuery> for QueryProtocol {
@@ -246,6 +275,9 @@ impl GamePack {
             // `shipped_sven_pack_matches_the_builtin` enforces.
             content: PackContent::Steamcmd { app_id: 276060 },
             extra_ports: Vec::new(),
+            // GoldSrc, so a node can `changelevel` a live server. Kept in step
+            // with `packs/sven-coop.toml`.
+            console: Some(PackConsole::Goldsrc),
             // Kept in step with `packs/sven-coop.toml`, which
             // `shipped_sven_pack_matches_the_builtin` enforces: the fallback a
             // fresh install uses must not be a different game from the file.

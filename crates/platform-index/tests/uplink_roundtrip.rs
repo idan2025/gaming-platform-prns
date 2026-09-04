@@ -219,6 +219,7 @@ async fn an_index_creates_lists_stops_and_removes_on_a_remote_agent() {
             max_players: 8,
             port: None,
             extra_ports: Default::default(),
+            map: None,
             owner: None,
         };
 
