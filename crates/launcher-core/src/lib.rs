@@ -286,6 +286,14 @@ pub struct Launcher {
 
 struct Inner {
     browse: Option<BridgeSession>,
+    /// The interfaces the running browse node was started with.
+    ///
+    /// Kept because **a join needs the same ones**. Browsing and joining are
+    /// two separate Reticulum nodes in this process, and the second one used to
+    /// be built with `ClientArgs::new`'s defaults — no TCP peer, no
+    /// auto-discovery — so it attached nothing and could reach nothing. See
+    /// `join_server`.
+    browse_opts: Option<BrowseOpts>,
     client: Option<BridgeSession>,
     /// What the last successful [`Launcher::join_server`] bound, so
     /// [`Launcher::play`] knows which port and game to start against without the
@@ -334,6 +342,19 @@ impl LaunchPlan {
             LaunchPlan::Direct { args, .. } => args,
             LaunchPlan::Steam { args, .. } => args,
         }
+    }
+}
+
+/// Which interfaces a join should attach: whatever the running browse node was
+/// started with, else whatever the player saved.
+///
+/// Its own function so the choice can be tested without starting a Reticulum
+/// node. The rule it encodes is that **a join is never given fewer interfaces
+/// than a browse**, which is the bug this exists to prevent coming back.
+fn join_interfaces(browse_opts: Option<&BrowseOpts>, saved: &BrowseOpts) -> BrowseOpts {
+    match browse_opts {
+        Some(o) => o.clone(),
+        None => saved.clone(),
     }
 }
 
@@ -398,7 +419,12 @@ impl Launcher {
         settings_path: Option<PathBuf>,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner { browse: None, client: None, last_join: None })),
+            inner: Arc::new(Mutex::new(Inner {
+                browse: None,
+                browse_opts: None,
+                client: None,
+                last_join: None,
+            })),
             packs,
             settings: Arc::new(Mutex::new(settings)),
             settings_path,
@@ -476,8 +502,11 @@ impl Launcher {
         if inner.browse.is_some() {
             return Ok(());
         }
-        let args = BrowserArgs { tcp: opts.tcp, auto: opts.auto };
+        let args = BrowserArgs { tcp: opts.tcp.clone(), auto: opts.auto };
         inner.browse = Some(BridgeSession::start_browser(args).await?);
+        // A join has to attach the same interfaces, and this is the only record
+        // of which ones the player actually started browsing with.
+        inner.browse_opts = Some(opts);
         Ok(())
     }
 
@@ -655,6 +684,9 @@ impl Launcher {
         if let Some(port) = listen_port {
             self.set_listen_port(&game_id, Some(port)).await?;
         }
+        // Read before the session lock, because it takes the settings lock and
+        // the two are never held at once.
+        let saved_opts = self.saved_browse_opts().await;
         let listen_port = self
             .listen_port_for(&game_id)
             .await
@@ -679,6 +711,31 @@ impl Launcher {
         let listen_addr = format!("127.0.0.1:{listen_port}");
 
         let mut inner = self.inner.lock().await;
+
+        // **A join attaches the same interfaces the browse node did.**
+        //
+        // Browsing and joining are two separate Reticulum nodes inside this
+        // process. `start_browse` has always passed the player's interfaces to
+        // its own; this did not, so the client was built from
+        // `ClientArgs::new`'s defaults — `tcp: None, auto: false` — and
+        // attached nothing at all.
+        //
+        // Nothing about that looked broken from the outside, which is why it
+        // survived: the local port binds (a purely local operation), the server
+        // list fills, and the detail probe answers with live stats, because all
+        // three of those run on the *browse* node. Only the game's own packets
+        // went into a node with no way off this machine, so the join reported
+        // success and the game sat at "Connecting…" until it gave up — on any
+        // port, which is what ruled the port out as the cause.
+        let opts = join_interfaces(inner.browse_opts.as_ref(), &saved_opts);
+        if opts.tcp.is_none() && !opts.auto {
+            return Err(anyhow!(
+                "this launcher has no mesh interface, so a join could not reach the server.                  Add a TCP peer or turn on LAN auto-discovery, then join again"
+            ));
+        }
+        args.tcp = opts.tcp.clone();
+        args.auto = opts.auto;
+
         // Stop any previous join first: two clients cannot share a listen port,
         // and `stop` waits for the socket to actually be released.
         if let Some(mut old) = inner.client.take() {
@@ -1502,6 +1559,44 @@ query = "a2s"
         let path = Launcher::new(Vec::new()).client_identity_path();
         assert!(path.is_absolute(), "{} is relative", path.display());
         assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    /// **A join must attach the same interfaces a browse does.**
+    ///
+    /// This is the regression test for a join that reached nothing: the client
+    /// bridge was built from `ClientArgs::new`'s defaults, `tcp: None` and
+    /// `auto: false`, so it attached no interface and no game packet could
+    /// leave the machine. Nothing about it looked broken — the port bound, the
+    /// list filled, the detail probe answered with live stats — because all of
+    /// those run on the browse node instead.
+    #[test]
+    fn a_join_attaches_what_the_browse_node_attached() {
+        let browsing = BrowseOpts { tcp: Some("192.168.1.9:4966".into()), auto: true };
+        let saved = BrowseOpts { tcp: None, auto: false };
+        let chosen = join_interfaces(Some(&browsing), &saved);
+        assert_eq!(chosen.tcp.as_deref(), Some("192.168.1.9:4966"));
+        assert!(chosen.auto, "a join must not silently drop auto-discovery");
+    }
+
+    /// With no browse running, the player's saved interfaces are what a join
+    /// gets — not nothing.
+    #[test]
+    fn a_join_without_a_running_browse_falls_back_to_saved_interfaces() {
+        let saved = BrowseOpts { tcp: Some("hub.example.org:4789".into()), auto: false };
+        let chosen = join_interfaces(None, &saved);
+        assert_eq!(chosen.tcp.as_deref(), Some("hub.example.org:4789"));
+    }
+
+    /// The case that used to be silent. A join with nothing to attach cannot
+    /// reach any server, so it has to say so rather than bind a port and let
+    /// the game time out against it.
+    #[test]
+    fn a_join_with_no_interfaces_at_all_is_recognisable() {
+        let chosen = join_interfaces(None, &BrowseOpts { tcp: None, auto: false });
+        assert!(
+            chosen.tcp.is_none() && !chosen.auto,
+            "this is the state join_server refuses; if it stops being detectable,              a join can silently reach nothing again"
+        );
     }
 
     /// With nothing chosen, a join binds the pack's own port — the behaviour

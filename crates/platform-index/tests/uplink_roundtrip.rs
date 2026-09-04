@@ -80,7 +80,16 @@ fn agent_config_toml(data_root: &std::path::Path) -> String {
     format!(
         r#"
 data_root = "{root}"
-max_instances = 2
+# Deliberately far above what this test needs (it creates one instance).
+#
+# `max_instances` is a property of the **node**, and an agent counts every
+# container carrying `MANAGED_LABEL` on the daemon it drives — that is the
+# design, not an accident: the containers are the record. So a test agent
+# sharing a daemon with a machine's real game servers sees those too, and a
+# limit of 2 made this test fail with "this node is at its limit of 2
+# instances" on any developer box already hosting a couple. That failure looks
+# like a flake and is not one; it depends on what else is running.
+max_instances = 64
 api_bind = "127.0.0.1:0"
 
 [port_range]
