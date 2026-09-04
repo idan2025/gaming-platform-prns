@@ -180,6 +180,40 @@ await run('detail pane', {
   check('no undefined leaked into the detail pane', !t.includes('undefined'), t.slice(0, 300));
 });
 
+// A poll re-renders the detail pane every few seconds — it shows "Last seen:
+// 3s ago", so it has to. What it must not do is throw away where the reader was
+// and what they were typing in, which is what made the local-port field
+// impossible to use: scrolling down to it bounced back to the top.
+await run('the detail pane survives a re-render', {
+  status: running,
+  rows: () => [row()],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+
+  const port = doc.querySelector('#detail-port');
+  check('the detail pane offers a local port field', !!port);
+  check('the local port field has a stable id to be restored by', port.id === 'detail-port');
+  check('the local port is prefilled from the core', port.value === '27015', `got ${JSON.stringify(port.value)}`);
+
+  port.focus();
+  port.value = '270';
+  port.dispatchEvent(new win.Event('input', { bubbles: true }));
+  check('the field has focus before the re-render', doc.activeElement.id === 'detail-port');
+
+  // What a poll does.
+  win.eval('renderDetail()');
+
+  const after = doc.querySelector('#detail-port');
+  check('the field still has focus after a re-render',
+    doc.activeElement && doc.activeElement.id === 'detail-port',
+    `activeElement is ${doc.activeElement && doc.activeElement.id}`);
+  check('a half-typed port is not thrown away by a re-render',
+    after.value === '270', `got ${JSON.stringify(after.value)}`);
+  check('the scroll container is present to be restored',
+    !!doc.querySelector('#detail .detail-body'));
+});
+
 await run('unreachable server', {
   status: running,
   rows: () => [row()],

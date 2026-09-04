@@ -462,6 +462,25 @@ function renderDetail() {
   const d = state.detail;
   const pane = $('detail');
   if (!d) { pane.hidden = true; return; }
+
+  // This pane re-renders on every poll, and legitimately so: it shows "Last
+  // seen: 3s ago", which is different every second. Rebuilding it wholesale
+  // therefore threw away the scroll position several times a minute — the
+  // local-port field is near the bottom, so scrolling to it bounced straight
+  // back to the top — and took the caret with it.
+  //
+  // Same lesson `renderList` already learned about the peer-address input, and
+  // the same fix in the form this pane can take: `.detail-body` is the element
+  // that scrolls and it is replaced on each pass, so its offset and the
+  // focused control are carried across by hand. Every control this pane builds
+  // that a person can land on therefore needs a stable id.
+  const prevBody = pane.querySelector('.detail-body');
+  const prevScroll = prevBody ? prevBody.scrollTop : 0;
+  const active = document.activeElement;
+  const keepId = active && active.id && pane.contains(active) ? active.id : null;
+  const selStart = keepId && active.selectionStart != null ? active.selectionStart : null;
+  const selEnd = keepId && active.selectionEnd != null ? active.selectionEnd : null;
+
   pane.innerHTML = '';
 
   // head
@@ -612,6 +631,7 @@ function renderDetail() {
   // foot
   const foot = el('div', 'detail-foot');
   const join = el('button', 'btn-join', 'Join server');
+  join.id = 'detail-join';
   join.onclick = joinServer;
   if (d.joining) { join.disabled = true; join.textContent = 'Joining…'; }
   else if (d.joined) { join.textContent = 'Join again'; }
@@ -648,6 +668,23 @@ function renderDetail() {
     foot.appendChild(m);
   }
   pane.appendChild(foot);
+
+  // Put the reader back where they were. Order matters: the scroll offset is
+  // restored before focus, because focusing an element the browser considers
+  // off-screen scrolls it into view and would undo the line above.
+  const scroller = pane.querySelector('.detail-body');
+  if (scroller && prevScroll) scroller.scrollTop = prevScroll;
+  if (keepId) {
+    const again = document.getElementById(keepId);
+    if (again) {
+      again.focus({ preventScroll: true });
+      if (selStart != null && again.setSelectionRange) {
+        // A number input refuses selection in some engines, and losing the
+        // caret offset is not worth failing the render over.
+        try { again.setSelectionRange(selStart, selEnd); } catch (_) { /* ignore */ }
+      }
+    }
+  }
 }
 
 // A server whose announce names no game — every deployed v0.1.10 peer, whose
@@ -675,6 +712,7 @@ function renderGamePicker(d) {
     'Pick the game it runs and the launcher will remember it for this server.'));
 
   const sel = el('select', 'game-picker');
+  sel.id = 'detail-game';
   sel.setAttribute('aria-label', 'Game this server runs');
   const blank = el('option', '', 'Choose a game…');
   blank.value = '';
@@ -730,6 +768,7 @@ function renderPortSection(d, gameId) {
 
   const row = el('div', 'port-row');
   const input = el('input', 'port-input');
+  input.id = 'detail-port';
   input.type = 'number';
   input.min = '1';
   input.max = '65535';
@@ -741,6 +780,7 @@ function renderPortSection(d, gameId) {
   row.appendChild(input);
 
   const reset = el('button', 'btn-locate', 'Use default');
+  reset.id = 'detail-port-reset';
   reset.type = 'button';
   reset.onclick = async () => {
     try {
