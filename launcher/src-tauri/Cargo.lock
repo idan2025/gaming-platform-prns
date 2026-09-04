@@ -1862,6 +1862,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "index-client"
+version = "0.2.9"
+dependencies = [
+ "anyhow",
+ "game-bridge",
+ "personal-rns",
+ "prns-core",
+ "tracing",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,6 +2116,7 @@ dependencies = [
  "anyhow",
  "game-bridge",
  "hex",
+ "index-client",
  "personal-rns",
  "prns-core",
  "serde",

@@ -2042,6 +2042,49 @@ query = "a2s"
         }
     }
 
+    /// Adding an index is a person typing an address, so a wrong one is
+    /// refused where they can see the complaint rather than failing later as a
+    /// query that never answers.
+    #[tokio::test]
+    async fn an_index_address_is_checked_when_it_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
+        assert!(l.add_index("not-a-hash").await.is_err());
+        assert!(l.add_index(&"aa".repeat(16)).await.is_ok());
+        assert_eq!(l.indexes().await.len(), 1);
+        // Adding the same one twice is not two indexes.
+        l.add_index(&"aa".repeat(16)).await.unwrap();
+        assert_eq!(l.indexes().await.len(), 1);
+        l.remove_index(&"aa".repeat(16)).await.unwrap();
+        assert!(l.indexes().await.is_empty());
+    }
+
+    /// **An index is a cache, so it loses every tie.** A row heard directly is
+    /// this launcher's own evidence; an index row only fills a gap, and must
+    /// say that it is second-hand — its `hops` is the distance from the index,
+    /// not from here.
+    #[test]
+    fn an_index_row_is_marked_and_never_pretends_to_be_heard() {
+        let info = AnnounceInfo::Record(game_bridge::announce::AnnounceRecord {
+            protocol_version: 1,
+            flags: Default::default(),
+            min_link_class: 1,
+            players: 3,
+            max_players: 16,
+            game_id: "sven-coop".into(),
+            name: "Elsewhere".into(),
+            map: "crystal".into(),
+            tlvs: Vec::new(),
+        });
+        let r = index_row("aa", 4, &info);
+        assert!(r.from_index, "an index row must say where it came from");
+        assert!(!r.remembered, "it is somebody's sighting, not our memory");
+        // The numbers are real — they came from a real announce.
+        assert_eq!(r.players, Some(3));
+        assert_eq!(r.map.as_deref(), Some("crystal"));
+        assert_eq!(r.hops, 4);
+    }
+
     /// With nothing chosen, a join binds the pack's own port — the behaviour
     /// every join had before the port was settable.
     #[tokio::test]

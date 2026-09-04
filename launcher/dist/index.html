@@ -42,6 +42,24 @@
 
   <div id="legacy-notice" class="legacy-notice hidden" role="status"></div>
 
+  <!-- An index is a cache of the mesh, never the source of truth (DESIGN.md
+       §0). None is configured by default and browsing works with none; adding
+       one is a player choosing to trust somebody's list. -->
+  <details id="index-panel" class="index-panel">
+    <summary>Indexes <span id="index-count" class="muted"></span></summary>
+    <p class="index-help">An index is somebody else's list of servers, and it is
+      optional. Browsing works without one — the launcher hears servers directly
+      and remembers the ones it has seen. An index adds the ones it has heard
+      that you have not, which is the only way to find a server that was already
+      running before you ever started.</p>
+    <div class="index-add">
+      <input id="index-hash" type="text" placeholder="index address (32 hex characters)"
+             aria-label="Index destination address">
+      <button id="index-add-btn" type="button" class="quiet">Add index</button>
+    </div>
+    <div id="index-list"></div>
+  </details>
+
   <main class="main">
     <section class="list-wrap" aria-label="Server list">
       <div class="list-head" role="row">

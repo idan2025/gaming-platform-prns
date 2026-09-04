@@ -116,6 +116,11 @@ function makeInvoke(scenario) {
         return scenario.join ?? { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: true };
       case 'listen_port':
         return 27015;
+      case 'indexes':
+        return scenario.indexes ?? [];
+      case 'add_index':
+      case 'remove_index':
+        return null;
       case 'known_servers':
         return scenario.known ?? [];
       case 'refresh_known_servers':
@@ -282,6 +287,27 @@ await run('a join that cannot reach the server says so', {
   check('an unroutable join is not reported as success', /did not answer/i.test(t), t.slice(-300));
   check('and names the likely cause', /address may have changed/i.test(t), t.slice(-300));
   check('no undefined in the warning', !t.includes('undefined'));
+});
+
+// An index row is somebody else's sighting. Real numbers, but second-hand, and
+// the list must show which is which — an index is a cache of the mesh, never
+// the source of truth.
+await run('an index row is marked as second-hand', {
+  status: running,
+  indexes: ['aa'.repeat(16)],
+  rows: () => [row({
+    destination_hash: 'cafebabe00000000000000000000feed',
+    name: 'Someone Else\u2019s Server',
+    from_index: true, hops: 4,
+  })],
+}, async (win, doc) => {
+  const el = doc.querySelector('#list .row');
+  check('an index row appears in the list', !!el);
+  check('it is badged as coming via an index', /via index/i.test(el.textContent));
+  check('no undefined in an index row', !el.textContent.includes('undefined'));
+  const panel = doc.querySelector('#index-panel');
+  check('the launcher offers an index panel', !!panel);
+  check('and says an index is optional', /works without one/i.test(panel.textContent));
 });
 
 await run('unreachable server', {

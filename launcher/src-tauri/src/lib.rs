@@ -128,6 +128,33 @@ async fn forget_server(
     state.launcher.forget_server(destination_hash.as_deref()).await.map_err(fmt_err)
 }
 
+/// Indexes this launcher is willing to ask.
+///
+/// An index is a cache of the mesh, never the source of truth (`DESIGN.md`
+/// §0): the list is empty by default, browsing works with it empty, and adding
+/// one is a player deciding to trust somebody's list rather than the platform
+/// acquiring a dependency.
+#[tauri::command]
+async fn indexes(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state.launcher.indexes().await)
+}
+
+#[tauri::command]
+async fn add_index(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+) -> Result<(), String> {
+    state.launcher.add_index(&destination_hash).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn remove_index(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+) -> Result<(), String> {
+    state.launcher.remove_index(&destination_hash).await.map_err(fmt_err)
+}
+
 #[tauri::command]
 async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.launcher.leave().await.map_err(fmt_err)
@@ -256,6 +283,9 @@ pub fn run() {
             known_servers,
             refresh_known_servers,
             forget_server,
+            indexes,
+            add_index,
+            remove_index,
             leave,
             play_server,
             game_location,

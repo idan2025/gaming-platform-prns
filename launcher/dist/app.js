@@ -221,6 +221,13 @@ function updateRowEl(e, row) {
     b.title = 'From this launcher\u2019s memory, not heard this session.';
     nameV.parentElement.appendChild(b);
   }
+  if (row.from_index) {
+    // Second-hand evidence. The numbers are real, but somebody else heard
+    // them, and `hops` is the distance from the index rather than from here.
+    const b = el('span', 'badge index-badge', 'via index');
+    b.title = 'Reported by an index, not heard directly. Distance is measured from the index.';
+    nameV.parentElement.appendChild(b);
+  }
   if (legacy) {
     const b = el('span', 'badge legacy-badge', 'legacy');
     nameV.parentElement.appendChild(b);
@@ -1181,6 +1188,69 @@ async function pollAll() {
   await pollServers();
 }
 
+// ---------- indexes ----------
+
+// An index is a cache of the mesh, never the source of truth (`DESIGN.md` §0).
+// The list is empty by default and the launcher is complete with it empty:
+// servers are heard directly and remembered once seen. An index only adds the
+// ones somebody else heard that you did not.
+async function renderIndexes() {
+  const list = $('index-list');
+  const count = $('index-count');
+  if (!list) return;
+  let items = [];
+  try {
+    items = await invoke('indexes') || [];
+  } catch (err) { /* an unreadable list renders as none */ }
+  if (count) count.textContent = items.length ? '(' + items.length + ')' : '(none)';
+  list.textContent = '';
+  if (!items.length) {
+    list.appendChild(el('p', 'muted small',
+      'No indexes. The launcher works without one; this is where you add somebody\u2019s if you want theirs too.'));
+    return;
+  }
+  items.forEach(hash => {
+    const row = el('div', 'index-row');
+    const code = el('code', '', hash.slice(0, 12) + '\u2026');
+    code.title = hash;
+    row.appendChild(code);
+    const drop = el('button', 'quiet', 'Remove');
+    drop.type = 'button';
+    drop.onclick = async () => {
+      try {
+        await invoke('remove_index', { destinationHash: hash });
+        await renderIndexes();
+        pollServers();
+      } catch (err) {
+        showError(String(err && err.message || err));
+      }
+    };
+    row.appendChild(drop);
+    list.appendChild(row);
+  });
+}
+
+function wireIndexPanel() {
+  const btn = $('index-add-btn');
+  const input = $('index-hash');
+  if (!btn || !input) return;
+  const add = async () => {
+    const hash = (input.value || '').trim();
+    if (!hash) return;
+    try {
+      await invoke('add_index', { destinationHash: hash });
+      input.value = '';
+      hideError();
+      await renderIndexes();
+      pollServers();
+    } catch (err) {
+      showError(String(err && err.message || err));
+    }
+  };
+  btn.addEventListener('click', add);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); add(); } });
+}
+
 // ---------- remembered servers ----------
 
 // Ask the mesh where every remembered server is.
@@ -1276,6 +1346,12 @@ function schedulePoll() {
 }
 
 // ---------- sort headers ----------
+function bindSortAndIndexes() {
+  wireIndexPanel();
+  renderIndexes();
+  bindSort();
+}
+
 function bindSort() {
   document.querySelectorAll('.list-head button.col[data-sort]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1306,7 +1382,7 @@ function updateSortIndicators() {
 // ---------- init ----------
 async function init() {
   bindFilters();
-  bindSort();
+  bindSortAndIndexes();
   syncFilterUI();
   $('list').addEventListener('keydown', onListKey);
   document.addEventListener('keydown', e => {

@@ -603,3 +603,23 @@ input:focus-visible, select:focus-visible {
   border: 1px dashed var(--border);
 }
 #f-refresh { white-space: nowrap; }
+
+/* Indexes. Collapsed by default: optional infrastructure should not be the
+   first thing a player sees in a browser that works without it. */
+.index-panel {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 12px;
+  font-size: 12px;
+}
+.index-panel > summary { cursor: pointer; user-select: none; }
+.index-help { color: var(--fg-muted); margin: 6px 0; max-width: 70ch; }
+.index-add { display: flex; gap: 6px; margin-bottom: 6px; }
+.index-add input { flex: 1 1 auto; min-width: 0; font-family: var(--mono); }
+.index-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.index-row code { font-family: var(--mono); font-size: 11px; }
+/* Second-hand: real numbers, but somebody else heard them. */
+.badge.index-badge {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px dashed var(--border);
+}

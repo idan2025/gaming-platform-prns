@@ -87,6 +87,26 @@ defaults to 37429 rather than RNS's own 37428, so a node sharing a machine with
 Interfaces added at runtime go straight onto the hub, so running servers pick
 them up with no restart.
 
+### UDP does not carry a game to a stock RNS peer
+
+Measured, not assumed, and recorded so nobody spends an evening on it twice.
+With the destination held constant and **only the transport changed**, a link
+to a stock `rnsd` peer over `UDPInterface` carried announces (316 B) and A2S
+queries (~100 B) perfectly while a game connect stalled partway through, every
+time. TCP and Backbone over the same route carried it.
+
+Two explanations were tried and **both were wrong**, which is the useful part:
+
+* RNS's `UDPInterface` sets `HW_MTU = 1064`, well under this platform's
+  1967-byte link plaintext (`ENGINE.md`) — but that is not a receive buffer.
+  RNS reads through `socketserver.UDPServer`, whose `max_packet_size` is 8192.
+* Raising `HW_MTU` to 4096 and the bitrate to 1 Gbps, via a custom interface
+  module and confirmed live in `rnstatus`, did not help.
+
+So the mechanism is still unknown. What is established is the measurement.
+**Use Backbone for a hub link** — it is what RNS built for the job, declares a
+1 MB frame size and a gigabit rate, and is what a hub's listener already is.
+
 **A containerised peer must publish the UDP port** — worth knowing because it
 wastes an evening otherwise. An outbound datagram leaves a container through NAT
 whether or not a port is published, so a one-way flow looks like a healthy
