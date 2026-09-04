@@ -288,6 +288,21 @@ pub struct JoinResult {
     /// pack *could* start a game; `launch_ready` says this machine can. The UI
     /// shows Play when this is true and a "locate your game" prompt otherwise.
     pub launch_ready: bool,
+    /// Whether the server answered a probe at the moment of joining.
+    ///
+    /// **A join binds a local port, which always succeeds — it says nothing
+    /// about the server.** Point a game at a port whose bridge has no route and
+    /// the game sits on "establishing connection" until it gives up, with the
+    /// launcher having reported success. The commonest cause is an address that
+    /// is simply gone: a recreated server gets a new destination, so a row from
+    /// an earlier session, or from this launcher's memory, can name a
+    /// destination nobody can route to any more.
+    ///
+    /// `Some(false)` is a warning and never a refusal. Mesh routing is
+    /// asymmetric and an allowlisted server declines probes on purpose, so a
+    /// server that did not answer may still be joinable — the launcher says so
+    /// and lets the player try. `None` means it was not asked.
+    pub reachable: Option<bool>,
 }
 
 /// What the launcher knows about starting one game on this machine — the UI's
@@ -644,6 +659,15 @@ impl Launcher {
         Ok(out)
     }
 
+    /// Whether the server answers right now, or `None` if there was no browse
+    /// node to ask through.
+    async fn probe_reachable(&self, destination_hash: &str) -> Option<bool> {
+        let hash = parse_hash(destination_hash).ok()?;
+        let inner = self.inner.lock().await;
+        let session = inner.browse.as_ref()?;
+        Some(session.probe_details(hash).await.is_ok())
+    }
+
     /// Record every server heard, so it can be found again after the mesh has
     /// stopped repeating its announce.
     async fn remember_heard(&self, rows: &[ServerRow]) {
@@ -931,7 +955,12 @@ impl Launcher {
             port: listen_port,
             game_id: game_id.clone(),
         });
-        Ok(JoinResult { listen_addr, can_launch, launch_ready, game_id: Some(game_id) })
+        drop(inner);
+        // Ask whether anyone can actually route to this server, using the probe
+        // the detail pane already uses. One Link, on a join the player asked
+        // for — not the per-row traffic `PLAN.md` §3.4 rules out.
+        let reachable = self.probe_reachable(destination_hash).await;
+        Ok(JoinResult { listen_addr, can_launch, launch_ready, reachable, game_id: Some(game_id) })
     }
 
     fn launch_profile(&self, game_id: &str) -> Option<&LaunchProfile> {
@@ -1421,9 +1450,10 @@ mod tests {
             game_id: Some("sven-coop".into()),
             can_launch: true,
             launch_ready: false,
+            reachable: Some(false),
         })
         .unwrap();
-        for key in ["listen_addr", "game_id", "can_launch", "launch_ready"] {
+        for key in ["listen_addr", "game_id", "can_launch", "launch_ready", "reachable"] {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
         }
     }

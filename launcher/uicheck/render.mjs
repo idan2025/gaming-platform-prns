@@ -113,7 +113,7 @@ function makeInvoke(scenario) {
       case 'leave':
         return null;
       case 'join_server':
-        return { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop' };
+        return scenario.join ?? { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: true };
       case 'listen_port':
         return 27015;
       case 'known_servers':
@@ -263,6 +263,25 @@ await run('a remembered server is marked as memory, not as live', {
   check('and offers to forget it', /Forget this server/i.test(pane.textContent));
   check('and offers to look for it now', /Look for it now/i.test(pane.textContent));
   check('no undefined in a remembered pane', !pane.textContent.includes('undefined'));
+});
+
+// Binding a local port always succeeds. If nobody could route to the server,
+// the launcher has to say so — otherwise the game sits on "establishing
+// connection" while the launcher claims success, which is exactly what a stale
+// address looks like.
+await run('a join that cannot reach the server says so', {
+  status: running,
+  rows: () => [row()],
+  join: { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: false },
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  doc.querySelector('#detail .btn-join').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const t = doc.querySelector('#detail').textContent;
+  check('an unroutable join is not reported as success', /did not answer/i.test(t), t.slice(-300));
+  check('and names the likely cause', /address may have changed/i.test(t), t.slice(-300));
+  check('no undefined in the warning', !t.includes('undefined'));
 });
 
 await run('unreachable server', {

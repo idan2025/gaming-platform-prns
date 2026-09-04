@@ -987,6 +987,21 @@ async function joinServer() {
     d.canLaunch = !!res.can_launch;
     d.launchReady = !!res.launch_ready;
     d.joinErr = false;
+    // Binding a local port always succeeds and says nothing about the server.
+    // If nobody could route to it, say so here rather than letting the game sit
+    // on "establishing connection" until it gives up. The commonest cause is an
+    // address that is gone: a recreated server gets a new destination, so an
+    // old row can name one nobody can reach any more.
+    if (res.reachable === false) {
+      d.joinErr = true;
+      d.joinMsg = 'Bound on ' + res.listen_addr + ', but this server did not answer. '
+        + 'It may be offline, or its address may have changed — a server that was '
+        + 'recreated gets a new one, and an older row still points at the old address. '
+        + 'Press "Find remembered" and pick the current entry. You can still try, '
+        + 'because mesh routing is asymmetric and a probe can fail on a server that works.';
+      renderDetail();
+      return;
+    }
     if (d.canLaunch && d.launchReady) {
       d.joinMsg = 'Connected. Press Play to start the game (listening on ' + res.listen_addr + ').';
     } else if (d.canLaunch) {
