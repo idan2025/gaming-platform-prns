@@ -446,6 +446,25 @@ impl BridgeSession {
     /// announce per destination per hour; asking for extra ones cheaply here
     /// spends someone else's airtime there. Hence the floor, and hence this
     /// being driven by events rather than by a shorter timer.
+    /// Ask the mesh where a destination is.
+    ///
+    /// The answer to a path request is the cached announce for that
+    /// destination, so this is also how a **passive** browser learns about a
+    /// server that was already running when it started: the mesh floods an
+    /// announce once and then suppresses the repeats, and asking is the only
+    /// way back in. The reply arrives as an ordinary `AnnounceHeard`, so the
+    /// row appears through the same path as any other.
+    ///
+    /// Best-effort: a destination nobody has a path to simply produces no
+    /// answer, which is not an error — it is a server that is off.
+    pub async fn request_path_to(&self, destination: DestinationHash) -> Result<()> {
+        self.handle
+            .request_path(destination)
+            .await
+            .map_err(|e| anyhow!("path request failed: {e:?}"))?;
+        Ok(())
+    }
+
     pub fn request_announce(&self) {
         if let Some(tx) = &self.announce_tx {
             let _ = tx.send(());

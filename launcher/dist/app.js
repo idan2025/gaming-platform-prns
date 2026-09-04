@@ -216,6 +216,11 @@ function updateRowEl(e, row) {
   nameV.textContent = row.name || 'Unnamed server';
   // badges
   nameV.parentElement.querySelectorAll('.badge').forEach(b => b.remove());
+  if (row.remembered) {
+    const b = el('span', 'badge remembered-badge', 'remembered');
+    b.title = 'From this launcher\u2019s memory, not heard this session.';
+    nameV.parentElement.appendChild(b);
+  }
   if (legacy) {
     const b = el('span', 'badge legacy-badge', 'legacy');
     nameV.parentElement.appendChild(b);
@@ -250,6 +255,15 @@ function updateRowEl(e, row) {
 
   e.setAttribute('aria-selected', String(row.destination_hash === state.detail?.hash));
   e.classList.toggle('selected', row.destination_hash === state.detail?.hash);
+
+  // A row this launcher remembers rather than heard. It is joinable — a
+  // destination hash is all a join needs — but nothing about it is live, and
+  // the list must not let the two look alike.
+  e.classList.toggle('remembered', !!row.remembered);
+  if (row.remembered) {
+    e.title = 'Remembered from a previous session; not heard on the mesh this time. '
+      + 'Still joinable. Last heard ' + fmtSeen(row.last_seen_secs) + '.';
+  }
 }
 
 function renderList() {
@@ -622,6 +636,7 @@ function renderDetail() {
   body.appendChild(probeSec);
 
   const gameId = effectiveGameId(d);
+  if (a.remembered) body.appendChild(renderRememberedNote(d));
   if (!a.game_id) body.appendChild(renderGamePicker(d));
   body.appendChild(renderPackSection(gameId));
   if (gameId) body.appendChild(renderPortSection(d, gameId));
@@ -734,6 +749,29 @@ function renderGamePicker(d) {
     renderDetail();
   });
   sec.appendChild(sel);
+  return sec;
+}
+
+// A server from memory rather than from an announce. Say so plainly, and offer
+// the way out: forgetting it. Nothing here pretends to know whether it is up —
+// the launcher knows only that it existed and how to address it.
+function renderRememberedNote(d) {
+  const sec = el('div', 'section');
+  sec.appendChild(el('h3', '', 'Remembered'));
+  sec.appendChild(el('p', 'pack-detail',
+    'Not heard on the mesh this session — this row comes from what this launcher '
+    + 'saw before, last time ' + fmtSeen(d.announce.last_seen_secs) + '. '
+    + 'It can still be joined: the address is all a join needs. Players, map and '
+    + 'distance are unknown until it is heard again.'));
+  const row = el('div', 'port-row');
+  const find = el('button', 'btn-locate', 'Look for it now');
+  find.type = 'button';
+  find.onclick = refreshKnown;
+  const forget = el('button', 'btn-locate', 'Forget this server');
+  forget.type = 'button';
+  forget.onclick = () => forgetServer(d.hash);
+  row.append(find, forget);
+  sec.appendChild(row);
   return sec;
 }
 
@@ -1128,6 +1166,48 @@ async function pollAll() {
   await pollServers();
 }
 
+// ---------- remembered servers ----------
+
+// Ask the mesh where every remembered server is.
+//
+// This is the action that makes a remembered list useful rather than
+// decorative: the mesh floods an announce once and then suppresses the
+// repeats, so a server that was already running when you started browsing is
+// never heard. A path request is the way back in — the answer is that cached
+// announce, and it arrives through the normal path, so rows simply fill in.
+async function refreshKnown() {
+  const btn = $('f-refresh');
+  if (btn) { btn.disabled = true; btn.textContent = 'Looking…'; }
+  try {
+    const asked = await invoke('refresh_known_servers');
+    hideError();
+    if (!asked) {
+      showError('No remembered servers to look for yet. They are remembered as you see them.');
+    }
+  } catch (err) {
+    showError(String(err && err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Find remembered'; }
+    // Answers arrive as announces over the next moment, not synchronously.
+    setTimeout(pollServers, 1500);
+    setTimeout(pollServers, 4000);
+  }
+}
+
+// Forget one server, or all of them. Forgetting is per-launcher and immediate;
+// a server forgotten here is simply not looked for again, and reappears on its
+// own the next time it is heard.
+async function forgetServer(hash) {
+  try {
+    await invoke('forget_server', { destinationHash: hash || null });
+    hideError();
+    if (state.detail && hash && state.detail.hash === hash) closeDetail();
+    await pollServers();
+  } catch (err) {
+    showError('Could not forget that server: ' + String(err && err.message || err));
+  }
+}
+
 // ---------- games ----------
 async function loadGames() {
   try {
@@ -1165,6 +1245,8 @@ function bindFilters() {
   $('f-pw').addEventListener('change', e => { state.filters.exclude_passworded = e.target.checked; pollServers(); });
   $('f-dedicated').addEventListener('change', e => { state.filters.dedicated_only = e.target.checked; pollServers(); });
   $('f-legacy').addEventListener('change', e => { state.filters.include_legacy = e.target.checked; pollServers(); });
+  const refreshBtn = $('f-refresh');
+  if (refreshBtn) refreshBtn.addEventListener('click', refreshKnown);
   $('f-maxhops').addEventListener('input', e => {
     const v = e.target.value.trim();
     if (v === '') state.filters.max_hops = null;

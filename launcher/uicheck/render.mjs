@@ -52,6 +52,19 @@ const legacyRow = row({
   dedicated: null, transport_mode: null, legacy: true, hops: 3,
 });
 
+// A row the launcher remembers rather than heard. The mesh announces a server
+// once and then stops repeating it, so this is how an already-running server
+// gets into the list at all.
+const rememberedRow = row({
+  destination_hash: '1021110900000000000000000000beef',
+  name: 'Test SErver',
+  game_id: 'sven-coop',
+  map: null, players: null, max_players: null,
+  min_link_class: null, passworded: null, allowlisted: null,
+  dedicated: null, transport_mode: null,
+  hops: 0, legacy: false, remembered: true, last_seen_secs: 900,
+});
+
 const details = {
   destination_hash: row().destination_hash,
   reachable: true,
@@ -103,6 +116,12 @@ function makeInvoke(scenario) {
         return { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop' };
       case 'listen_port':
         return 27015;
+      case 'known_servers':
+        return scenario.known ?? [];
+      case 'refresh_known_servers':
+        return (scenario.known ?? []).length;
+      case 'forget_server':
+        return null;
       case 'clear_listen_port':
         return null;
       default:
@@ -212,6 +231,38 @@ await run('the detail pane survives a re-render', {
     after.value === '270', `got ${JSON.stringify(after.value)}`);
   check('the scroll container is present to be restored',
     !!doc.querySelector('#detail .detail-body'));
+});
+
+// A remembered row must be visibly different from a live one. It is joinable —
+// a destination hash is all a join needs — but nothing about it is current, and
+// rendering a stale player count as a live one is the single thing a server
+// browser must not do.
+await run('a remembered server is marked as memory, not as live', {
+  status: running,
+  rows: () => [rememberedRow],
+}, async (win, doc) => {
+  const el = doc.querySelector('#list .row');
+  check('a remembered server still appears in the list', !!el);
+  check('the row is marked as remembered', el.classList.contains('remembered'));
+  check('the row carries a badge saying so', el.textContent.includes('remembered'));
+
+  const players = el.querySelector('[data-cell="players"]').textContent;
+  check('unknown players render as a dash, never a stale number',
+    players === '—', `got ${JSON.stringify(players)}`);
+  // "Unknown" is the list's existing word for a field it does not have, and it
+  // is the honest one here: the launcher knows the server existed, not what it
+  // is running now.
+  const map = el.querySelector('[data-cell="map"]').textContent;
+  check('the map is not presented as known', map === 'Unknown' || map === '—',
+    `got ${JSON.stringify(map)}`);
+
+  el.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const pane = doc.querySelector('#detail');
+  check('the detail pane explains that it is from memory', /Remembered/i.test(pane.textContent));
+  check('and offers to forget it', /Forget this server/i.test(pane.textContent));
+  check('and offers to look for it now', /Look for it now/i.test(pane.textContent));
+  check('no undefined in a remembered pane', !pane.textContent.includes('undefined'));
 });
 
 await run('unreachable server', {

@@ -47,6 +47,20 @@ pub struct LauncherSettings {
     /// runs.
     #[serde(default)]
     pub listen_ports: BTreeMap<String, u16>,
+    /// Servers this launcher has seen before, keyed by destination hash.
+    ///
+    /// Exists because **a browser is passive and the mesh does not repeat
+    /// itself**. A transport node floods an announce when a destination is new
+    /// and suppresses the repeats once it holds a path, so a launcher that
+    /// starts browsing after a server did never hears about it — measured on a
+    /// live mesh: a server created mid-browse appeared at once, while one
+    /// already running was never heard in a hundred seconds on the same link.
+    ///
+    /// Remembering them turns that around. A destination hash is all a join
+    /// needs, and it is enough to ask the mesh for a path — so a server seen
+    /// once is joinable forever after without anyone hosting an index.
+    #[serde(default)]
+    pub known_servers: BTreeMap<String, KnownServer>,
     /// How this launcher reaches the mesh, remembered between runs.
     ///
     /// Reticulum has no global directory: a node gets an interface from LAN
@@ -55,6 +69,26 @@ pub struct LauncherSettings {
     /// bootstrap problem every time.
     #[serde(default)]
     pub interfaces: Vec<LauncherInterface>,
+}
+
+/// A server this launcher has seen, remembered so it can be found again.
+///
+/// Only what a person needs to recognise the row and what the launcher needs to
+/// go looking: the hash is the key, the rest is the last thing heard about it.
+/// Live numbers are deliberately absent — they would be stale the moment they
+/// were written, and a remembered row must never look like a live one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownServer {
+    /// Last name it announced under, for a list a person can read.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Last game it announced, so the pack can be matched without a probe.
+    #[serde(default)]
+    pub game_id: Option<String>,
+    /// When it was last heard, as a Unix timestamp. Used to age the list out
+    /// and to tell a person how long ago "before" was.
+    #[serde(default)]
+    pub last_seen_unix: u64,
 }
 
 /// One way this launcher reaches the mesh.

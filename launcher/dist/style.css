@@ -592,3 +592,14 @@ input:focus-visible, select:focus-visible {
 .iface-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
 .iface-row + .iface-row { border-top: 1px solid color-mix(in srgb, var(--fg-faint) 20%, transparent); }
 .iface-label { flex: 1; font-variant-numeric: tabular-nums; }
+
+/* A row this launcher remembers rather than heard this session. Dimmed, not
+   hidden: it is still joinable, and a hash is all a join needs. The point is
+   that it must never be mistaken for a live sighting. */
+.row.remembered .v { opacity: 0.68; }
+.badge.remembered-badge {
+  background: var(--bg-selected, #dde9f5);
+  color: var(--fg-muted);
+  border: 1px dashed var(--border);
+}
+#f-refresh { white-space: nowrap; }

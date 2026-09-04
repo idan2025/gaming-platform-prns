@@ -100,6 +100,34 @@ async fn clear_listen_port(
     state.launcher.set_listen_port(&game_id, None).await.map_err(fmt_err)
 }
 
+/// The servers this launcher remembers, so a person can see, refresh or forget
+/// them. Remembering exists because the mesh floods an announce once and then
+/// suppresses the repeats: without it, a launcher started after a server was
+/// already running never hears about it.
+#[tauri::command]
+async fn known_servers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<launcher_core::KnownServerView>, String> {
+    Ok(state.launcher.known_servers().await)
+}
+
+/// Ask the mesh where every remembered server is. The answers arrive as
+/// ordinary announces, so rows fill in through the normal path.
+#[tauri::command]
+async fn refresh_known_servers(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    state.launcher.refresh_known_servers().await.map_err(fmt_err)
+}
+
+/// Forget one remembered server, or all of them when `destination_hash` is
+/// absent.
+#[tauri::command]
+async fn forget_server(
+    state: tauri::State<'_, AppState>,
+    destination_hash: Option<String>,
+) -> Result<(), String> {
+    state.launcher.forget_server(destination_hash.as_deref()).await.map_err(fmt_err)
+}
+
 #[tauri::command]
 async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.launcher.leave().await.map_err(fmt_err)
@@ -225,6 +253,9 @@ pub fn run() {
             join_server,
             listen_port,
             clear_listen_port,
+            known_servers,
+            refresh_known_servers,
+            forget_server,
             leave,
             play_server,
             game_location,

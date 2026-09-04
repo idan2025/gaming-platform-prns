@@ -30,7 +30,7 @@ use game_bridge::announce::AnnounceInfo;
 use game_bridge::browse::{BrowseFilter, SortBy};
 use game_bridge::config::{BrowserArgs, ClientArgs};
 use game_bridge::details::StatsSource;
-use crate::settings::LauncherInterface;
+use crate::settings::{KnownServer, LauncherInterface};
 use game_bridge::launch::{LaunchProfile, LaunchValues};
 use game_bridge::pack::TrustedPack;
 use game_bridge::profile::GameProfile;
@@ -65,6 +65,62 @@ pub struct ServerRow {
     pub transport_mode: Option<u8>,
     pub last_seen_secs: u64,
     pub legacy: bool,
+    /// True for a row that comes from this launcher's memory rather than from
+    /// an announce heard this run.
+    ///
+    /// The UI must show the difference. Everything live about a remembered row
+    /// is unknown — players, map, hops — and rendering a stale number as a
+    /// current one is the one thing a server browser must not do. It is still
+    /// **joinable**: a destination hash is all a join needs.
+    pub remembered: bool,
+}
+
+/// A remembered server, as the UI lists it for forgetting or refreshing.
+#[derive(Debug, Clone, Serialize)]
+pub struct KnownServerView {
+    pub destination_hash: String,
+    pub name: Option<String>,
+    pub game_id: Option<String>,
+    pub last_seen_secs: u64,
+}
+
+/// How stale a remembered `last_seen` has to get before a write is worth it.
+///
+/// The list is polled every couple of seconds; persisting a new timestamp each
+/// time would rewrite the settings file forever for no gain.
+const SEEN_WRITE_INTERVAL_SECS: u64 = 3600;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A row built from memory rather than from an announce.
+///
+/// Every live field is `None` on purpose. The launcher knows what this server
+/// was called and what it ran; it does not know whether it is up, and must not
+/// imply it.
+fn remembered_row(hash: &str, k: &KnownServer) -> ServerRow {
+    ServerRow {
+        destination_hash: hash.to_string(),
+        name: k.name.clone(),
+        game_id: k.game_id.clone(),
+        map: None,
+        players: None,
+        max_players: None,
+        hops: 0,
+        interface_label: String::new(),
+        min_link_class: None,
+        passworded: None,
+        allowlisted: None,
+        dedicated: None,
+        transport_mode: None,
+        last_seen_secs: unix_now().saturating_sub(k.last_seen_unix),
+        legacy: false,
+        remembered: true,
+    }
 }
 
 /// The query the UI builds from its filter bar.
@@ -507,6 +563,16 @@ impl Launcher {
         // A join has to attach the same interfaces, and this is the only record
         // of which ones the player actually started browsing with.
         inner.browse_opts = Some(opts);
+        drop(inner);
+
+        // Go looking for what we already know about. Without this a launcher
+        // shows an empty list until some server happens to be created, because
+        // the mesh floods an announce once and then suppresses the repeats.
+        // Failure here is not a failure to browse — a remembered server that
+        // nobody can route to is a server that is off.
+        if let Err(e) = self.refresh_known_servers().await {
+            tracing::debug!(error = %e, "could not ask about remembered servers");
+        }
         Ok(())
     }
 
@@ -553,7 +619,125 @@ impl Launcher {
             return Ok(Vec::new());
         };
         let rows = session.browse(&input.to_query()).await;
-        Ok(rows.iter().map(row_view).collect())
+        let mut out: Vec<ServerRow> = rows.iter().map(row_view).collect();
+        drop(inner);
+
+        // Everything heard is worth remembering: the mesh will not repeat it.
+        self.remember_heard(&out).await;
+
+        // Then add back the ones we know about but have not heard this run,
+        // flagged so nothing about them reads as live. They are joinable —
+        // a destination hash is all a join needs — and that is the whole
+        // point of keeping them.
+        let heard: std::collections::HashSet<&str> =
+            out.iter().map(|r| r.destination_hash.as_str()).collect();
+        let remembered: Vec<ServerRow> = self
+            .settings
+            .lock()
+            .await
+            .known_servers
+            .iter()
+            .filter(|(hash, _)| !heard.contains(hash.as_str()))
+            .map(|(hash, k)| remembered_row(hash, k))
+            .collect();
+        out.extend(remembered);
+        Ok(out)
+    }
+
+    /// Record every server heard, so it can be found again after the mesh has
+    /// stopped repeating its announce.
+    async fn remember_heard(&self, rows: &[ServerRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let now = unix_now();
+        let mut settings = self.settings.lock().await;
+        let mut changed = false;
+        for row in rows {
+            // A remembered row is not evidence of anything; only a real one is.
+            if row.remembered {
+                continue;
+            }
+            let entry = settings.known_servers.entry(row.destination_hash.clone()).or_default();
+            let fresh = KnownServer {
+                name: row.name.clone().or_else(|| entry.name.clone()),
+                game_id: row.game_id.clone().or_else(|| entry.game_id.clone()),
+                last_seen_unix: now,
+            };
+            // Persisting on every poll would rewrite the file every two
+            // seconds forever. Only a real change earns a write, and a newer
+            // timestamp alone is not one.
+            if entry.name != fresh.name || entry.game_id != fresh.game_id {
+                changed = true;
+            }
+            let was_stale = now.saturating_sub(entry.last_seen_unix) > SEEN_WRITE_INTERVAL_SECS;
+            *entry = fresh;
+            if was_stale {
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.persist(&settings);
+        }
+    }
+
+    /// Every server this launcher remembers, newest first.
+    pub async fn known_servers(&self) -> Vec<KnownServerView> {
+        let now = unix_now();
+        let settings = self.settings.lock().await;
+        let mut out: Vec<KnownServerView> = settings
+            .known_servers
+            .iter()
+            .map(|(hash, k)| KnownServerView {
+                destination_hash: hash.clone(),
+                name: k.name.clone(),
+                game_id: k.game_id.clone(),
+                last_seen_secs: now.saturating_sub(k.last_seen_unix),
+            })
+            .collect();
+        out.sort_by_key(|k| k.last_seen_secs);
+        out
+    }
+
+    /// Forget one remembered server, or all of them when `hash` is `None`.
+    pub async fn forget_server(&self, hash: Option<&str>) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        match hash {
+            Some(h) => {
+                settings.known_servers.remove(h);
+            }
+            None => settings.known_servers.clear(),
+        }
+        self.persist(&settings)
+    }
+
+    /// Ask the mesh where every remembered server is.
+    ///
+    /// **This is what makes a remembered list useful rather than decorative.**
+    /// A transport node floods an announce once and then suppresses the
+    /// repeats, so a browser that started later never hears an already-running
+    /// server. A path request is the way back in: the answer is that cached
+    /// announce, and it arrives as an ordinary `AnnounceHeard`, so the row
+    /// fills in through exactly the same path as a live one.
+    ///
+    /// Returns how many were asked about. Best-effort per server: one that
+    /// nobody has a path to simply does not answer, which is a server that is
+    /// off rather than an error.
+    pub async fn refresh_known_servers(&self) -> Result<usize> {
+        let hashes: Vec<String> =
+            self.settings.lock().await.known_servers.keys().cloned().collect();
+        let inner = self.inner.lock().await;
+        let Some(session) = inner.browse.as_ref() else {
+            return Err(anyhow!("start browsing before looking for remembered servers"));
+        };
+        let mut asked = 0;
+        for hash in &hashes {
+            let Ok(parsed) = parse_hash(hash) else { continue };
+            if session.request_path_to(parsed).await.is_ok() {
+                asked += 1;
+            }
+        }
+        Ok(asked)
     }
 
     pub async fn server_details(&self, destination_hash: &str) -> ServerDetailsView {
@@ -1036,6 +1220,8 @@ fn row_view(row: &game_bridge::DiscoveredServer) -> ServerRow {
         transport_mode: record.map(|r| r.flags.transport_mode),
         last_seen_secs: row.last_seen.elapsed().as_secs(),
         legacy: matches!(row.info, AnnounceInfo::Legacy { .. }),
+        // Heard this run, from a real announce.
+        remembered: false,
     }
 }
 
@@ -1141,12 +1327,13 @@ mod tests {
             transport_mode: None,
             last_seen_secs: 3,
             legacy: true,
+            remembered: false,
         };
         let v: serde_json::Value = serde_json::to_value(&row).unwrap();
         for key in [
             "destination_hash", "name", "game_id", "map", "players", "max_players",
             "hops", "interface_label", "min_link_class", "passworded", "allowlisted",
-            "dedicated", "transport_mode", "last_seen_secs", "legacy",
+            "dedicated", "transport_mode", "last_seen_secs", "legacy", "remembered",
         ] {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
         }
@@ -1597,6 +1784,102 @@ query = "a2s"
             chosen.tcp.is_none() && !chosen.auto,
             "this is the state join_server refuses; if it stops being detectable,              a join can silently reach nothing again"
         );
+    }
+
+    /// A server heard once is remembered, and comes back as a row that is
+    /// honestly marked as memory rather than as a live sighting.
+    ///
+    /// This exists because the mesh will not repeat itself: a transport node
+    /// floods an announce when a destination is new and suppresses the repeats
+    /// once it holds a path, so a launcher started later hears nothing. A
+    /// destination hash is all a join needs, so remembering one keeps the
+    /// server joinable with no index and no infrastructure.
+    #[tokio::test]
+    async fn a_server_heard_once_is_remembered_and_returns_marked_as_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
+
+        let mut row = a_row("aa");
+        row.name = Some("Idan's".into());
+        row.game_id = Some("sven-coop".into());
+        l.remember_heard(&[row]).await;
+
+        let known = l.known_servers().await;
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].name.as_deref(), Some("Idan's"));
+
+        let back = remembered_row("aa", &l.settings.lock().await.known_servers["aa"]);
+        assert!(back.remembered, "a row from memory must say so");
+        assert_eq!(back.name.as_deref(), Some("Idan's"));
+        // Nothing live may be invented. A stale player count rendered as a
+        // current one is the single thing a server browser must not do.
+        assert!(back.players.is_none() && back.map.is_none() && back.max_players.is_none());
+    }
+
+    /// Remembering survives a restart, which is the entire point of writing it
+    /// down.
+    #[tokio::test]
+    async fn remembered_servers_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launcher.json");
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        l.remember_heard(&[a_row("bb")]).await;
+
+        let l2 = Launcher::new(Vec::new()).with_settings_file(file);
+        assert_eq!(l2.known_servers().await.len(), 1);
+    }
+
+    /// A remembered row must never be mistaken for evidence: feeding one back
+    /// in cannot refresh its own timestamp or resurrect a forgotten server.
+    #[tokio::test]
+    async fn a_remembered_row_is_not_evidence_of_a_sighting() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
+        let mut ghost = a_row("cc");
+        ghost.remembered = true;
+        l.remember_heard(&[ghost]).await;
+        assert!(l.known_servers().await.is_empty(), "memory must not feed itself");
+    }
+
+    #[tokio::test]
+    async fn forgetting_removes_one_or_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
+        l.remember_heard(&[a_row("aa"), a_row("bb")]).await;
+        l.forget_server(Some("aa")).await.unwrap();
+        assert_eq!(l.known_servers().await.len(), 1);
+        l.forget_server(None).await.unwrap();
+        assert!(l.known_servers().await.is_empty());
+    }
+
+    /// Asking about remembered servers needs a browse node to ask through, and
+    /// says so rather than silently doing nothing.
+    #[tokio::test]
+    async fn refreshing_without_a_browse_node_is_a_clear_error() {
+        let l = Launcher::new(Vec::new());
+        let err = l.refresh_known_servers().await.unwrap_err().to_string();
+        assert!(err.contains("start browsing"), "{err}");
+    }
+
+    fn a_row(hash: &str) -> ServerRow {
+        ServerRow {
+            destination_hash: hash.to_string(),
+            name: Some("S".into()),
+            game_id: Some("sven-coop".into()),
+            map: Some("crystal".into()),
+            players: Some(1),
+            max_players: Some(8),
+            hops: 1,
+            interface_label: "Tcp".into(),
+            min_link_class: Some(1),
+            passworded: Some(false),
+            allowlisted: Some(false),
+            dedicated: Some(true),
+            transport_mode: Some(0),
+            last_seen_secs: 1,
+            legacy: false,
+            remembered: false,
+        }
     }
 
     /// With nothing chosen, a join binds the pack's own port — the behaviour

@@ -33,6 +33,11 @@
     <label class="field field-num">Max hops
       <input id="f-maxhops" type="number" min="0" step="1" placeholder="any" aria-label="Maximum hops">
     </label>
+    <!-- The mesh announces a server once and then stops repeating it, so a
+         launcher started later hears nothing. This asks the mesh where the
+         servers it already knows about are. -->
+    <button id="f-refresh" type="button" class="quiet"
+            title="Ask the mesh where remembered servers are. The mesh announces a server once and then stops repeating it, so this is how one that was already running is found again.">Find remembered</button>
   </section>
 
   <div id="legacy-notice" class="legacy-notice hidden" role="status"></div>
