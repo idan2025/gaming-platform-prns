@@ -74,6 +74,55 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.5
+
+**A join could not reach anything, and this is the release that fixes it.** If
+you are on 0.2.1–0.2.4, the launcher can browse and probe but cannot actually
+carry a game to a server. Upgrade.
+
+`start_browse` has always passed the player's interfaces to its Reticulum node.
+`join_server` did not: it built `ClientArgs::new`'s defaults — `tcp: None,
+auto: false` — so the client bridge attached no interface at all and had no way
+off the machine.
+
+What made it survive two releases is that nothing about it looks broken:
+
+- the local port **binds**, because binding a UDP port is purely local;
+- the server list **fills**, and the detail probe answers with **live stats** —
+  both of those run on the *browse* node (`server_details` reads `inner.browse`);
+- only the game's own packets went into the isolated node, so a join reported
+  success and the game sat at "Connecting…" until it gave up — on the pack's
+  default port and on a custom one alike, which is what ruled the port out as
+  the cause.
+
+The engine had been saying so the whole time:
+
+```
+attach_interfaces called tcp=None auto=false
+WARN no interfaces attached; this node cannot talk to anything
+no route to server; requesting path then retrying
+  error=Failed(Rejected(NoRouteToDestination))
+```
+
+That warning goes to stdout, and a windowed app never shows stdout. **When a
+launcher symptom does not match what the library does under test, run the
+`game-bridge` CLI against the same server — it prints what the GUI swallows.**
+That is what found this.
+
+A join now attaches whatever the running browse node was started with, or the
+player's saved interfaces when nothing is browsing; a join with neither is
+refused with a sentence rather than binding a port that leads nowhere.
+`join_interfaces` is its own function so the rule — *a join is never given
+fewer interfaces than a browse* — is testable without starting a node.
+
+### A test that failed on what else the machine was running
+
+`uplink_roundtrip` set `max_instances = 2`. An agent counts every container
+carrying `MANAGED_LABEL` on the daemon it drives, by design — the containers
+are the record — so a development box already hosting two game servers failed
+that test with "this node is at its limit of 2 instances". It reads exactly
+like a flake and is not one. The limit is now far above what the test needs.
+
 ## v0.2.4
 
 **No change to the shipped software.** The binaries and the launcher are
