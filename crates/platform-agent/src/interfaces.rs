@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use personal_rns::prelude::*;
+use prns_core::interfaces::udp::UDP_BITRATE_ESTIMATE;
 use prns_core::interfaces::{IfacContext, InterfaceId, DEFAULT_IFAC_SIZE};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -198,6 +199,23 @@ pub enum AddInterface {
         #[serde(default)]
         ifac_passphrase: Option<String>,
     },
+    /// A UDP interface: a local `host:port` to bind and a peer `host:port` to
+    /// send to. Point-to-point and symmetric — the peer needs the mirror image
+    /// of this entry, its `local` and `peer` swapped.
+    ///
+    /// Worth having beside TCP because they are not the same trade. A TCP
+    /// interface is a stream with retransmission and ordering underneath a
+    /// protocol that already has its own, and on a local network that
+    /// duplicated machinery is pure added latency. UDP hands Reticulum the
+    /// datagram boundary it actually wants.
+    Udp {
+        local: String,
+        peer: String,
+        #[serde(default)]
+        ifac_name: Option<String>,
+        #[serde(default)]
+        ifac_passphrase: Option<String>,
+    },
     /// A Wi-Fi/LAN auto-discovery interface. No address: it finds neighbours on
     /// the local segment with no configuration.
     Auto {
@@ -325,6 +343,26 @@ impl InterfaceManager {
                     id,
                     kind: "tcp".to_string(),
                     addr: Some(addr),
+                    ifac_name,
+                    ifac_passphrase,
+                }
+            }
+            AddInterface::Udp { local, peer, ifac_name, ifac_passphrase } => {
+                let id = attach_udp(
+                    handle,
+                    &local,
+                    &peer,
+                    ifac_name.as_deref(),
+                    ifac_passphrase.as_deref(),
+                )
+                .await?;
+                InterfaceDescriptor {
+                    id,
+                    kind: "udp".to_string(),
+                    // Both halves in one field so the existing descriptor shape
+                    // carries a point-to-point pair: what is bound, then where
+                    // it sends. Read back apart by `local`/`peer` below.
+                    addr: Some(format!("{local}|{peer}")),
                     ifac_name,
                     ifac_passphrase,
                 }
@@ -482,6 +520,44 @@ pub(crate) async fn attach_tcp(
     } else {
         return Err(InterfaceError::BadAddress(addr.to_string()));
     }
+    Ok(new_interface_id(handle, &before))
+}
+
+/// Attach a point-to-point UDP interface and return its captured id.
+///
+/// `local` is what this node binds, `peer` is where its datagrams go. Both are
+/// `host:port`. The far side needs the mirror of it — a UDP interface is not
+/// discovered and not negotiated, so an entry with no counterpart simply sends
+/// into nothing.
+pub(crate) async fn attach_udp(
+    handle: &PrnsNodeHandle,
+    local: &str,
+    peer: &str,
+    ifac_name: Option<&str>,
+    ifac_passphrase: Option<&str>,
+) -> Result<Option<String>, InterfaceError> {
+    let before = interface_ids(handle);
+    for (label, addr) in [("local", local), ("peer", peer)] {
+        if addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(InterfaceError::BadAddress(format!(
+                "{label} address {addr:?} must be host:port"
+            )));
+        }
+    }
+    let ifac = IfacContext::derive(ifac_name, ifac_passphrase, DEFAULT_IFAC_SIZE);
+    let ifac_set = ifac.is_some();
+    let iface = UdpInterface::bind(local, peer, UDP_BITRATE_ESTIMATE)
+        .await
+        .map_err(|e| InterfaceError::Bind(format!("{e:?}")))?;
+    match ifac {
+        Some(ifac) => {
+            handle.add_interface_with_ifac_name(iface, ifac, ifac_name.map(String::from));
+        }
+        None => {
+            handle.add_interface(iface);
+        }
+    }
+    info!(local = %local, peer = %peer, ifac = ifac_set, "attached UDP interface");
     Ok(new_interface_id(handle, &before))
 }
 

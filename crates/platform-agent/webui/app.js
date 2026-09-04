@@ -282,6 +282,27 @@ function renderInstances() {
     statePill.textContent = inst.state;
     statePill.className = "state-pill " + stateClass(inst.state);
 
+    // Updated in place like every other cell — the row node is never replaced,
+    // which is what keeps this table from stealing focus or scroll on a poll.
+    //
+    // null is "the game could not be asked", not "no map", exactly as with
+    // players below. Showing an empty string would make an unreachable server
+    // look like one sitting on a blank map.
+    const mapCell = row.querySelector(".cell-map");
+    if (mapCell) {
+      if (inst.map_now) {
+        mapCell.textContent = inst.map_now;
+        mapCell.title = "Read from the game just now";
+        mapCell.classList.remove("muted-em");
+      } else {
+        mapCell.textContent = "—";
+        mapCell.title = inst.state === "running"
+          ? "This game answers no query, or did not answer — not the same as having no map."
+          : "The server is not running.";
+        mapCell.classList.add("muted-em");
+      }
+    }
+
     row.querySelector(".cell-port").textContent = (inst.port != null ? String(inst.port) : "—");
 
     // Changing the map talks to the *running* process's console, so it needs
@@ -1259,7 +1280,13 @@ function wireMeshInterfaceForm() {
   if (!form) return;
   const kind = $("mesh-iface-kind");
   const addr = $("mesh-iface-addr");
-  const syncKind = () => { addr.disabled = kind.value === "auto"; };
+  const udpWrap = $("mesh-iface-udp");
+  const syncKind = () => {
+    const k = kind.value;
+    addr.disabled = k !== "tcp";
+    addr.classList.toggle("hidden", k !== "tcp");
+    if (udpWrap) udpWrap.classList.toggle("hidden", k !== "udp");
+  };
   kind.addEventListener("change", syncKind);
   syncKind();
   form.addEventListener("submit", async (e) => {
@@ -1269,6 +1296,15 @@ function wireMeshInterfaceForm() {
       const a = addr.value.trim();
       if (!a) { showError("A TCP interface needs an address, like hub.example.org:4789."); return; }
       body.addr = a;
+    } else if (kind.value === "udp") {
+      const local = ($("mesh-iface-local").value || "").trim();
+      const peer = ($("mesh-iface-peer").value || "").trim();
+      if (!local || !peer) {
+        showError("A UDP interface needs both a local address to bind and a peer to send to.");
+        return;
+      }
+      body.local = local;
+      body.peer = peer;
     }
     const name = $("mesh-iface-ifac").value.trim();
     const pass = $("mesh-iface-pass").value;

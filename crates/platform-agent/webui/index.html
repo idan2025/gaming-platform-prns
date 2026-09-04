@@ -52,8 +52,9 @@
             <th>Name</th>
             <th>Game</th>
             <th>State</th>
+            <th>Map</th>
             <th>Port</th>
-        <th>Mesh</th>
+            <th>Mesh</th>
             <th>Players</th>
             <th>Uptime</th>
             <th class="actions-col">Actions</th>
@@ -105,10 +106,22 @@
           <label for="mesh-iface-kind">Kind</label>
           <select id="mesh-iface-kind">
             <option value="tcp">TCP</option>
+            <option value="udp">UDP (point-to-point)</option>
             <option value="auto">LAN auto-discovery</option>
           </select>
           <label for="mesh-iface-addr">Address (host:port)</label>
           <input id="mesh-iface-addr" type="text" placeholder="hub.example.org:4789">
+          <div id="mesh-iface-udp" class="hidden">
+            <label for="mesh-iface-local">Local address to bind (host:port)</label>
+            <input id="mesh-iface-local" type="text" placeholder="0.0.0.0:4790">
+            <label for="mesh-iface-peer">Peer address to send to (host:port)</label>
+            <input id="mesh-iface-peer" type="text" placeholder="192.168.1.20:4790">
+            <p class="muted small">UDP here is point-to-point and is not discovered:
+              <strong>the far side needs the mirror of this</strong>, its local and peer
+              swapped, or datagrams go into nothing. Worth it on a local network, where a
+              TCP interface makes Reticulum ride a reliable ordered stream underneath a
+              protocol that already does its own retransmission and ordering.</p>
+          </div>
           <label for="mesh-iface-ifac">IFAC network name (optional)</label>
           <input id="mesh-iface-ifac" type="text" placeholder="leave empty for an open network">
           <label for="mesh-iface-pass">IFAC passphrase (optional)</label>
@@ -184,6 +197,7 @@
     <td class="cell-name"></td>
     <td class="cell-game"></td>
     <td class="cell-state"><span class="state-pill"></span></td>
+    <td class="cell-map"></td>
     <td class="cell-port"></td>
     <td class="cell-mesh"></td>
     <td class="cell-players"></td>

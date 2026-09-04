@@ -140,6 +140,13 @@ pub struct InstanceStatus {
     /// zero would stop a busy server for being idle.
     #[serde(default)]
     pub players_now: Option<u32>,
+    /// The map this server is on right now, when the game can be asked.
+    ///
+    /// `None` carries the same meaning as it does for `players_now`: not "no
+    /// map", but "this game answers no query, or did not answer". A UI must
+    /// show the difference rather than render an empty string.
+    #[serde(default)]
+    pub map_now: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

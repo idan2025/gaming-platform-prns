@@ -201,6 +201,16 @@ impl Agent {
                 // The spec is this run's memory and a restart has none, so fall
                 // back to the pack's own idea rather than refusing to restore.
                 .unwrap_or(16);
+            // Only a seed for the first announce; the bridge's A2S poller
+            // replaces it with the map the game is really on. A restarted agent
+            // has no spec and so seeds nothing, which is correct — it should
+            // report what it observes, not what it once asked for.
+            let seed_map = self
+                .specs
+                .lock()
+                .await
+                .get(&instance.instance_id)
+                .and_then(|s| s.map.clone());
             if let Err(e) = self
                 .mesh
                 .start(
@@ -208,8 +218,11 @@ impl Agent {
                     &profile,
                     &identity,
                     (&addr.0, addr.1),
-                    &instance.name,
-                    max_players,
+                    crate::mesh::MeshAnnounce {
+                        name: &instance.name,
+                        max_players,
+                        map: seed_map.as_deref(),
+                    },
                 )
                 .await
             {
@@ -522,8 +535,11 @@ impl Agent {
                     &profile,
                     &identity,
                     (&addr.0, addr.1),
-                    &spec.name,
-                    spec.max_players,
+                    crate::mesh::MeshAnnounce {
+                        name: &spec.name,
+                        max_players: spec.max_players,
+                        map: spec.map.as_deref(),
+                    },
                 )
                 .await
             {
@@ -562,6 +578,7 @@ impl Agent {
             uptime_secs: Some(0),
             owner: spec.owner,
             players_now: None,
+            map_now: None,
         })
     }
 
@@ -712,6 +729,7 @@ impl Agent {
             .get(instance_id)
             .map(|s| s.max_players)
             .unwrap_or(16);
+        let seed_map = self.specs.lock().await.get(instance_id).and_then(|s| s.map.clone());
         let identity = crate::mesh::identity_path(&self.config.data_root, instance_id);
         if let Err(e) = self
             .mesh
@@ -720,8 +738,11 @@ impl Agent {
                 &profile,
                 &identity,
                 (&addr.0, addr.1),
-                &instance.name,
-                max_players,
+                crate::mesh::MeshAnnounce {
+                    name: &instance.name,
+                    max_players,
+                    map: seed_map.as_deref(),
+                },
             )
             .await
         {
@@ -829,6 +850,7 @@ impl Agent {
                     // placement — so it never queries a game. `list_detailed`
                     // is the one that does.
                     players_now: None,
+                    map_now: None,
                 }
             })
             .collect())
@@ -863,20 +885,25 @@ impl Agent {
                 .await
                 .and_then(|s| s.destination);
         }
-        let queries = instances.iter().map(|i| self.player_count(i));
-        let counts = futures_util::future::join_all(queries).await;
-        for (instance, count) in instances.iter_mut().zip(counts) {
-            instance.players_now = count;
+        // One query per instance, and it already carries the map — asking
+        // twice for two fields of the same A2S reply would double the traffic
+        // to every game on the node for nothing.
+        let queries = instances.iter().map(|i| self.live_stats(i));
+        let stats = futures_util::future::join_all(queries).await;
+        for (instance, s) in instances.iter_mut().zip(stats) {
+            instance.players_now = s.as_ref().map(|(p, _)| *p);
+            instance.map_now = s.map(|(_, m)| m);
         }
         Ok(instances)
     }
 
-    /// Ask one instance's game how many players it has, if it can be asked.
+    /// Ask one instance's game what it is doing, if it can be asked: how many
+    /// players, and which map.
     ///
     /// The query is aimed at the published port on this node's own loopback:
     /// the game is a container this agent started, not a stranger on the
     /// network.
-    async fn player_count(&self, instance: &InstanceStatus) -> Option<u32> {
+    async fn live_stats(&self, instance: &InstanceStatus) -> Option<(u32, String)> {
         if instance.state != InstanceState::Running {
             return None;
         }
@@ -894,7 +921,10 @@ impl Agent {
                 // as empty.
                 let ip: std::net::IpAddr = instance.container_ip.as_ref()?.parse().ok()?;
                 let addr = std::net::SocketAddr::new(ip, profile.default_port);
-                game_bridge::a2s::query(addr).await.ok().map(|s| u32::from(s.info.players))
+                game_bridge::a2s::query(addr)
+                    .await
+                    .ok()
+                    .map(|s| (u32::from(s.info.players), s.info.map))
             }
         }
     }

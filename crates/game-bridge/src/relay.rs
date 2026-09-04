@@ -151,6 +151,19 @@ impl ServerState {
         }
     }
 
+    /// The last live read's map and player counts, for the announcer.
+    ///
+    /// Same policy `details()` uses: the most recent good read wins, and a
+    /// failed query leaves the previous one standing rather than blanking it.
+    /// A server whose game is down keeps announcing what it last saw, which is
+    /// no worse than announcing nothing and is corrected within one poll of the
+    /// game coming back.
+    fn live_summary(&self) -> Option<(u8, u8, String)> {
+        let slot = self.inner.live.lock().ok()?;
+        let s = slot.as_ref()?;
+        Some((s.players, s.max_players, s.map.clone()))
+    }
+
     /// Whether `requester` may ask this server about itself.
     ///
     /// An allowlisted server does not hand its roster to strangers. The
@@ -584,19 +597,41 @@ impl BridgeSession {
             }
 
             // Announcer.
+            //
+            // **The record is rebuilt every tick, not once.** It used to be
+            // encoded a single time before this loop and re-sent unchanged
+            // forever, so a browser's list showed the map and player count the
+            // server started with and never anything else. For a node-hosted
+            // server that meant a permanently empty map — nothing sets
+            // `args.map` there — displayed as "Unknown", and a player count
+            // frozen at its initial value.
+            //
+            // The live poller above already reads both from the game; this is
+            // the half that was missing. The announce is the entire
+            // server-browser row (`PLAN.md` §2: 316 bytes of app_data), so a
+            // stale one is not a cosmetic problem — it is the whole listing.
             let announcer = handle.clone();
             let interval = args.announce_interval;
-            let announce_app_data = server_announce_app_data(&args);
+            let announce_format = args.announce_format;
+            let base_record = server_announce_record(&args);
+            let fallback_name = args.name.clone();
+            let announce_state = state.clone();
             let _announce_task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval.max(1)));
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
+                    let app_data = current_announce_app_data(
+                        announce_format,
+                        &base_record,
+                        &fallback_name,
+                        announce_state.live_summary(),
+                    );
                     if announcer
                         .issue(PrnsCommand::AnnounceNow(AnnounceNow {
                             destination: server_hash,
                             target: AnnounceTarget::AllInterfaces,
-                            app_data: announce_app_data.clone(),
+                            app_data,
                         }))
                         .is_none()
                     {
@@ -1895,21 +1930,21 @@ pub fn server_announce_name_bytes(name: &Option<String>) -> Vec<u8> {
     bytes[..bytes.len().min(MAX_ANNOUNCE_APP_DATA_LEN)].to_vec()
 }
 
-/// Build the §3.3 record this server advertises.
+/// Truncate on a char boundary so a shortened field stays valid UTF-8.
 ///
 /// Over-long fields are truncated rather than refused: a server should still
 /// appear in the browser under a shortened name, and refusing to announce over
-/// a 49th character would make the server invisible instead.
-pub fn server_announce_record(args: &ServerArgs) -> AnnounceRecord {
-    fn truncate(s: &str, max: usize) -> String {
-        // Truncate on a char boundary so the field stays valid UTF-8.
-        let mut end = s.len().min(max);
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s[..end].to_string()
+/// a 49th character would make it invisible instead.
+fn truncate(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
     }
+    s[..end].to_string()
+}
 
+/// Build the §3.3 record this server advertises.
+pub fn server_announce_record(args: &ServerArgs) -> AnnounceRecord {
     let name = args
         .name
         .as_deref()
@@ -1951,6 +1986,44 @@ pub fn server_announce_bytes(args: &ServerArgs) -> Vec<u8> {
             }
         },
     }
+}
+
+/// The announce for *right now*: the configured record with map and player
+/// counts replaced by the last live read, when there is one.
+///
+/// Kept as a free function so the substitution is testable without a node.
+/// `AnnounceFormat::Legacy` is untouched by design — a bare name carries no map
+/// or counts, and `PLAN.md` §5 freezes what a deployed v0.1.10 peer sees.
+pub fn current_announce_app_data(
+    format: AnnounceFormat,
+    base: &AnnounceRecord,
+    fallback_name: &Option<String>,
+    live: Option<(u8, u8, String)>,
+) -> AnnounceAppData {
+    let bytes = match format {
+        AnnounceFormat::Legacy => server_announce_name_bytes(fallback_name),
+        AnnounceFormat::Record => {
+            let mut record = base.clone();
+            if let Some((players, max_players, map)) = live {
+                record.players = players;
+                // A game that reports zero slots is answering nonsense; keep
+                // what the operator configured rather than announcing a server
+                // nobody can join.
+                if max_players > 0 {
+                    record.max_players = max_players;
+                }
+                record.map = truncate(&map, announce::MAX_MAP_LEN);
+            }
+            match record.encode() {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(error = %e, "announce record did not encode; falling back to a bare name");
+                    server_announce_name_bytes(fallback_name)
+                }
+            }
+        }
+    };
+    AnnounceAppData::Data(AnnounceAppDataBytes::from_slice(&bytes).unwrap_or_default())
 }
 
 /// The `AnnounceAppData` for an `AnnounceNow` command, built from the same
@@ -2076,6 +2149,101 @@ mod tests {
             );
             assert!(may_use_channel(channel, framing::FRAMING_V2));
         }
+    }
+
+    /// The announce is the entire server-browser row (`PLAN.md` §2: 316 bytes
+    /// of app_data), so a stale one is not cosmetic — it is the whole listing.
+    ///
+    /// It used to be encoded once before the announce loop and re-sent
+    /// unchanged forever, so a node-hosted server showed an empty map (nothing
+    /// sets `args.map` there) rendered as "Unknown", and a player count frozen
+    /// at whatever it started with. The live poller already read both from the
+    /// game; this is the half that was missing.
+    #[test]
+    fn an_announce_carries_the_map_the_game_is_actually_on() {
+        let mut args = sven_server_args();
+        args.announce_format = AnnounceFormat::Record;
+        args.map = Some("crystal".to_string());
+        args.max_players = 16;
+        let base = server_announce_record(&args);
+        assert_eq!(base.map, "crystal");
+
+        let live = Some((7u8, 24u8, "crystal2".to_string()));
+        let AnnounceAppData::Data(bytes) =
+            current_announce_app_data(AnnounceFormat::Record, &base, &args.name, live)
+        else {
+            panic!("record format must produce data");
+        };
+        let AnnounceInfo::Record(decoded) = announce::decode(bytes.as_slice()).expect("decodes")
+        else {
+            panic!("a record announce must decode as a record");
+        };
+        assert_eq!(decoded.map, "crystal2", "a changelevel must reach the browser list");
+        assert_eq!(decoded.players, 7);
+        assert_eq!(decoded.max_players, 24);
+    }
+
+    /// With no live read yet — a game that has not answered once — the
+    /// configured values stand rather than being blanked.
+    #[test]
+    fn an_announce_without_live_stats_keeps_what_was_configured() {
+        let mut args = sven_server_args();
+        args.announce_format = AnnounceFormat::Record;
+        args.map = Some("crystal".to_string());
+        let base = server_announce_record(&args);
+        let AnnounceAppData::Data(bytes) =
+            current_announce_app_data(AnnounceFormat::Record, &base, &args.name, None)
+        else {
+            panic!("record format must produce data");
+        };
+        let AnnounceInfo::Record(decoded) = announce::decode(bytes.as_slice()).expect("decodes")
+        else {
+            panic!("a record announce must decode as a record");
+        };
+        assert_eq!(decoded.map, "crystal");
+    }
+
+    /// A game reporting zero slots is answering nonsense, and announcing it
+    /// would advertise a server nobody can join.
+    #[test]
+    fn a_zero_slot_reading_does_not_overwrite_the_configured_capacity() {
+        let mut args = sven_server_args();
+        args.announce_format = AnnounceFormat::Record;
+        args.max_players = 16;
+        let base = server_announce_record(&args);
+        let AnnounceAppData::Data(bytes) = current_announce_app_data(
+            AnnounceFormat::Record,
+            &base,
+            &args.name,
+            Some((0, 0, "crystal".to_string())),
+        ) else {
+            panic!("record format must produce data");
+        };
+        let AnnounceInfo::Record(decoded) = announce::decode(bytes.as_slice()).expect("decodes")
+        else {
+            panic!("a record announce must decode as a record");
+        };
+        assert_eq!(decoded.max_players, 16);
+    }
+
+    /// `PLAN.md` §5: a legacy announce is a bare name and carries no map or
+    /// counts at all. Live stats must not change what a deployed v0.1.10 peer
+    /// sees.
+    #[test]
+    fn live_stats_never_alter_a_legacy_announce() {
+        let mut args = sven_server_args();
+        args.announce_format = AnnounceFormat::Legacy;
+        args.name = Some("Old Peer".to_string());
+        let base = server_announce_record(&args);
+        let with = current_announce_app_data(
+            AnnounceFormat::Legacy,
+            &base,
+            &args.name,
+            Some((7, 24, "crystal2".to_string())),
+        );
+        let without =
+            current_announce_app_data(AnnounceFormat::Legacy, &base, &args.name, None);
+        assert_eq!(with, without);
     }
 
     #[test]

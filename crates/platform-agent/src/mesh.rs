@@ -115,6 +115,21 @@ pub enum MeshInterface {
         #[serde(default)]
         ifac_passphrase: Option<String>,
     },
+    /// Point-to-point UDP: bind `local`, send to `peer`, both `host:port`.
+    ///
+    /// Symmetric and not discovered — the far side needs the mirror image of
+    /// this entry with `local` and `peer` swapped, or datagrams go into
+    /// nothing. That is the cost of it; the benefit is that Reticulum gets a
+    /// datagram boundary directly instead of a reliable ordered stream carrying
+    /// a protocol that already does its own retransmission and ordering.
+    Udp {
+        local: String,
+        peer: String,
+        #[serde(default)]
+        ifac_name: Option<String>,
+        #[serde(default)]
+        ifac_passphrase: Option<String>,
+    },
     Auto {
         #[serde(default)]
         ifac_name: Option<String>,
@@ -131,6 +146,9 @@ impl MeshInterface {
     pub fn id(&self) -> String {
         match self {
             Self::Tcp { addr, .. } => format!("tcp:{addr}"),
+            // Both halves, because one node may hold several UDP links that
+            // share a local port and differ only in peer.
+            Self::Udp { local, peer, .. } => format!("udp:{local}->{peer}"),
             Self::Auto { .. } => "auto".to_string(),
         }
     }
@@ -142,6 +160,11 @@ impl MeshInterface {
         match self {
             Self::Tcp { addr, ifac_name, .. } => serde_json::json!({
                 "id": self.id(), "kind": "tcp", "addr": addr,
+                "ifac_name": ifac_name, "ifac": ifac_name.is_some(),
+            }),
+            Self::Udp { local, peer, ifac_name, .. } => serde_json::json!({
+                "id": self.id(), "kind": "udp", "addr": format!("{local} -> {peer}"),
+                "local": local, "peer": peer,
                 "ifac_name": ifac_name, "ifac": ifac_name.is_some(),
             }),
             Self::Auto { ifac_name, .. } => serde_json::json!({
@@ -166,6 +189,22 @@ impl MeshInterface {
                 )
                 .await;
             }
+            Self::Udp { local, peer, ifac_name, ifac_passphrase } => {
+                if let Err(e) = crate::interfaces::attach_udp(
+                    handle,
+                    local,
+                    peer,
+                    ifac_name.as_deref(),
+                    ifac_passphrase.as_deref(),
+                )
+                .await
+                {
+                    // A bind that fails leaves the bridge on whatever other
+                    // interfaces it has rather than failing the server: LAN-only
+                    // is degraded, not broken. Same rule as `Agent::create`.
+                    tracing::warn!(local = %local, peer = %peer, error = %e, "UDP mesh interface did not attach");
+                }
+            }
             Self::Auto { ifac_name, ifac_passphrase } => {
                 let _ = crate::interfaces::attach_auto(
                     handle,
@@ -175,6 +214,24 @@ impl MeshInterface {
             }
         }
     }
+}
+
+/// What a bridge announces about its server on the mesh.
+///
+/// Grouped rather than passed as three more parameters because they are one
+/// thing — the §3.3 record's human-facing half — and because they are the part
+/// most likely to grow: the record already has room for fields this does not
+/// set yet.
+///
+/// `map` is only a **seed** for the first announce. The bridge's own A2S poller
+/// replaces it with whatever the game is actually running, which is what makes
+/// a `changelevel` show up in a browser's list rather than the map the server
+/// happened to start on.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshAnnounce<'a> {
+    pub name: &'a str,
+    pub max_players: u8,
+    pub map: Option<&'a str>,
 }
 
 /// Every instance's mesh bridge, by instance id.
@@ -298,8 +355,7 @@ impl MeshBridges {
         profile: &GameProfile,
         identity_path: &Path,
         game_addr: (&str, u16),
-        name: &str,
-        max_players: u8,
+        announce: MeshAnnounce<'_>,
     ) -> Result<Option<MeshStatus>> {
         let Some(config) = &self.config else { return Ok(None) };
 
@@ -319,8 +375,13 @@ impl MeshBridges {
         args.tcp = config.tcp.clone();
         args.auto = config.auto;
         args.announce_interval = config.announce_interval;
-        args.name = Some(name.to_string());
-        args.max_players = max_players;
+        args.name = Some(announce.name.to_string());
+        args.max_players = announce.max_players;
+        // The map this instance was asked to start on, so the very first
+        // announce carries one. After that the bridge's own A2S poller replaces
+        // it with whatever the game is actually running, which is what makes a
+        // `changelevel` show up in a browser's list.
+        args.map = announce.map.map(|m| m.to_string());
         // A node's instances are dedicated servers by definition: nobody is
         // playing on the machine that runs them.
         args.dedicated = true;
@@ -343,7 +404,7 @@ impl MeshBridges {
             instance_id: instance_id.to_string(),
             destination: session.own_hash().map(|h| hex::encode(h.as_bytes())),
             game_id: profile.id.clone(),
-            name: name.to_string(),
+            name: announce.name.to_string(),
         };
         tracing::info!(
             instance = %instance_id,
@@ -402,8 +463,7 @@ mod tests {
                 &GameProfile::sven_coop(),
                 Path::new("/nonexistent/mesh.identity"),
                 ("127.0.0.1", 27015),
-                "Test",
-                16,
+                MeshAnnounce { name: "Test", max_players: 16, map: Some("crystal") },
             )
             .await
             .expect("no mesh config is not an error");

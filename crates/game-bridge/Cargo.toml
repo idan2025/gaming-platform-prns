@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Game-agnostic Reticulum bridge. Generalizes the Sven Co-op bridge in idan2025/Svencoop-Prns."
 
 [dependencies]
-personal-rns = { workspace = true, features = ["tokio-host", "tcp", "wifi-auto"] }
+personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "wifi-auto"] }
 prns-core = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 anyhow = "1"
