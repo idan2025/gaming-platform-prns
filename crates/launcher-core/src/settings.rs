@@ -37,6 +37,16 @@ pub struct LauncherSettings {
     /// The display name the player joins under, reused across games so it is
     /// typed once rather than per join.
     pub player_name: Option<String>,
+    /// The local port a join binds for each game, keyed by pack id, when the
+    /// player has chosen one. Absent means the pack's own `default_port`,
+    /// which is what every join used before this existed.
+    ///
+    /// Worth remembering rather than retyping: the reason to move off the
+    /// default is usually a permanent fact about the machine — a local
+    /// dedicated server, or another launcher — and it does not change between
+    /// runs.
+    #[serde(default)]
+    pub listen_ports: BTreeMap<String, u16>,
     /// How this launcher reaches the mesh, remembered between runs.
     ///
     /// Reticulum has no global directory: a node gets an interface from LAN

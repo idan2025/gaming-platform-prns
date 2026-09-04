@@ -101,6 +101,10 @@ function makeInvoke(scenario) {
         return null;
       case 'join_server':
         return { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop' };
+      case 'listen_port':
+        return 27015;
+      case 'clear_listen_port':
+        return null;
       default:
         throw new Error(`the UI called an unknown command: ${cmd}`);
     }

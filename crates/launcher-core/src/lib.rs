@@ -337,6 +337,19 @@ impl LaunchPlan {
     }
 }
 
+/// Render an error with its whole cause chain, for a caller that can only carry
+/// a `String` — which is every Tauri command.
+///
+/// `e.to_string()` prints the outermost context and nothing else. That is how a
+/// failed join reported `loading identity at ./game-bridge-client.identity` and
+/// dropped the `Permission denied` that said what was actually wrong, leaving a
+/// message that named a file and no reason. Lives here rather than in the Tauri
+/// shell so the shell stays a pure forwarder with no error-handling dependency
+/// of its own.
+pub fn error_text(e: anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
 impl Launcher {
     /// Build a launcher over packs of unestablished provenance, falling back to
     /// the built-in Sven Co-op pack so a fresh install with no pack directory
@@ -582,8 +595,46 @@ impl Launcher {
         dir.join("client.identity")
     }
 
+    /// The local port a join for `game_id` would bind: what the player chose
+    /// for this game, else the pack's own default.
+    pub async fn listen_port_for(&self, game_id: &str) -> Option<u16> {
+        let chosen = self.settings.lock().await.listen_ports.get(game_id).copied();
+        chosen.or_else(|| self.profile_for(game_id).map(|p| p.default_port))
+    }
+
+    /// Remember which local port this game's joins should bind, or forget it
+    /// and go back to the pack's default.
+    ///
+    /// Port 0 is refused rather than treated as "any": the number is shown to
+    /// the player and typed into a game's console, and one the OS picked after
+    /// the fact is neither.
+    pub async fn set_listen_port(&self, game_id: &str, port: Option<u16>) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        match port {
+            Some(0) => return Err(anyhow!("0 is not a port you can point a game at")),
+            Some(p) => settings.listen_ports.insert(game_id.to_string(), p),
+            None => settings.listen_ports.remove(game_id),
+        };
+        self.persist(&settings)
+    }
+
     /// Start a client bridge pointed at one server. Does not launch a game.
-    pub async fn join_server(&self, destination_hash: &str, game_id: Option<&str>) -> Result<JoinResult> {
+    ///
+    /// `listen_port` overrides which local port the bridge binds, and is
+    /// remembered for this game. `None` uses whatever was remembered before,
+    /// and failing that the pack's `default_port`.
+    ///
+    /// **The default is not always available**, which is why this is settable
+    /// at all: the pack's port is the one the game's own dedicated server
+    /// binds, so a machine already running one — or Docker publishing one —
+    /// owns it, and the join fails with `Address already in use` on a port the
+    /// player never chose.
+    pub async fn join_server(
+        &self,
+        destination_hash: &str,
+        game_id: Option<&str>,
+        listen_port: Option<u16>,
+    ) -> Result<JoinResult> {
         let hash = parse_hash(destination_hash)?;
         let game_id = match game_id {
             Some(id) => id.to_string(),
@@ -601,8 +652,15 @@ impl Launcher {
             .profile_for(&game_id)
             .ok_or_else(|| anyhow!("no game pack installed for {game_id:?}"))?;
 
-        let listen_port = profile.default_port;
+        if let Some(port) = listen_port {
+            self.set_listen_port(&game_id, Some(port)).await?;
+        }
+        let listen_port = self
+            .listen_port_for(&game_id)
+            .await
+            .unwrap_or(profile.default_port);
         let mut args = ClientArgs::new(profile);
+        args.listen_port = listen_port;
         args.server_hash = Some(hex::encode(hash.as_bytes()));
         // The identity file is created on first join, so its directory has to
         // exist by then — the loader opens the path, it does not build the way
@@ -1444,6 +1502,54 @@ query = "a2s"
         let path = Launcher::new(Vec::new()).client_identity_path();
         assert!(path.is_absolute(), "{} is relative", path.display());
         assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    /// With nothing chosen, a join binds the pack's own port — the behaviour
+    /// every join had before the port was settable.
+    #[tokio::test]
+    async fn the_default_local_port_is_still_the_packs_own() {
+        let l = Launcher::new(Vec::new());
+        let pack = GamePack::sven_coop();
+        assert_eq!(l.listen_port_for(&pack.id).await, Some(pack.default_port));
+    }
+
+    /// A chosen port wins over the pack's, and survives a restart. The reason
+    /// to move off the default is a standing fact about the machine — another
+    /// dedicated server of the same game holding 27015 — so retyping it every
+    /// launch would be retyping the same number forever.
+    #[tokio::test]
+    async fn a_chosen_local_port_wins_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launcher.json");
+
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        l.set_listen_port("sven-coop", Some(27099)).await.unwrap();
+        assert_eq!(l.listen_port_for("sven-coop").await, Some(27099));
+
+        let l2 = Launcher::new(Vec::new()).with_settings_file(file);
+        assert_eq!(l2.listen_port_for("sven-coop").await, Some(27099));
+    }
+
+    /// Clearing goes back to the pack's default rather than to "no port".
+    #[tokio::test]
+    async fn clearing_a_local_port_returns_to_the_packs_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
+        l.set_listen_port("sven-coop", Some(27099)).await.unwrap();
+        l.set_listen_port("sven-coop", None).await.unwrap();
+        assert_eq!(
+            l.listen_port_for("sven-coop").await,
+            Some(GamePack::sven_coop().default_port)
+        );
+    }
+
+    /// Port 0 means "let the OS pick" to a socket, and the launcher shows this
+    /// number to a person and types it into a game's console. One chosen after
+    /// the fact is neither.
+    #[tokio::test]
+    async fn port_zero_is_refused() {
+        let l = Launcher::new(Vec::new());
+        assert!(l.set_listen_port("sven-coop", Some(0)).await.is_err());
     }
 
     /// Setting a game path persists it, and a fresh launcher loading the same

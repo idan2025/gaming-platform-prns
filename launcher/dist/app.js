@@ -28,6 +28,10 @@ const state = {
   // nonsense at a server. Remembered per destination so the choice survives
   // closing the detail pane.
   chosenGame: new Map(),
+  // game id -> local port a join would bind. Read from the core rather than
+  // assumed, because the core is where the pack default and the player's saved
+  // choice are reconciled.
+  listenPorts: new Map(),
 };
 
 const LINK_CLASS = { 1: 'Low-rate', 2: 'TCP / bursty', 3: 'High-bitrate' };
@@ -601,6 +605,7 @@ function renderDetail() {
   const gameId = effectiveGameId(d);
   if (!a.game_id) body.appendChild(renderGamePicker(d));
   body.appendChild(renderPackSection(gameId));
+  if (gameId) body.appendChild(renderPortSection(d, gameId));
 
   pane.appendChild(body);
 
@@ -691,6 +696,75 @@ function renderGamePicker(d) {
     renderDetail();
   });
   sec.appendChild(sel);
+  return sec;
+}
+
+// Which local port this machine binds for the game to connect to.
+//
+// The pack's default is the port the game's *own* dedicated server listens on,
+// so any machine already running one — or Docker publishing one — owns it, and
+// the join fails with `Address already in use` on a number the player never
+// chose. Making it settable is the fix; showing it is what makes the failure
+// legible when it happens.
+// Ask the core once per game what port a join would bind. Fire-and-forget: the
+// field renders empty until it answers, and answers by re-rendering.
+function ensureListenPort(gameId) {
+  if (!gameId || state.listenPorts.has(gameId)) return;
+  state.listenPorts.set(gameId, null);
+  invoke('listen_port', { gameId })
+    .then(p => {
+      state.listenPorts.set(gameId, p == null ? null : p);
+      if (state.detail) renderDetail();
+    })
+    .catch(() => { /* a port we cannot read just renders empty */ });
+}
+
+function renderPortSection(d, gameId) {
+  ensureListenPort(gameId);
+  const sec = el('div', 'section');
+  sec.appendChild(el('h3', '', 'Local port'));
+  sec.appendChild(el('p', 'pack-detail',
+    'Your game connects to this port on this machine. Change it if something ' +
+    'else here already uses the default — a dedicated server of the same game, ' +
+    'usually.'));
+
+  const row = el('div', 'port-row');
+  const input = el('input', 'port-input');
+  input.type = 'number';
+  input.min = '1';
+  input.max = '65535';
+  input.setAttribute('aria-label', 'Local port to bind');
+  const current = state.listenPorts.get(gameId);
+  input.value = d.portDraft != null ? d.portDraft : (current != null ? String(current) : '');
+  input.placeholder = 'the pack default';
+  input.addEventListener('input', () => { d.portDraft = input.value; });
+  row.appendChild(input);
+
+  const reset = el('button', 'btn-locate', 'Use default');
+  reset.type = 'button';
+  reset.onclick = async () => {
+    try {
+      await invoke('clear_listen_port', { gameId });
+      const back = await invoke('listen_port', { gameId });
+      if (back != null) state.listenPorts.set(gameId, back);
+      d.portDraft = null;
+      d.joined = false;
+      d.joinMsg = null;
+      d.joinErr = false;
+    } catch (err) {
+      d.joinErr = true;
+      d.joinMsg = 'Could not reset the port: ' + String(err && err.message || err);
+    }
+    renderDetail();
+  };
+  row.appendChild(reset);
+  sec.appendChild(row);
+
+  const shown = d.portDraft != null && d.portDraft !== '' ? d.portDraft : current;
+  if (shown) {
+    sec.appendChild(el('p', 'pack-detail',
+      'Point your game at 127.0.0.1:' + shown + ' — the Play button does this for you.'));
+  }
   return sec;
 }
 
@@ -805,6 +879,20 @@ async function joinServer() {
     renderDetail();
     return;
   }
+  // A typed port is sent and remembered; a blank field means "whatever is
+  // already remembered, else the pack default", which the core decides.
+  let listenPort = null;
+  const draft = (d.portDraft == null ? '' : String(d.portDraft)).trim();
+  if (draft !== '') {
+    const n = parseInt(draft, 10);
+    if (isNaN(n) || n < 1 || n > 65535) {
+      d.joinErr = true;
+      d.joinMsg = 'A local port must be a number between 1 and 65535.';
+      renderDetail();
+      return;
+    }
+    listenPort = n;
+  }
   d.joining = true;
   d.joinMsg = null;
   d.joinErr = false;
@@ -813,9 +901,11 @@ async function joinServer() {
     const res = await invoke('join_server', {
       destinationHash: d.hash,
       gameId,
+      listenPort,
     });
     d.joined = true;
     d.listenAddr = res.listen_addr;
+    if (listenPort != null) state.listenPorts.set(gameId, listenPort);
     d.canLaunch = !!res.can_launch;
     d.launchReady = !!res.launch_ready;
     d.joinErr = false;

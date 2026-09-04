@@ -319,6 +319,10 @@ input:focus-visible, select:focus-visible {
 /* The picker for a server whose announce names no game. Full width so it does
    not read as an afterthought: nothing can be joined until it is answered. */
 .game-picker { width: 100%; margin-top: 6px; }
+/* The local port and its reset, on one line: the number and the way back to the
+   default belong together. */
+.port-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.port-input { flex: 1 1 auto; min-width: 0; }
 
 .empty {
   padding: 40px 24px;

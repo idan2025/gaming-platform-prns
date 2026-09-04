@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 
 use launcher_core::{
-    BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView, GameSummary, JoinResult, Launcher,
-    PlayResult, ServerDetailsView, ServerRow,
+    error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
+    GameSummary, JoinResult, Launcher, PlayResult, ServerDetailsView, ServerRow,
 };
 use tauri::Manager;
 
@@ -30,12 +30,12 @@ async fn browse_status(state: tauri::State<'_, AppState>) -> Result<BrowseStatus
 
 #[tauri::command]
 async fn start_browse(state: tauri::State<'_, AppState>, opts: BrowseOpts) -> Result<(), String> {
-    state.launcher.start_browse(opts).await.map_err(|e| e.to_string())
+    state.launcher.start_browse(opts).await.map_err(fmt_err)
 }
 
 #[tauri::command]
 async fn stop_browse(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.launcher.stop_browse().await.map_err(|e| e.to_string())
+    state.launcher.stop_browse().await.map_err(fmt_err)
 }
 
 #[tauri::command]
@@ -43,7 +43,7 @@ async fn list_servers(
     state: tauri::State<'_, AppState>,
     query: BrowseQueryInput,
 ) -> Result<Vec<ServerRow>, String> {
-    state.launcher.list_servers(query).await.map_err(|e| e.to_string())
+    state.launcher.list_servers(query).await.map_err(fmt_err)
 }
 
 #[tauri::command]
@@ -63,29 +63,53 @@ async fn server_details(
     Ok(state.launcher.server_details(&destination_hash).await)
 }
 
+/// `listen_port` is the local port the bridge binds for the game to connect to,
+/// and it is remembered per game. It exists because the pack's default is the
+/// port the game's *own* dedicated server uses, so a machine already running
+/// one owns it and the join fails on a number the player never picked.
 #[tauri::command]
 async fn join_server(
     state: tauri::State<'_, AppState>,
     destination_hash: String,
     game_id: Option<String>,
+    listen_port: Option<u16>,
 ) -> Result<JoinResult, String> {
     state
         .launcher
-        .join_server(&destination_hash, game_id.as_deref())
+        .join_server(&destination_hash, game_id.as_deref(), listen_port)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(fmt_err)
+}
+
+/// The local port a join for this game would bind right now — what the player
+/// chose, else the pack's default. The UI prefills its field with it.
+#[tauri::command]
+async fn listen_port(
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+) -> Result<Option<u16>, String> {
+    Ok(state.launcher.listen_port_for(&game_id).await)
+}
+
+/// Forget a chosen local port and go back to the pack's default.
+#[tauri::command]
+async fn clear_listen_port(
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+) -> Result<(), String> {
+    state.launcher.set_listen_port(&game_id, None).await.map_err(fmt_err)
 }
 
 #[tauri::command]
 async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.launcher.leave().await.map_err(|e| e.to_string())
+    state.launcher.leave().await.map_err(fmt_err)
 }
 
 /// Start the game for the current join — the Play button (`PLAN.md` §13.3). All
 /// the deciding and spawning is in `launcher-core`; this only forwards.
 #[tauri::command]
 async fn play_server(state: tauri::State<'_, AppState>) -> Result<PlayResult, String> {
-    state.launcher.play().await.map_err(|e| e.to_string())
+    state.launcher.play().await.map_err(fmt_err)
 }
 
 /// What the launcher knows about locating one game, so the UI can choose between
@@ -110,12 +134,12 @@ async fn set_game_path(
         .launcher
         .set_game_path(&game_id, std::path::Path::new(&path))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(fmt_err)
 }
 
 #[tauri::command]
 async fn clear_game_path(state: tauri::State<'_, AppState>, game_id: String) -> Result<(), String> {
-    state.launcher.clear_game_path(&game_id).await.map_err(|e| e.to_string())
+    state.launcher.clear_game_path(&game_id).await.map_err(fmt_err)
 }
 
 #[tauri::command]
@@ -138,12 +162,12 @@ async fn add_interface(
         },
         other => return Err(format!("unknown interface kind {other:?}")),
     };
-    state.launcher.add_interface(iface).await.map_err(|e| e.to_string())
+    state.launcher.add_interface(iface).await.map_err(fmt_err)
 }
 
 #[tauri::command]
 async fn remove_interface(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
-    state.launcher.remove_interface(&id).await.map_err(|e| e.to_string())
+    state.launcher.remove_interface(&id).await.map_err(fmt_err)
 }
 
 /// The saved interfaces as browse options, so the UI can start browsing with
@@ -162,7 +186,7 @@ async fn player_name(state: tauri::State<'_, AppState>) -> Result<Option<String>
 
 #[tauri::command]
 async fn set_player_name(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
-    state.launcher.set_player_name(&name).await.map_err(|e| e.to_string())
+    state.launcher.set_player_name(&name).await.map_err(fmt_err)
 }
 
 /// Where game packs live: next to the executable in a shipped build, and at the
@@ -199,6 +223,8 @@ pub fn run() {
             list_games,
             server_details,
             join_server,
+            listen_port,
+            clear_listen_port,
             leave,
             play_server,
             game_location,
