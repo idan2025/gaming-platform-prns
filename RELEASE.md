@@ -74,6 +74,28 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.2
+
+The local port a join binds is now the player's to choose.
+
+- **A join can bind a port other than the pack's default.** The default is the
+  port the game's *own* dedicated server listens on, so any machine already
+  running one owns it — the node this was developed on publishes
+  `0.0.0.0:27015/udp` for an unrelated container — and the join failed with
+  `Address already in use` on a number nobody picked. The detail pane now
+  offers the port and remembers it per game; leaving it alone keeps the old
+  behaviour exactly. Extra ports still follow it, because `relay.rs` derives
+  them as `listen_port + channel`.
+- **Tauri commands report an error's whole cause chain.** `e.to_string()`
+  prints only the outermost context, which is how 0.2.0's join failure read
+  `loading identity at ./game-bridge-client.identity` and dropped the reason
+  the file could not be written. The helper is in `launcher-core`, so the
+  shell stays a pure forwarder.
+
+Verified against a live node rather than only in tests: a recreated instance
+came up on `GPP_MAP=crystal`, `changelevel crystal2` moved it without a
+restart, and an A2S query over a real Reticulum path reported the new map.
+
 ## v0.2.1
 
 A join that could not work on an installed launcher, and map control on a node.

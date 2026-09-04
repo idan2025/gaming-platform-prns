@@ -8,7 +8,7 @@ exclude = ["launcher/src-tauri"]
 [workspace.package]
 # One version for every platform crate: they ship together and a mesh peer's
 # useful question is "which release is that", not "which crate".
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
