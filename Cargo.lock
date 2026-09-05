@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "game-bridge"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "hex",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "index-client"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "game-bridge",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "launcher-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "game-bridge",
@@ -1800,7 +1800,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "platform-agent"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "platform-auth"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "platform-index"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "axum",

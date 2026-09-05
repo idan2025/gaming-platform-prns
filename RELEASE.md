@@ -74,6 +74,60 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.10
+
+Three things: a join that stops lying, a transport that carries a game, and the
+index a launcher can finally ask.
+
+### A join that cannot reach the server says so
+
+Binding a local port always succeeds and says nothing about the server. Point a
+game at a port whose bridge has no route and the game sits on "establishing
+connection" until it gives up, while the launcher reports success — no error
+anywhere, nothing pointing at the address.
+
+The commonest cause is an address that is simply gone: **a mesh identity is per
+instance id, so recreating a server mints a new destination**, and a row from
+an earlier session, or from the launcher's memory, names one nobody can route
+to. `JoinResult.reachable` now carries the answer, from the same probe the
+detail pane uses. A warning and never a refusal — mesh routing is asymmetric
+and an allowlisted server declines probes on purpose.
+
+### Backbone interfaces
+
+A node can reach a hub over Reticulum's `BackboneInterface` instead of a
+generic TCP client: a 1 MB frame size and a gigabit rate, against
+`UDPInterface`'s 1064 bytes and 10 Mbps guess. A hub offering one was already
+being dialled — with the wrong protocol at our end.
+
+**UDP does not carry a game to a stock RNS peer, and HOSTING.md now records
+why that stays unexplained.** With the destination held constant and only the
+transport changed, UDP carried announces and A2S queries perfectly while a game
+connect stalled every time. Two mechanisms were proposed and both were wrong:
+`HW_MTU = 1064` is not a receive buffer (RNS reads through
+`socketserver.UDPServer` at 8192), and raising it to 4096 with a 1 Gbps
+bitrate, confirmed live, changed nothing. The measurement is solid; the
+explanation is not, and the note says so rather than inventing a third story —
+a plausible-but-false mechanism is exactly what makes someone retry it.
+
+### The launcher can ask an index
+
+Index addresses can be added in the launcher, which queries each and merges the
+rows. **This is the only way to find a server that was already running before
+you started**: the mesh floods an announce once and suppresses the repeats, and
+remembering covers only servers you have seen yourself.
+
+An index **loses every tie**. A row heard directly is the launcher's own
+evidence and wins; an index row fills a gap and is badged `via index`, because
+it is second-hand — the numbers are real, but somebody else heard them and
+`hops` is the distance from the index. Empty by default and complete when
+empty: adding one is a player trusting somebody's list, not the platform
+acquiring a dependency (`DESIGN.md` §0).
+
+`index-client` is a new crate carrying the query call and the codec both ends
+speak, because `platform-index` depends on `platform-agent` and therefore
+bollard — a launcher must not ship a Docker client to read a list.
+
 ## v0.2.9
 
 **The launcher remembers servers, and asks the mesh where they are.** If you
