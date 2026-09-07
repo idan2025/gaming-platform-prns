@@ -1303,7 +1303,13 @@ async function loadGames() {
   }
   const sel = $('f-game');
   sel.innerHTML = '';
-  sel.appendChild(el('option', '', 'Any game'));
+  // `value` must be set explicitly, and empty. An <option> with no value
+  // attribute reports its own *text* as its value, so this one read back as
+  // "Any game" and was sent to the core as a game id nothing matches: picking
+  // it emptied the list instead of clearing the filter.
+  const any = el('option', '', 'Any game');
+  any.value = '';
+  sel.appendChild(any);
   state.games.forEach(g => {
     const o = el('option', '', g.display_name || g.id);
     o.value = g.id;

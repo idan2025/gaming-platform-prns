@@ -230,6 +230,47 @@ Rules a later change could quietly break:
   field for the same reason) nor as one more thing an operator must set. The
   agent started the process, so the server's stdin is already its own.
 
+**Counter-Strike 1.6 actually runs on a node** (2026-09-07): `images/goldsrc` is
+a bare HLDS image in the same shape as `images/sven-coop`, and one steamcmd app
+90 install (~930 MB) serves Counter-Strike, Half-Life, DoD and TFC — the mod
+directory is a start argument, so it is `[games.<id>].env`'s `HLDS_MOD` and not
+a pack field. `HOSTING.md` has the operator's copy. Rules a later change could
+quietly break:
+- **`SteamAppId=90` is why it starts.** Without it the engine loads the map,
+  reaches the Steam *client* interfaces, and dies with
+  `FATAL ERROR (shutting down): Unable to initialize Steam` on the line after a
+  log that reads like a healthy server. The mod's shipped `steam_appid.txt`
+  (10 for Counter-Strike, the *client* app id) is not a substitute — it is what
+  the failing case reads. Measured against build 10211 on this node's daemon.
+- **The knob is `HLDS_MOD`, deliberately not `GPP_MOD`.** `docker.rs:368` drops
+  every operator env named `GPP_*` so config cannot overwrite a value the
+  instance spec set; a mod name is the operator's, so it must not take that
+  prefix.
+- **A game's own `maps_dir` must never be in `writable_paths`.** A writable path
+  is an empty directory mounted *over* the shared content, so declaring
+  `cstrike/maps` hid all 53 shipped maps and left the server with no `de_dust2`
+  to start — the same bug `svencoop/maps` once was. `half-life`,
+  `counter-strike-16` and `team-fortress-2` all shipped with it. Pinned by
+  `no_shipped_pack_declares_its_own_maps_dir_writable`, which finds its subjects
+  by property rather than by id.
+- **The in-game server name is best-effort and the announce is not.** Every
+  mod's `server.cfg` sets `hostname` and runs after the command line, so
+  `+hostname` loses; `-servercfgfile logs/…` loads nothing at all and `+exec`
+  runs too early (both measured). What a player browses by is the announce,
+  which the agent sets from the spec.
+
+**The shipped launcher had no packs and an unusable "any game" filter**
+(2026-09-07): `pack_dir` looks beside the executable and then falls back to a
+`CARGO_MANIFEST_DIR` path that exists only in a checkout, and nothing was
+bundling `packs/` — so an installed launcher fell back to the built-in Sven pack
+and offered exactly one game. `tauri.conf.json` now maps `../../packs/*.toml`
+into the bundle's `packs/`. The filter's own first entry was built as
+`el('option', '', 'Any game')`: **an `<option>` with no `value` attribute
+reports its text as its value**, so clearing the filter asked the core for a
+game called "Any game" and emptied the list. Both are pinned in
+`launcher/uicheck/render.mjs`, which is `node render.mjs` and not part of
+`cargo test`.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

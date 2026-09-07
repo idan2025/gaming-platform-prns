@@ -422,6 +422,50 @@ await run('saved mesh connections are shown', {
   check('no undefined in the interface list', !t.includes('undefined'), t.slice(0, 300));
 });
 
+// The game filter is built from the loaded packs, and its first entry clears
+// the filter. An <option> with no `value` attribute reports its own text as its
+// value, so this one once read back as the string "Any game" and was sent to
+// the core as a game id nothing matches: picking it emptied the list instead of
+// showing everything.
+{
+  const queries = [];
+  await run('the game filter lists every pack and can be cleared', {
+    status: running,
+    games: [
+      { id: 'sven-coop', display_name: 'Sven Co-op', trust: 'built in', trust_detail: '', signer: null, signature_expires_at: null },
+      { id: 'counter-strike-16', display_name: 'Counter-Strike 1.6', trust: 'unsigned', trust_detail: '', signer: null, signature_expires_at: null },
+      { id: 'half-life', display_name: 'Half-Life Deathmatch', trust: 'unsigned', trust_detail: '', signer: null, signature_expires_at: null },
+    ],
+    rows: q => { queries.push(q); return [row()]; },
+  }, async (win, doc) => {
+    const sel = doc.querySelector('#f-game');
+    const opts = [...sel.options];
+    check('every loaded pack is offered as a filter',
+      ['sven-coop', 'counter-strike-16', 'half-life'].every(id => opts.some(o => o.value === id)),
+      opts.map(o => `${o.value}=${o.textContent}`).join(', '));
+    check('the first option clears the filter and has an empty value',
+      opts[0].value === '', JSON.stringify(opts[0].value));
+
+    // Pick a game, then go back to "any" and check what the core was asked.
+    sel.value = 'counter-strike-16';
+    sel.dispatchEvent(new win.Event('change', { bubbles: true }));
+    for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+    // A poll with a metadata filter on also issues a second, unfiltered query
+    // to find legacy peers, so look for the filtered one rather than the last.
+    check('picking a game filters by its id',
+      queries.some(q => q.game_id === 'counter-strike-16'),
+      JSON.stringify(queries.map(q => q.game_id)));
+
+    sel.value = '';
+    sel.dispatchEvent(new win.Event('change', { bubbles: true }));
+    for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+    const last = queries[queries.length - 1];
+    check('clearing it asks for every game, not for a game called "Any game"',
+      last.game_id === null || last.game_id === undefined, JSON.stringify(last));
+    check('and the list still has rows', doc.querySelectorAll('#list .row').length > 0);
+  });
+}
+
 await run('nothing heard yet', {
   status: { running: true, interfaces: [], heard_total: 0 },
   rows: () => [],
