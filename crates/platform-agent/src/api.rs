@@ -359,6 +359,10 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
         .values()
         .map(|pack| {
             let runtime = config.runtime_for(&pack.id);
+            // The node's own declaration wins, which is what makes a bots
+            // control appear for Counter-Strike 1.6 on a node that installed
+            // YaPB and stay absent on one that did not.
+            let bots = runtime.and_then(|r| r.bots).is_some() || pack.bots.is_some();
             GameOption {
                 runnable: runtime.is_some(),
                 reason: runtime.is_none().then(|| {
@@ -375,7 +379,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 default_port: pack.default_port,
                 extra_ports: pack.extra_ports.len(),
                 console: pack.console.is_some(),
-                bots: pack.bots.is_some() && pack.console.is_some(),
+                bots: bots && pack.console.is_some(),
             }
         })
         .collect();

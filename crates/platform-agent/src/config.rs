@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use game_bridge::signing::TrustPolicy;
 use prns_core::identity::IdentityHash;
+use game_bridge::console::BotProtocol;
 use serde::{Deserialize, Serialize};
 
 /// Prefix on every container this agent creates.
@@ -252,6 +253,29 @@ pub struct GameRuntime {
     /// in the agent docs.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// A bot implementation this node's copy of the game has, when it is one a
+    /// pack cannot know about.
+    ///
+    /// **The operator's assertion, not the pack's.** Valve's Z-Bot comes with
+    /// Condition Zero and `packs/condition-zero.toml` says so; YaPB is a binary
+    /// somebody installed into this node's content, and only that somebody can
+    /// say it is there. Set here it wins over the pack, which is what lets a
+    /// node run Counter-Strike 1.6 with bots the game itself does not have.
+    #[serde(default)]
+    pub bots: Option<BotProtocol>,
+    /// Extra paths inside the content copy this node makes writable, on top of
+    /// the ones the pack declares.
+    ///
+    /// Same escape hatch, same reason: a pack describes a game and cannot know
+    /// that this node installed a bot that wants to cache its pathfinding.
+    /// Validated exactly like a pack's `writable_paths` — a relative path, no
+    /// `..` — because it becomes a mount inside a directory the node owns.
+    ///
+    /// **A writable path hides what it covers.** It is an empty per-instance
+    /// directory mounted *over* the shared content, so naming a directory that
+    /// has files in it makes them disappear for every instance.
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +567,44 @@ mod tests {
     const SAMPLE_DATA_ROOT: &str = "C:\\\\ProgramData\\\\gaming-platform-prns";
     #[cfg(not(windows))]
     const SAMPLE_DATA_ROOT: &str = "/var/lib/gaming-platform-prns";
+
+    /// A node may declare a bot its game does not ship, because a third-party
+    /// bot is a binary the operator installed into their own content copy.
+    /// This is the seam that lets Counter-Strike 1.6 — a game with no bots at
+    /// all — have them on one node and not on another, without any pack
+    /// claiming something untrue about either.
+    #[test]
+    fn a_node_may_declare_a_bot_it_installed_itself() {
+        let toml = sample()
+            + r#"
+[games.counter-strike-16]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-yapb"
+bots = "yapb"
+writable_paths = ["cstrike/addons/yapb/data/train"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, toml).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        let runtime = config.runtime_for("counter-strike-16").expect("the game is configured");
+        assert_eq!(runtime.bots, Some(BotProtocol::Yapb));
+        assert_eq!(runtime.writable_paths, ["cstrike/addons/yapb/data/train"]);
+    }
+
+    /// Both fields are optional, and a config written before they existed keeps
+    /// meaning exactly what it did: no bots, and only the pack's writable paths.
+    #[test]
+    fn a_game_that_says_nothing_about_bots_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, sample()).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        let runtime = config.runtime_for("sven-coop").expect("the sample configures sven");
+        assert_eq!(runtime.bots, None);
+        assert!(runtime.writable_paths.is_empty());
+    }
 
     fn sample() -> String {
         SAMPLE_TEMPLATE.replace("__DATA_ROOT__", SAMPLE_DATA_ROOT)

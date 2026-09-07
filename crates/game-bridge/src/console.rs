@@ -81,6 +81,15 @@ pub enum BotProtocol {
     /// all — no bot, no error. A pack for a game whose mod is not `czero` must
     /// not declare it.
     Zbot,
+    /// YaPB, a third-party bot for Counter-Strike 1.6 and Condition Zero.
+    ///
+    /// **A pack can never name this one** (`pack.rs`'s `PackBots` has no
+    /// variant for it, deliberately). Z-Bot is part of a game: a node that has
+    /// Condition Zero has it. YaPB is a separate binary an operator installs
+    /// into their own content copy, so only that operator can say it is there —
+    /// it is `[games.<id>].bots` in the node's config, next to the image, for
+    /// exactly the reason the image lives there.
+    Yapb,
 }
 
 impl BotProtocol {
@@ -103,6 +112,14 @@ impl BotProtocol {
         Ok(match self {
             Self::Zbot => {
                 vec!["bot_join_after_player 0".to_string(), format!("bot_quota {count}")]
+            }
+            // `yb_autovacate 0` is this bot's version of the same trap: it
+            // defaults to 1, which keeps a slot free for a human by quietly
+            // running one bot fewer than asked. Off, so a request for four is
+            // four. `yb_quota` itself needs no companion — YaPB's bots join an
+            // empty server on their own, which Z-Bot's do not.
+            Self::Yapb => {
+                vec!["yb_autovacate 0".to_string(), format!("yb_quota {count}")]
             }
         })
     }
@@ -199,6 +216,17 @@ mod tests {
         assert_eq!(BotProtocol::Zbot.quota_lines(0).unwrap()[1], "bot_quota 0");
     }
 
+    /// Both implementations answer the same request, in their own words. This
+    /// is the test that fails if a variant is added and the match arm is
+    /// forgotten.
+    #[test]
+    fn every_bot_protocol_has_words_for_a_quota() {
+        for proto in [BotProtocol::Zbot, BotProtocol::Yapb] {
+            let lines = proto.quota_lines(3).unwrap();
+            assert!(lines.iter().any(|l| l.ends_with(" 3")), "{proto:?}: {lines:?}");
+        }
+    }
+
     #[test]
     fn a_count_past_the_ceiling_is_refused() {
         assert!(matches!(
@@ -212,11 +240,13 @@ mod tests {
     /// asserts the property directly rather than trusting the type.
     #[test]
     fn no_bot_line_can_carry_a_second_command() {
+        for proto in [BotProtocol::Zbot, BotProtocol::Yapb] {
         for n in 0..=MAX_BOTS {
-            for line in BotProtocol::Zbot.quota_lines(n).unwrap() {
+            for line in proto.quota_lines(n).unwrap() {
                 assert!(!line.contains('\n'), "{line:?}");
                 assert!(!line.contains(';'), "{line:?}");
             }
+        }
         }
     }
 

@@ -115,6 +115,8 @@ fn test_runtime() -> GameRuntime {
         memory_limit_bytes: Some(64 * 1024 * 1024),
         cpus: Some(0.5),
         env: BTreeMap::new(),
+        bots: None,
+        writable_paths: Vec::new(),
     }
 }
 

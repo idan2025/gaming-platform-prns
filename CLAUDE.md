@@ -309,6 +309,15 @@ form and a button on a running server. Rules a later change could quietly break:
   reports.** A2S counts bots among its players and this build does not separate
   them; presenting a queried number under this name would be a different fact
   wearing the same one.
+- **A pack names only bots the game ships; an installed one is the node's.**
+  `PackBots` has a `zbot` variant and no `yapb`, and a pack carrying
+  `bots = "yapb"` is a parse error
+  (`a_pack_cannot_claim_a_bot_its_node_would_have_to_install`). YaPB is a binary
+  an operator drops into their own content copy, so `[games.<id>].bots` in
+  `agent.toml` declares it and wins over the pack — the same seam as `image`.
+  `scripts/install-yapb.sh` is the install, pinned and digest-checked.
+  `GameRuntime.writable_paths` exists for the same reason: a pack cannot know
+  the node's copy has a bot that caches pathfinding.
 - **`mod` on the steamcmd driver is a validated identifier.** It becomes an
   argument in `app_set_config`, so `content::validate_mod_name` is an allowlist
   and a failing name is refused, never repaired — the same rule as a map name.

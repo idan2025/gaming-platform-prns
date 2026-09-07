@@ -160,6 +160,13 @@ content_version = "app90-czero"
 env = { HLDS_MOD = "czero" }
 ```
 
+Counter-Strike 1.6 itself can have bots too, by installing one:
+`scripts/install-yapb.sh <content-dir>` adds YaPB (pinned, digest-checked) to a
+copy of your content, and the node declares it with `bots = "yapb"` in that
+game's `[games.<id>]` section. That declaration is the operator's because the
+bot is a binary they installed — a pack may only name bots the game ships, and
+the parser refuses `bots = "yapb"` in a pack.
+
 The node's web UI then offers a bot count when you start a server and a **Bots**
 button on a running one. Both are a quota — 0 empties the server, asking twice
 for 4 leaves 4 — and neither disconnects anyone. Games with no bots show no

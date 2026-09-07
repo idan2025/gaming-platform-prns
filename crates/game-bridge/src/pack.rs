@@ -204,8 +204,17 @@ pub enum PackConsole {
 }
 
 /// Which bot implementation a pack's game has, as written in the pack.
+///
+/// **Deliberately narrower than [`BotProtocol`].** A pack may only name bots
+/// that come *with the game*: any node that installed Condition Zero has
+/// Z-Bot, so a pack saying so is describing the game rather than the machine.
+/// A third-party bot like YaPB is a binary somebody installs into their own
+/// content copy, and a pack claiming it would be a stranger's file asserting a
+/// fact about a node it has never seen — the button would be there and do
+/// nothing on every node that had not installed it. Those live in the node's
+/// own `[games.<id>].bots`, beside the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum PackBots {
     /// Valve's Z-Bot. Only honest for a game whose mod is Condition Zero.
     Zbot,
@@ -653,6 +662,18 @@ query = "a2s"
         assert_eq!(cs.content, hl.content);
         assert_eq!(hl.writable_paths, ["valve/logs"]);
         assert_eq!(cs.writable_paths, ["cstrike/logs"]);
+    }
+
+    /// A pack may name bots the game ships and no others. `yapb` is a binary an
+    /// operator installs, so a pack that could claim it would put a bots button
+    /// on every node that had never heard of it.
+    #[test]
+    fn a_pack_cannot_claim_a_bot_its_node_would_have_to_install() {
+        let toml = SVEN_TOML.replace("console = \"goldsrc\"", "console = \"goldsrc\"\nbots = \"yapb\"");
+        assert!(matches!(GamePack::parse(&toml), Err(PackError::Parse(_))));
+        // The one it may name still parses, so this is a fence and not a wall.
+        let ok = SVEN_TOML.replace("console = \"goldsrc\"", "console = \"goldsrc\"\nbots = \"zbot\"");
+        assert_eq!(GamePack::parse(&ok).unwrap().bots, Some(PackBots::Zbot));
     }
 
     /// Bots are asked for over a console, so a pack claiming bots and no

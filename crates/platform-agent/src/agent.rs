@@ -291,7 +291,7 @@ impl Agent {
                 &spec.instance_id,
                 &content,
                 &runtime.content_root,
-                &pack.writable_paths,
+                &self.writable_paths_for(&spec.game_id, pack),
             )
             .map_err(|e| anyhow!("cannot plan instance layout: {e}"))?;
 
@@ -370,8 +370,28 @@ impl Agent {
             .content
             .ensure(&content, &pack.content, Some(&self.docker))
             .await?;
-        self.create_writable_mountpoints(&content, &pack.writable_paths)?;
+        self.create_writable_mountpoints(&content, &self.writable_paths_for(game_id, pack))?;
         Ok(provisioned)
+    }
+
+    /// Every path this node makes writable inside a game's content: the pack's,
+    /// plus whatever the operator added.
+    ///
+    /// The operator's exist because a pack cannot know what a node installed
+    /// into its own copy of a game — YaPB caching its pathfinding under
+    /// `addons/yapb/data` is the case that motivated it. Both lists are
+    /// validated identically further down; this only decides what is on the
+    /// list.
+    fn writable_paths_for(&self, game_id: &str, pack: &GamePack) -> Vec<String> {
+        let mut paths = pack.writable_paths.clone();
+        if let Some(runtime) = self.config.runtime_for(game_id) {
+            for extra in &runtime.writable_paths {
+                if !paths.contains(extra) {
+                    paths.push(extra.clone());
+                }
+            }
+        }
+        paths
     }
 
     /// Make sure every path the pack declares writable exists inside the shared
@@ -547,10 +567,7 @@ impl Agent {
             // the background task carries data and not a pack lookup — and a
             // count this build would refuse fails the create rather than a
             // task nobody is watching.
-            let bots: Option<BotProtocol> = {
-                let packs = self.packs.read().await;
-                packs.get(&spec.game_id).and_then(|p| p.bots).map(Into::into)
-            };
+            let bots = self.bot_protocol(&spec.game_id).await;
             if let Some(bots) = bots {
                 let lines = bots.quota_lines(count).map_err(|e| anyhow!("{e}"))?;
                 let docker = self.docker.clone();
@@ -762,6 +779,21 @@ impl Agent {
         Ok(line)
     }
 
+    /// Which bot implementation this node can drive for a game, if any.
+    ///
+    /// The node's config wins over the pack. A pack may only name bots the game
+    /// ships (`PackBots`), so the two never contradict each other about the
+    /// same thing: the pack says "Condition Zero has Z-Bot", the operator says
+    /// "this copy of Counter-Strike has YaPB in it", and only the second is a
+    /// fact about this machine.
+    async fn bot_protocol(&self, game_id: &str) -> Option<BotProtocol> {
+        if let Some(bots) = self.config.runtime_for(game_id).and_then(|r| r.bots) {
+            return Some(bots);
+        }
+        let packs = self.packs.read().await;
+        packs.get(game_id).and_then(|p| p.bots).map(Into::into)
+    }
+
     /// Set how many bots a running server holds, without restarting it.
     ///
     /// Same shape as [`change_map`](Self::change_map) and refused on the same
@@ -779,6 +811,17 @@ impl Agent {
             .find(|i| i.instance_id == instance_id)
             .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
 
+        let bots = self.bot_protocol(&instance.game_id).await.ok_or_else(|| {
+            anyhow!(
+                "nothing on this node can add bots to {:?}. A pack names only bots the game \
+                 ships — Condition Zero's Z-Bot — and Counter-Strike 1.6 is the case worth \
+                 knowing: its server library carries Z-Bot and runs it only as Condition Zero. \
+                 A bot you installed yourself, like YaPB, is declared by this node instead: \
+                 bots = \"yapb\" in [games.{}]",
+                instance.game_id,
+                instance.game_id
+            )
+        })?;
         let packs = self.packs.read().await;
         let pack = packs.get(&instance.game_id).ok_or_else(|| {
             anyhow!(
@@ -786,24 +829,12 @@ impl Agent {
                 instance.game_id
             )
         })?;
-        // Two separate refusals, because they are two different things for an
-        // operator to fix: a game with no bots at all, and a game with bots
-        // this node cannot reach because the pack named no console.
-        let bots: BotProtocol = pack
-            .bots
-            .ok_or_else(|| {
-                anyhow!(
-                    "the {:?} pack declares no bots, so there is nothing this node can add. \
-                     Counter-Strike 1.6 is the case worth knowing: its server library carries \
-                     Valve's Z-Bot and runs it only as Condition Zero",
-                    instance.game_id
-                )
-            })?
-            .into();
+        // A separate refusal from the one above, because it is a different
+        // thing for an operator to fix: bots exist, and the pack named no
+        // console to ask for them over.
         if pack.console.is_none() {
             return Err(anyhow!(
-                "the {:?} pack declares bots but no console, so this node has no way to ask for \
-                 them",
+                "the {:?} pack declares no console, so this node has no way to ask for bots",
                 instance.game_id
             ));
         }

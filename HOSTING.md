@@ -292,6 +292,50 @@ Two facts behind that, both measured rather than assumed:
 A game whose pack declares no bots has no field and no button, rather than a
 control that explains itself.
 
+### Bots on Counter-Strike 1.6, with YaPB
+
+Counter-Strike 1.6 has no bots of its own, and no amount of configuration
+changes that. What can change it is installing one — YaPB is a third-party bot
+that works there, and `scripts/install-yapb.sh` puts it into a copy of your
+content:
+
+```sh
+# Never into a copy that servers are already running from: content is shared.
+cp -a <data_root>/content/counter-strike-16/app90 \
+      <data_root>/content/counter-strike-16/app90-yapb
+scripts/install-yapb.sh <data_root>/content/counter-strike-16/app90-yapb
+```
+
+It downloads a pinned release, checks its SHA-256 before extracting anything,
+and points `liblist.gam` at YaPB, which loads the real game library itself.
+
+Then tell the node what its copy now has:
+
+```toml
+[games.counter-strike-16]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-yapb"
+env = { HLDS_MOD = "cstrike" }
+bots = "yapb"
+writable_paths = ["cstrike/addons/yapb/data/train", "cstrike/addons/yapb/data/logs"]
+```
+
+**`bots` is in your config and not in the pack, deliberately.** A pack may name
+only bots the game ships — Condition Zero's Z-Bot — because any node with that
+game has them. YaPB is a binary *you* installed on *your* hardware, so only you
+can assert it is there; a pack that could claim it would put a Bots button on
+every node that had never heard of it. Same rule as the image, and
+`crates/game-bridge/src/pack.rs` enforces it: `bots = "yapb"` in a pack is a
+parse error.
+
+`writable_paths` here is the same kind of escape hatch: a pack cannot know that
+this node's copy has a bot that wants to cache its pathfinding. Without those two
+entries YaPB logs `Unable to open Pathmatrix file for writing` on every map and
+recomputes it each time; with them each instance gets its own cache. Remember
+that a writable path mounts an **empty** directory over the content, so name
+only directories that are empty in the install.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an
