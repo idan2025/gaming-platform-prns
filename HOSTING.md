@@ -234,6 +234,16 @@ server and a puzzling log:
   the image links it to the copy in the content mount at start, because the
   content mount is read-only and shared.
 
+A third thing it does, which you can turn off: the server starts with
+`sv_lan 1`. Players arrive over a Reticulum link and connect to `127.0.0.1` on
+their own machine, so a secure server asks Steam to validate a session ticket
+against an address Steam has no server at, and the client is dropped with
+`STEAM validation rejected` before it spawns. LAN mode skips client Steam
+authentication; the log then says `VAC secure mode disabled` rather than
+`activated`. If this node also publishes the port straight to the internet and
+you want VAC and Steam auth for those players, set
+`env = { HLDS_SV_LAN = "0" }` — and expect bridged players to be rejected.
+
 The server's own name is best-effort: every mod's `server.cfg` sets `hostname`
 and runs after the command line, so a Counter-Strike server calls itself
 `Counter-Strike 1.6 Server` in an A2S reply no matter what you named it. The

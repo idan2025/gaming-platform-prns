@@ -136,6 +136,15 @@ that one install contains Counter-Strike, Half-Life, DoD and TFC. Which of them
 a server runs is a start argument, so it is `HLDS_MOD` in your `env` and not a
 pack field. `images/sven-coop` is the same shape for Sven Co-op.
 
+These servers run in **LAN mode** (`sv_lan 1`). A player reaches them over a
+Reticulum link, connecting to `127.0.0.1` on their own machine, and a secure
+server asks Steam to validate that session against an address Steam has no
+server at — the client is dropped with `STEAM validation rejected` before it
+spawns. The cost is no VAC and no master-list entry, on a server nobody was
+finding through the master list. A node publishing a port straight to the
+internet can set `env = { HLDS_SV_LAN = "0" }` and get Steam authentication
+back.
+
 ### Host or relay from a terminal
 
 ```sh

@@ -13,6 +13,20 @@ CONTENT="${GPP_CONTENT_ROOT:-/game}"
 PORT="${GPP_PORT:-27015}"
 MAXPLAYERS="${GPP_MAX_PLAYERS:-16}"
 MOD="${HLDS_MOD:-valve}"
+# LAN mode, which on a bridged server is not a nicety. Every player reaches a
+# server here through a Reticulum link and connects to 127.0.0.1 on their *own*
+# machine, so a secure server asks Steam to validate a session ticket against an
+# address Steam has no server at — and the client is dropped with
+# `STEAM validation rejected` before it ever spawns. `sv_lan 1` skips client
+# Steam authentication, and the log says `VAC secure mode disabled` instead of
+# `activated`.
+#
+# The cost is real and is the operator's to weigh: no VAC, and no Steam master
+# listing, on a server nobody was going to reach through the master list anyway.
+# A node publishing a port straight to the internet can set HLDS_SV_LAN=0 and
+# get authentication back. Nothing in the shipped `server.cfg` sets `sv_lan`, so
+# unlike `hostname` this one survives from the command line.
+SV_LAN="${HLDS_SV_LAN:-1}"
 MAP="${GPP_MAP:-}"
 NAME="${GPP_SERVER_NAME:-Half-Life}"
 
@@ -89,7 +103,7 @@ cd "$CONTENT"
 # for the agent to send (crates/game-bridge/src/console.rs), not something an
 # image can do without a config file it is allowed to write.
 
-echo "Starting GoldSrc: mod=$MOD port=$PORT maxplayers=$MAXPLAYERS map=$MAP name=$NAME"
+echo "Starting GoldSrc: mod=$MOD port=$PORT maxplayers=$MAXPLAYERS map=$MAP sv_lan=$SV_LAN name=$NAME"
 
 # `hlds_linux`, not the `hlds_run` wrapper. The wrapper is a restart loop that
 # runs the DS as a child, so `docker stop`'s SIGTERM reaches the shell and not
@@ -104,6 +118,7 @@ export LD_LIBRARY_PATH
 exec ./hlds_linux \
     -game "$MOD" \
     -port "$PORT" \
+    +sv_lan "$SV_LAN" \
     +maxplayers "$MAXPLAYERS" \
     +map "$MAP" \
     +hostname "$NAME"

@@ -253,6 +253,12 @@ quietly break:
   `counter-strike-16` and `team-fortress-2` all shipped with it. Pinned by
   `no_shipped_pack_declares_its_own_maps_dir_writable`, which finds its subjects
   by property rather than by id.
+- **A bridged GoldSrc server has to run `sv_lan 1`.** The player's game
+  connects to `127.0.0.1`, so a secure server asks Steam to validate a session
+  against an address Steam has no server at and answers
+  `STEAM validation rejected`. Nothing in a shipped `server.cfg` sets `sv_lan`,
+  so unlike `hostname` the command line wins. `HLDS_SV_LAN=0` is there for a
+  node that also publishes the port directly, and costs bridged players.
 - **The in-game server name is best-effort and the announce is not.** Every
   mod's `server.cfg` sets `hostname` and runs after the command line, so
   `+hostname` loses; `-servercfgfile logs/…` loads nothing at all and `+exec`
