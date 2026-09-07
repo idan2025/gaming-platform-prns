@@ -12,11 +12,10 @@ data_root = "/var/lib/gaming-platform-prns"
 # Refuse to run more than this many instances on this node.
 max_instances = 8
 
-# Where the local API listens. Loopback only, and the agent refuses to start
-# otherwise: every route creates or destroys containers and there is no
-# authentication of any kind, so the boundary is "you are already on this host".
-# Identity challenge/response arrives with phase 4; until then, put an
-# authenticating proxy in front if you need remote access.
+# Where the local API listens. Loopback unless `api_token_file` is set below,
+# and the agent refuses to start bound anywhere else without one: every route
+# creates or destroys containers, so unauthenticated the only honest boundary is
+# "you are already on this machine".
 api_bind = "127.0.0.1:4750"
 
 # Stop an instance with no players for this long. Leave unset on a node whose
@@ -58,7 +57,12 @@ start = 27100
 end = 27199
 
 [games.sven-coop]
-image = "ghcr.io/idan2025/svencoop-prns:0.1.10"
+# Built from this repo: `docker build -t gpp/sven-coop:1 images/sven-coop`.
+# Deliberately not ghcr.io/idan2025/svencoop-prns — that image is the whole
+# standalone product, with its own controller and its own web GUI, and started
+# by this agent it comes up and waits for somebody to press start in *its*
+# interface. See the note at the top of images/sven-coop/Dockerfile.
+image = "gpp/sven-coop:1"
 # Where the install lives inside that image.
 content_root = "/game"
 # Directory under <data_root>/content/sven-coop/ holding the game files. The
@@ -67,3 +71,26 @@ content_root = "/game"
 content_version = "5.26"
 memory_limit_bytes = 2147483648
 cpus = 1.5
+
+# Counter-Strike 1.6 and Half-Life are the same steamcmd app (90) and the same
+# image; the mod directory is a start argument, so it is env here rather than a
+# pack field. `docker build -t gpp/goldsrc:1 images/goldsrc`.
+#
+# [games.counter-strike-16]
+# image = "gpp/goldsrc:1"
+# content_root = "/game"
+# content_version = "app90"
+# env = { HLDS_MOD = "cstrike" }
+#
+# [games.half-life]
+# image = "gpp/goldsrc:1"
+# content_root = "/game"
+# content_version = "app90"
+# env = { HLDS_MOD = "valve" }
+
+# Let packs fetch the content they declare. Off unless you say so: a pack is a
+# file somebody wrote, and this is what turns it into a download.
+# allow_content_fetch = true
+
+# Which steamcmd runs is the operator's choice, exactly like a game's image.
+# steamcmd_image = "steamcmd/steamcmd:latest"

@@ -17,12 +17,160 @@ account, no port forwarding, no central service, and no internet required.
 > | 2 | Browse | done — list and filter from announces alone, no index and no internet; a detail probe over a Link; a Tauri launcher |
 > | 3 | One node, many servers | done — `platform-agent` runs many servers off one shared copy of the content, loopback-only local API, no central service; a server starts on a chosen map and its map can be changed live without dropping players |
 > | 4 | Index + hosting | done — identity challenge/response bound to the verifying index, an index served over both HTTP and Reticulum with quotas, hosted deploy, and multi-node over an agent uplink that needs no inbound port |
-> | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance |
+> | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance; a GoldSrc node image, so Counter-Strike 1.6 and Half-Life actually host |
 >
-> Building and tagging a release: [`RELEASE.md`](RELEASE.md).
+> Current release: **v0.2.12**. What changed, release by release, is in
+> [`RELEASE.md`](RELEASE.md); building and tagging one is in there too.
 >
 > The working single-host implementation this generalizes is
 > [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns).
+
+## Install and use
+
+Every artifact is on the [releases page](https://github.com/idan2025/gaming-platform-prns/releases).
+The launcher is the only one a player needs; the rest are for hosting.
+
+| You want to | Take |
+| --- | --- |
+| Browse and join servers | `Mesh Game Servers` — `.deb`, `.rpm`, `.AppImage` (x86-64, arm64), `.dmg` (universal), `.exe` (Windows) |
+| Run a node with a web UI | the Docker image, `ghcr.io/idan2025/gaming-platform-prns` |
+| Host or relay without a desktop | the CLI tarball for your target: `game-bridge`, `platform-agent`, `platform-index` |
+
+### Browse and join
+
+Install the launcher and start it. It needs one thing to hear anything: a
+Reticulum interface. Either tick **Wi-Fi / LAN auto-discovery** to find
+neighbours on the same physical network, or give it a **TCP peer** — an address
+someone already on the mesh gave you. With neither, the list stays empty and
+says so.
+
+Then: pick a row, read the detail pane, press **Join server**. That binds a
+local port and tunnels it to the server over a Reticulum Link. **Play** then
+starts your own copy of the game pointed at that port — the first time, the
+button reads **Locate game** instead, because the launcher never guesses an
+executable. It never downloads a game either: a pack cannot name a program, so
+what runs is always what you installed (`PLAN.md` §13.1). Any game can also be
+pointed at `127.0.0.1:<port>` by hand.
+
+Two things worth knowing:
+
+- **Legacy servers show as "Unknown"** for game, map and players. A deployed
+  `svencoop-prns` v0.1.10 announce carries a name and nothing else, so the
+  launcher refuses to guess; tell it which game the server runs and the join
+  works.
+- **Every shipped pack rides in the bundle** since v0.2.11, so the game filter
+  lists Sven Co-op, Half-Life, Counter-Strike 1.6 and Team Fortress 2 out of the
+  box. Before that, an installed launcher fell back to the one pack built into
+  the binary.
+
+### Run a node
+
+The node runs game servers as **sibling containers** on your own Docker daemon,
+so one copy of a game's files serves every instance of it, and manages them from
+a browser. [`HOSTING.md`](HOSTING.md) is the full account, including the two
+rules that will bite you (`data_root` must be the same path on both sides of the
+bind; the Docker socket is root-equivalent).
+
+The short version, as actually deployed:
+
+```sh
+mkdir -p ~/gpp/packs && cd ~/gpp
+cp /path/to/checkout/crates/platform-agent/agent.example.toml ./agent.toml
+cp /path/to/checkout/packs/*.toml ./packs/
+```
+
+In `agent.toml`: `data_root = "/home/you/gpp/data"` (an absolute path under the
+directory bound below), `api_bind = "0.0.0.0:4750"` — inside a container,
+loopback *is* the container — and an `api_token_file` under that same data root.
+Add `allow_content_fetch = true` and a `steamcmd_image` if you want the node to
+download games it has packs for.
+
+```sh
+docker run -d --name gpp --restart unless-stopped \
+  --user "$(id -u):$(id -g)" --group-add "$(getent group docker | cut -d: -f3)" \
+  -p 4750:4750 -p 4789:4789 \
+  -v "$HOME/gpp:$HOME/gpp" -v /var/run/docker.sock:/var/run/docker.sock \
+  ghcr.io/idan2025/gaming-platform-prns:v0.2.12 \
+  platform-agent "$HOME/gpp/agent.toml" "$HOME/gpp/packs"
+```
+
+Three things in that command are load-bearing:
+
+- **The bind is the same path on both sides.** The agent asks *your* daemon to
+  mount each instance's directory, and the daemon resolves those paths on the
+  host — it cannot see inside the agent's container. A named volume, or a
+  different path either side of the colon, produces a game server that starts
+  with no game files rather than an error.
+- **`--user`.** The image's own user is `mesh` (uid 10001), while `data_root`
+  and its 0600 API token belong to you. Without it the agent dies on
+  `reading the API token: Permission denied`.
+- **`--group-add`.** `/var/run/docker.sock` is `root:docker 660`, so a
+  container process outside that group cannot reach the daemon at all:
+  `client error (Connect): Permission denied`.
+
+Then read the token the agent generated (`api_token_file`, mode 0600) and paste
+it into `http://localhost:4750`. `-p 4789:4789` is only needed if your config
+has a `[mesh] tcp` listener for other nodes to dial.
+
+### Host Counter-Strike 1.6 or Half-Life
+
+A pack describes a game and can never name a container image — an image selects
+the code your node executes, so that choice stays in your config
+(`crates/platform-agent/src/config.rs`). This repo ships the image to point at:
+
+```sh
+docker build -t gpp/goldsrc:1 images/goldsrc
+```
+
+```toml
+[games.counter-strike-16]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90"
+env = { HLDS_MOD = "cstrike" }
+```
+
+With `allow_content_fetch = true` and a `steamcmd_image` set, the node fetches
+Steam app 90 itself — the Half-Life Dedicated Server, ~930 MB, anonymous — and
+that one install contains Counter-Strike, Half-Life, DoD and TFC. Which of them
+a server runs is a start argument, so it is `HLDS_MOD` in your `env` and not a
+pack field. `images/sven-coop` is the same shape for Sven Co-op.
+
+### Host or relay from a terminal
+
+```sh
+game-bridge server sven-coop --auto --name "My Server"   # bridge a server you already run
+game-bridge client sven-coop --tcp relay.example:4242    # bind a local port and join
+game-bridge relay --tcp 0.0.0.0:4242                     # carry other people's traffic only
+game-bridge browse --auto                                # list what the mesh is announcing
+```
+
+`game-bridge --help` has the rest, including `sign` and `verify` for pack
+signatures (`PLAN.md` §11.3).
+
+### Which version am I running
+
+Both UIs show it in a corner — the node's web UI after the token is accepted,
+the launcher as soon as it starts (v0.2.12). Every binary also answers
+`--version`, and the node's `GET /health` carries a `version` field.
+
+## What changed recently
+
+Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
+the last three.
+
+- **v0.2.12** — both UIs show which build they are, in a corner chip. The
+  node's `/health` gained a `version` field; the launcher asks its core, not its
+  Tauri shell, because the shell's version is one of the two a release bumps by
+  hand.
+- **v0.2.11** — Counter-Strike 1.6 hosts for the first time: `images/goldsrc`
+  is the image a node points at, and one steamcmd app 90 install serves several
+  GoldSrc games through `HLDS_MOD`. Two pack bugs went with it — every GoldSrc
+  and Source pack declared its own map directory writable, which mounted an
+  empty directory over every shipped map, and the installed launcher shipped no
+  packs at all, so its game filter had one entry and "Any game" matched nothing.
+- **v0.2.10** — a join that cannot reach the server says so instead of
+  reporting success; Backbone interfaces; a launcher that can query an index.
 
 ## The idea
 

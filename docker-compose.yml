@@ -60,6 +60,24 @@ services:
     command: ["platform-agent", "/config/agent.toml", "/packs"]
     restart: unless-stopped
 
+    # ===================================================================
+    # Both of these are required on an ordinary host, and neither is a
+    # default this file can guess for you.
+    # ===================================================================
+    # The image's own user is `mesh`, uid 10001. Your data_root, and the 0600
+    # API token the agent writes into it, belong to *you*, so the agent has to
+    # run as you or it starts and dies on
+    #   Error: reading the API token / Permission denied (os error 13)
+    # Replace with your own `id -u`:`id -g`.
+    user: "1000:1000"
+
+    # /var/run/docker.sock is root:docker 0660. A process outside that group
+    # cannot reach the daemon at all, and the failure is
+    #   client error (Connect) / Permission denied (os error 13)
+    # Replace with your own `getent group docker | cut -d: -f3`.
+    group_add:
+      - "994"
+
     ports:
       # Loopback on purpose. See the socket note above before widening this.
       - "127.0.0.1:4750:4750"

@@ -23,6 +23,21 @@ api_bind = "0.0.0.0:4750"                     # loopback inside a container is t
 api_token_file = "/var/lib/gaming-platform-prns/api.token"
 ```
 
+The container has to run as you, and in the `docker` group. Put your own ids in
+`docker-compose.yml` (`user:` and `group_add:`), and make the data root yours:
+
+```sh
+id -u; id -g                              # -> user: "<uid>:<gid>"
+getent group docker | cut -d: -f3         # -> group_add: ["<gid>"]
+sudo chown "$(id -u):$(id -g)" /var/lib/gaming-platform-prns
+```
+
+Neither is optional and neither fails gently. The image's own user is `mesh`
+(uid 10001) while `data_root` and its 0600 API token are yours, so without
+`user:` the agent dies on `reading the API token: Permission denied`; and
+`/var/run/docker.sock` is `root:docker 0660`, so without `group_add:` it cannot
+reach the daemon at all — `client error (Connect): Permission denied`.
+
 Then:
 
 ```sh
@@ -30,6 +45,10 @@ docker compose up -d
 sudo cat /var/lib/gaming-platform-prns/api.token   # paste this into the UI
 xdg-open http://localhost:4750
 ```
+
+A node run with plain `docker run` needs the same two flags — `--user` and
+`--group-add` — plus a bind whose path is identical on both sides. `README.md`
+has that form of the command.
 
 ## What the UI does
 
