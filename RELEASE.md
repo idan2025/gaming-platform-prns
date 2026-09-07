@@ -74,6 +74,85 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.11
+
+A third game that actually runs on a node, and a launcher that can see it.
+
+### Counter-Strike 1.6 hosts
+
+The pack has shipped since 0.2.9 and no node could start it, because a pack
+cannot name a container image and no GoldSrc image existed. `images/goldsrc` is
+that image, in the same shape as `images/sven-coop`: it carries no game files
+and runs whatever the node mounted at `content_root`.
+
+```
+docker build -t gpp/goldsrc:1 images/goldsrc
+```
+
+```toml
+[games.counter-strike-16]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90"
+env = { HLDS_MOD = "cstrike" }
+```
+
+One steamcmd app 90 install — about 930 MB, fetched anonymously — is the
+Half-Life Dedicated Server, and it contains Counter-Strike, Half-Life, DoD and
+TFC. Which one a server runs is a start argument, so `HLDS_MOD` is the
+operator's `env` and not a pack field: one download, several games. It is
+deliberately not named `GPP_MOD`, because the agent drops operator env with that
+prefix so config can never overwrite what an instance spec set.
+
+Two things the image does that a hand-written one usually misses, both measured
+against HLDS build 10211 on a real daemon:
+
+- **`SteamAppId=90`.** Without it the server initialises, loads the map, prints
+  a log that reads exactly like a healthy server, and then dies on the last line
+  with `FATAL ERROR (shutting down): Unable to initialize Steam`. The mod's own
+  `steam_appid.txt` is the *client* app id (10 for Counter-Strike) and is not a
+  substitute — it is what the failing case reads.
+- **`~/.steam/sdk32/steamclient.so`.** HLDS dlopens it from its home directory,
+  and the copy it needs is in a content mount that is read-only and shared, so
+  the image links it at start.
+
+The name a player browses by is the announce, which the agent sets from the
+instance spec. The server's *own* `hostname` stays whatever the mod's
+`server.cfg` says, because that file runs after the command line and lives in
+the read-only content copy.
+
+### Every pack hid its own maps
+
+A `writable_path` becomes an empty per-instance directory bind-mounted **over**
+the shared content, and `half-life`, `counter-strike-16` and `team-fortress-2`
+all declared their own map directory writable. So `cstrike/maps` hid all 53
+maps the install ships and the server had no `de_dust2` to start — the same bug
+`svencoop/maps` was before 0.1.x. Fixed in all three packs;
+`no_shipped_pack_declares_its_own_maps_dir_writable` finds its subjects by
+property rather than by id, so a pack added later is checked without anyone
+remembering to.
+
+**If you host these games, take the new packs.** The old ones are why a
+GoldSrc server could not start.
+
+### The installed launcher shipped no packs
+
+`pack_dir` looks for `packs/` beside the executable and otherwise falls back to
+a path that only exists in a source checkout — and nothing put `packs/` in the
+bundle. An installed launcher therefore fell back to the single built-in Sven
+Co-op pack: one entry in the game filter, and no way to name any other game a
+legacy server might be running. The bundle now carries every shipped pack.
+
+### "Any game" showed no games
+
+The filter's first option was built with no `value` attribute, and an `<option>`
+without one reports its own text as its value. Clearing the filter asked for
+servers running a game called `Any game`, which matched nothing, so the list
+went empty instead of showing everything. `launcher/uicheck/render.mjs` now
+pins the whole dropdown: every loaded pack is offered, the first option's value
+is empty, and picking a game and then clearing it sends the id and then sends
+none.
+
 ## v0.2.10
 
 Three things: a join that stops lying, a transport that carries a game, and the
