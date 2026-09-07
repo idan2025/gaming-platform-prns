@@ -74,6 +74,41 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.13
+
+One fix, and it is the difference between a Counter-Strike server nobody can
+join and one people are playing on.
+
+### `STEAM validation rejected`, and why it was not the transport
+
+A GoldSrc server registers with Steam as whatever `SteamAppId` names, and
+v0.2.11 named 90 — the Half-Life *Dedicated Server* app. That server boots,
+logs `Connection to Steam servers successful`, activates VAC, and then turns
+away every player with `STEAM validation rejected` on their screen and nothing
+whatsoever in its own log. A client's session ticket is for Counter-Strike (10)
+or Half-Life (70); the server is not that app, so there is nothing to validate
+against.
+
+`images/goldsrc` now derives the id from `HLDS_MOD` — cstrike 10, valve 70,
+tfc 20, dod 30, and 90 only for a mod Steam has no app for. Rebuild the image
+and recreate the instance; no config change is needed.
+
+The wrong lesson was available and briefly taken: `sv_lan 1` also lets clients
+in, by switching Steam authentication and VAC off. That would have been a
+platform-wide downgrade in response to a one-line configuration error, so it is
+back to being the escape hatch — `env = { HLDS_SV_LAN = "1" }` — for a mod
+Steam does not know, or players whose Steam cannot reach Valve.
+
+What settled it was the reference implementation. A deployed Sven Co-op server
+on this same Reticulum transport logs `STEAM USERID validated` for a player
+arriving from a private address, which means a bridged client is perfectly
+validatable and the fault had to be ours. `PLAN.md` §5 keeps extraction
+one-directional, and this is a case of it paying rent in the other currency:
+`svencoop-prns` had no code to copy, but it had the evidence.
+
+Docs corrected with it, including the v0.2.11 note that told operators to set
+90.
+
 ## v0.2.12
 
 The build number is on screen now, in both UIs.
