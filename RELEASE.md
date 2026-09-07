@@ -74,6 +74,32 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.12
+
+The build number is on screen now, in both UIs.
+
+### Which version am I running?
+
+A quiet chip in the bottom-right corner of the node's web UI and of the
+launcher names the build. It exists because two questions had no answer short
+of a shell: *did my redeploy actually land*, and *which version is the person
+reporting this bug on*.
+
+The node's `/health` carries a `version` field and the web UI renders it once
+the token is accepted. Deliberately not before: every API route here is
+token-gated, and a version string served to anyone who can reach the port would
+be the only thing that is not.
+
+The launcher asks its core rather than its Tauri shell. Both hold the same
+number, but the shell's `Cargo.toml` is one of the two places a release has to
+bump **by hand** (see *Version* above), so reporting the shell's would show the
+wrong build in exactly the case where somebody forgot to bump it.
+
+Neither chip lies to an older backend: a node with no `version` field reads
+"version unknown", and a launcher shell without the `app_version` command
+leaves the chip empty rather than rendering "vundefined" or raising an error
+banner.
+
 ## v0.2.11
 
 A third game that actually runs on a node, and a launcher that can see it.
