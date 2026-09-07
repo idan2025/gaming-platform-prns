@@ -133,11 +133,17 @@ prefix so config can never overwrite what an instance spec set.
 Two things the image does that a hand-written one usually misses, both measured
 against HLDS build 10211 on a real daemon:
 
-- **`SteamAppId=90`.** Without it the server initialises, loads the map, prints
-  a log that reads exactly like a healthy server, and then dies on the last line
-  with `FATAL ERROR (shutting down): Unable to initialize Steam`. The mod's own
-  `steam_appid.txt` is the *client* app id (10 for Counter-Strike) and is not a
-  substitute — it is what the failing case reads.
+- **`SteamAppId` in the environment.** Without it the server initialises, loads
+  the map, prints a log that reads exactly like a healthy server, and then dies
+  on the last line with `FATAL ERROR (shutting down): Unable to initialize
+  Steam`. The mod's own `steam_appid.txt` is not a substitute — it is what the
+  failing case reads.
+
+  **Corrected after this release shipped:** 0.2.11 set it to 90, the Half-Life
+  Dedicated Server app. That boots, connects to Steam and activates VAC, and
+  then rejects every player with `STEAM validation rejected`, because a client's
+  session ticket is for Counter-Strike (10) or Half-Life (70) and the server is
+  not that app. The image now derives the id from `HLDS_MOD`.
 - **`~/.steam/sdk32/steamclient.so`.** HLDS dlopens it from its home directory,
   and the copy it needs is in a content mount that is read-only and shared, so
   the image links it at start.

@@ -236,12 +236,16 @@ a bare HLDS image in the same shape as `images/sven-coop`, and one steamcmd app
 directory is a start argument, so it is `[games.<id>].env`'s `HLDS_MOD` and not
 a pack field. `HOSTING.md` has the operator's copy. Rules a later change could
 quietly break:
-- **`SteamAppId=90` is why it starts.** Without it the engine loads the map,
-  reaches the Steam *client* interfaces, and dies with
+- **`SteamAppId` must be set, and must be the app the *player* owns.** Unset,
+  the engine reaches the Steam client interfaces and dies with
   `FATAL ERROR (shutting down): Unable to initialize Steam` on the line after a
-  log that reads like a healthy server. The mod's shipped `steam_appid.txt`
-  (10 for Counter-Strike, the *client* app id) is not a substitute — it is what
-  the failing case reads. Measured against build 10211 on this node's daemon.
+  log that reads like a healthy server; the mod's shipped `steam_appid.txt` is
+  not a substitute. Set to 90 — the Half-Life *Dedicated Server* app — the
+  server boots, connects to Steam, activates VAC, and then rejects every
+  connection with `STEAM validation rejected`, because a client's session
+  ticket is for Counter-Strike (10) or Half-Life (70) and the server is not
+  that app. The entrypoint derives it from `HLDS_MOD`. Both values boot
+  cleanly, which is what makes 90 a trap worth naming here.
 - **The knob is `HLDS_MOD`, deliberately not `GPP_MOD`.** `docker.rs:368` drops
   every operator env named `GPP_*` so config cannot overwrite a value the
   instance spec set; a mod name is the operator's, so it must not take that
@@ -253,12 +257,15 @@ quietly break:
   `counter-strike-16` and `team-fortress-2` all shipped with it. Pinned by
   `no_shipped_pack_declares_its_own_maps_dir_writable`, which finds its subjects
   by property rather than by id.
-- **A bridged GoldSrc server has to run `sv_lan 1`.** The player's game
-  connects to `127.0.0.1`, so a secure server asks Steam to validate a session
-  against an address Steam has no server at and answers
-  `STEAM validation rejected`. Nothing in a shipped `server.cfg` sets `sv_lan`,
-  so unlike `hostname` the command line wins. `HLDS_SV_LAN=0` is there for a
-  node that also publishes the port directly, and costs bridged players.
+- **A bridged server stays *secure*; `sv_lan 1` is the escape hatch, not the
+  fix.** A player reaching a server over a Reticulum link connects to
+  `127.0.0.1` and validates fine — a deployed Sven Co-op server on this same
+  transport logs `STEAM USERID validated` for a player arriving from a private
+  address, and a Counter-Strike client joined this node's server once the app
+  id was right. Reaching for `sv_lan 1` when the real fault was the app id
+  would have shipped a platform that quietly turns VAC off for every GoldSrc
+  game. Nothing in a shipped `server.cfg` sets `sv_lan`, so unlike `hostname`
+  the command line wins.
 - **The in-game server name is best-effort and the announce is not.** Every
   mod's `server.cfg` sets `hostname` and runs after the command line, so
   `+hostname` loses; `-servercfgfile logs/…` loads nothing at all and `+exec`

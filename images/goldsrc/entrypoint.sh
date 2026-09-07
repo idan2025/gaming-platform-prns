@@ -13,20 +13,20 @@ CONTENT="${GPP_CONTENT_ROOT:-/game}"
 PORT="${GPP_PORT:-27015}"
 MAXPLAYERS="${GPP_MAX_PLAYERS:-16}"
 MOD="${HLDS_MOD:-valve}"
-# LAN mode, which on a bridged server is not a nicety. Every player reaches a
-# server here through a Reticulum link and connects to 127.0.0.1 on their *own*
-# machine, so a secure server asks Steam to validate a session ticket against an
-# address Steam has no server at — and the client is dropped with
-# `STEAM validation rejected` before it ever spawns. `sv_lan 1` skips client
-# Steam authentication, and the log says `VAC secure mode disabled` instead of
-# `activated`.
+# Steam authentication stays **on** by default, because a bridged client is not
+# inherently unvalidatable: a deployed Sven Co-op server on this same transport
+# logs `STEAM USERID validated` for a player arriving from a private address.
+# What rejects a player is a server claiming the wrong app id, which is the
+# block above.
 #
-# The cost is real and is the operator's to weigh: no VAC, and no Steam master
-# listing, on a server nobody was going to reach through the master list anyway.
-# A node publishing a port straight to the internet can set HLDS_SV_LAN=0 and
-# get authentication back. Nothing in the shipped `server.cfg` sets `sv_lan`, so
-# unlike `hostname` this one survives from the command line.
-SV_LAN="${HLDS_SV_LAN:-1}"
+# `HLDS_SV_LAN=1` turns client Steam authentication off — the log then says
+# `VAC secure mode disabled` — and is the escape hatch for a mod with no Steam
+# app of its own, or for players whose Steam cannot reach Valve. It also costs
+# VAC and the master listing, so it is not the default.
+#
+# Nothing in a shipped `server.cfg` sets `sv_lan`, so unlike `hostname` this one
+# survives from the command line.
+SV_LAN="${HLDS_SV_LAN:-0}"
 MAP="${GPP_MAP:-}"
 NAME="${GPP_SERVER_NAME:-Half-Life}"
 
@@ -56,19 +56,37 @@ if [ -z "$MAP" ]; then
     esac
 fi
 
-# **`SteamAppId` is what makes this work at all.** Without it the engine reaches
-# the Steam client interfaces, asks for the connected universe, gets nothing,
-# and dies with `FATAL ERROR (shutting down): Unable to initialize Steam` —
-# after the map has loaded, so the log reads like a working server right up to
-# the last line. With it the server logs `Connection to Steam servers
-# successful` and VAC comes up. Verified against build 10211 (Oct 2024) on this
-# node's daemon.
+# **`SteamAppId` in the environment is what makes this work at all**, and the
+# value decides who the server is to Steam.
 #
-# 90 is the Half-Life *Dedicated Server* app, the one steamcmd installed. It is
-# not the mod's client app id (10 for Counter-Strike, 70 for Half-Life), and
-# `cstrike/steam_appid.txt` — which ships as 10 — is not a substitute: a run
-# with that value and no `SteamAppId` is exactly the failing case above.
-SteamAppId="${HLDS_APP_ID:-90}"
+# Unset, the engine reaches the Steam *client* interfaces, asks for the
+# connected universe, gets nothing, and dies with `FATAL ERROR (shutting down):
+# Unable to initialize Steam` — after the map has loaded, so the log reads like
+# a working server right up to the last line. The mod's shipped
+# `steam_appid.txt` is not a substitute: the failing case is exactly a run that
+# has one and no environment variable.
+#
+# Set, the server registers as that app. It must be **the app a player owns**,
+# not app 90: a client presents a session ticket for Counter-Strike (10) or
+# Half-Life (70), and a server authenticating as the Half-Life Dedicated Server
+# is not the app that ticket is for, so every connection ends in
+# `STEAM validation rejected` on the client and nothing at all in the server
+# log. 90 boots perfectly well, which is what makes it such a good trap.
+#
+# Both were verified against build 10211 on this node's daemon: 90 and 10 each
+# reach `Connection to Steam servers successful` and `VAC secure mode is
+# activated`.
+case "$MOD" in
+    cstrike) MOD_APP_ID=10 ;;
+    valve)   MOD_APP_ID=70 ;;
+    tfc)     MOD_APP_ID=20 ;;
+    dod)     MOD_APP_ID=30 ;;
+    # An unknown mod is somebody's own: it has no Steam app of its own to
+    # authenticate as, so fall back to the dedicated server's. Such a server
+    # can still be joined with HLDS_SV_LAN=1.
+    *)       MOD_APP_ID=90 ;;
+esac
+SteamAppId="${HLDS_APP_ID:-$MOD_APP_ID}"
 export SteamAppId
 
 # HLDS refuses to run without a Steam client library it can dlopen from its own
