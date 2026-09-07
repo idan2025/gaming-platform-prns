@@ -74,6 +74,64 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.14
+
+Bots, and a fifth game to have them.
+
+### Counter-Strike 1.6 has no bots; Condition Zero does
+
+Valve's Z-Bot is compiled into the Counter-Strike server library — the bot
+manager, the profiles, `bot_add`, `bot_quota` — and gated on an internal
+Condition Zero flag. On a `cstrike` server the command adds nothing and says
+nothing, which is the worst shape a missing feature can take. Sven Co-op has no
+bots to add either: it exposes an AngelScript `CreateBot` for plugins and
+nothing reachable from a console.
+
+So `packs/condition-zero.toml` joins the shipped packs. It is the same steamcmd
+app 90 as Half-Life and Counter-Strike, plus the parameter that selects its
+depots:
+
+```toml
+[content]
+driver = "steamcmd"
+app_id = 90
+mod = "czero"
+```
+
+`mod` is new on the steamcmd driver and validated as an identifier, because it
+becomes an argument in a command the node runs — refused rather than repaired,
+the same rule as a map name.
+
+```toml
+[games.condition-zero]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-czero"
+env = { HLDS_MOD = "czero" }
+```
+
+### Asking for bots
+
+The start form takes a bot count, and a running server gets a **Bots** button
+beside Change map — both only for a game whose pack declares them. What travels
+is a **quota**: 4 means "hold four", asking twice changes nothing, 0 empties the
+server, and nobody is disconnected. `POST /instances/:id/bots` is the API.
+
+Two behaviours worth knowing, because both were measured on a real server after
+looking wrong first:
+
+- **`+bot_quota` on the command line does nothing.** The bot manager is not
+  there when the command line is parsed, so a server started that way comes up
+  empty. The node sends the quota over the console a few seconds after the map
+  loads instead, which is the same path the button uses.
+- **`bot_join_after_player` defaults to 1**, holding every bot out of the game
+  until a human joins. A quota on its own produces a server that reports bots
+  and looks deserted, so the two lines always go together.
+
+`InstanceStatus.bots` reports what the node asked for, never a queried number:
+A2S counts bots among its players, and presenting that under the same name would
+be a different fact.
+
 ## v0.2.13
 
 One fix, and it is the difference between a Counter-Strike server nobody can
