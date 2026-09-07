@@ -277,6 +277,7 @@ mod tests {
             port: None,
             extra_ports: Default::default(),
             map: None,
+            bots: None,
             owner: None,
         }
     }
@@ -296,6 +297,7 @@ mod tests {
             owner: None,
             players_now: None,
             map_now: None,
+            bots: None,
         }
     }
 

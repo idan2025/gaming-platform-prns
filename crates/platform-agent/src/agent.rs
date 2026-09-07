@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
-use game_bridge::console::ConsoleProtocol;
+use game_bridge::console::{BotProtocol, ConsoleProtocol};
 use game_bridge::profile::GameProfile;
 use game_bridge::GamePack;
 use tokio::sync::{Mutex, RwLock};
@@ -36,6 +36,13 @@ use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus}
 use crate::ports::PortAllocator;
 use crate::store::{ContentRef, InstancePlan, StoreLayout};
 use crate::uplink_wire::CapacityResp;
+
+/// How long to wait between attempts to give a freshly created server its
+/// bots, and how many times to try. A GoldSrc map load is a second or two on a
+/// warm cache and longer on a cold one; the console accepts the lines any time
+/// after that, so this is a short poll rather than a deadline.
+const BOT_APPLY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+const BOT_APPLY_ATTEMPTS: u32 = 10;
 
 pub struct Agent {
     config: AgentConfig,
@@ -521,6 +528,58 @@ impl Agent {
             .await
             .insert(spec.instance_id.clone(), spec.clone());
 
+        // Bots the spec asked for, applied over the console rather than the
+        // command line.
+        //
+        // **Not a shortcut — the command line does not work.** A GoldSrc server
+        // started with `+bot_quota 4 +bot_join_after_player 0` comes up with no
+        // bots: the bot manager is not there to take those cvars when the
+        // command line is parsed. So the number has to be sent once the map is
+        // loaded, which is seconds after this function returns.
+        //
+        // In the background, and never fatal: the server is running and
+        // joinable either way, and a create that failed because bots were slow
+        // would be a worse outcome than a server that starts empty. The retries
+        // exist because "the map is loaded" is the condition, and nothing here
+        // can observe it directly.
+        if let Some(count) = spec.bots {
+            // The lines are built here, where the pack is already in hand, so
+            // the background task carries data and not a pack lookup — and a
+            // count this build would refuse fails the create rather than a
+            // task nobody is watching.
+            let bots: Option<BotProtocol> = {
+                let packs = self.packs.read().await;
+                packs.get(&spec.game_id).and_then(|p| p.bots).map(Into::into)
+            };
+            if let Some(bots) = bots {
+                let lines = bots.quota_lines(count).map_err(|e| anyhow!("{e}"))?;
+                let docker = self.docker.clone();
+                let instance_id = spec.instance_id.clone();
+                tokio::spawn(async move {
+                    for attempt in 1..=BOT_APPLY_ATTEMPTS {
+                        tokio::time::sleep(BOT_APPLY_INTERVAL).await;
+                        let mut sent = true;
+                        for line in &lines {
+                            if let Err(e) = docker.send_console_line(&instance_id, line).await {
+                                sent = false;
+                                if attempt == BOT_APPLY_ATTEMPTS {
+                                    tracing::warn!(
+                                        instance = %instance_id,
+                                        error = %format!("{e:#}"),
+                                        "this server is running but never took its bots"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                        if sent {
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+
         // Put it on the mesh. A bridge that will not start leaves a server that
         // is reachable on the LAN and not the mesh, which is degraded; failing
         // the create here would leave one that is not reachable at all, which
@@ -579,6 +638,7 @@ impl Agent {
             owner: spec.owner,
             players_now: None,
             map_now: None,
+            bots: spec.bots,
         })
     }
 
@@ -700,6 +760,66 @@ impl Agent {
 
         self.docker.send_console_line(instance_id, &line).await?;
         Ok(line)
+    }
+
+    /// Set how many bots a running server holds, without restarting it.
+    ///
+    /// Same shape as [`change_map`](Self::change_map) and refused on the same
+    /// two grounds: a pack that declares no bot implementation, and a container
+    /// with no console to talk to. What a node sends is a **quota**, so calling
+    /// this twice with 4 leaves four bots and calling it with 0 empties the
+    /// server — a caller never has to know what is already there.
+    ///
+    /// The count is a number the console module formats. A pack contributes the
+    /// protocol and nothing else, exactly as it does for a map change.
+    pub async fn set_bots(&self, instance_id: &str, count: u8) -> Result<Vec<String>> {
+        let instances = self.list().await?;
+        let instance = instances
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
+
+        let packs = self.packs.read().await;
+        let pack = packs.get(&instance.game_id).ok_or_else(|| {
+            anyhow!(
+                "no game pack installed for {:?}, so this node cannot tell its server anything",
+                instance.game_id
+            )
+        })?;
+        // Two separate refusals, because they are two different things for an
+        // operator to fix: a game with no bots at all, and a game with bots
+        // this node cannot reach because the pack named no console.
+        let bots: BotProtocol = pack
+            .bots
+            .ok_or_else(|| {
+                anyhow!(
+                    "the {:?} pack declares no bots, so there is nothing this node can add. \
+                     Counter-Strike 1.6 is the case worth knowing: its server library carries \
+                     Valve's Z-Bot and runs it only as Condition Zero",
+                    instance.game_id
+                )
+            })?
+            .into();
+        if pack.console.is_none() {
+            return Err(anyhow!(
+                "the {:?} pack declares bots but no console, so this node has no way to ask for \
+                 them",
+                instance.game_id
+            ));
+        }
+        let lines = bots.quota_lines(count).map_err(|e| anyhow!("{e}"))?;
+        drop(packs);
+
+        for line in &lines {
+            self.docker.send_console_line(instance_id, line).await?;
+        }
+        // Remembered so a restart, which recreates nothing but does re-read the
+        // spec's environment, does not quietly come back with a different
+        // number of bots than the operator last asked for.
+        if let Some(spec) = self.specs.lock().await.get_mut(instance_id) {
+            spec.bots = Some(count);
+        }
+        Ok(lines)
     }
 
     /// Restart an instance in place, and put it back on the mesh.
@@ -851,6 +971,11 @@ impl Agent {
                     // is the one that does.
                     players_now: None,
                     map_now: None,
+                    // This run's memory of what was asked for. A restarted
+                    // agent has none, exactly like `spec` itself — the
+                    // container is the record for ports and ownership, and
+                    // nothing writes a bot count on it.
+                    bots: spec.and_then(|s| s.bots),
                 }
             })
             .collect())

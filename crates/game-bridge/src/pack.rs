@@ -43,7 +43,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::console::ConsoleProtocol;
+use crate::console::{BotProtocol, ConsoleProtocol};
 use crate::content::{ContentError, PackContent};
 use crate::launch::{LaunchError, LaunchKind, LaunchProfile};
 use crate::profile::{GamePort, GameProfile, GameTransport, ProfileError, QueryProtocol};
@@ -132,6 +132,16 @@ pub struct GamePack {
     /// is naming what runs by another route — see the module docs.
     #[serde(default)]
     pub console: Option<PackConsole>,
+    /// Which bot implementation a node may drive on this game's console, if
+    /// any (`GAMES.md` §3). Absent means this game has no bots a node can add,
+    /// which is the answer for every pack that shipped before this field
+    /// existed and for Counter-Strike 1.6 — its server library carries Z-Bot
+    /// and refuses to run it outside Condition Zero.
+    ///
+    /// A protocol, never a command: the words live in `console.rs`, for the
+    /// same reason `console` names an engine rather than a console line.
+    #[serde(default)]
+    pub bots: Option<PackBots>,
     /// Free-text note for a human reading the pack. Never parsed.
     #[serde(default)]
     pub notes: Option<String>,
@@ -191,6 +201,22 @@ pub enum PackQuery {
 pub enum PackConsole {
     Goldsrc,
     Source,
+}
+
+/// Which bot implementation a pack's game has, as written in the pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackBots {
+    /// Valve's Z-Bot. Only honest for a game whose mod is Condition Zero.
+    Zbot,
+}
+
+impl From<PackBots> for BotProtocol {
+    fn from(b: PackBots) -> Self {
+        match b {
+            PackBots::Zbot => BotProtocol::Zbot,
+        }
+    }
 }
 
 impl From<PackConsole> for ConsoleProtocol {
@@ -293,7 +319,7 @@ impl GamePack {
             // anonymously, which is what `steamcmd` requires. Kept in step with
             // `packs/sven-coop.toml`, which
             // `shipped_sven_pack_matches_the_builtin` enforces.
-            content: PackContent::Steamcmd { app_id: 276060 },
+            content: PackContent::Steamcmd { app_id: 276060, mod_dir: None },
             extra_ports: Vec::new(),
             // Where the 108 shipped maps are, so a node can offer them as a
             // list instead of asking someone to remember a name.
@@ -301,6 +327,9 @@ impl GamePack {
             // GoldSrc, so a node can `changelevel` a live server. Kept in step
             // with `packs/sven-coop.toml`.
             console: Some(PackConsole::Goldsrc),
+            // Sven Co-op's own bots are an AngelScript API a plugin calls
+            // (`CreateBot`), not something a node can ask for over a console.
+            bots: None,
             // Kept in step with `packs/sven-coop.toml`, which
             // `shipped_sven_pack_matches_the_builtin` enforces: the fallback a
             // fresh install uses must not be a different game from the file.
@@ -620,10 +649,50 @@ query = "a2s"
         };
         let hl = get("half-life");
         let cs = get("counter-strike-16");
-        assert_eq!(hl.content, PackContent::Steamcmd { app_id: 90 });
+        assert_eq!(hl.content, PackContent::Steamcmd { app_id: 90, mod_dir: None });
         assert_eq!(cs.content, hl.content);
         assert_eq!(hl.writable_paths, ["valve/logs"]);
         assert_eq!(cs.writable_paths, ["cstrike/logs"]);
+    }
+
+    /// Bots are asked for over a console, so a pack claiming bots and no
+    /// console describes a game this node can never actually add one to. Named
+    /// by property rather than by game: the next pack with bots gets checked
+    /// without anyone remembering this test exists.
+    #[test]
+    fn no_shipped_pack_declares_bots_it_could_not_ask_for() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let loaded = GamePack::load_dir(&dir).unwrap();
+        for pack in &loaded.packs {
+            if pack.bots.is_some() {
+                assert!(
+                    pack.console.is_some(),
+                    "{} declares bots but no console to ask for them over",
+                    pack.id
+                );
+            }
+        }
+    }
+
+    /// Valve's Z-Bot runs only as Condition Zero — the Counter-Strike server
+    /// library carries the code and gates it — so a pack whose content is not
+    /// the czero mod must not claim it. This is the check that would have
+    /// caught the tempting mistake of adding `bots = "zbot"` to
+    /// `counter-strike-16.toml`, where `bot_add` silently does nothing.
+    #[test]
+    fn only_a_czero_pack_claims_zbot() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let loaded = GamePack::load_dir(&dir).unwrap();
+        for pack in &loaded.packs {
+            if pack.bots == Some(PackBots::Zbot) {
+                assert_eq!(
+                    pack.content,
+                    PackContent::Steamcmd { app_id: 90, mod_dir: Some("czero".to_string()) },
+                    "{} claims Z-Bot without being the Condition Zero mod",
+                    pack.id
+                );
+            }
+        }
     }
 
     /// A writable path is an empty per-instance directory mounted **over** the

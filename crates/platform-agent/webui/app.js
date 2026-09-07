@@ -279,11 +279,31 @@ function renderInstances() {
       // Wire row action buttons once.
       const stopBtn = row.querySelector(".stop-btn");
       const restartBtn = row.querySelector(".restart-btn");
-      const mapBtn = row.querySelector(".map-btn");
+      // Bots. Hidden outright for a game that has none — every other game on
+    // this node would otherwise carry a button whose only behaviour is to
+    // explain itself — and disabled with a reason while the server is not
+    // running, which is a state that passes.
+    const botsBtn = row.querySelector(".bots-btn");
+    if (botsBtn) {
+      const game = state.games.find(g => g.id === inst.game_id);
+      const hasBots = !!(game && game.bots);
+      botsBtn.hidden = !hasBots;
+      if (hasBots) {
+        const running = inst.state === "running";
+        botsBtn.disabled = !running;
+        botsBtn.title = running
+          ? "Add or remove bots without restarting — players stay connected."
+          : "The server has to be running to be told anything.";
+      }
+    }
+
+    const mapBtn = row.querySelector(".map-btn");
       const removeBtn = row.querySelector(".remove-btn");
       stopBtn.addEventListener("click", () => onStop(inst.instance_id));
       if (restartBtn) restartBtn.addEventListener("click", () => onRestart(inst.instance_id));
       if (mapBtn) mapBtn.addEventListener("click", () => onChangeMap(inst.instance_id, inst.game_id));
+      const wireBots = row.querySelector(".bots-btn");
+      if (wireBots) wireBots.addEventListener("click", () => onBots(inst.instance_id, inst.game_id));
       // Ask for this game's maps as soon as a row for it exists, so the dialog
       // opens with the list already there rather than empty for a moment.
       ensureMaps(inst.game_id);
@@ -325,6 +345,24 @@ function renderInstances() {
     // both a running server and a pack that says which console this game
     // speaks. Say which one is missing rather than offering a button that
     // fails.
+    // Bots. Hidden outright for a game that has none — every other game on
+    // this node would otherwise carry a button whose only behaviour is to
+    // explain itself — and disabled with a reason while the server is not
+    // running, which is a state that passes.
+    const botsBtn = row.querySelector(".bots-btn");
+    if (botsBtn) {
+      const game = state.games.find(g => g.id === inst.game_id);
+      const hasBots = !!(game && game.bots);
+      botsBtn.hidden = !hasBots;
+      if (hasBots) {
+        const running = inst.state === "running";
+        botsBtn.disabled = !running;
+        botsBtn.title = running
+          ? "Add or remove bots without restarting — players stay connected."
+          : "The server has to be running to be told anything.";
+      }
+    }
+
     const mapBtn = row.querySelector(".map-btn");
     if (mapBtn) {
       const game = state.games.find(g => g.id === inst.game_id);
@@ -540,7 +578,7 @@ function mapDatalist(id, gameId) {
 
 function onOpenStartForm(gameId) {
   if (!state.openForms.has(gameId)) {
-    state.openForms.set(gameId, { name: "", maxPlayers: 16, map: "", advanced: false, fixedPort: "" });
+    state.openForms.set(gameId, { name: "", maxPlayers: 16, map: "", bots: "", advanced: false, fixedPort: "" });
   }
   const opening = state.openForms.get(gameId);
   if (opening) opening._opened = true;
@@ -595,6 +633,22 @@ function renderStartForm(gameId) {
       : "The map name as the game knows it — svencoop1, de_dust2, cp_dustbowl. ") +
     "Letters, digits, '_', '-', '.' and '/' only.");
 
+  // Bots, and only for a game that has them. A game whose pack declares none
+  // gets no field at all rather than a disabled one: there is nothing an
+  // operator could do here to make it appear, so a control would be furniture.
+  const game = state.games.find(g => g.id === gameId) || {};
+  let botsLabel = null, botsInput = null, botsHint = null;
+  if (game.bots) {
+    botsLabel = el("label", null, "Bots");
+    botsLabel.htmlFor = "sf-bots-" + gameId;
+    botsInput = el("input"); botsInput.type = "number"; botsInput.id = "sf-bots-" + gameId;
+    botsInput.min = "0"; botsInput.max = "32"; botsInput.step = "1"; botsInput.value = f.bots || "";
+    botsInput.placeholder = "leave blank for none";
+    botsInput.addEventListener("input", () => { f.bots = botsInput.value; });
+    botsHint = el("p", "muted small",
+      "Bots join immediately rather than waiting for a human, and the number can be changed on a running server.");
+  }
+
   const advLabel = el("label", "checkbox-row");
   const advInput = el("input"); advInput.type = "checkbox"; advInput.id = "sf-adv-" + gameId;
   advInput.checked = f.advanced;
@@ -622,7 +676,9 @@ function renderStartForm(gameId) {
   cancelBtn.addEventListener("click", () => closeStartForm(gameId));
   actions.append(startBtn, cancelBtn);
 
-  form.append(nameLabel, nameInput, mpLabel, mpInput, mapLabel, mapInput, mapList, mapHint, advLabel, advancedWrap, actions);
+  form.append(nameLabel, nameInput, mpLabel, mpInput, mapLabel, mapInput, mapList, mapHint);
+  if (botsLabel) form.append(botsLabel, botsInput, botsHint);
+  form.append(advLabel, advancedWrap, actions);
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     onStartSubmit(gameId);
@@ -680,6 +736,17 @@ async function onStartSubmit(gameId) {
   }
   const game = state.games.find(g => g.id === gameId);
   if (!game) { showError("Game not found."); return; }
+  // Blank means "say nothing about bots", which is not the same as zero: the
+  // node only sets GPP_BOTS when it was given a number.
+  let bots = null;
+  if (game.bots) {
+    const bv = (f.bots || "").trim();
+    if (bv !== "") {
+      const n = parseInt(bv, 10);
+      if (isNaN(n) || n < 0 || n > 32) { showError("Bots must be a number between 0 and 32, or blank."); return; }
+      bots = n;
+    }
+  }
   if (!game.runnable) { showError("This game is not runnable: " + (game.reason || "")); return; }
 
   const instance_id = randomInstanceId(gameId);
@@ -694,6 +761,7 @@ async function onStartSubmit(gameId) {
     port,
     extra_ports: {},
     map: map === "" ? null : map,
+    bots,
     owner: null,
   };
 
@@ -835,6 +903,68 @@ async function onRestart(instanceId) {
 // what they typed — is not a way to choose one. The field still accepts a name
 // the node did not list, because the node lists what it has installed and an
 // operator may know better.
+// Bots on a running server, without restarting it: the number sent is a quota,
+// so the dialog asks "how many" rather than "add" and "kick". Asking twice for
+// four leaves four, and asking for zero empties the server — which is why there
+// is one field here and not a pair of buttons whose effect depends on what is
+// already in the game.
+function onBots(instanceId, gameId) {
+  let back = $("bots-dialog");
+  if (back) back.remove();
+  back = el("div", "modal-back");
+  back.id = "bots-dialog";
+  const box = el("div", "modal");
+
+  box.appendChild(el("h3", null, "Bots"));
+  box.appendChild(el("p", "muted small",
+    "How many bots this server should hold. The number is a target, not an addition: " +
+    "0 removes them all, and asking twice for the same number changes nothing. " +
+    "Nobody is disconnected."));
+
+  const label = el("label", null, "Bots");
+  label.htmlFor = "bots-count";
+  const input = el("input");
+  input.type = "number"; input.id = "bots-count";
+  input.min = "0"; input.max = "32"; input.step = "1";
+  const inst = state.instances.find(i => i.instance_id === instanceId);
+  input.value = inst && inst.bots != null ? String(inst.bots) : "4";
+  box.append(label, input);
+
+  const actions = el("div", "form-actions");
+  const go = el("button", "primary", "Set bots");
+  go.type = "button";
+  const cancel = el("button", "quiet", "Cancel");
+  cancel.type = "button";
+  const close = () => { const d = $("bots-dialog"); if (d) d.remove(); };
+  cancel.addEventListener("click", close);
+  go.addEventListener("click", async () => {
+    const n = parseInt(input.value, 10);
+    if (isNaN(n) || n < 0 || n > 32) {
+      showError("Bots must be a number between 0 and 32.");
+      return;
+    }
+    go.disabled = true; go.textContent = "Setting…";
+    try {
+      await withInFlight(api("POST", "/instances/" + encodeURIComponent(instanceId) + "/bots", { count: n }));
+      clearError();
+      close();
+      poll();
+    } catch (e) {
+      if (e && e.__auth) { close(); return; }
+      showError((e && e.error) || "Failed to set the number of bots.");
+      go.disabled = false; go.textContent = "Set bots";
+    }
+  });
+  actions.append(go, cancel);
+  box.appendChild(actions);
+
+  back.appendChild(box);
+  back.addEventListener("click", e => { if (e.target === back) close(); });
+  document.body.appendChild(back);
+  input.focus();
+  input.select();
+}
+
 function onChangeMap(instanceId, gameId) {
   ensureMaps(gameId, () => renderMapDialog(instanceId, gameId));
   renderMapDialog(instanceId, gameId);

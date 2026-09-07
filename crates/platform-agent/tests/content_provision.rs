@@ -75,7 +75,7 @@ async fn steamcmd_installs_what_the_tool_wrote() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = StoreLayout::new(tmp.path().to_path_buf());
     let provisioner = Provisioner::new(layout.clone(), true, Some(OK_IMAGE.to_string()));
-    let spec = PackContent::Steamcmd { app_id: 276060 };
+    let spec = PackContent::Steamcmd { app_id: 276060, mod_dir: None };
 
     let out = provisioner.ensure(&sven(), &spec, Some(&docker)).await.unwrap();
     let dir = layout.content_dir(&sven()).unwrap();
@@ -112,7 +112,7 @@ async fn a_failed_steamcmd_run_installs_nothing_and_reports_what_it_said() {
     let provisioner = Provisioner::new(layout.clone(), true, Some(FAIL_IMAGE.to_string()));
 
     match provisioner
-        .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060 }, Some(&docker))
+        .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None }, Some(&docker))
         .await
     {
         Err(ProvisionError::ToolFailed { tool, exit_code, output }) => {
@@ -141,7 +141,7 @@ async fn a_provisioning_run_leaves_no_container_behind() {
     let layout = StoreLayout::new(tmp.path().to_path_buf());
     let before = docker.list_managed().await.unwrap().len();
     Provisioner::new(layout, true, Some(OK_IMAGE.to_string()))
-        .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060 }, Some(&docker))
+        .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None }, Some(&docker))
         .await
         .unwrap();
     assert_eq!(docker.list_managed().await.unwrap().len(), before);

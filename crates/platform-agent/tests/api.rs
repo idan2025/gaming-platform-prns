@@ -289,6 +289,50 @@ async fn health_reports_the_nodes_limits() {
     assert_eq!(body["version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
 }
 
+/// A game whose pack declares no bots is refused by name, before anything is
+/// typed at a server. The refusal matters more than it looks: Counter-Strike
+/// 1.6 *has* the Z-Bot code in its server library and runs it only as Condition
+/// Zero, so a node that tried anyway would send `bot_quota` into a server that
+/// silently ignores it and report success.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_game_without_bots_is_told_so_rather_than_asked_for_them() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{addr}/instances/nothing-here/bots"))
+        .json(&serde_json::json!({ "count": 4 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let msg = body["error"].as_str().unwrap_or_default().to_string();
+    assert!(msg.contains("nothing-here"), "{msg}");
+}
+
+/// The UI decides whether to show a bots control from this flag, so it has to
+/// be present and honest for every game the node lists.
+#[tokio::test(flavor = "multi_thread")]
+async fn games_say_whether_they_have_bots() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/games"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let games = body.as_array().expect("a list of games");
+    assert!(!games.is_empty());
+    for game in games {
+        assert!(game["bots"].is_boolean(), "{game}");
+    }
+}
+
 /// A node with no `[uplink]` block has no mesh node to configure, so the
 /// interfaces routes answer 501 with the reason rather than 404 or a panic. The
 /// route is wired and reachable; it just has nothing to act on. (The interface

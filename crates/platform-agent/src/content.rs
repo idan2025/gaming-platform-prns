@@ -243,7 +243,7 @@ impl Provisioner {
                 let _ = fs::remove_dir_all(&staging);
                 Ok(Provisioned::Installed { dir, bytes: written })
             }
-            PackContent::Steamcmd { app_id } => {
+            PackContent::Steamcmd { app_id, mod_dir } => {
                 if !self.allow_fetch {
                     return Err(ProvisionError::FetchNotPermitted {
                         url: format!("steam app {app_id}"),
@@ -285,16 +285,31 @@ impl Provisioner {
                 // Every argument here is built by this code. The pack supplied
                 // one number, and `+login anonymous` is not negotiable: an app
                 // that needs credentials is a `manual` pack (GAMES.md §5).
-                let cmd = vec![
+                let mut cmd = vec![
                     "+force_install_dir".to_string(),
                     TASK_INSTALL_DIR.to_string(),
                     "+login".to_string(),
                     "anonymous".to_string(),
-                    "+app_update".to_string(),
-                    app_id.to_string(),
-                    "validate".to_string(),
-                    "+quit".to_string(),
                 ];
+                // Which depots of a multi-mod app to fetch. Steam app 90 is the
+                // case: by default it installs Half-Life and Counter-Strike,
+                // and only `mod czero` brings Condition Zero as well. The name
+                // was validated as an identifier when the pack loaded
+                // (`content::validate_mod_name`) and is re-checked here,
+                // because "it was validated elsewhere" is how a shell-shaped
+                // string reaches a command line.
+                if let Some(name) = mod_dir {
+                    game_bridge::content::validate_mod_name(name)
+                        .map_err(ProvisionError::BadSpec)?;
+                    cmd.push("+app_set_config".to_string());
+                    cmd.push(app_id.to_string());
+                    cmd.push("mod".to_string());
+                    cmd.push(name.clone());
+                }
+                cmd.push("+app_update".to_string());
+                cmd.push(app_id.to_string());
+                cmd.push("validate".to_string());
+                cmd.push("+quit".to_string());
                 let name = format!(
                     "gpp-content-{}-{}",
                     app_id,
@@ -878,7 +893,7 @@ mod tests {
         let provisioner = Provisioner::new(layout(&tmp), true, None);
         assert!(matches!(
             provisioner
-                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060 }, None)
+                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None }, None)
                 .await,
             Err(ProvisionError::NoSteamcmdImage { app_id: 276060 })
         ));
@@ -893,7 +908,7 @@ mod tests {
             Provisioner::new(layout(&tmp), false, Some("example/steamcmd".to_string()));
         assert!(matches!(
             provisioner
-                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060 }, None)
+                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None }, None)
                 .await,
             Err(ProvisionError::FetchNotPermitted { .. })
         ));

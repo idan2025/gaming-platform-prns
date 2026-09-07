@@ -137,6 +137,7 @@ fn spec(id: &str) -> InstanceSpec {
         port: None,
         extra_ports: BTreeMap::new(),
         map: None,
+        bots: None,
         owner: None,
     }
 }

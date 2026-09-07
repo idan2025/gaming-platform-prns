@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use game_bridge::console::{validate_map_name, MapNameError};
+use game_bridge::console::{validate_map_name, MapNameError, MAX_BOTS};
 use game_bridge::profile::GameTransport;
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,16 @@ pub struct InstanceSpec {
     /// is a spec choosing what the node exposes.
     #[serde(default)]
     pub extra_ports: BTreeMap<u8, u16>,
+    /// How many bots the server starts with, for a game whose pack declares a
+    /// bot implementation. `None` leaves it to the image, which adds none.
+    ///
+    /// A count, never a command — `console::BotProtocol` turns it into console
+    /// lines, and the container gets it as `GPP_BOTS`. A game with no bots
+    /// ignores it rather than failing the create: the field is a request, and
+    /// the pack decides whether there is anything to request.
+    #[serde(default)]
+    pub bots: Option<u8>,
+
     /// Which map the server starts on. `None` leaves it to the image's own
     /// default, which is what every instance did before this field existed.
     ///
@@ -147,6 +157,15 @@ pub struct InstanceStatus {
     /// show the difference rather than render an empty string.
     #[serde(default)]
     pub map_now: Option<String>,
+    /// How many bots this node last asked this server to hold, when it asked at
+    /// all.
+    ///
+    /// **The node's request, not a reading of the game.** A2S reports bots
+    /// among its player counts and this build does not separate them, so
+    /// presenting a queried number here would be a different fact wearing the
+    /// same name. `None` means nobody has set a count on this instance.
+    #[serde(default)]
+    pub bots: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +177,8 @@ pub enum SpecError {
     EmptyName,
     /// The requested starting map is not a usable map name.
     BadMap(MapNameError),
+    /// More bots than this build will ask any server for.
+    TooManyBots(u8),
 }
 
 impl core::fmt::Display for SpecError {
@@ -175,6 +196,9 @@ impl core::fmt::Display for SpecError {
             Self::EmptyGameId => write!(f, "spec names no game"),
             Self::EmptyName => write!(f, "spec has no display name"),
             Self::BadMap(e) => write!(f, "{e}"),
+            Self::TooManyBots(n) => {
+                write!(f, "{n} bots is over this build's limit of {MAX_BOTS}")
+            }
         }
     }
 }
@@ -221,6 +245,13 @@ impl InstanceSpec {
         if let Some(map) = &self.map {
             validate_map_name(map).map_err(SpecError::BadMap)?;
         }
+        // The same ceiling the live console path applies, checked here so a
+        // create and a later change agree about what is askable.
+        if let Some(bots) = self.bots {
+            if bots > MAX_BOTS {
+                return Err(SpecError::TooManyBots(bots));
+            }
+        }
         Ok(())
     }
 
@@ -245,6 +276,7 @@ mod tests {
             port: None,
             extra_ports: BTreeMap::new(),
             map: None,
+            bots: None,
             owner: None,
         }
     }

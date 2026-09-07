@@ -284,6 +284,35 @@ game called "Any game" and emptied the list. Both are pinned in
 `launcher/uicheck/render.mjs`, which is `node render.mjs` and not part of
 `cargo test`.
 
+**Bots are a Condition Zero feature** (2026-09-07): `packs/condition-zero.toml`
+is pack #5, `bots = "zbot"` is a protocol like `console`, and
+`crates/game-bridge/src/console.rs` owns the words. `POST /instances/:id/bots`
+and `InstanceSpec.bots` are the two ways in; the web UI has a field on the start
+form and a button on a running server. Rules a later change could quietly break:
+- **Only a czero pack may declare `zbot`.** The Counter-Strike server library
+  contains the whole bot manager and gates it on an internal `isCZero` flag, so
+  `bot_add` on a `cstrike` server adds nothing and *says* nothing — a node would
+  report success on a server that never gains a bot. Pinned by
+  `only_a_czero_pack_claims_zbot`.
+- **`bot_quota` on the command line does not work**, so the image deliberately
+  does not pass `GPP_BOTS` to `hlds_linux`. The bot manager is not there when
+  the command line is parsed; the agent sends the quota over the console a few
+  seconds after create instead, which is also the path the button uses. One
+  mechanism, not two.
+- **`bot_join_after_player 0` always ships with the quota.** The cvar defaults
+  to 1 and holds every bot out until a human joins, so a quota alone produces a
+  server that claims bots and looks empty. Pinned by
+  `asking_for_bots_also_lets_them_join_an_empty_server`.
+- **A quota, not add/kick.** Idempotent, so a UI never has to know what is
+  already in the game, and 0 is a real request rather than an error.
+- **`InstanceStatus.bots` is what this node asked for, not what the game
+  reports.** A2S counts bots among its players and this build does not separate
+  them; presenting a queried number under this name would be a different fact
+  wearing the same one.
+- **`mod` on the steamcmd driver is a validated identifier.** It becomes an
+  argument in `app_set_config`, so `content::validate_mod_name` is an allowlist
+  and a failing name is refused, never repaired — the same rule as a map name.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

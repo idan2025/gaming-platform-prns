@@ -110,6 +110,7 @@ pub fn router_full(
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
+        .route("/instances/:id/bots", post(set_bots))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
         .route("/content/:game", post(install_content).get(install_status))
@@ -232,6 +233,10 @@ struct GameOption {
     /// can offer a live map change instead of offering one and then explaining
     /// that the pack declares no console.
     console: bool,
+    /// Whether this game has bots a node can ask for. Same reasoning as
+    /// `console`: the UI hides the control rather than offering one that
+    /// answers 400.
+    bots: bool,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -370,6 +375,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 default_port: pack.default_port,
                 extra_ports: pack.extra_ports.len(),
                 console: pack.console.is_some(),
+                bots: pack.bots.is_some() && pack.console.is_some(),
             }
         })
         .collect();
@@ -504,6 +510,31 @@ async fn game_maps(
 #[derive(serde::Deserialize)]
 struct ChangeMapReq {
     map: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BotsReq {
+    count: u8,
+}
+
+/// Set how many bots a running server holds. Not a restart, and idempotent: the
+/// number sent is a quota, so asking twice changes nothing the second time and
+/// asking for zero empties the server.
+///
+/// A 400 with the reason for every way this fails — an unknown instance, a game
+/// with no bots, a pack with no console to ask over, a count past the build's
+/// ceiling — because each one is something the caller can act on.
+async fn set_bots(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<BotsReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .set_bots(&id, req.count)
+        .await
+        .map(|lines| Json(json!({ "instance_id": id, "bots": req.count, "commands": lines })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 
 /// Change a running server's map in place. Not a restart — see

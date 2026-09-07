@@ -60,6 +60,11 @@ pub struct TaskOutcome {
     pub output: String,
 }
 
+/// Cloneable because the handle inside is: `bollard::Docker` is an
+/// `Arc`-backed client, so a clone is another reference to one connection, not
+/// a second one. Background work that outlives a call — applying an instance's
+/// bots once its map has loaded — takes a clone rather than a lifetime.
+#[derive(Clone)]
 pub struct DockerRuntime {
     docker: Docker,
 }
@@ -387,6 +392,12 @@ impl DockerRuntime {
         // `InstanceSpec::validate` before it ever gets here.
         if let Some(map) = &spec.map {
             env.push(format!("GPP_MAP={map}"));
+        }
+        // How many bots to start with, for an image whose game has them. A
+        // number the agent formats, so there is nothing here for a caller to
+        // put a second command in.
+        if let Some(bots) = spec.bots {
+            env.push(format!("GPP_BOTS={bots}"));
         }
 
         let host_config = HostConfig {

@@ -1,0 +1,59 @@
+# Game pack #5, and the first with bots.
+#
+# Condition Zero is the same steamcmd app as Counter-Strike 1.6 and Half-Life
+# (90), and a *different set of depots* inside it: only `mod = "czero"` brings
+# it down. That is why the `[content]` block below carries a mod name and the
+# others do not — see crates/game-bridge/src/content.rs, which validates it as
+# an identifier because it becomes an argument in a command the node runs.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "condition-zero"
+display_name = "Counter-Strike: Condition Zero"
+app_name = "condition-zero"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+query = "a2s"
+
+# Where this game's maps live, relative to its install directory, so a node can
+# offer them as a list instead of asking someone to remember a name.
+maps_dir = "czero/maps"
+
+console = "goldsrc"
+
+# **The reason this pack exists.** Valve's Z-Bot ships inside the Counter-Strike
+# server library, and refuses to run outside Condition Zero: `bot_add` on a
+# `cstrike` server adds nothing and says nothing, because the code is gated on
+# an internal `isCZero` flag. Here it works — and the nav meshes and
+# `BotProfile.db` the bots need are part of this mod's own content.
+#
+# A protocol, not a command: `crates/game-bridge/src/console.rs` owns the words,
+# for the same reason `console` names an engine rather than a console line.
+bots = "zbot"
+
+# GoldSrc, one UDP port, A2S on that same port, tier 1 (`GAMES.md` §4).
+#
+# `czero/maps` is deliberately NOT writable: the install ships 22 maps and 55
+# nav meshes in it, and a writable path is an empty directory mounted *over*
+# the content, which would hide every one of them.
+writable_paths = ["czero/logs"]
+
+notes = "GoldSrc. steamcmd app 90 with mod czero. The only shipped pack whose game has bots a node can add."
+
+[content]
+driver = "steamcmd"
+app_id = 90
+mod = "czero"
+
+# How a launcher starts the player's own copy and points it at a server
+# (PLAN.md §13.1). No executable, no path, no command: the program comes from
+# the player's own Condition Zero installation, and `steam_app_id` only helps
+# the launcher find it in a Steam library they already have.
+[launch]
+kind = "goldsrc"
+steam_app_id = 80
+args = ["+connect {address}", "+password {password}"]

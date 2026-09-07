@@ -93,7 +93,39 @@ pub enum PackContent {
     Steamcmd {
         /// Steam application id. A number, not a command line.
         app_id: u32,
+        /// Which mod of that app to install, for apps whose depots are selected
+        /// by one (`app_set_config <id> mod <name>`). Steam app 90 is the
+        /// example that matters: by default it installs Half-Life and
+        /// Counter-Strike, and only with `mod = "czero"` does it also bring
+        /// Condition Zero.
+        ///
+        /// A **name**, validated as an identifier, because it is interpolated
+        /// into a command line this code builds. It selects depots the app
+        /// already publishes; it does not add a source, and it cannot name a
+        /// program.
+        #[serde(default, rename = "mod")]
+        mod_dir: Option<String>,
     },
+}
+
+/// Longest mod name accepted. Every real one is a short directory name
+/// (`czero`, `cstrike`, `valve`, `dod`).
+pub const MAX_MOD_NAME_LEN: usize = 32;
+
+/// A mod name that can be interpolated into a steamcmd command line safely.
+///
+/// An allowlist, and refused rather than repaired — the same rule as
+/// `console::validate_map_name`, for the same reason: this string becomes an
+/// argument in a command the node runs.
+pub fn validate_mod_name(name: &str) -> Result<(), ContentError> {
+    if name.is_empty() || name.len() > MAX_MOD_NAME_LEN {
+        return Err(ContentError::BadModName(name.to_string()));
+    }
+    if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return Err(ContentError::BadModName(name.to_string()));
+    }
+    Ok(())
 }
 
 impl Default for PackContent {
@@ -113,6 +145,8 @@ pub enum ContentError {
     StripTooDeep(u8),
     /// App id zero is not an app.
     BadAppId(u32),
+    /// A mod name that is not a plain directory identifier.
+    BadModName(String),
 }
 
 impl core::fmt::Display for ContentError {
@@ -134,6 +168,12 @@ impl core::fmt::Display for ContentError {
                 "content strip_components {n} is over the limit of {MAX_STRIP_COMPONENTS}"
             ),
             Self::BadAppId(n) => write!(f, "steamcmd app_id {n} is not a Steam application id"),
+            Self::BadModName(m) => write!(
+                f,
+                "steamcmd mod {m:?} is not a mod directory name — lowercase letters, digits, \
+                 '_' and '-', at most {MAX_MOD_NAME_LEN} characters. It becomes an argument in \
+                 a command this node runs, so it is refused rather than rewritten"
+            ),
         }
     }
 }
@@ -160,9 +200,12 @@ impl PackContent {
                 }
                 Ok(())
             }
-            Self::Steamcmd { app_id } => {
+            Self::Steamcmd { app_id, mod_dir } => {
                 if *app_id == 0 {
                     return Err(ContentError::BadAppId(*app_id));
+                }
+                if let Some(name) = mod_dir {
+                    validate_mod_name(name)?;
                 }
                 Ok(())
             }
@@ -189,6 +232,32 @@ impl PackContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mod name reaches a steamcmd command line, so it is an allowlist and
+    /// a failing name is refused rather than repaired — same rule as a map
+    /// name, and for the same reason.
+    #[test]
+    fn a_mod_name_is_an_identifier_or_it_is_refused() {
+        for good in ["czero", "cstrike", "valve", "dod", "op4-ctf", "gearbox_2"] {
+            assert!(validate_mod_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", "../valve", "cz ero", "czero;quit", "CZero", "c/z", &"x".repeat(33)] {
+            assert!(
+                matches!(validate_mod_name(bad), Err(ContentError::BadModName(_))),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// The mod is optional, and a pack that gives one has it validated when the
+    /// pack loads rather than when a download starts.
+    #[test]
+    fn a_steamcmd_mod_is_validated_with_the_rest_of_the_spec() {
+        let ok = PackContent::Steamcmd { app_id: 90, mod_dir: Some("czero".to_string()) };
+        assert!(ok.validate().is_ok());
+        let bad = PackContent::Steamcmd { app_id: 90, mod_dir: Some("../czero".to_string()) };
+        assert!(matches!(bad.validate(), Err(ContentError::BadModName(_))));
+    }
 
     const DIGEST: &str = "9f2c00000000000000000000000000000000000000000000000000000000abcd";
 
@@ -275,7 +344,7 @@ mod tests {
             app_id = 276060
         "#;
         let content: PackContent = toml::from_str(src).unwrap();
-        assert_eq!(content, PackContent::Steamcmd { app_id: 276060 });
+        assert_eq!(content, PackContent::Steamcmd { app_id: 276060, mod_dir: None });
         content.validate().unwrap();
         assert!(content.is_automatic());
     }
@@ -296,7 +365,7 @@ mod tests {
     #[test]
     fn app_id_zero_is_refused() {
         assert!(matches!(
-            PackContent::Steamcmd { app_id: 0 }.validate(),
+            PackContent::Steamcmd { app_id: 0, mod_dir: None }.validate(),
             Err(ContentError::BadAppId(0))
         ));
     }

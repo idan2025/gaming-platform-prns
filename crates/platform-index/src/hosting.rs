@@ -393,6 +393,11 @@ impl Hosting {
                 port: None,
                 extra_ports: Default::default(),
                 map: request.map.clone(),
+                // The index does not decide this. Bots are something an
+                // operator or a player asks a running server for; a deploy
+                // request has no field for one, and inventing a default here
+                // would put players in a game nobody asked to share.
+                bots: None,
                 owner: None,
             };
             let created = client

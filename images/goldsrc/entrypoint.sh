@@ -29,6 +29,10 @@ MOD="${HLDS_MOD:-valve}"
 SV_LAN="${HLDS_SV_LAN:-0}"
 MAP="${GPP_MAP:-}"
 NAME="${GPP_SERVER_NAME:-Half-Life}"
+# How many bots to start with, for a mod that has them. Valve's Z-Bot lives in
+# the Counter-Strike server library but runs only as Condition Zero, so this is
+# passed through for every mod and quietly does nothing on the rest.
+BOTS="${GPP_BOTS:-}"
 
 if [ ! -x "$CONTENT/hlds_linux" ]; then
     echo "No Half-Life Dedicated Server at $CONTENT." >&2
@@ -50,6 +54,7 @@ fi
 if [ -z "$MAP" ]; then
     case "$MOD" in
         cstrike) MAP="de_dust2" ;;
+        czero)   MAP="de_dust2" ;;
         dod)     MAP="dod_avalanche" ;;
         tfc)     MAP="2fort" ;;
         *)       MAP="crossfire" ;;
@@ -78,6 +83,7 @@ fi
 # activated`.
 case "$MOD" in
     cstrike) MOD_APP_ID=10 ;;
+    czero)   MOD_APP_ID=80 ;;
     valve)   MOD_APP_ID=70 ;;
     tfc)     MOD_APP_ID=20 ;;
     dod)     MOD_APP_ID=30 ;;
@@ -121,7 +127,7 @@ cd "$CONTENT"
 # for the agent to send (crates/game-bridge/src/console.rs), not something an
 # image can do without a config file it is allowed to write.
 
-echo "Starting GoldSrc: mod=$MOD port=$PORT maxplayers=$MAXPLAYERS map=$MAP sv_lan=$SV_LAN name=$NAME"
+echo "Starting GoldSrc: mod=$MOD port=$PORT maxplayers=$MAXPLAYERS map=$MAP sv_lan=$SV_LAN bots=${BOTS:-none} name=$NAME"
 
 # `hlds_linux`, not the `hlds_run` wrapper. The wrapper is a restart loop that
 # runs the DS as a child, so `docker stop`'s SIGTERM reaches the shell and not
@@ -133,6 +139,12 @@ echo "Starting GoldSrc: mod=$MOD port=$PORT maxplayers=$MAXPLAYERS map=$MAP sv_l
 LD_LIBRARY_PATH="$CONTENT:$CONTENT/$MOD:${LD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH
 
+# `GPP_BOTS` is deliberately *not* passed on the command line. Measured: a
+# server started with `+bot_quota 4 +bot_join_after_player 0` comes up with no
+# bots at all, because the bot manager is not there to take the cvars when the
+# command line is parsed. The node sets them over the console once the map is
+# loaded instead — the same path the Bots button uses, so there is one mechanism
+# and not two. It is echoed above only so the log says what was asked for.
 exec ./hlds_linux \
     -game "$MOD" \
     -port "$PORT" \

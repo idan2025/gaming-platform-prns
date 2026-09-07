@@ -145,6 +145,26 @@ Dedicated Server, boots and connects to Steam and then rejects every client with
 whose Steam cannot reach Valve, `env = { HLDS_SV_LAN = "1" }` turns client
 authentication off, at the cost of VAC.
 
+### Bots
+
+Counter-Strike 1.6 has none: Valve's Z-Bot lives in its server library and runs
+only as Condition Zero. So the pack that declares bots is
+`packs/condition-zero.toml` — the same steamcmd app 90, the `czero` mod, and the
+nav meshes and bot profiles the bots need come with it.
+
+```toml
+[games.condition-zero]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-czero"
+env = { HLDS_MOD = "czero" }
+```
+
+The node's web UI then offers a bot count when you start a server and a **Bots**
+button on a running one. Both are a quota — 0 empties the server, asking twice
+for 4 leaves 4 — and neither disconnects anyone. Games with no bots show no
+control at all.
+
 ### Host or relay from a terminal
 
 ```sh

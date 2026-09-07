@@ -64,6 +64,68 @@ impl ConsoleProtocol {
     }
 }
 
+/// Most bots a caller may ask for. A GoldSrc server holds 32 slots including
+/// humans, so anything past this is a typo rather than a request.
+pub const MAX_BOTS: u8 = 32;
+
+/// A bot implementation this build knows how to drive over a game's console.
+///
+/// Same seam as [`ConsoleProtocol`]: a pack names the variant, this file owns
+/// the words. There is exactly one today, and it is the one Valve ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BotProtocol {
+    /// Valve's Z-Bot, as shipped with Condition Zero. Present in the
+    /// Counter-Strike server library too, and inert there: the code is gated on
+    /// an `isCZero` flag, so `bot_add` on a `cstrike` server does nothing at
+    /// all — no bot, no error. A pack for a game whose mod is not `czero` must
+    /// not declare it.
+    Zbot,
+}
+
+impl BotProtocol {
+    /// The console lines that leave a server running `count` bots.
+    ///
+    /// Two lines, and the first is not optional. `bot_join_after_player`
+    /// defaults to 1, which holds every bot out of the game until a human
+    /// arrives — so a node that set only `bot_quota` would report success on a
+    /// server that stays visibly empty, which is exactly the bug an operator
+    /// cannot diagnose from the outside.
+    ///
+    /// `bot_quota` rather than repeated `bot_add`, because a quota is
+    /// idempotent: asking twice for four bots leaves four, and asking for zero
+    /// removes them. Every value is a number this function formats, so nothing
+    /// a caller sends can become a second command.
+    pub fn quota_lines(&self, count: u8) -> Result<Vec<String>, BotCountError> {
+        if count > MAX_BOTS {
+            return Err(BotCountError::TooMany { asked: count, limit: MAX_BOTS });
+        }
+        Ok(match self {
+            Self::Zbot => {
+                vec!["bot_join_after_player 0".to_string(), format!("bot_quota {count}")]
+            }
+        })
+    }
+}
+
+/// Why a bot count was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotCountError {
+    TooMany { asked: u8, limit: u8 },
+}
+
+impl core::fmt::Display for BotCountError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooMany { asked, limit } => {
+                write!(f, "{asked} bots is over this build's limit of {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BotCountError {}
+
 /// Why a map name was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapNameError {
@@ -120,6 +182,43 @@ pub fn validate_map_name(map: &str) -> Result<(), MapNameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The quota is what a caller asks for, and the join cvar is what makes it
+    /// visible. A build that sent only the quota would leave an operator
+    /// looking at an empty server with no error anywhere.
+    #[test]
+    fn asking_for_bots_also_lets_them_join_an_empty_server() {
+        let lines = BotProtocol::Zbot.quota_lines(4).unwrap();
+        assert_eq!(lines, ["bot_join_after_player 0", "bot_quota 4"]);
+    }
+
+    /// Zero is a real request — it is how a server is emptied — and not an
+    /// error.
+    #[test]
+    fn zero_bots_is_a_request_not_a_refusal() {
+        assert_eq!(BotProtocol::Zbot.quota_lines(0).unwrap()[1], "bot_quota 0");
+    }
+
+    #[test]
+    fn a_count_past_the_ceiling_is_refused() {
+        assert!(matches!(
+            BotProtocol::Zbot.quota_lines(200),
+            Err(BotCountError::TooMany { asked: 200, limit: MAX_BOTS })
+        ));
+    }
+
+    /// The count is formatted, never interpolated from text, so there is no
+    /// path by which a caller's value becomes a second console command. This
+    /// asserts the property directly rather than trusting the type.
+    #[test]
+    fn no_bot_line_can_carry_a_second_command() {
+        for n in 0..=MAX_BOTS {
+            for line in BotProtocol::Zbot.quota_lines(n).unwrap() {
+                assert!(!line.contains('\n'), "{line:?}");
+                assert!(!line.contains(';'), "{line:?}");
+            }
+        }
+    }
 
     #[test]
     fn ordinary_map_names_are_accepted() {

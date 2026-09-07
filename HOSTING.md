@@ -252,6 +252,46 @@ and runs after the command line, so a Counter-Strike server calls itself
 `Counter-Strike 1.6 Server` in an A2S reply no matter what you named it. The
 name people browse by — the one in the announce — is the name you gave it.
 
+## Bots: Condition Zero, and only Condition Zero
+
+Valve's Z-Bot is compiled into the Counter-Strike server library and gated on
+an internal Condition Zero flag, so on a `cstrike` server `bot_add` adds nothing
+and reports nothing. Condition Zero is the same steamcmd app (90) with a
+different set of depots, and it brings the bot profiles and the 55 nav meshes
+the bots need — so `packs/condition-zero.toml` is the one shipped pack that
+declares bots, and its `[content]` block is the one that names a `mod`.
+
+```
+docker build -t gpp/goldsrc:1 images/goldsrc
+```
+
+```toml
+[games.condition-zero]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-czero"
+env = { HLDS_MOD = "czero" }
+```
+
+The start form gains a **Bots** field for a game whose pack declares them, and a
+running server gains a **Bots** button beside Change map. Both send a *quota*,
+not an addition: 4 means "hold four", asking twice changes nothing, and 0 empties
+the server. Nobody is disconnected either way.
+
+Two facts behind that, both measured rather than assumed:
+
+- **`bot_quota` on the command line does nothing.** A server started with
+  `+bot_quota 4` comes up empty — the bot manager is not there yet when the
+  command line is parsed. So the node sets bots over the console a few seconds
+  after the map loads, and the create returns before that has happened.
+- **`bot_join_after_player` defaults to 1**, which keeps every bot out of the
+  game until a human joins. A node that sent only the quota would leave an
+  operator staring at a server that says it has bots and looks empty, so the
+  two lines always go together.
+
+A game whose pack declares no bots has no field and no button, rather than a
+control that explains itself.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an
