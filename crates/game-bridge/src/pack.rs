@@ -622,8 +622,32 @@ query = "a2s"
         let cs = get("counter-strike-16");
         assert_eq!(hl.content, PackContent::Steamcmd { app_id: 90 });
         assert_eq!(cs.content, hl.content);
-        assert_eq!(hl.writable_paths, ["valve/maps", "valve/logs"]);
-        assert_eq!(cs.writable_paths, ["cstrike/maps", "cstrike/logs"]);
+        assert_eq!(hl.writable_paths, ["valve/logs"]);
+        assert_eq!(cs.writable_paths, ["cstrike/logs"]);
+    }
+
+    /// A writable path is an empty per-instance directory mounted **over** the
+    /// shared content, so declaring a directory the install populates hides
+    /// everything in it. A game's map directory is the one that costs a server
+    /// its ability to start: `svencoop/maps` once hid 108 shipped maps, and
+    /// `cstrike/maps` hid the 53 a steamcmd app 90 install ships, `de_dust2`
+    /// among them.
+    ///
+    /// Named by property rather than by game on purpose: a shipped pack added
+    /// later gets checked without anyone remembering to add it here.
+    #[test]
+    fn no_shipped_pack_declares_its_own_maps_dir_writable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let loaded = GamePack::load_dir(&dir).unwrap();
+        for pack in &loaded.packs {
+            let Some(maps) = pack.maps_dir.as_deref() else { continue };
+            assert!(
+                !pack.writable_paths.iter().any(|w| w == maps),
+                "{} declares its own maps_dir {maps:?} writable, which mounts an empty \
+                 directory over every map the install ships",
+                pack.id
+            );
+        }
     }
 
     #[test]

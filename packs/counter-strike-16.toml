@@ -31,7 +31,13 @@ console = "goldsrc"
 
 # GoldSrc, same engine family as Sven Co-op: one UDP port, A2S on that same
 # port, tier 1 (`GAMES.md` §4).
-writable_paths = ["cstrike/maps", "cstrike/logs"]
+# `cstrike/maps` is NOT here, and must not be: a steamcmd app 90 install ships
+# 53 maps in it, and a writable path is an empty per-instance directory mounted
+# *over* the content, so listing it hides every one of them — de_dust2 included,
+# which is the map the server starts on. Same rule, and the same bug, as
+# `svencoop/maps` in sven-coop.toml. steamcmd ships no `logs` directory at all;
+# the agent creates the mountpoint at install time.
+writable_paths = ["cstrike/logs"]
 
 notes = "GoldSrc. Same steamcmd app (90) as half-life.toml; a different mod directory is the only difference, and the mod itself is a runtime argument the operator sets."
 

@@ -171,6 +171,55 @@ content_version = "1.0"
 
 Until that section exists, the UI lists the game and says exactly this.
 
+## Counter-Strike 1.6 and Half-Life: one image, one download, two games
+
+`images/goldsrc` is a bare Half-Life dedicated server (HLDS) the same shape as
+`images/sven-coop`: no game files, run whatever the node mounted at
+`content_root`. Build it, then point one or both packs at it:
+
+```
+docker build -t gpp/goldsrc:1 images/goldsrc
+```
+
+```toml
+[games.counter-strike-16]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90"
+env = { HLDS_MOD = "cstrike" }
+
+[games.half-life]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90"
+env = { HLDS_MOD = "valve" }
+```
+
+Both packs fetch steamcmd app 90 — the Half-Life Dedicated Server, about 930 MB
+— and the mod directory is the only difference between them, which is why it is
+`env` here and not a pack field: *which* mod a server runs is a start argument,
+and start arguments are the node's. Note that the two games are separate
+`content_version` trees under `data_root/content/<game id>/`, so running both
+downloads app 90 twice; a node short on disk can host one and leave the other
+unconfigured.
+
+Two things the image does for you, both of which are the difference between a
+server and a puzzling log:
+
+- **`SteamAppId=90`.** Without it the engine loads the map, prints
+  `Connection to Steam servers` never, and dies on the last line with
+  `FATAL ERROR (shutting down): Unable to initialize Steam`. The mod's own
+  `steam_appid.txt` (10 for Counter-Strike) is *not* a substitute — it is the
+  client app id, and it is what the failing case reads.
+- **`~/.steam/sdk32/steamclient.so`.** HLDS dlopens it from its home directory;
+  the image links it to the copy in the content mount at start, because the
+  content mount is read-only and shared.
+
+The server's own name is best-effort: every mod's `server.cfg` sets `hostname`
+and runs after the command line, so a Counter-Strike server calls itself
+`Counter-Strike 1.6 Server` in an A2S reply no matter what you named it. The
+name people browse by — the one in the announce — is the name you gave it.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an

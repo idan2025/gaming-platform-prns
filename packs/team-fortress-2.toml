@@ -47,7 +47,10 @@ console = "source"
 # created. `tf/logs` is deliberately absent for exactly that reason — the
 # install does not create it, and a server that cannot write a log file still
 # runs. An operator who wants on-disk logs makes the directory once and adds it.
-writable_paths = ["tf/cfg", "tf/maps"]
+# `tf/maps` is NOT here, and must not be: the install ships maps in it, and a
+# writable path is an empty per-instance directory mounted *over* the content,
+# so listing it hides every shipped map. Same rule as `svencoop/maps`.
+writable_paths = ["tf/cfg"]
 
 notes = "Source engine. Game on UDP 27015 with A2S on the same port, RCON on TCP 27015 beside it. First pack to use extra_ports, so the first to announce framing generation 2."
 

@@ -31,7 +31,12 @@ console = "goldsrc"
 
 # GoldSrc, same engine family as Sven Co-op: one UDP port, A2S on that same
 # port, tier 1 (`GAMES.md` §4).
-writable_paths = ["valve/maps", "valve/logs"]
+# `valve/maps` is NOT here, and must not be: a steamcmd app 90 install ships 132
+# maps in it, and a writable path is an empty per-instance directory mounted
+# *over* the content, so listing it hides every one of them. Same rule, and the
+# same bug, as `svencoop/maps` in sven-coop.toml. steamcmd ships no `logs`
+# directory at all; the agent creates the mountpoint at install time.
+writable_paths = ["valve/logs"]
 
 notes = "GoldSrc. Same engine, A2S and single UDP port as Sven Co-op; the pack differs only in data."
 
