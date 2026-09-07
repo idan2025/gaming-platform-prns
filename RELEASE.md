@@ -74,6 +74,50 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.15
+
+Counter-Strike 1.6 can have bots after all — by installing one.
+
+### A node may declare a bot it installed itself
+
+1.6 ships none, and no setting changes that: Valve's Z-Bot sits in the same
+server library and is gated on a Condition Zero flag. That was worth testing
+past the obvious explanation, so it was: with `BotProfile.db`, `BotChatter.db`
+and a nav mesh copied in from a Condition Zero install, `bot_quota 4` on a
+`cstrike` server still produces nothing. The missing thing is the mod, not the
+data.
+
+[YaPB](https://github.com/yapb/yapb) does work there, and it is a binary the
+node executes — so it arrives the way a container image does, from the operator:
+
+```sh
+cp -a <data_root>/content/counter-strike-16/app90 \
+      <data_root>/content/counter-strike-16/app90-yapb
+scripts/install-yapb.sh <data_root>/content/counter-strike-16/app90-yapb
+```
+
+```toml
+[games.counter-strike-16]
+content_version = "app90-yapb"
+bots = "yapb"
+writable_paths = ["cstrike/addons/yapb/data/train", "cstrike/addons/yapb/data/logs"]
+```
+
+The installer pins a version, checks its SHA-256 before extracting anything,
+stages and then moves, and refuses a directory that already has YaPB in it.
+
+**`bots` belongs to the node here, and a pack cannot say it.** A pack may name
+bots the game *ships* — Condition Zero's Z-Bot — because every node with that
+game has them. An installed bot is a fact about one machine, so a pack carrying
+`bots = "yapb"` is now a parse error rather than a Bots button that does
+nothing on every node that never installed it. Same rule as `image`, for the
+same reason.
+
+`[games.<id>].writable_paths` is new alongside it: a pack cannot know this
+node's copy has a bot that caches pathfinding, and without those entries YaPB
+reports `Unable to open Pathmatrix file for writing` on every map. Each
+instance now gets its own cache.
+
 ## v0.2.14
 
 Bots, and a fifth game to have them.
