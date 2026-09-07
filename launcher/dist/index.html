@@ -18,6 +18,12 @@
     <div id="status" class="status" aria-live="polite"></div>
   </header>
 
+  <!-- Which build this is, so a player reporting a problem, and whoever asks
+       them "which version?", both have the answer on screen. Filled in from
+       the core; an older shell without the command leaves it blank rather than
+       printing "undefined". -->
+  <div id="build-version" class="build-version" title="The launcher build you are running"></div>
+
   <section class="filters" id="filters" aria-label="Filters">
     <div class="field field-text">
       <input id="f-text" type="search" placeholder="Search server name…" aria-label="Search by name">

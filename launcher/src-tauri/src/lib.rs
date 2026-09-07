@@ -51,6 +51,13 @@ async fn list_games(state: tauri::State<'_, AppState>) -> Result<Vec<GameSummary
     Ok(state.launcher.list_games())
 }
 
+/// Which build the player is running, for the corner chip. The core answers, so
+/// the number is the platform's rather than this shell's hand-bumped one.
+#[tauri::command]
+async fn app_version(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    Ok(state.launcher.version().to_string())
+}
+
 /// Never returns `Err` for an unreachable server: a probe that did not answer is
 /// a *state* the detail pane renders, not an error banner. Mesh routing is
 /// asymmetric and an allowlisted server refuses probes on purpose, so "did not
@@ -276,6 +283,7 @@ pub fn run() {
             stop_browse,
             list_servers,
             list_games,
+            app_version,
             server_details,
             join_server,
             listen_port,

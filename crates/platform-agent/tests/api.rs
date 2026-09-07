@@ -283,6 +283,10 @@ async fn health_reports_the_nodes_limits() {
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["max_instances"], serde_json::json!(2));
     assert_eq!(body["port_range"]["start"], serde_json::json!(27150));
+    // The build answering, which the web UI shows in a corner. Compared
+    // against the crate's own version rather than a literal, so a release bump
+    // does not have to remember this test.
+    assert_eq!(body["version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
 }
 
 /// A node with no `[uplink]` block has no mesh node to configure, so the

@@ -389,6 +389,10 @@ async fn capacity(State(state): State<ApiState>) -> Json<crate::uplink_wire::Cap
 async fn health(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(json!({
         "ok": true,
+        // Which build is answering. The UI shows it in a corner, because
+        // "did my redeploy land" is otherwise a question only `docker inspect`
+        // can answer, and the person asking it is usually looking at a browser.
+        "version": env!("CARGO_PKG_VERSION"),
         "max_instances": state.agent.config().max_instances,
         "port_range": {
             "start": state.agent.config().port_range.start,

@@ -1293,6 +1293,22 @@ async function forgetServer(hash) {
   }
 }
 
+// ---------- build version ----------
+
+// A launcher built before `app_version` existed simply has no command to call,
+// and an unknown command throws. Leave the chip empty in that case: a blank
+// corner is better than a corner insisting the version is "undefined".
+async function loadVersion() {
+  const el = $('build-version');
+  if (!el) return;
+  try {
+    const v = await invoke('app_version');
+    el.textContent = v ? 'v' + v : '';
+  } catch (_) {
+    el.textContent = '';
+  }
+}
+
 // ---------- games ----------
 async function loadGames() {
   try {
@@ -1397,6 +1413,7 @@ async function init() {
     }
   });
   await loadGames();
+  await loadVersion();
   // The saved interfaces, so pressing Start uses what was configured rather
   // than asking the player to retype a relay address they were given once.
   try {

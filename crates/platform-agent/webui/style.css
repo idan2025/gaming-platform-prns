@@ -238,3 +238,14 @@ option, optgroup { background: var(--bg-elev); color: var(--text); }
   font-size: 11px;
   line-height: 1.45;
 }
+
+/* Build version, pinned to the bottom-right of the viewport. Deliberately
+   quiet: it is a fact you go looking for, not one competing with the UI. */
+.build-version {
+  position: fixed; right: 10px; bottom: 8px;
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--bg-elev2); border: 1px solid var(--border);
+  color: var(--muted); font-size: 11px; letter-spacing: 0.3px;
+  opacity: 0.75; pointer-events: none; user-select: none;
+  z-index: 50;
+}

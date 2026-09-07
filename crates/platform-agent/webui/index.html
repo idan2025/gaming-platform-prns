@@ -27,6 +27,12 @@
 </section>
 
 <!-- Main UI -->
+<!-- Which build is serving this page, so "did my redeploy land" is a glance
+     rather than a `docker inspect`. Filled in from /health after the token is
+     accepted: every API route is token-gated, and a version string handed to
+     anyone who can reach the port would be the one thing here that is not. -->
+<div id="build-version" class="build-version" title="The agent build serving this page">—</div>
+
 <section id="main-ui" class="screen hidden">
   <header class="app-header">
     <div class="brand">Mesh Host</div>

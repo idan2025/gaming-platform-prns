@@ -623,3 +623,16 @@ input:focus-visible, select:focus-visible {
   color: var(--fg-muted);
   border: 1px dashed var(--border);
 }
+
+/* Build version, pinned to the bottom-right of the window. Quiet by design:
+   it is a fact you go looking for when something is wrong, not one that should
+   compete with the server list. */
+.build-version {
+  position: fixed; right: 10px; bottom: 8px;
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--fg-faint); font-size: 11px; letter-spacing: 0.3px;
+  opacity: 0.75; pointer-events: none; user-select: none;
+  z-index: 50;
+}

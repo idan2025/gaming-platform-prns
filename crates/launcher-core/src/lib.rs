@@ -592,6 +592,17 @@ impl Launcher {
         }
     }
 
+    /// The platform version this launcher was built from.
+    ///
+    /// Read from `launcher-core` rather than from the Tauri shell on purpose:
+    /// every platform crate inherits one `[workspace.package]` version
+    /// (`RELEASE.md`), and the shell's own `Cargo.toml` is one of the two
+    /// places a release has to bump *by hand*. Reporting the hand-bumped one
+    /// would show the wrong number exactly when somebody forgot.
+    pub fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
     pub fn list_games(&self) -> Vec<GameSummary> {
         self.packs
             .iter()

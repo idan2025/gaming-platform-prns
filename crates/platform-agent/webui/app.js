@@ -206,6 +206,9 @@ async function tryConnect(token) {
   try {
     const health = await api("GET", "/health");
     // We could store max_instances from health too; /capacity is the source for the pill.
+    // The build answering, shown in the corner chip. An older agent has no
+    // `version` field, so the chip says so rather than rendering "undefined".
+    renderBuildVersion(health && health.version);
     const games = await api("GET", "/games");
     state.games = Array.isArray(games) ? games : [];
     const cap = await api("GET", "/capacity");
@@ -222,6 +225,19 @@ async function tryConnect(token) {
     }
     setToken(null);
   }
+}
+
+// ---------- rendering: build version ----------
+
+// The agent build serving this page. Called once per connect; the value cannot
+// change without the page being served again by a different binary.
+function renderBuildVersion(version) {
+  const el = $("build-version");
+  if (!el) return;
+  el.textContent = version ? "v" + version : "version unknown";
+  el.title = version
+    ? "Agent build v" + version + " is serving this page"
+    : "This agent is older than the build that started reporting its version";
 }
 
 // ---------- rendering: status pill ----------

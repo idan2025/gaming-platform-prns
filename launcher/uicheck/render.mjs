@@ -99,6 +99,11 @@ function makeInvoke(scenario) {
           signer: null,
           signature_expires_at: null,
         }];
+      case 'app_version':
+        // A shell too old to carry the command throws, exactly as Tauri does
+        // for an unknown command; the UI has to survive that.
+        if (scenario.noVersionCommand) throw new Error('unknown command app_version');
+        return scenario.version ?? '9.9.9';
       case 'list_interfaces':
         return scenario.interfaces ?? [];
       case 'saved_browse_opts':
@@ -465,6 +470,34 @@ await run('saved mesh connections are shown', {
     check('and the list still has rows', doc.querySelectorAll('#list .row').length > 0);
   });
 }
+
+// The build a player is running has to be on screen: it is the first thing
+// anyone asks about a bug report, and the last thing a player can find out.
+await run('the launcher shows which build it is', {
+  status: running,
+  version: '1.2.3',
+  rows: () => [row()],
+}, (win, doc) => {
+  const chip = doc.querySelector('#build-version');
+  check('there is a version chip', !!chip);
+  check('it names the build', chip.textContent === 'v1.2.3', JSON.stringify(chip?.textContent));
+  check('it is out of the way, not in the flow',
+    win.getComputedStyle(chip).position === 'fixed', win.getComputedStyle(chip).position);
+});
+
+// A launcher shell built before `app_version` existed throws on the call. An
+// empty corner is right; a corner reading "vundefined" is not.
+await run('an older shell leaves the chip blank rather than lying', {
+  status: running,
+  rows: () => [row()],
+  noVersionCommand: true,
+}, (win, doc) => {
+  const chip = doc.querySelector('#build-version');
+  check('the chip is empty when the backend has no version command',
+    chip.textContent === '', JSON.stringify(chip.textContent));
+  check('and the failure is not shown as an error banner',
+    doc.querySelector('#error').classList.contains('hidden'));
+});
 
 await run('nothing heard yet', {
   status: { running: true, interfaces: [], heard_total: 0 },
