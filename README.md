@@ -19,7 +19,7 @@ account, no port forwarding, no central service, and no internet required.
 > | 4 | Index + hosting | done — identity challenge/response bound to the verifying index, an index served over both HTTP and Reticulum with quotas, hosted deploy, and multi-node over an agent uplink that needs no inbound port |
 > | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance; a GoldSrc node image, so Counter-Strike 1.6 and Half-Life actually host |
 >
-> Current release: **v0.2.12**. What changed, release by release, is in
+> Current release: **v0.2.19**. What changed, release by release, is in
 > [`RELEASE.md`](RELEASE.md); building and tagging one is in there too.
 >
 > The working single-host implementation this generalizes is
@@ -195,18 +195,18 @@ the launcher as soon as it starts (v0.2.12). Every binary also answers
 Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
 the last three.
 
-- **v0.2.12** — both UIs show which build they are, in a corner chip. The
-  node's `/health` gained a `version` field; the launcher asks its core, not its
-  Tauri shell, because the shell's version is one of the two a release bumps by
-  hand.
-- **v0.2.11** — Counter-Strike 1.6 hosts for the first time: `images/goldsrc`
-  is the image a node points at, and one steamcmd app 90 install serves several
-  GoldSrc games through `HLDS_MOD`. Two pack bugs went with it — every GoldSrc
-  and Source pack declared its own map directory writable, which mounted an
-  empty directory over every shipped map, and the installed launcher shipped no
-  packs at all, so its game filter had one entry and "Any game" matched nothing.
-- **v0.2.10** — a join that cannot reach the server says so instead of
-  reporting success; Backbone interfaces; a launcher that can query an index.
+- **v0.2.19** — the Linux launcher works at all. The AppImage bundled the build
+  host's `libwayland-client`, which the host's NVIDIA EGL driver then crashed
+  on, so every AppImage ever published segfaulted before drawing a window; and
+  pressing Start hung on "Starting…" forever once any server had been
+  remembered, because the remembered-server sweep asked the mesh about each one
+  in sequence, unbounded, holding the lock the status poll needed.
+- **v0.2.18** — `docker stop` stops the agent. As PID 1 it never handled
+  SIGTERM, so every redeploy waited out Docker's 10-second timeout and ended in
+  a kill. Game servers are separate containers and keep running, as always.
+- **v0.2.17** — a TCP game's greeting is no longer lost to a race with the
+  player's own identify, and a server stops answering every game datagram with
+  a signed proof nothing read.
 
 ## The idea
 

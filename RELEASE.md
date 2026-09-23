@@ -74,6 +74,58 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.19
+
+Two fixes, either of which on its own stopped a Linux player from getting as
+far as a server list.
+
+### The AppImage starts on a machine with the NVIDIA driver
+
+Every AppImage the project has published segfaulted before drawing a window —
+v0.2.18, v0.2.17, all of them — with nothing on stderr but two unrelated GTK
+module warnings, which made it look like the launcher silently did nothing.
+
+`linuxdeploy` bundles the build host's `libwayland-client.so.0`, ubuntu-22.04's
+1.20. `libEGL` cannot be bundled in turn, because glvnd is host-only, so EGL
+init loads the *host's* `libnvidia-egl-wayland2.so.1` — built against 1.26 —
+and that calls into the bundled 1.20 client. It dies on a mutex in a struct
+whose layout the two versions do not agree on.
+
+The release workflow now unpacks each AppImage, drops that one library and
+repacks. `libwayland-client` is host-by-nature: it speaks a protocol to the
+host's compositor, and the host's copy is always the right one.
+
+Worth recording for anyone who hits something like it, because all three are
+the obvious first guesses and none of them helps: `WEBKIT_DISABLE_DMABUF_RENDERER`,
+`WEBKIT_DISABLE_COMPOSITING_MODE` and `GDK_BACKEND=x11` all still crash. The
+X11 one is the informative failure — EGL probes every external platform at init
+whatever the GDK backend is, so the NVIDIA wayland platform loads even with no
+compositor in sight. The crash is underneath WebKit, in EGL.
+
+### Start no longer hangs on "Starting…"
+
+Pressing Start left the button reading "Starting…" and the chip reading
+"Browse node stopped" indefinitely, while the log said the opposite a second
+after the click. The node was up; what never returned was the command.
+
+`start_browse` awaited the remembered-server sweep, which asked the mesh for a
+path to each known server one at a time — and a path request settles when a
+path is found *or* when the engine's timeout expires, so a server that is
+merely switched off costs the full timeout. Four remembered servers meant four
+timeouts, in sequence, before the button could change.
+
+It asked them all while holding the session lock, so `browse_status`,
+`list_servers` and `stop_browse` queued behind it too. That is why the chip
+never caught up on the next poll: nothing could answer. A launcher that has
+heard of a server is the normal case, so this was every launcher after its
+first successful browse.
+
+The sweep now takes the node handle and drops the session lock before touching
+the network, asks concurrently rather than in sequence, and bounds each request
+at 8 seconds — "no path" has no other way to end. `start_browse` spawns it
+instead of awaiting it: the node is listening the moment it is attached and the
+UI has to be told so then.
+
 ## v0.2.18
 
 ### `docker stop` stops the agent
