@@ -565,7 +565,7 @@ impl BridgeSession {
                 aspects: &[ASPECT_SERVER],
                 identity,
                 announce_app_data: b"",
-                proof: ProofStrategy::ProveAll,
+                proof: ProofStrategy::ProveNone,
                 link_requests: LinkRequestPolicy::AcceptAll,
                 ratchet: RatchetPolicy::NoRatchets,
                 resource_strategy: ResourceStrategy::AcceptNone,
@@ -590,7 +590,21 @@ impl BridgeSession {
                 aspects: &[ASPECT_SERVER],
                 identity: identity.clone(),
                 announce_app_data: &name_bytes,
-                proof: ProofStrategy::ProveAll,
+                // A game datagram is never retried and its receipt is never
+                // read, so a proof for one is a packet on the return leg that
+                // buys nothing. `ProofStrategy` gates link *data* only
+                // (`routing/ingress/links.rs:656`): the link-establishment
+                // proof is unconditional (`routing/links/establish/mod.rs:354`),
+                // the §3.4 detail probe rides the request context, and a TCP
+                // pack's channel is acked on its own path
+                // (`ingest_channel_data`, same file), so all three still work.
+                // It is not part of the destination hash
+                // (`runtime/node/recipe.rs:48`), so deployed v0.1.10 peers
+                // still address this server — their receipts simply time out,
+                // which settles as `SendToLinkFailure::Timeout`
+                // (`engine/settlement.rs:86`) and tears nothing down. Measured
+                // against a v0.1.10 client: 90 s, 3599 datagrams, all echoed.
+                proof: ProofStrategy::ProveNone,
                 link_requests: LinkRequestPolicy::AcceptAll,
                 ratchet: RatchetPolicy::NoRatchets,
                 resource_strategy: ResourceStrategy::AcceptNone,

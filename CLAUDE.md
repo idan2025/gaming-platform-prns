@@ -94,6 +94,16 @@ bridge. Two rules here:
   handshake immediately. Pinned end to end by `tests/stream_relay.rs`, whose
   half-close test is the one an echo-only test would not catch.
 
+**A game server's destination is `ProveNone`** (2026-09-23): under `ProveAll`
+every inbound game datagram bought one signed ~118 B proof on the return leg — a
+1:1 shadow of the upstream traffic that nothing reads, since a datagram is never
+retried. `ProofStrategy` gates link *data* only; link establishment, the §3.4
+detail probe and a TCP pack's channel acks are unaffected, and it is not part of
+the destination hash. A v0.1.10 client's receipts simply time out and tear
+nothing down (measured: 90 s, every datagram echoed). Reverting fails nothing
+that checks delivery — only `tests/proof_cost.rs`, which counts what the server
+sends back.
+
 **Multi-port is built** (2026-08-31, `GAMES.md` §3): a pack's `[[extra_ports]]`
 puts several of a server's ports on one destination — UDP extras on framing
 generation 2's channel ids, TCP extras on their own stream id pairs
