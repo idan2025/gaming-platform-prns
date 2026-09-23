@@ -230,6 +230,75 @@ jobs:
         working-directory: launcher/src-tauri
         run: cargo tauri build ${{ matrix.args || '' }}
 
+      # linuxdeploy bundles the build host's libwayland-client.so.0 into the
+      # AppImage, and on any machine with the NVIDIA driver that library *is*
+      # the crash: v0.2.18 and every AppImage before it segfault before a
+      # window is ever drawn, with nothing on stderr but two unrelated GTK
+      # module warnings. The core says why:
+      #
+      #   #0 pthread_mutex_lock            (libc.so.6)
+      #   #2 libnvidia-egl-wayland2.so.1
+      #   #4 libEGL_nvidia.so.0
+      #   #6 libEGL.so.1
+      #
+      # libEGL is a *host* library — glvnd is not bundleable — so EGL init
+      # loads the host's libnvidia-egl-wayland2.so.1, which then calls into
+      # the bundled wayland client: 1.20 from ubuntu-22.04 against the 1.26 it
+      # was built against. GDK_BACKEND=x11 does not help, because EGL probes
+      # every external platform at init regardless of the GDK backend, and
+      # neither WEBKIT_DISABLE_DMABUF_RENDERER nor
+      # WEBKIT_DISABLE_COMPOSITING_MODE helps either — the crash is below
+      # WebKit, in EGL.
+      #
+      # libwayland-client is a host library by nature: it speaks a protocol to
+      # the host's compositor, and the host's copy is always the right one.
+      # That is what the AppImage excludelist is for, but linuxdeploy's
+      # embedded copy does not carry this entry and Tauri exposes no way to
+      # pass `--exclude-library`, so unpack, drop it, repack. Dropping it and
+      # nothing else was confirmed against a real NVIDIA machine: restoring
+      # any one of the other three bundled wayland libraries kept it alive,
+      # restoring this one brought the SIGSEGV straight back.
+      - name: Un-bundle libwayland-client from the AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export ARCH="$(uname -m)"
+
+          tool="$RUNNER_TEMP/appimagetool"
+          curl -fsSL --retry 3 -o "$tool" \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
+          chmod +x "$tool"
+
+          # Absolute paths, because each image is repacked from a scratch
+          # directory that `cd` makes the relative ones meaningless from.
+          mapfile -d '' images < <(
+            find "$PWD/launcher/src-tauri/target" -type f -path '*/bundle/*' \
+              -name '*.AppImage' -print0
+          )
+          if [ ${#images[@]} -eq 0 ]; then
+            echo "no AppImage was produced" >&2
+            exit 1
+          fi
+
+          for img in "${images[@]}"; do
+            work="$(mktemp -d)"
+            ( cd "$work" && "$img" --appimage-extract >/dev/null )
+            lib="$work/squashfs-root/usr/lib/libwayland-client.so.0"
+            if [ ! -e "$lib" ]; then
+              # Either linuxdeploy stopped bundling it or the excludelist grew
+              # the entry. Either way this step is now a no-op, not a failure.
+              echo "$(basename "$img"): nothing bundled, left alone"
+              rm -rf "$work"
+              continue
+            fi
+            rm -f "$lib" "$img"
+            "$tool" --no-appstream "$work/squashfs-root" "$img"
+            rm -rf "$work"
+            echo "$(basename "$img"): dropped the bundled libwayland-client"
+          done
+
       - name: Collect bundles
         shell: bash
         run: |
