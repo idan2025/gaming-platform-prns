@@ -811,8 +811,9 @@ impl BridgeSession {
             let _router_task = tokio::spawn(async move {
                 let mut event_rx = event_rx;
                 // Links accepted but not yet identified, held with their
-                // buffered data. Only ever non-empty when an allowlist is
-                // configured. Local to this task, which is the only owner.
+                // buffered data: an allowlisted server's, or an open
+                // server's TCP game waiting for the client's reader.
+                // Local to this task, which is the only owner.
                 let mut pending_identify: std::collections::HashMap<LinkId, mpsc::Receiver<Vec<u8>>> =
                     std::collections::HashMap::new();
                 // The TCP equivalent: a link's stream halves, opened at accept
@@ -826,15 +827,12 @@ impl BridgeSession {
                         }
                         BridgeEvent::PeerIdentified { link_id, identity } => {
                             router_connected_clients.write().await.insert(link_id, identity);
-                            if allowlist.is_empty() {
-                                continue;
-                            }
-                            if allowlist.contains(&identity) {
+                            if allowlist.is_empty() || allowlist.contains(&identity) {
                                 if let Some(rx) = pending_identify.remove(&link_id) {
                                     info!(
                                         link = ?link_id,
                                         identity = ?identity.as_bytes(),
-                                        "peer is on the allowlist; starting relay"
+                                        "peer identified; starting relay"
                                     );
                                     start_server_link(
                                         link_id,
@@ -863,6 +861,25 @@ impl BridgeSession {
                         BridgeEvent::IdentifyTimeout { link_id } => {
                             // Only fires for a link still waiting: an allowed
                             // peer's entry was removed when its relay started.
+                            if allowlist.is_empty() {
+                                // An open server only waited so the client's
+                                // stream reader could come up; identifying is
+                                // best effort, so a peer that never does still
+                                // gets its game.
+                                if let Some(rx) = pending_identify.remove(&link_id) {
+                                    start_server_link(
+                                        link_id,
+                                        rx,
+                                        pending_streams.remove(&link_id).unwrap_or_default(),
+                                        transport,
+                                        game_addr,
+                                        &router_extra_udp,
+                                        &router_senders,
+                                        &router_handle,
+                                    );
+                                }
+                                continue;
+                            }
                             pending_streams.remove(&link_id);
                             if pending_identify.remove(&link_id).is_some() {
                                 warn!(
@@ -898,7 +915,17 @@ impl BridgeSession {
                                 streams.push((*channel, *addr, reader, writer));
                             }
 
-                            if allowlist.is_empty() {
+                            // An open server starts at once — unless it is
+                            // about to connect a TCP game, which greets the
+                            // moment it is connected. The client registers its
+                            // reader *after* its link comes up, and a greeting
+                            // that beats it is acked by the channel and then
+                            // dropped, never resent. The client identifies only
+                            // once its reader is live, so identify is the
+                            // signal that the far side can hear. Measured on
+                            // the hotfix.5 engine: without this wait, about
+                            // one connection in eight lost its greeting.
+                            if allowlist.is_empty() && transport != GameTransport::Tcp {
                                 start_server_link(
                                     link_id,
                                     rx,
@@ -913,7 +940,8 @@ impl BridgeSession {
                                 continue;
                             }
 
-                            // Allowlisted: hold the link until it identifies.
+                            // Allowlisted, or an open TCP game: hold the link
+                            // until it identifies.
                             // The sender is already in the map, so anything
                             // the peer sends meanwhile buffers in the channel
                             // instead of being dropped -- a peer that turns
@@ -1802,12 +1830,19 @@ fn spawn_client_tcp_listener(
                 let Some(link_id) = establish_link_with_path_retry(&handle, server).await else {
                     return;
                 };
+                // The reader goes in before anything else is awaited, for the
+                // reason the server's does (`stream.rs` module docs): an open
+                // server connects to the game the moment the link is up, the
+                // game greets at once, and a greeting that lands before this
+                // sink exists is acked by the channel and then dropped — never
+                // resent. Registered after `identify`, it lost that race
+                // whenever identify was slower than a game's hello.
+                let (reader, writer) = stream::client_stream(&handle, link_id, channel).await;
                 // Best effort, exactly as on the datagram path: it lets the
                 // server list this client and gates nothing.
                 if let Err(e) = handle.identify(link_id, client_identity_hash).await {
                     debug!(peer = %peer, link = ?link_id, error = ?e, "identify failed");
                 }
-                let (reader, writer) = stream::client_stream(&handle, link_id, channel).await;
                 let _ = stream::splice(tcp, reader, writer).await;
                 let _ = handle.close_link(link_id);
                 debug!(peer = %peer, link = ?link_id, channel, "client stream relay ended");

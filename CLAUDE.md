@@ -93,6 +93,14 @@ bridge. Two rules here:
   registered is forwarded past it and dropped, and a TCP client sends its
   handshake immediately. Pinned end to end by `tests/stream_relay.rs`, whose
   half-close test is the one an echo-only test would not catch.
+- **The same race runs the other way, and identify is what closes it.** A game
+  greets the moment the server connects to it, so the *client's* reader must
+  be live first: the client registers it before identifying, and an open server
+  holds a TCP game's connect until the client identifies (or the identify
+  timeout passes — identifying stays best effort). The hotfix.5 engine made
+  identify slower and exposed it: about one connection in eight lost its
+  greeting, and macOS CI failed all three stream tests. The symptom is
+  `stream_relay` durations in 5.5 s steps — one lost greeting per step.
 
 **A game server's destination is `ProveNone`** (2026-09-23): under `ProveAll`
 every inbound game datagram bought one signed ~118 B proof on the return leg — a
