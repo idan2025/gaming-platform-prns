@@ -16,7 +16,7 @@ prns-core = { workspace = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bollard = "0.17"

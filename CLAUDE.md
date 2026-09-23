@@ -35,6 +35,14 @@ stylistic, and both have tests against a real Docker daemon:
 The agent's Docker tests skip themselves where there is no daemon, and they
 build a tiny local image from busybox rather than pulling anything.
 
+**The agent handles SIGTERM itself** (2026-09-23). As PID 1 in a container it
+gets no default action for a signal it has no handler for, so without one every
+`docker stop` sat out the 10 s timeout and ended in SIGKILL (exit 137). On a
+signal it stops taking API requests, gives in-flight ones `SHUTDOWN_GRACE` (5 s,
+under Docker's 10), and exits 0. **It does not stop game servers** — they are
+sibling containers that outlive the agent on purpose, and the next start
+re-announces them. Pinned by `tests/shutdown.rs`.
+
 **Phase 4 is underway**: `crates/platform-auth` (challenge/response against a
 Reticulum identity) and `crates/platform-index` (registry, HTTP front door,
 quota engine, and the index served over a Reticulum destination). Hosted deploy

@@ -7,7 +7,9 @@
 //! nobody chose: this process creates containers, and it should be obvious from
 //! the command line which file told it what to run.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use platform_agent::agent::Agent;
@@ -154,7 +156,8 @@ async fn main() -> Result<()> {
         ),
     }
 
-    axum::serve(
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
         listener,
         api::router_full(
             agent,
@@ -163,9 +166,71 @@ async fn main() -> Result<()> {
             interfaces,
         ),
     )
-        .await
-        .context("serving the local API")?;
+    .with_graceful_shutdown(async {
+        let _ = stop_rx.await;
+    })
+    .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        served = &mut server => served.context("serving the local API")?,
+        signal = shutdown_signal() => {
+            // Game servers are sibling containers and deliberately outlive
+            // this process; the next start re-announces them
+            // (`restore_mesh_bridges`). So a stop only has to stop taking
+            // requests and let the ones in flight answer.
+            tracing::info!(
+                signal,
+                "shutting down; game servers keep running and are re-announced on the next start"
+            );
+            let _ = stop_tx.send(());
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                Ok(served) => served.context("serving the local API")?,
+                Err(_) => tracing::warn!(
+                    grace = ?SHUTDOWN_GRACE,
+                    "requests still in flight at the end of the grace period; exiting anyway"
+                ),
+            }
+        }
+    }
     Ok(())
+}
+
+/// How long requests already in flight get to answer after a stop signal.
+///
+/// Under Docker's default 10 s stop timeout, so the agent exits on its own
+/// rather than being killed. Nothing is lost past it: the agent keeps no
+/// database, and a content fetch cut short leaves only a staging directory,
+/// never a half-installed version (`content.rs` stages and renames).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Resolves on SIGTERM or SIGINT and names which one arrived.
+///
+/// SIGTERM is what `docker stop` and systemd send. As PID 1 in a container the
+/// process gets no default action for it — the kernel ignores signals PID 1 has
+/// no handler for — so without this the agent sat out the whole stop timeout
+/// and was SIGKILLed (exit 137) on every redeploy.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C stops this agent cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
 }
 
 fn tracing_init() {
