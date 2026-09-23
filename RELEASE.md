@@ -74,6 +74,38 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.17
+
+Two fixes on top of the engine move in v0.2.16.
+
+### A TCP game's greeting could be lost
+
+A game that speaks first — most TCP games greet the moment someone connects —
+could have that greeting dropped on its way to the player, leaving a connection
+that sat open saying nothing. The player's side only started listening on the
+link after it had also identified itself, and anything arriving before it
+listened was thrown away rather than resent. v0.2.16's engine made identifying
+slower, which turned a rare race into roughly one connection in eight, and
+failed every stream test on macOS CI.
+
+Now the player's side listens before it does anything else, and a server with
+no allowlist waits for the player to identify before connecting a TCP game —
+which is the moment it knows the far side can hear. A client that never
+identifies still gets its game once the identify timeout passes.
+
+No shipped pack was affected: TF2's RCON port is the only TCP one, and it
+connects on the player's first byte, not the server's. It matters for any pack
+whose game itself runs over TCP.
+
+### A server no longer answers every datagram with a proof
+
+Each game packet a server received cost a ~118-byte signed receipt sent back to
+the player: a copy of the player's upstream traffic, travelling against the
+game's own updates, for receipts nothing ever read. A game server's destination
+now asks for none. Joining, the detail probe and TCP games are unaffected, and
+players on Sven Co-op over Reticulum v0.1.10 still join — tested for 90 seconds
+of traffic with every packet answered.
+
 ## v0.2.16
 
 The engine underneath moved: Prns `v0.3.7` to `v0.3.7-hotfix.5`. Nothing to
