@@ -74,6 +74,24 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.18
+
+### `docker stop` stops the agent
+
+Inside a container the agent runs as PID 1, and the kernel ignores a signal PID
+1 has not asked to handle. The agent never asked, so every `docker stop` — and
+so every redeploy — waited out Docker's 10-second timeout and ended in a kill
+(exit 137).
+
+It now handles SIGTERM and Ctrl-C: it stops taking API requests, gives any
+request already running up to 5 seconds, and exits cleanly. On the same image,
+a stop went from 10.2 seconds to 0.2.
+
+**Game servers keep running.** They are separate containers and always
+outlived the agent on purpose; the next start puts them back on the mesh. A
+game download cut short by the stop leaves only a staging directory, never a
+half-installed version.
+
 ## v0.2.17
 
 Two fixes on top of the engine move in v0.2.16.
