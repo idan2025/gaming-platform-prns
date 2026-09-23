@@ -241,7 +241,10 @@ impl RequestEndpoint<ServerState> for DetailsEndpoint {
     // a `&'static [IdentityHash]` we do not have.
     const POLICY: RequestEndpointPolicy = RequestEndpointPolicy::AllowAll;
 
-    async fn handle(mut cx: RequestContext<'_, ServerState>) -> Result<(), Decline> {
+    async fn handle(
+        mut cx: RequestContext<'_, ServerState>,
+        _node: &impl personal_rns::PrnsNodeApi,
+    ) -> Result<(), Decline> {
         if !cx.state.may_answer(cx.requester) {
             return Err(Decline::Ignore);
         }
@@ -651,6 +654,11 @@ impl BridgeSession {
                 // leaves the engine's TransportState::Unidentified, so nothing
                 // is forwarded for anyone else.
                 transport_identity: relay_transit.then_some(identity),
+                // Prns's own node-administration service (hotfix.5 on). A
+                // bridge is administered by whoever runs it, and a node's
+                // control surface is the agent's uplink — never a second one
+                // the operator did not ask for.
+                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
                 pre_configured_destinations: [destination],
                 app_state: state.clone(),
                 storage: GrowableHeap,
@@ -1045,6 +1053,7 @@ impl BridgeSession {
                 // installed this to join one server should not be forwarding
                 // strangers' traffic on a metered connection without knowing.
                 transport_identity: args.relay_transit.then_some(identity),
+                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
                 pre_configured_destinations: [destination],
                 app_state: (),
                 storage: GrowableHeap,
@@ -1202,6 +1211,7 @@ impl BridgeSession {
             let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
             let node = PrnsNode::new(PrnsNodeRecipe {
                 transport_identity: Some(identity),
+                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
                 // The whole point of the role: no game, no destination.
                 pre_configured_destinations: [] as [PreConfiguredDestination; 0],
                 app_state: (),
@@ -1252,6 +1262,7 @@ impl BridgeSession {
                 // No transport identity, so this node forwards nothing for
                 // anyone. That is structural, not a setting — see BrowserArgs.
                 transport_identity: None,
+                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
                 pre_configured_destinations: [] as [PreConfiguredDestination; 0],
                 app_state: (),
                 storage: GrowableHeap,
@@ -1897,6 +1908,7 @@ where
 
     std::thread::Builder::new()
         .name("game-bridge-node".into())
+        .stack_size(crate::NODE_THREAD_STACK)
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
@@ -2036,7 +2048,7 @@ fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
             // A malformed announce is dropped, not listed: it is bytes from an
             // unauthenticated stranger, and a row we cannot parse is a row we
             // cannot honestly show.
-            match crate::announce::decode(&app_data) {
+            match crate::announce::decode(app_data) {
                 Ok(info) => {
                     let _ = tx.send(BridgeEvent::AnnounceHeard {
                         destination,

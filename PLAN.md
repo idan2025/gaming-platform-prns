@@ -62,12 +62,12 @@ that does not fit is a Link query to the server itself, or an index lookup.
 
 ### 3.1 The constraint that decides the design
 
-`Diagnostic::AnnounceHeard` (`prns-runtime/core/src/runtime/event.rs:97`)
-exposes exactly four things:
+`Diagnostic::AnnounceHeard` (`prns-runtime/core/src/runtime/event.rs:133` at
+the `hotfix.5` pin, `ENGINE.md`) exposes exactly four things:
 
 ```rust
 AnnounceHeard { destination: DestinationHash, hops: u8,
-                source_interface: InterfaceId, app_data: AnnounceAppDataBytes }
+                source_interface: InterfaceId, app_data: &'a [u8] }
 ```
 
 **No aspect string and no identity.** The destination hash is one-way —

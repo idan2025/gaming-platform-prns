@@ -56,6 +56,16 @@ const _: () = assert!(
     "pinned engine lost the link-MTU patch: MAX_SEND_TO_LINK_PLAINTEXT_LEN is not 1967 (upstream default is 431). See ENGINE.md."
 );
 
+/// Stack for a thread that drives a Prns node on its own `LocalSet`.
+///
+/// The node future is `!Send`, so each role runs it on a dedicated thread, and
+/// the engine's state machine lives on that thread's stack. From upstream
+/// `v0.3.7-hotfix.5` on it no longer fits the 2 MiB `std::thread` default in a
+/// debug build: `browse_discovery`, `reticulum_query` and `uplink_roundtrip`
+/// each died with `fatal runtime error: stack overflow` until this was raised.
+/// It is address space, not memory — pages are committed only when touched.
+pub const NODE_THREAD_STACK: usize = 16 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use personal_rns::prelude::Diagnostic;
@@ -63,7 +73,9 @@ mod tests {
     /// The whole server browser rests on `app_data` being readable off an
     /// announce: `AnnounceHeard` carries no aspect and no identity, and the
     /// destination hash is one-way, so the game id cannot be recovered from it
-    /// (`PLAN.md` §3.1). If the pin loses this patch, Browse is unbuildable.
+    /// (`PLAN.md` §3.1). Upstream has carried the field since
+    /// `v0.3.7-hotfix.5`, so the fork no longer patches it — but a pin that
+    /// lost it would leave Browse unbuildable, so it stays pinned here.
     #[test]
     fn announce_heard_exposes_app_data() {
         fn assert_field(d: &Diagnostic) -> Option<usize> {

@@ -167,7 +167,10 @@ impl RequestEndpoint<Arc<UplinkState>> for ControlEndpoint {
     // have. Same constraint and same resolution as `DetailsEndpoint`.
     const POLICY: RequestEndpointPolicy = RequestEndpointPolicy::AllowAll;
 
-    async fn handle(mut cx: RequestContext<'_, Arc<UplinkState>>) -> Result<(), Decline> {
+    async fn handle(
+        mut cx: RequestContext<'_, Arc<UplinkState>>,
+        _node: &impl personal_rns::PrnsNodeApi,
+    ) -> Result<(), Decline> {
         let now = SystemTime::now();
         let (op, body) = match decode_request(cx.data) {
             Ok(v) => v,
@@ -364,6 +367,7 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
 
     std::thread::Builder::new()
         .name("platform-agent-uplink".into())
+        .stack_size(game_bridge::NODE_THREAD_STACK)
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
@@ -391,6 +395,7 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
                     // An agent is infrastructure: it carries transit for others,
                     // like the index node, unlike a player's client.
                     transport_identity: Some(secret),
+                    remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
                     pre_configured_destinations: [destination],
                     app_state: state,
                     storage: GrowableHeap,

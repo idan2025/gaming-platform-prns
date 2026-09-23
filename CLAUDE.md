@@ -380,10 +380,12 @@ the doc and say so in the commit.
 ## Measure the engine, never quote its README
 
 Prns facts in this repo are read out of the pinned fork, checked out at
-`/home/pi/prns-fork` (branch `platform/0.3.7`, `ENGINE.md`). That tree is
-byte-identical to the engine vendored in `svencoop-prns` at
-`/home/pi/svencoop-prns-clone/vendor`, so either reads the same — but the fork is
-the one with history, and it is what this repo compiles.
+`/home/pi/prns-fork` (branch `platform/0.3.7-hotfix.5`, `ENGINE.md`). That is
+**not** the tree vendored in `svencoop-prns` at
+`/home/pi/svencoop-prns-clone/vendor`, which is still `v0.3.7` — read engine
+facts from the fork, and read the vendor copy only for what a deployed v0.1.10
+peer does. Wire compatibility between the two is measured, not inherited;
+`ENGINE.md` has the cross-engine run to repeat before any pin move.
 
 **The Prns and Sven READMEs are stale on payload sizes** — the "384 bytes" figure
 in the Sven README refers to the broadcast packet class, not to links. Verify

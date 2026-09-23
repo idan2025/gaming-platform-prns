@@ -9,31 +9,45 @@ next to the dependency.
 | | |
 | --- | --- |
 | Fork | `https://github.com/idan2025/Prns` (fork of `KenAKAFrosty/Prns`) |
-| Branch | `platform/0.3.7` |
-| Rev | `33f0a8391bd0a07888e44207ec87f07fbe2b132b` |
-| Base | upstream tag **`v0.3.7`** |
+| Branch | `platform/0.3.7-hotfix.5` |
+| Rev | `71e02528ff112eda3eea1948fed53d3c7b6c8554` |
+| Base | upstream tag **`v0.3.7-hotfix.5`** (= upstream `main` for the engine) |
 | Declared in | `Cargo.toml` `[workspace.dependencies]` |
 
-The base is not arbitrary. The engine tree vendored in `svencoop-prns` v0.1.10
-(`/home/pi/svencoop-prns-clone/vendor`) is byte-identical to upstream `v0.3.7`
-except for the two patches below and three files the vendoring dropped
-(`benchmarks/reference/requirements.lock`, `validation/oracles/requirements.lock`,
-`docs/website/public/browser-node-playground-console/pkg`). Verified by
-directory diff against every candidate tag: `v0.3.7` differs in 6 entries,
-`v0.3.7-hotfix.1` in 50, `hotfix.4` in 143, `upstream/main` in 697.
+**The platform and `svencoop-prns` no longer run the same engine tree.** The
+standalone app's vendored copy (`/home/pi/svencoop-prns-clone/vendor`) is still
+upstream `v0.3.7` plus the two patches below; the platform moved to
+`hotfix.5` on 2026-09-23. The old pin (`platform/0.3.7`, `33f0a839`) is kept on
+the fork so that tree stays reproducible.
 
-So the platform and the shipped standalone app run **the same engine tree**.
-That is what makes the wire-compatibility requirement in `PLAN.md` §5 testable
-rather than aspirational.
+That makes the wire-compatibility requirement in `PLAN.md` §5 something to
+*measure*, not something inherited. It was measured before the move, with the
+v0.1.10 `sc-rns-bridge` binary built from `svencoop-prns-clone` (its `src/` is
+unchanged since the `v0.1.10` tag) against a `game-bridge` built on this pin,
+over a TCP interface, with a UDP echo server standing in for the game:
+
+| Server | Client | Discovered by announce | 32 / 600 / 1400 B round-trip |
+| --- | --- | --- | --- |
+| v0.1.10 (`v0.3.7`) | platform (`hotfix.5`) | yes | all three |
+| platform (`hotfix.5`) | v0.1.10 (`v0.3.7`) | yes | all three |
+
+No test in `cargo test` crosses engine versions, so **repeat that run before
+every pin move** — a green suite on one engine proves nothing about the other.
 
 ## What the fork adds
 
-Two commits on top of `v0.3.7`. Both were previously unrecorded edits inside the
-vendored copy in `svencoop-prns` (`c9ec90b` and earlier); they are now real
-commits that can be rebased onto a future Prns release with conflicts shown
-instead of silently lost.
+One commit on top of `v0.3.7-hotfix.5`. It began as an unrecorded edit inside
+the vendored copy in `svencoop-prns` (`c9ec90b` and earlier); as a real commit it
+rebases onto a future Prns release with conflicts shown instead of silently
+lost.
 
-### `c393bae7` — expose announce `app_data` on `Diagnostic::AnnounceHeard`
+### Retired: `c393bae7` — expose announce `app_data` on `Diagnostic::AnnounceHeard`
+
+**Upstream carries this now**, as `app_data: &'a [u8]`
+(`prns-runtime/core/src/runtime/event.rs:137` at `hotfix.5`), so the patch was
+dropped rather than rebased. The only caller change was a borrow: the field is
+a slice, not an owned buffer. What follows is kept because it is why the field
+matters.
 
 `prns-runtime/core/src/runtime/event.rs`, plus a `..` in the tokio impl's
 `tracing_events.rs`.
@@ -47,7 +61,11 @@ signature, so the metadata is tamper-evident for free (`PLAN.md` §3.2).
 
 Plausibly useful upstream; worth offering as a PR.
 
-### `33f0a839` — size the link plaintext cap for game-sized datagrams
+### `71e02528` — size the link plaintext cap for game-sized datagrams
+
+(`33f0a839` on the old pin; cherry-picked onto `hotfix.5` without conflict.)
+Still needed: upstream `main` and `trunk` both still size it off
+`BROADCAST_MTU` (`prns-core/src/engine/commands/link.rs:23`).
 
 `prns-core/src/engine/commands/link.rs`.
 
@@ -99,20 +117,34 @@ simpler and states the truth: we do not run a published version.
 ## Moving the pin
 
 1. `git -C /home/pi/prns-fork fetch upstream --tags`
-2. `git rebase <new tag> platform/0.3.7` — expect conflicts only in the three
-   patched files; if a conflict lands anywhere else, upstream restructured and
-   the patch needs rewriting, not merging.
-3. Rebuild here; the compile-time assertion and the `app_data` test are the gate.
+2. Branch `platform/<new tag>` from the tag and cherry-pick the link-cap commit
+   — expect a conflict only in `link.rs`; anywhere else means upstream
+   restructured and the patch needs rewriting, not merging. Keep the old branch:
+   the rev in an old `Cargo.lock` must stay fetchable.
+3. Rebuild here; the compile-time assertion and the `app_data` test are the
+   gate, then the cross-engine run above.
 4. **Then decide separately whether `svencoop-prns` follows.** It may keep its
    `vendor/` copy indefinitely (`PLAN.md` §7). Moving the platform's engine while
    the standalone stays on `v0.3.7` puts the two on different engine trees, which
    is exactly when the §5 wire-compatibility rules stop being free.
 5. Update the rev, the base tag, and the diff evidence in this file.
 
-Upstream has already moved past the pin: `v0.3.7-hotfix.1` through `hotfix.4`
-(a Heltec LoRa fix) and `main` at `a2f1fabf`. Nothing in them is known to matter
-to the platform, and none has been validated against the bridge. Staying on
-`v0.3.7` keeps parity with the shipped app; that is the trade being made.
+### What moving to `hotfix.5` cost
+
+- **`RemoteControl`.** Every `PrnsNodeRecipe` now takes a `remote_control`
+  field, and `RequestEndpoint::handle` receives the node. Every role sets
+  `RemoteControlService::Unavailable`: a node's control surface is the agent's
+  uplink, not a second one the operator did not ask for.
+- **Stack.** The node future no longer fits the 2 MiB `std::thread` default in a
+  debug build — `browse_discovery`, `reticulum_query` and `uplink_roundtrip`
+  died with `fatal runtime error: stack overflow`. `game_bridge::NODE_THREAD_STACK`
+  (16 MiB) is applied to all three node threads.
+- **Crypto crates.** The engine moved to `ed25519-dalek`/`x25519-dalek` 3.x.
+  None of our crates names either directly, so `Cargo.lock` holds one copy.
+
+Upstream `trunk` is further ahead again (unreleased), and building against it
+adds a required `RemoteControlHostControls` bound on each role's app state. Wait
+for it to reach a tag.
 
 ## Offline builds
 

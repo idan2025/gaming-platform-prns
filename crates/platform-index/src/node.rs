@@ -44,7 +44,10 @@ impl RequestEndpoint<Arc<IndexState>> for QueryEndpoint {
     const ENDPOINT_ID: &'static str = QUERY_ENDPOINT_ID;
     const POLICY: RequestEndpointPolicy = RequestEndpointPolicy::AllowAll;
 
-    async fn handle(mut cx: RequestContext<'_, Arc<IndexState>>) -> Result<(), Decline> {
+    async fn handle(
+        mut cx: RequestContext<'_, Arc<IndexState>>,
+        _node: &impl personal_rns::PrnsNodeApi,
+    ) -> Result<(), Decline> {
         // A malformed query is answered with an empty result rather than a
         // decline. A client that sent nonsense gets a well-formed "nothing",
         // which it can render; a decline it would have to special-case.
@@ -138,6 +141,7 @@ pub async fn start(
     // same arrangement game-bridge uses, and for the same reason.
     std::thread::Builder::new()
         .name("platform-index-node".into())
+        .stack_size(game_bridge::NODE_THREAD_STACK)
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
@@ -166,6 +170,7 @@ pub async fn start(
                     // carries transit for others too. Unlike a player's client,
                     // it opted into being infrastructure.
                     transport_identity: Some(identity),
+                    remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
                     pre_configured_destinations: [destination],
                     app_state: state,
                     storage: GrowableHeap,
