@@ -641,9 +641,21 @@ impl Launcher {
         // the mesh floods an announce once and then suppresses the repeats.
         // Failure here is not a failure to browse — a remembered server that
         // nobody can route to is a server that is off.
-        if let Err(e) = self.refresh_known_servers().await {
-            tracing::debug!(error = %e, "could not ask about remembered servers");
-        }
+        //
+        // Spawned rather than awaited: the node is listening *now*, and the UI
+        // has to be told so now. Awaiting this is what left the Start button
+        // reading "Starting…" and the chip reading "Browse node stopped" long
+        // after the node was up and hearing announces — every remembered
+        // server that could not be routed to held the command open for its
+        // full path timeout, and the session lock with it, so `browse_status`
+        // could not answer either.
+        let settings = Arc::clone(&self.settings);
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            if let Err(e) = Self::refresh_known(&settings, &inner).await {
+                tracing::debug!(error = %e, "could not ask about remembered servers");
+            }
+        });
         Ok(())
     }
 
@@ -884,17 +896,58 @@ impl Launcher {
     /// Returns how many were asked about. Best-effort per server: one that
     /// nobody has a path to simply does not answer, which is a server that is
     /// off rather than an error.
+    /// How long one remembered destination gets to answer before the refresh
+    /// gives up on it.
+    ///
+    /// There has to be a bound. A path request settles when the mesh finds a
+    /// path *or* when the engine's own timeout expires, and for a server that
+    /// is simply switched off there is nothing out there to find.
+    const KNOWN_SERVER_PATH_TIMEOUT: Duration = Duration::from_secs(8);
+
     pub async fn refresh_known_servers(&self) -> Result<usize> {
-        let hashes: Vec<String> =
-            self.settings.lock().await.known_servers.keys().cloned().collect();
-        let inner = self.inner.lock().await;
-        let Some(session) = inner.browse.as_ref() else {
-            return Err(anyhow!("start browsing before looking for remembered servers"));
+        Self::refresh_known(&self.settings, &self.inner).await
+    }
+
+    /// The body of [`Launcher::refresh_known_servers`], written over the two
+    /// `Arc`s it actually needs rather than `&self`, so
+    /// [`Launcher::start_browse`] can spawn it and return.
+    async fn refresh_known(
+        settings: &Arc<Mutex<LauncherSettings>>,
+        inner: &Arc<Mutex<Inner>>,
+    ) -> Result<usize> {
+        let hashes: Vec<String> = settings.lock().await.known_servers.keys().cloned().collect();
+
+        // Take a handle and let the session lock go *before* asking the mesh
+        // anything. A path request is a network round trip, and holding
+        // `inner` across it queues `browse_status`, `list_servers` and
+        // `stop_browse` behind it — the whole launcher stops answering, which
+        // looks exactly like a hung app because it is one.
+        let handle = {
+            let guard = inner.lock().await;
+            let Some(session) = guard.browse.as_ref() else {
+                return Err(anyhow!("start browsing before looking for remembered servers"));
+            };
+            session.handle().clone()
         };
-        let mut asked = 0;
+
+        // Concurrently, not one after another: these are independent round
+        // trips, and four unreachable servers asked in sequence is four
+        // timeouts spent before the first answer.
+        let mut asking = tokio::task::JoinSet::new();
         for hash in &hashes {
             let Ok(parsed) = parse_hash(hash) else { continue };
-            if session.request_path_to(parsed).await.is_ok() {
+            let handle = handle.clone();
+            asking.spawn(async move {
+                let asked =
+                    tokio::time::timeout(Self::KNOWN_SERVER_PATH_TIMEOUT, handle.request_path(parsed))
+                        .await;
+                matches!(asked, Ok(Ok(_)))
+            });
+        }
+
+        let mut asked = 0;
+        while let Some(found) = asking.join_next().await {
+            if found.unwrap_or(false) {
                 asked += 1;
             }
         }
