@@ -74,6 +74,38 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.16
+
+The engine underneath moved: Prns `v0.3.7` to `v0.3.7-hotfix.5`. Nothing to
+reconfigure, and a node or launcher on this version still talks to one on
+v0.2.15 — and to Sven Co-op over Reticulum v0.1.10.
+
+### Why move at all
+
+Upstream now does one of the two things this project had to patch into Prns
+itself: an announce's `app_data`, the whole row a server browser shows, is on
+the event an app hears. That patch is gone. The other — letting one link packet
+carry a whole game datagram (1967 B instead of 431) — is still ours, and is now
+the only commit the fork carries. `ENGINE.md` has both, and how to move again.
+
+It also brings upstream's own work since August: announces verified before they
+are acted on, and reworked link maintenance and resource transfer.
+
+### Still compatible with what is already deployed
+
+Until now the platform and the standalone Sven Co-op app ran the same engine
+tree, so compatibility came for free. It no longer does, so it was tested: the
+v0.1.10 `sc-rns-bridge` and this `game-bridge` found each other by announce and
+passed 32, 600 and 1400-byte datagrams both ways, each side taking a turn as the
+server.
+
+### Prns's new remote control is off
+
+Prns now ships a service for administering a node over the mesh. Every role here
+turns it off: a node is administered by whoever runs it, and the agent's control
+surface is its own uplink with the operator's `trusted_indexes` allowlist — not a
+second door nobody asked for.
+
 ## v0.2.15
 
 Counter-Strike 1.6 can have bots after all — by installing one.
