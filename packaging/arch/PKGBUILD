@@ -1,0 +1,81 @@
+# Mesh Game Servers — the launcher, built against the system WebKitGTK.
+#
+# Why this exists: the release AppImage carries Ubuntu 22.04's libraries, and
+# every one before v0.2.19 died with SIGSEGV at startup on a machine with the
+# NVIDIA driver — its bundled libwayland-client is older than the one the host's
+# NVIDIA EGL was built against. v0.2.19 strips that library, but any bundled
+# library can drift from the host the same way. A package built against Arch's
+# own webkit2gtk-4.1 has no bundled libraries to disagree with.
+#
+# Build and install from this directory:  makepkg -si
+# Bump:  set pkgver, reset pkgrel=1, then `updpkgsums`.
+
+pkgname=mesh-game-servers
+pkgver=0.2.19
+pkgrel=1
+pkgdesc='Decentralized game-server browser over Reticulum'
+arch=('x86_64' 'aarch64')
+url='https://github.com/idan2025/gaming-platform-prns'
+license=('MIT OR Apache-2.0')
+depends=('webkit2gtk-4.1' 'gtk3' 'glib2' 'cairo' 'gdk-pixbuf2' 'libsoup3' 'dbus' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+# makepkg's LTO flags reach the C parts of the Rust build and are not what the
+# upstream release was built or tested with.
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('97475f1dd5810dd6bc099594d8c546b1fdcd07c20533e83808b3231ab2d2d1d5')
+
+_srcdir() { echo "$srcdir/gaming-platform-prns-$pkgver"; }
+
+prepare() {
+  # The Tauri shell is its own Cargo workspace with its own lockfile; the engine
+  # is a git dependency pinned by rev there, fetched here so build() is offline.
+  cd "$(_srcdir)/launcher/src-tauri"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$(_srcdir)/launcher/src-tauri"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # `custom-protocol` is what `cargo tauri build` turns on for a release build:
+  # the UI is served from the embedded frontend, never from a dev server.
+  cargo build --frozen --release --features custom-protocol
+}
+
+package() {
+  local src
+  src="$(_srcdir)"
+
+  install -Dm755 "$src/launcher/src-tauri/target/release/launcher" \
+    "$pkgdir/usr/bin/mesh-game-servers"
+
+  # Tauri resolves resources at <exe dir>/../lib/<productName>
+  # (tauri-utils platform.rs, resource_dir_from), which is where the .deb puts
+  # them too. Without these the launcher falls back to one built-in game.
+  install -dm755 "$pkgdir/usr/lib/Mesh Game Servers/packs"
+  install -m644 "$src"/packs/*.toml "$pkgdir/usr/lib/Mesh Game Servers/packs/"
+
+  local size
+  for size in 32 64 128; do
+    install -Dm644 "$src/launcher/src-tauri/icons/${size}x${size}.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/mesh-game-servers.png"
+  done
+  install -Dm644 "$src/launcher/src-tauri/icons/128x128@2x.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/mesh-game-servers.png"
+  install -Dm644 "$src/launcher/src-tauri/icons/icon.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/mesh-game-servers.png"
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/mesh-game-servers.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Mesh Game Servers
+Comment=$pkgdesc
+Exec=mesh-game-servers
+Icon=mesh-game-servers
+StartupWMClass=mesh-game-servers
+Terminal=false
+Categories=Game;Network;
+DESKTOP
+}
