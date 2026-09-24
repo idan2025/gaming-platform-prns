@@ -20,6 +20,13 @@ permissions:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # The engine is a git dependency. v0.2.19's ubuntu-24.04-arm launcher died
+  # cloning it through cargo's built-in libgit2 ("the SSL certificate is
+  # invalid; class=Ssl (16)") after cargo's default three retries, and shipped
+  # without an arm64 bundle. The git CLI uses the runner's own TLS stack and CA
+  # store; more retries cover the rest of a flaky network.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   test:
