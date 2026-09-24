@@ -879,6 +879,7 @@ version = "0.2.19"
 dependencies = [
  "anyhow",
  "hex",
+ "libc",
  "personal-rns",
  "prns-core",
  "serde",

@@ -221,6 +221,11 @@ impl LanSession {
         self.view.lock().expect("room view lock").clone()
     }
 
+    /// The room's subnet, without copying the member table.
+    pub fn subnet(&self) -> RoomSubnet {
+        self.view.lock().expect("room view lock").subnet
+    }
+
     pub fn own_address(&self) -> Option<Ipv4Addr> {
         self.view().own_address
     }

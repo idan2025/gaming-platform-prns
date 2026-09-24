@@ -374,6 +374,18 @@ Rules a later change could quietly break:
 - **Storm control is at the host, per member**: rate plus dedupe of repeats
   (`lan::BroadcastGate`). Unicast is not gated — a game's real traffic must not
   be rationed by a rule written for its beacons.
+- **A room subnet must lie inside `198.18.0.0/15`, checked at decode and again
+  by the adapter.** It comes from the room's host and becomes a route on every
+  member; without the check a host could route a member's real LAN into the
+  room. Caught by `a_host_cannot_put_a_members_real_lan_into_the_room`.
+- **`lan-helper` does only `up`/`down`, only on `gbl*` names, with ioctls.**
+  The launcher opens the persistent, user-owned adapter itself and never
+  elevates. Do not shell out to `ip` from the helper: file capabilities are
+  not inherited by children.
+- **The inbound rule lives in the pump (`lan_filter.rs`), not the firewall.**
+  Only declared ports and replies to flows this side opened get in; only
+  declared ports get broadcast. `tests/lan_adapter.rs` runs real adapters in
+  two network namespaces under `unshare -rn`, no root needed.
 
 **The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
 `cargo fmt --all` — it reformats every file, in a style the tree was not written

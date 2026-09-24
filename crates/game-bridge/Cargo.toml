@@ -21,6 +21,10 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # subscriber — a launcher that links this crate owns that decision.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# The Mode 3 adapter (`src/lan_adapter.rs`) is TUN ioctls, Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["serde"]
 serde = []
@@ -31,3 +35,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 [[bin]]
 name = "game-bridge"
 path = "src/main.rs"
+
+# Mode 3's privileged half (`PLAN.md` §14.1): creates and removes a room
+# adapter, nothing else. The launcher never runs elevated.
+[[bin]]
+name = "lan-helper"
+path = "src/bin/lan_helper.rs"

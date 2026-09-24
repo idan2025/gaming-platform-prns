@@ -76,6 +76,11 @@ pub const MAX_MEMBERS: usize = 32;
 pub const DEFAULT_ROOM_PREFIX: Ipv4Addr = Ipv4Addr::new(198, 19, 0, 0);
 pub const DEFAULT_ROOM_PREFIX_LEN: u8 = 16;
 
+/// Every room subnet lies inside this range, whatever a host sends
+/// ([`RoomSubnet::new`]).
+pub const ALLOWED_RANGE: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 0);
+pub const ALLOWED_RANGE_LEN: u8 = 15;
+
 // ---------------------------------------------------------------------------
 // Addresses
 // ---------------------------------------------------------------------------
@@ -95,13 +100,25 @@ impl Default for RoomSubnet {
 
 impl RoomSubnet {
     /// A subnet with at least 8 host bits, so a room of [`MAX_MEMBERS`] always
-    /// has room, and at most 16, so a derived address is two identity bytes.
+    /// has room, and at most 16, so a derived address is two identity bytes —
+    /// and always inside `198.18.0.0/15`.
+    ///
+    /// **The range is not the host's to choose.** The subnet arrives from the
+    /// room's host and becomes a route on every member's machine. A host that
+    /// could send `192.168.1.0/24` would put that route on a member's adapter
+    /// and pull their real LAN — printer, router, NAS — into the room. So a
+    /// subnet outside the benchmarking range is refused at decode, and the
+    /// adapter checks again (`lan_adapter.rs`).
     pub fn new(prefix: Ipv4Addr, prefix_len: u8) -> Option<Self> {
         if !(16..=24).contains(&prefix_len) {
             return None;
         }
         let mask = Self::mask_for(prefix_len);
-        Some(Self { prefix: Ipv4Addr::from(u32::from(prefix) & mask), prefix_len })
+        let prefix = u32::from(prefix) & mask;
+        if prefix & Self::mask_for(ALLOWED_RANGE_LEN) != u32::from(ALLOWED_RANGE) {
+            return None;
+        }
+        Some(Self { prefix: Ipv4Addr::from(prefix), prefix_len })
     }
 
     fn mask_for(prefix_len: u8) -> u32 {
@@ -686,11 +703,30 @@ mod tests {
 
     #[test]
     fn a_subnet_outside_16_to_24_bits_is_refused() {
-        assert!(RoomSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 8).is_none());
-        assert!(RoomSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 30).is_none());
-        let s = RoomSubnet::new(Ipv4Addr::new(10, 9, 8, 7), 24).unwrap();
-        assert_eq!(s.prefix, Ipv4Addr::new(10, 9, 8, 0), "host bits are masked off");
-        assert_eq!(s.broadcast(), Ipv4Addr::new(10, 9, 8, 255));
+        assert!(RoomSubnet::new(Ipv4Addr::new(198, 18, 0, 0), 8).is_none());
+        assert!(RoomSubnet::new(Ipv4Addr::new(198, 18, 0, 0), 30).is_none());
+        let s = RoomSubnet::new(Ipv4Addr::new(198, 18, 8, 7), 24).unwrap();
+        assert_eq!(s.prefix, Ipv4Addr::new(198, 18, 8, 0), "host bits are masked off");
+        assert_eq!(s.broadcast(), Ipv4Addr::new(198, 18, 8, 255));
+    }
+
+    /// A host must not be able to route a member's real LAN into the room.
+    #[test]
+    fn a_host_cannot_put_a_members_real_lan_into_the_room() {
+        for (prefix, len) in [
+            ((192, 168, 1, 0), 24),
+            ((10, 0, 0, 0), 16),
+            ((198, 20, 0, 0), 16),
+            ((198, 16, 0, 0), 16),
+        ] {
+            let (a, b, c, d) = prefix;
+            assert!(RoomSubnet::new(Ipv4Addr::new(a, b, c, d), len).is_none(), "{prefix:?}/{len}");
+        }
+        assert!(RoomSubnet::new(Ipv4Addr::new(198, 18, 0, 0), 16).is_some());
+        let mut bytes = RoomSubnet::default().snapshot_for_test();
+        bytes[5..9].copy_from_slice(&[192, 168, 1, 0]);
+        bytes[9] = 24;
+        assert_eq!(LanMessage::decode(&bytes), Err(LanDecodeError::BadSubnet));
     }
 
     #[test]
@@ -731,6 +767,12 @@ mod tests {
         let mut bytes = vec![MSG_PACKET];
         bytes.extend(std::iter::repeat_n(0u8, LAN_MTU + 1));
         assert_eq!(LanMessage::decode(&bytes), Err(LanDecodeError::PacketTooLarge(LAN_MTU + 1)));
+    }
+
+    impl RoomSubnet {
+        fn snapshot_for_test(self) -> Vec<u8> {
+            MemberTable::new(self, 8).snapshot().encode()
+        }
     }
 
     fn room() -> (MemberTable, Ipv4Addr, Ipv4Addr) {

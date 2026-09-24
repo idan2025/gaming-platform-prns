@@ -1198,11 +1198,38 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    predates rooms lists one as an ordinary row and offers to Join it — the join
    links to the room and is ignored, because a room reads no game datagram as a
    message. Step 5 gives rooms their own row.
-2. **Linux helper and a real adapter.** TUN, the pump between it and
-   `LanSession`, the inbound rule. Integration test in two network namespaces with a
-   tiny UDP broadcast/echo program — no game, so it runs in CI where
-   `CAP_NET_ADMIN` is available and skips where it is not, like the agent's
-   Docker tests.
+2. ~~**Linux helper and a real adapter.**~~ **Built 2026-09-24.**
+   `lan_adapter.rs` is the TUN device, all ioctls — a helper granted
+   `cap_net_admin` by file capability cannot pass it to an `ip` child, so
+   shelling out would work under `sudo` and fail under `setcap`. The
+   privilege split is Linux's own: **`lan-helper up` creates a *persistent*
+   adapter *owned by the user*, and the unprivileged launcher then opens it
+   with no capability at all** (`TunDevice::attach`); `lan-helper down`
+   removes it. The helper refuses any name but `gbl*` and any subnet outside
+   `198.18.0.0/15` — and so does the room protocol itself, at decode, because
+   the subnet comes from the host and becomes a route on the member's machine:
+   a host sending `192.168.1.0/24` would otherwise pull a member's real LAN
+   into the room.
+
+   `lan_filter.rs` is the inbound rule, in the pump rather than as firewall
+   rules — unprivileged, the same on every platform, and gone with the room.
+   A member admits only the game's declared ports and replies on flows it
+   opened, and broadcasts only to declared ports, which keeps the operating
+   system's own mDNS/NetBIOS/SSDP beacons out of the room. `lan_pump.rs` joins
+   any `PacketDevice` to a `LanSession` through it, so the Windows adapter
+   plugs into the same pump.
+
+   `tests/lan_adapter.rs` needs no root: it re-runs itself under
+   `unshare -rn`, puts the host's and a member's adapters in two network
+   namespaces, and sends a real `255.255.255.255` broadcast from one and a
+   reply from the other, then checks an undeclared port stays shut. Both
+   halves were checked by breaking them: an open filter and a missing
+   broadcast route each fail it. It skips where unprivileged user namespaces
+   are off (Ubuntu's AppArmor default among them).
+
+   **Not done here:** the policy is passed in by the caller — no pack carries
+   a `[lan]` block yet, and nothing outside the test calls the pump. Step 3
+   is the first caller.
 3. **First free game, native Linux.** A game with LAN-broadcast discovery that
    needs no purchase (OpenTTD or Xonotic LAN browse), measured end to end.
 4. **Windows helper.** Wintun, signing, the installer's opt-in, the metric
