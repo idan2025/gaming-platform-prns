@@ -1391,6 +1391,21 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    per minute, and whether the game's own LAN browser lists the room.
 7. **Packs for the rest**, one `[lan]` block each, tested field honest.
 
+**Where this stands (2026-09-24, v0.2.20 released):** steps 1–5 and 5b are
+built and shipped, and CI proves each on real adapters — Linux in network
+namespaces, including a real OpenTTD game; Windows on a real Wintun adapter
+with the metric fix and the driver removal. Steps 6 and 7 need people and
+games CI cannot run. Open beyond them, none started:
+
+- **Code signing** for `lan-helper.exe`, so SmartScreen does not warn. A
+  certificate is a purchase and the owner's call.
+- **Direct member-to-member links**, a latency optimization: every packet
+  passes through the room's host today. Measure with a real game first.
+- **macOS rooms** (`utun`), not planned yet.
+- **The real `pkexec` prompt and a Windows portable room through the UI** are
+  each covered in parts but have not been seen whole; the NFS session is the
+  first time a person will.
+
 Each step ends somewhere usable, and step 1 alone is worth having: it makes a
 room visible in the browser before any adapter exists.
 

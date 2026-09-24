@@ -226,7 +226,8 @@ deliberately not written here: look each one up and put it in the pack, with a
 ### Wave 0 — shipped
 
 Sven Co-op, Half-Life DM, Counter-Strike 1.6, Condition Zero (zbot), and the
-Team Fortress 2 pack (runs once an operator supplies a Source image).
+Team Fortress 2 pack (runs once an operator supplies a Source image). OpenTTD
+since v0.2.20, both as a server and as the first LAN-room game.
 
 ### Wave 1 — pure data, no Rust
 
@@ -289,13 +290,41 @@ multi-port), Sons of the Forest, Valheim. Each must declare
 never over radio (§4). Verify direct-IP join per game before writing the pack —
 several of these default to Steam networking.
 
+### The LAN back catalogue — Mode 3 rooms
+
+Games that only find each other by LAN broadcast, the Hamachi and Tunngle
+catalogue. **The platform half is shipped (v0.2.20, `PLAN.md` §14)**: rooms in
+the launcher, on Linux and Windows, portable or installed, leaving nothing
+behind. Each game now needs only a pack with a `[lan]` block, and what makes
+one hard is knowing its ports and testing it with people.
+
+- **OpenTTD — shipped**, played end to end by CI with a real server and client.
+  `tested = false` until a person has played it in a room.
+- **Need for Speed: Most Wanted (2005) — next** (`PLAN.md` §14.3 step 6): two
+  Windows players over the Internet interface. Needs its LAN ports, captured
+  while hosting, or a first pack with `inbound = "any"` narrowed afterwards.
+- **Underground 1/2, Carbon, Hot Pursuit 2** — same family, after Most Wanted.
+- **Saints Row 2 (PC)** — only if a LAN or direct-IP path survived GameSpy's
+  shutdown; check before writing a pack.
+- **Saints Row The Third / IV** — co-op is Steam networking (Mode 4) as
+  shipped. A player who replaces the game's Steam layer with a LAN emulator on
+  their own copy produces ordinary LAN traffic a room carries; the platform
+  never ships, names or links to such an emulator.
+- **Warcraft III, StarCraft, Age of Empires II** and the rest of the RTS era —
+  packs, once the NFS test has shown a commercial game through a room.
+- **IPX-era games** (NFS III, early Command & Conquer) need a layer-2 room,
+  which is deliberately not built (`MODES.md`).
+
 ### Not embeddable, and why
 
 - **A vendor token must approve the server:** Counter-Strike 2 public servers
   (GSLT), Don't Starve Together (Klei cluster token), games on EOS/PlayFab-only
   session auth.
 - **No dedicated server, or P2P/Steam-networking-only join:** Stardew Valley,
-  Core Keeper, most co-op titles without an IP field.
+  Core Keeper, most co-op titles without an IP field. **Jump Space** probably
+  belongs here: its developer describes peer-to-peer lobbies with one player
+  hosting and no dedicated servers, with no mention of direct-IP or LAN play.
+  A packet capture on the host while a friend joins would settle it.
 - **Server files require a login:** not refused — they are `manual` packs on a
   node whose operator owns the game (§5). Central hosting cannot offer them.
 
