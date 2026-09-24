@@ -676,10 +676,13 @@ not pre-emptively switch; wait for WebView2 to actually bite in testing.
 
 Carried from `DESIGN.md` §7, still open, listed here so they are not lost:
 node supply (user-contributed is the default under the decentralization rule, so
-agents are untrusted), whether Mode 3 justifies a privileged installer, and
-monetization.
+agents are untrusted), and monetization.
 
-Three have since been decided:
+Four have since been decided:
+
+- **Whether Mode 3 justifies a privileged installer** — decided 2026-09-24:
+  **yes, as an opt-in separate helper**, never by elevating the launcher. §14
+  is the plan.
 
 - **Whether a pack may carry launch arguments** — decided 2026-08-31: **yes, on
   the player's own machine only, as a constrained template, and never on a
@@ -1095,3 +1098,99 @@ Reticulum interface, no account, no index, **no repository**, no internet. Every
 step above is a convenience layered on that, and a user who never adds a
 repository must lose nothing except convenience. If a step cannot be built that
 way, it is the wrong step.
+
+## 14. Mode 3 — virtual LAN, planned 2026-09-24
+
+`MODES.md` Mode 3 is the design; this section is the build plan. The target is
+the back catalogue that finds peers only by LAN broadcast — old Need for Speed
+(Underground 1/2, Most Wanted 2005, Carbon), Saints Row 2 if its LAN path
+survived GameSpy, Warcraft-era RTS — and, as a consequence, any game whose
+online side has been replaced on the player's own machine by a LAN emulator.
+The platform carries LAN traffic; it never ships, names or links to an emulator
+or a modified game (`GAMES.md` §9).
+
+Decided with it: the §10 question **"whether Mode 3 justifies a privileged
+installer" — yes, as an opt-in, separate component.** The launcher itself stays
+an unprivileged binary; only a player who turns LAN on installs the helper.
+
+### 14.1 Shape
+
+- **A separate privileged helper, not an elevated launcher.** `lan-helper` owns
+  the TUN adapter and nothing else; the launcher talks to it over a local
+  socket. Linux: `CAP_NET_ADMIN` on the helper binary. Windows: Wintun, a
+  signed driver, installed once with admin rights. The launcher never runs
+  elevated.
+- **L3 TUN, IPv4 only, no L2.** No TAP, no ARP, no IPX. An IPX-era game is a
+  later, separate decision (`MODES.md`).
+- **Room = a destination plus a GROUP.** A room host announces a normal
+  destination whose `app_data` carries the game id and a LAN flag, so rooms
+  appear in the same browser as servers and cost nothing new on the announce
+  budget. Joining is a Link to the host; after the host's allowlist admits the
+  member, the host hands over the room's GROUP key and the member table over
+  that Link. The key never travels in an announce.
+- **Addresses from identity.** Each member's virtual IPv4 is derived from its
+  identity hash inside `100.64.0.0/10`, with the room host arbitrating the rare
+  collision. No DHCP, no central allocator, works offline.
+- **Unicast rides a Link, opened lazily** on the first packet to a member's
+  virtual address, reusing framing. TUN MTU ~1400 keeps one IP packet inside one
+  1900 B chunk (§2), so IP never fragments across bridge chunks.
+- **Broadcast rides the GROUP.** 383 B, fire-and-forget (§2). A broadcast larger
+  than that is dropped and logged — never split, never reassembled.
+- **No default route, ever.** The adapter carries the room's /10 and the
+  broadcast addresses, nothing else. It is not a VPN to the internet.
+
+### 14.2 Rules a later change could quietly break
+
+- **Inbound is closed by default.** Hamachi's worst property is that every
+  member can reach every listening service on every other member's machine.
+  The helper admits inbound traffic only to ports the pack declares and to
+  replies on flows the local side opened. A pack may declare `inbound = "any"`
+  for a game with unpredictable ports, and the launcher says so before joining.
+- **Only a pack with a `[lan]` block offers LAN.** It declares the game's
+  broadcast ports; broadcasts to any other port are not forwarded. This is
+  storm control and scope at once, and it is data — a pack still names no
+  program (`GAMES.md` §6).
+- **Storm control ships in the first commit**, not after: per-source rate limit
+  on GROUP sends, dedupe of identical consecutive beacons, and a hard ceiling on
+  GROUP traffic as a fraction of the link budget (`MODES.md`, "The thing that
+  will kill it"). Answering discovery locally from the member table is the
+  follow-up that removes most of it.
+- **Windows sends `255.255.255.255` out of the primary adapter only.** This is
+  the Hamachi "set the adapter metric" problem. The helper sets the Wintun
+  adapter's metric on install, and a test drives a limited broadcast to prove
+  it arrives, because a player cannot see this failure — the game just shows no
+  rooms.
+- **Tested status per game.** A `[lan]` pack carries a tested field; untested
+  says untested (`MODES.md`, "Anti-cheat, honestly").
+
+### 14.3 Steps, in build order
+
+1. **Room protocol, no adapter.** Room announce, join over Link, key handover,
+   member table, address derivation and collision arbitration — pure library
+   code, tested between two in-process nodes like `tests/multi_port.rs`.
+2. **Linux helper and a real adapter.** TUN, the Link/GROUP pump, storm
+   control, the inbound rule. Integration test in two network namespaces with a
+   tiny UDP broadcast/echo program — no game, so it runs in CI where
+   `CAP_NET_ADMIN` is available and skips where it is not, like the agent's
+   Docker tests.
+3. **First free game, native Linux.** A game with LAN-broadcast discovery that
+   needs no purchase (OpenTTD or Xonotic LAN browse), measured end to end.
+4. **Windows helper.** Wintun, signing, the installer's opt-in, the metric
+   fix and its test. This is where the real cost is.
+5. **Launcher rooms.** Create/join a LAN room in the browser, the inbound
+   warning, the helper install prompt, and whether the helper is running.
+6. **First target game: Need for Speed: Most Wanted (2005)** on Windows, two
+   players on this project's Internet interface. Record latency, GROUP traffic
+   per minute, and whether the game's own LAN browser lists the room.
+7. **Packs for the rest**, one `[lan]` block each, tested field honest.
+
+Each step ends somewhere usable, and step 1 alone is worth having: it makes a
+room visible in the browser before any adapter exists.
+
+### 14.4 What this does not change
+
+Modes 1 and 2 stay port mapping and unprivileged — the helper is never a
+prerequisite for anything but LAN rooms. A game that can join by `host:port`
+uses Mode 1 or 2 even if it also has a LAN mode. Mode 4 — traffic addressed to a
+publisher's relay (Steam networking, EOS P2P) — stays impossible, and a game
+that is only reachable that way is listed as such rather than attempted.

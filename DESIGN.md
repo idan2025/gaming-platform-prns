@@ -241,9 +241,9 @@ gaming-platform-prns/
   decentralized-first rule, user-contributed is the default and platform-owned is
   the convenience — but that means untrusted agents, which shapes pack signing
   (`GAMES.md` §6) and any billing model.
-- Does Mode 3 (virtual LAN, `MODES.md`) justify shipping a privileged installer?
-  It unlocks the LAN-party back catalogue but changes signing, install, and
-  support. Decide only after Modes 1–2 have users.
+- ~~Does Mode 3 (virtual LAN, `MODES.md`) justify shipping a privileged
+  installer?~~ Decided 2026-09-24: yes, as an opt-in separate helper; the
+  launcher stays unprivileged. `PLAN.md` §14.
 - Do central-deployed servers get a platform-run Reticulum uplink by default, or
   must the operator supply one?
 - Monetization — free/open, paid instances, or bring-your-own-node with a paid
