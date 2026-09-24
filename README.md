@@ -34,6 +34,7 @@ The launcher is the only one a player needs; the rest are for hosting.
 | You want to | Take |
 | --- | --- |
 | Browse and join servers | `Mesh Game Servers` — `.deb`, `.rpm`, `.AppImage` (x86-64, arm64), `.dmg` (universal), `.exe` (Windows) |
+| The same, installing nothing | the portable `-portable.zip` (Windows) or `-portable.tar.gz` (Linux; needs the system's WebKitGTK 4.1): unpack and run. Everything it keeps stays in its `portable-data` folder, LAN rooms included, and deleting the folder leaves nothing behind |
 | Run a node with a web UI | the Docker image, `ghcr.io/idan2025/gaming-platform-prns` |
 | Host or relay without a desktop | the CLI tarball for your target: `game-bridge`, `platform-agent`, `platform-index` |
 

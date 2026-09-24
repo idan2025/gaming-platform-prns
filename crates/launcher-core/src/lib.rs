@@ -19,6 +19,7 @@
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
 pub mod lan;
+pub mod portable;
 pub mod settings;
 pub mod steam;
 
@@ -402,6 +403,10 @@ pub struct Launcher {
     /// in-memory launcher (the test constructors, or a machine with no config
     /// directory). `None` means changes are kept for this run but not persisted.
     settings_path: Option<PathBuf>,
+    /// A portable run (`portable.rs`): rooms install nothing and leave
+    /// nothing — on Linux the helper is asked for per room, on Windows the
+    /// Wintun driver is removed again when a room ends.
+    portable: bool,
 }
 
 struct Inner {
@@ -551,7 +556,20 @@ impl Launcher {
             packs,
             settings: Arc::new(Mutex::new(settings)),
             settings_path,
+            portable: false,
         }
+    }
+
+    /// Mark this launcher portable (`portable.rs`). The data directory itself
+    /// is not passed here: `portable::confine` has already pointed every
+    /// per-user directory, this crate's settings file included, inside it.
+    pub fn with_portable(self, portable: bool) -> Self {
+        Self { portable, ..self }
+    }
+
+    /// Whether this launcher runs portable.
+    pub fn is_portable(&self) -> bool {
+        self.portable
     }
 
     /// Load packs from a directory, ignoring individual broken ones, and

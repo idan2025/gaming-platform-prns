@@ -1539,7 +1539,7 @@ function gameById(id) { return (state.games || []).find(g => g.id === id) || nul
 const ADAPTER_TEXT = {
   none: '',
   waiting: 'waiting for a seat in the room…',
-  starting: 'bringing up the network adapter… (on Windows, approve the administrator prompt)',
+  starting: 'bringing up the network adapter… (approve the password or administrator prompt)',
   up: 'network adapter up',
   stopped: 'network adapter stopped',
   failed: 'network adapter failed',
@@ -1600,12 +1600,21 @@ function renderHelperStatus(parent) {
   if (!h) return;
   const box = el('div', 'helper-status ' + (h.ready ? 'ok' : 'warn'));
   box.appendChild(el('span', '', h.detail));
-  if (!h.ready && h.can_grant) {
+  // Granting is optional on an installed Linux launcher — without it a room
+  // asks for the password each time — so it is offered even when ready.
+  if (h.can_grant) {
     const g = el('button', 'quiet', 'Grant permission');
     g.type = 'button';
     g.id = 'grant-helper';
     g.onclick = grantHelper;
     box.appendChild(g);
+  }
+  if (h.can_revoke) {
+    const r = el('button', 'quiet', 'Revoke permission');
+    r.type = 'button';
+    r.id = 'revoke-helper';
+    r.onclick = revokeHelper;
+    box.appendChild(r);
   }
   parent.appendChild(box);
 }
@@ -1715,6 +1724,17 @@ async function grantHelper() {
     hideError();
   } catch (err) {
     showError('The permission was not granted: ' + String(err && err.message || err));
+  }
+  renderRoomPanel(true);
+  if (state.detail) renderDetail();
+}
+
+async function revokeHelper() {
+  try {
+    state.lanHelper = await invoke('revoke_lan_helper');
+    hideError();
+  } catch (err) {
+    showError('The permission was not revoked: ' + String(err && err.message || err));
   }
   renderRoomPanel(true);
   if (state.detail) renderDetail();

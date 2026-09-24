@@ -378,10 +378,16 @@ Rules a later change could quietly break:
   by the adapter.** It comes from the room's host and becomes a route on every
   member; without the check a host could route a member's real LAN into the
   room. Caught by `a_host_cannot_put_a_members_real_lan_into_the_room`.
-- **`lan-helper` does only `up`/`down`, only on `gbl*` names, with ioctls.**
-  The launcher opens the persistent, user-owned adapter itself and never
-  elevates. Do not shell out to `ip` from the helper: file capabilities are
-  not inherited by children.
+- **Nothing a room creates may outlive the launcher** (step 5b). On both
+  platforms the elevated `lan-helper serve` holds a *non-persistent* adapter
+  and relays to the launcher; it exits when the relay drops, and the adapter
+  goes with its descriptor — on a quit, a crash or `kill -9`. Never go back to
+  a persistent TUN device (`TUNSETPERSIST`): that was v0.2.20's, and a killed
+  launcher left `gbl0` behind until reboot. `tests/lan_no_garbage.rs` kills the
+  launcher with `SIGKILL` and fails if the adapter or the helper survives.
+- **`lan-helper` does only `serve` and `check`, only on `gbl*` names, with
+  ioctls.** Do not shell out to `ip` from it: file capabilities are not
+  inherited by children.
 - **The inbound rule lives in the pump (`lan_filter.rs`), not the firewall.**
   Only declared ports and replies to flows this side opened get in; only
   declared ports get broadcast. `tests/lan_adapter.rs` runs real adapters in
@@ -403,8 +409,22 @@ Rules a later change could quietly break:
   something.
 - **The launcher never joins a room row as a server, and never elevates.**
   Rooms are `launcher-core/src/lan.rs`; a room row's pane sends no probe and
-  its button calls `join_room`. The helper is asked with `lan-helper check`;
-  on Linux the only grant is `pkexec setcap` on the helper beside the launcher.
+  its button calls `join_room`. On Linux the helper runs either with a
+  capability granted once (`pkexec setcap`, revocable) or per room through
+  `pkexec`, as a copy staged in `$XDG_RUNTIME_DIR` and deleted the moment it
+  has connected back. The stand-in elevator (`GAME_BRIDGE_ELEVATOR`) that
+  tests use is compiled out of release builds; keep it that way.
+- **Portable mode writes nothing outside its folder** (`portable.rs`). A
+  `portable-data` folder beside the executable (or `<AppImage>.home`) makes a
+  run portable; `confine` must run first thing in `run()`, before any thread,
+  because every library reads the per-user directories once and early. A
+  portable launcher never offers to grant anything, and on Windows removes the
+  Wintun driver when a room ends. `scripts/check-portable.{sh,ps1}` run the
+  real app with an empty home in CI and fail on anything written outside.
+- **A portable Linux launcher finds its packs beside itself.** Tauri's
+  `resource_dir` never points at the executable's folder on Linux outside a
+  cargo `target/`, so `pack_dir` looks there first; drop that and a portable
+  launcher silently offers only the built-in game.
 - **`lan-helper` ships as a Tauri sidecar on Linux and Windows**, staged by
   `scripts/stage-lan-helper.sh` (and `scripts/fetch-wintun.ps1` on Windows).
   Building `launcher/src-tauri` there fails until they are staged — on

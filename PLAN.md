@@ -1344,6 +1344,48 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    ready, a typed room name survives a poll, and an older shell shows no room
    controls at all. Breaking the room branch of the detail pane fails it on
    seven checks.
+5b. **Portable, and nothing left behind. Built 2026-09-24**, asked for after
+   v0.2.20: the AppImage could not do rooms, and a room could leave things
+   behind. What changed:
+
+   - **Linux now works like Windows**: the elevated `lan-helper serve` holds a
+     *non-persistent* TUN device and relays to the launcher over
+     `lan_relay.rs`. v0.2.20's persistent device outlived a killed launcher
+     until reboot; this one goes with the helper, which exits when the relay
+     drops. `up`/`down` and `TUNSETPERSIST` are gone.
+   - **Per-room elevation, installing nothing**: with no capability granted,
+     the launcher stages a copy of the helper in `$XDG_RUNTIME_DIR` (memory,
+     cleared at logout), runs it through `pkexec`, and deletes the copy as soon
+     as it has connected back. That is what the AppImage and the portable
+     builds do — an AppImage's `nosuid`, owner-only FUSE mount can neither hold
+     a capability nor be read by root, which is why the copy is needed at all.
+     An installed launcher can still grant once, and now revoke.
+   - **Portable mode** (`launcher-core/src/portable.rs`): a `portable-data`
+     folder beside the executable, or `<AppImage>.home`, redirects every
+     per-user directory into it before anything starts, and gives the web view
+     its storage there. The release gains a portable `.zip` (Windows) and
+     `.tar.gz` (Linux). On Windows, portable mode also removes the Wintun
+     driver when a room ends (`WintunDeleteDriver`); an installed launcher
+     keeps it for a faster next room.
+   - **Proven, not assumed**: `tests/lan_no_garbage.rs` `SIGKILL`s a real
+     `lan-host` mid-room and requires the adapter and helper to be gone, then
+     drives the per-room path through a stand-in elevator and requires the
+     staged copy to be gone once the helper runs; breaking either fails it.
+     `lan_wintun.rs` requires the driver package to stay after an installed
+     room and be gone from the driver store after a portable one — asked of
+     `pnputil`, because Windows *unloads* the driver whenever no Wintun
+     adapter exists: the first version of the check asked whether it was
+     loaded, and read "gone" after every room, portable or not. `scripts/check-portable.{sh,ps1}` run the
+     real app in CI with an empty home and fail if it writes outside its
+     folder — locally, the same check on the old binary found WebKit's storage
+     in `~/.local/share`, which is what it is for.
+   - **Found on the way**: CI's Linux runner had been skipping every
+     namespace-based adapter test since step 2 ("finished in 0.00s": Ubuntu
+     24.04's AppArmor forbids unprivileged user namespaces). CI now allows
+     them, and fetches OpenTTD so the real-game test runs there too. And a
+     portable Linux launcher would have found no packs — Tauri's
+     `resource_dir` never points beside the executable on Linux — so the
+     launcher now looks there first.
 6. **First target game: Need for Speed: Most Wanted (2005)** on Windows, two
    players on this project's Internet interface. Record latency, broadcast traffic
    per minute, and whether the game's own LAN browser lists the room.

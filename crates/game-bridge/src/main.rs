@@ -408,7 +408,7 @@ async fn run_lan_adapter(
         beside.exists().then_some(beside)
     });
     let setup = match helper {
-        Some(path) => AdapterSetup::Helper(path),
+        Some(path) => AdapterSetup::Helper { path, portable: false },
         None => AdapterSetup::InProcess,
     };
     let stop = async {

@@ -142,7 +142,9 @@ function makeInvoke(scenario) {
       // them, and those commands throw exactly as Tauri does for an unknown one.
       case 'lan_helper':
       case 'grant_lan_helper':
+      case 'revoke_lan_helper':
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
+        if (cmd === 'revoke_lan_helper') scenario.lanHelper = scenario.afterRevoke ?? scenario.lanHelper;
         return scenario.lanHelper;
       case 'room_status':
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
@@ -561,10 +563,18 @@ const roomRow = row({
   dedicated: false, transport_mode: 3,
 });
 
-const readyHelper = { supported: true, path: '/usr/bin/lan-helper', ready: true, can_grant: false, detail: 'Ready.' };
+const readyHelper = {
+  supported: true, path: '/usr/bin/lan-helper', ready: true, mode: 'granted', can_grant: false, can_revoke: false,
+  detail: 'Ready.',
+};
+const perRoom = {
+  supported: true, path: '/usr/bin/lan-helper', ready: true, mode: 'per-room', can_grant: true, can_revoke: false,
+  detail: 'Ready. Your password is asked each time a room starts, and nothing is installed or left behind. Grant the permission once to stop being asked.',
+};
+const granted = { ...readyHelper, can_revoke: true, detail: 'Ready. lan-helper has its network permission, so rooms start without asking.' };
 const needsGrant = {
-  supported: true, path: '/usr/bin/lan-helper', ready: false, can_grant: true,
-  detail: 'LAN rooms need one-time permission for lan-helper to make a network adapter (and nothing else).',
+  supported: true, path: '/usr/bin/lan-helper', ready: false, mode: 'none', can_grant: false, can_revoke: false,
+  detail: 'LAN rooms need a way to ask for your password (polkit\u2019s pkexec), or a permission granted once: sudo setcap cap_net_admin+ep /usr/bin/lan-helper',
 };
 
 const memberRoom = {
@@ -643,8 +653,8 @@ await run('a room cannot be joined until the helper may make an adapter', {
   await settle();
   const join = doc.querySelector('#detail-join');
   check('Join room is disabled without the permission', join && join.disabled);
-  check('the reason is shown', doc.querySelector('#detail').textContent.includes('one-time permission'));
-  check('and the launcher offers to ask for it', !!doc.querySelector('#detail #grant-helper'));
+  check('the reason is shown', doc.querySelector('#detail').textContent.includes('sudo setcap'));
+  check('no grant is offered where none is possible', !doc.querySelector('#detail #grant-helper'));
   const host = doc.querySelector('#host-btn');
   check('hosting is disabled for the same reason', host && host.disabled);
 });
@@ -674,6 +684,39 @@ await run('hosting a room', {
   const banner = doc.querySelector('#room-banner').textContent;
   check('the banner says the room is being hosted', banner.includes('Hosting a LAN room for OpenTTD'), banner);
   check('and that the adapter is still coming up', banner.includes('bringing up the network adapter'), banner);
+});
+
+// The per-room path: a password each room, nothing installed. It is ready as
+// it stands, and granting once is an offer, not a requirement.
+await run('asking per room is ready, and granting is only an offer', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: perRoom,
+  rows: () => [roomRow],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const join = doc.querySelector('#detail-join');
+  check('Join room is enabled without any permission granted', join && !join.disabled);
+  check('the player is told nothing is installed', doc.querySelector('#detail').textContent.includes('nothing is installed'));
+  check('granting once is offered', !!doc.querySelector('#detail #grant-helper'));
+  check('there is nothing to revoke', !doc.querySelector('#revoke-helper'));
+});
+
+await run('a granted permission can be taken back', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: granted,
+  afterRevoke: perRoom,
+  rows: () => [row()],
+}, async (win, doc) => {
+  const revoke = doc.querySelector('#room-body #revoke-helper');
+  check('Revoke is offered once granted', !!revoke);
+  revoke?.click();
+  await settle();
+  check('revoke_lan_helper was called', calls.includes('revoke_lan_helper'));
+  check('and the panel goes back to asking per room',
+    doc.querySelector('#room-body').textContent.includes('asked each time'), doc.querySelector('#room-body').textContent);
 });
 
 await run('an older shell shows no room controls at all', {

@@ -268,6 +268,11 @@ async fn grant_lan_helper(state: tauri::State<'_, AppState>) -> Result<LanHelper
 }
 
 #[tauri::command]
+async fn revoke_lan_helper(state: tauri::State<'_, AppState>) -> Result<LanHelperView, String> {
+    state.launcher.revoke_lan_helper().await.map_err(fmt_err)
+}
+
+#[tauri::command]
 async fn host_room(
     state: tauri::State<'_, AppState>,
     game_id: String,
@@ -296,6 +301,16 @@ async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, Stri
 }
 
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
+    // Beside the executable first: that is the portable layout, and on Linux
+    // `resource_dir` never points there outside a cargo `target/` — it resolves
+    // to `../lib/<name>` or `/usr/lib/<name>`, so a portable launcher would
+    // otherwise find no packs and offer only the built-in game. An installed
+    // launcher has no `packs/` beside its binary, so it falls through.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("packs"))) {
+        if dir.is_dir() {
+            return dir;
+        }
+    }
     if let Ok(dir) = app.path().resource_dir() {
         let candidate = dir.join("packs");
         if candidate.is_dir() {
@@ -306,6 +321,14 @@ fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
 }
 
 pub fn run() {
+    // Portable mode (`launcher-core/src/portable.rs`): every per-user
+    // directory is pointed inside the portable folder *before* anything else
+    // runs — the web view, GTK, fonts and shaders all read those once, early.
+    let portable = launcher_core::portable::detect();
+    if let Some(p) = &portable {
+        launcher_core::portable::confine(p);
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -314,9 +337,31 @@ pub fn run() {
         .try_init();
 
     tauri::Builder::default()
-        .setup(|app| {
-            let launcher = Launcher::from_pack_dir(&pack_dir(app.handle()));
+        .setup(move |app| {
+            let packs = pack_dir(app.handle());
+            let launcher = Launcher::from_pack_dir(&packs).with_portable(portable.is_some());
+            tracing::info!(
+                packs = %packs.display(),
+                games = launcher.list_games().len(),
+                portable = ?portable.as_ref().map(|p| p.data_dir.display().to_string()),
+                "launcher starting"
+            );
             app.manage(AppState { launcher });
+            // The window is made here rather than from the config alone
+            // (`"create": false`), so a portable run can give the web view a
+            // storage folder inside the portable one.
+            let config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .cloned()
+                .ok_or("tauri.conf.json declares no window")?;
+            let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            if let Some(p) = &portable {
+                window = window.data_directory(launcher_core::portable::webview_dir(p));
+            }
+            window.build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -349,6 +394,7 @@ pub fn run() {
             set_player_name,
             lan_helper,
             grant_lan_helper,
+            revoke_lan_helper,
             host_room,
             join_room,
             leave_room,

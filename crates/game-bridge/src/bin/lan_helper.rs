@@ -1,65 +1,122 @@
 //! `lan-helper`: Mode 3's privileged half (`PLAN.md` §14.1).
 //!
 //! The room itself runs in the unprivileged launcher; this is the one part
-//! that needs privilege, and it does as little as each platform allows.
-//!
-//! **Linux** — create a room adapter owned by the calling user, or remove one.
-//! The launcher then opens it itself (`lan_adapter::TunDevice::attach`).
-//!
-//! ```text
-//! lan-helper up   <name> <address>/<prefix-len>
-//! lan-helper down <name>
-//! ```
-//!
-//! Grant it the one capability it needs rather than running it as root:
-//! `sudo setcap cap_net_admin+ep lan-helper`.
-//!
-//! **Windows** — only an administrator can open a Wintun adapter, so the
-//! helper holds it for the session: it creates it, connects *out* to the
-//! launcher that started it, proves itself with the token that launcher made,
-//! and relays packets until the launcher goes away (`lan_relay.rs`). The
-//! launcher starts it through Windows' elevation prompt.
+//! that needs privilege, and it does one thing: hold the room's adapter for as
+//! long as the launcher that started it is there. It creates the adapter,
+//! connects *out* to that launcher, proves itself with the token the launcher
+//! made, and relays packets until the launcher goes away (`lan_relay.rs`).
+//! Then it exits, and the adapter goes with it — on Linux a non-persistent
+//! TUN device, on Windows a Wintun adapter.
 //!
 //! ```text
-//! lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> --token <hex> [--wintun <dll>]
+//! lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> --token <hex>
+//!                  [--wintun <dll>] [--remove-driver]      (Windows)
+//! lan-helper check
 //! ```
+//!
+//! How it gets its privilege is the platform's: on Linux, `cap_net_admin`
+//! granted once (`sudo setcap cap_net_admin+ep lan-helper`) or `pkexec` per
+//! room; on Windows, the elevation prompt. `check` says whether `serve` could
+//! work right now, without doing anything.
 //!
 //! Every argument is the caller's, so `lan_adapter` refuses any name but
 //! `gbl*` and any subnet outside the room range, and `lan_relay` any address
 //! that is not this machine.
 
-#[cfg(target_os = "linux")]
-fn main() -> std::process::ExitCode {
-    use std::process::ExitCode;
+/// `serve`'s arguments after the adapter name and CIDR.
+#[cfg(any(target_os = "linux", windows))]
+struct ServeArgs {
+    connect: std::net::SocketAddr,
+    token: game_bridge::lan_relay::RelayToken,
+    wintun: Option<std::path::PathBuf>,
+    remove_driver: bool,
+}
 
+#[cfg(any(target_os = "linux", windows))]
+const USAGE: &str =
+    "usage: lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> \
+                     --token <hex> [--wintun <dll>] [--remove-driver] | lan-helper check";
+
+#[cfg(any(target_os = "linux", windows))]
+fn parse_serve(rest: &[String]) -> Result<ServeArgs, String> {
+    use game_bridge::lan_relay::RelayToken;
+    let (mut connect, mut token, mut wintun, mut remove_driver) = (None, None, None, false);
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        if flag == "--remove-driver" {
+            remove_driver = true;
+            continue;
+        }
+        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--connect" => {
+                connect = Some(value.parse().map_err(|_| format!("{value:?} is not an address"))?)
+            }
+            "--token" => token = Some(RelayToken::from_hex(value).map_err(|e| e.to_string())?),
+            "--wintun" => wintun = Some(value.into()),
+            other => return Err(format!("unknown option {other:?}\n{USAGE}")),
+        }
+    }
+    Ok(ServeArgs {
+        connect: connect.ok_or(USAGE)?,
+        token: token.ok_or(USAGE)?,
+        wintun,
+        remove_driver,
+    })
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["up", name, cidr] => parse_config(name, cidr).and_then(|config| {
-            game_bridge::lan_adapter::create(&config, owner()).map_err(|e| e.to_string())
-        }),
-        ["down", name] => game_bridge::lan_adapter::destroy(name).map_err(|e| e.to_string()),
-        ["check"] => check(),
-        _ => Err(
-            "usage: lan-helper up <name> <address>/<prefix-len> | lan-helper down <name> | lan-helper check"
-                .to_string(),
-        ),
+    let result = match args.as_slice() {
+        [cmd] if cmd == "check" => check(),
+        [cmd, name, cidr, rest @ ..] if cmd == "serve" => serve(name, cidr, rest),
+        _ => Err(USAGE.to_string()),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("lan-helper: {e}");
-            ExitCode::FAILURE
+            std::process::ExitCode::FAILURE
         }
     }
 }
 
-/// Whether this helper can make an adapter: it holds `CAP_NET_ADMIN`,
-/// whether granted by file capability or by running as root. The launcher asks
-/// before offering a room, rather than finding out when one fails.
+#[cfg(any(target_os = "linux", windows))]
+fn serve(name: &str, cidr: &str, rest: &[String]) -> Result<(), String> {
+    let config = game_bridge::lan_adapter::AdapterConfig::from_cidr(name, cidr)
+        .map_err(|e| e.to_string())?;
+    let args = parse_serve(rest)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    let run = {
+        let _ = (&args.wintun, args.remove_driver);
+        game_bridge::lan_adapter::serve(&config, args.connect, &args.token)
+    };
+    #[cfg(windows)]
+    let dll = match args.wintun {
+        Some(d) => d,
+        None => game_bridge::lan_adapter::default_wintun_dll().map_err(|e| e.to_string())?,
+    };
+    #[cfg(windows)]
+    let run = game_bridge::lan_adapter::serve(
+        &config,
+        args.connect,
+        &args.token,
+        &dll,
+        args.remove_driver,
+    );
+    runtime.block_on(run).map_err(|e| e.to_string())
+}
+
+/// Whether `serve` could make an adapter now.
 ///
-/// A capability granted to a binary on a `nosuid` mount — an AppImage's, for
-/// one — is silently not applied, and this is where that shows: `setcap`
-/// succeeds and `check` still says no.
+/// Linux: this process holds `CAP_NET_ADMIN`, granted by file capability or by
+/// running as root. A capability on a binary in a `nosuid` mount — an
+/// AppImage's — is silently not applied, and this is where that shows.
 #[cfg(target_os = "linux")]
 fn check() -> Result<(), String> {
     const CAP_NET_ADMIN: u32 = 12;
@@ -78,95 +135,17 @@ fn check() -> Result<(), String> {
     }
 }
 
-/// Whose adapter this is.
-///
-/// Run under `setcap`, the real uid is the user, and that is the answer — an
-/// environment variable must not be able to hand the adapter to somebody else.
-/// Only when actually running as root, via `sudo` or `pkexec`, is the invoking
-/// user read from where those two record it.
-#[cfg(target_os = "linux")]
-fn owner() -> u32 {
-    // SAFETY: getuid and geteuid cannot fail.
-    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
-    if uid == 0 && euid == 0 {
-        for var in ["PKEXEC_UID", "SUDO_UID"] {
-            if let Some(id) = std::env::var(var).ok().and_then(|v| v.parse().ok()) {
-                return id;
-            }
-        }
-    }
-    uid
-}
-
-#[cfg(target_os = "linux")]
-fn parse_config(name: &str, cidr: &str) -> Result<game_bridge::lan_adapter::AdapterConfig, String> {
-    game_bridge::lan_adapter::AdapterConfig::from_cidr(name, cidr).map_err(|e| e.to_string())
-}
-
+/// Windows: `wintun.dll` is where `serve` will load it from. Needs no
+/// elevation — the prompt is `serve`'s, when a room starts.
 #[cfg(windows)]
-fn main() -> std::process::ExitCode {
-    use std::process::ExitCode;
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match serve(&args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("lan-helper: {e}");
-            ExitCode::FAILURE
-        }
+fn check() -> Result<(), String> {
+    let dll = game_bridge::lan_adapter::default_wintun_dll().map_err(|e| e.to_string())?;
+    if dll.is_file() {
+        println!("ok");
+        Ok(())
+    } else {
+        Err(format!("no wintun.dll at {}", dll.display()))
     }
-}
-
-#[cfg(windows)]
-fn serve(args: &[String]) -> Result<(), String> {
-    use game_bridge::lan_adapter::{default_wintun_dll, AdapterConfig};
-    use game_bridge::lan_relay::RelayToken;
-
-    let usage = "usage: lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> --token <hex> [--wintun <dll>] | lan-helper check";
-    // `check` needs no elevation: it only says whether `serve` could find
-    // Wintun. The elevation prompt is `serve`'s, at the moment a room starts.
-    if let [cmd] = args {
-        if cmd == "check" {
-            let dll = default_wintun_dll().map_err(|e| e.to_string())?;
-            return if dll.is_file() {
-                println!("ok");
-                Ok(())
-            } else {
-                Err(format!("no wintun.dll at {}", dll.display()))
-            };
-        }
-    }
-    let [cmd, name, cidr, rest @ ..] = args else { return Err(usage.to_string()) };
-    if cmd != "serve" {
-        return Err(usage.to_string());
-    }
-    let config = AdapterConfig::from_cidr(name, cidr).map_err(|e| e.to_string())?;
-    let (mut connect, mut token, mut dll) = (None, None, None);
-    let mut it = rest.iter();
-    while let Some(flag) = it.next() {
-        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
-        match flag.as_str() {
-            "--connect" => {
-                connect = Some(value.parse().map_err(|_| format!("{value:?} is not an address"))?)
-            }
-            "--token" => token = Some(RelayToken::from_hex(value).map_err(|e| e.to_string())?),
-            "--wintun" => dll = Some(std::path::PathBuf::from(value)),
-            other => return Err(format!("unknown option {other:?}\n{usage}")),
-        }
-    }
-    let connect = connect.ok_or_else(|| usage.to_string())?;
-    let token = token.ok_or_else(|| usage.to_string())?;
-    let dll = match dll {
-        Some(d) => d,
-        None => default_wintun_dll().map_err(|e| e.to_string())?,
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    runtime
-        .block_on(game_bridge::lan_adapter::serve(&config, connect, &token, &dll))
-        .map_err(|e| e.to_string())
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]

@@ -61,6 +61,22 @@ jobs:
         with:
           key: ci-${{ matrix.os }}
 
+      # The Linux room-adapter tests (`lan_adapter`, `lan_no_garbage`,
+      # `lan_openttd`) re-run themselves in an unprivileged user namespace, which
+      # Ubuntu 24.04's AppArmor forbids by default. Without this they skip —
+      # and they did, silently, through v0.2.20: "finished in 0.00s".
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # A real OpenTTD server and client in a LAN room (`tests/lan_openttd.rs`).
+      # The pinned build is x86_64 Linux only.
+      - name: OpenTTD for the real-game LAN test
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          scripts/fetch-openttd.sh "$RUNNER_TEMP/openttd"
+          echo "OPENTTD_DIR=$RUNNER_TEMP/openttd/openttd-15.3-linux-generic-amd64" >> "$GITHUB_ENV"
+
       # `launcher/src-tauri` is excluded from the workspace, so this does not
       # build a webview anywhere — that is the `launcher` job's business.
       - name: Test
@@ -178,7 +194,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev xvfb
 
       # The launcher ships lan-helper as a sidecar on Linux and Windows, and
       # wintun.dll beside it on Windows (tauri.linux.conf.json,
@@ -202,6 +218,18 @@ jobs:
       - name: Build the launcher shell
         working-directory: launcher/src-tauri
         run: cargo build
+
+      # Portable mode's promise, checked on the real app: run it with a
+      # portable-data folder beside it and fail if it wrote anything outside
+      # that folder (PLAN.md §14, step 5b).
+      - name: A portable run leaves nothing outside its folder (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/check-portable.sh launcher/src-tauri/target/debug/launcher
+
+      - name: A portable run leaves nothing outside its folder (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/check-portable.ps1 launcher/src-tauri/target/debug/launcher.exe
 
   frontend:
     name: frontend render pass

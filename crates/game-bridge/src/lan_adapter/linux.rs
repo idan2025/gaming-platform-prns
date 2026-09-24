@@ -1,24 +1,34 @@
-//! The Linux room adapter: a TUN device (`PLAN.md` §14, step 2).
+//! The Linux room adapter: a TUN device (`PLAN.md` §14, steps 2 and 5b).
 //!
-//! A layer-3 TUN device carrying the room's subnet and nothing else. The split
-//! that keeps the launcher unprivileged (`PLAN.md` §14.1):
+//! A layer-3 TUN device carrying the room's subnet and nothing else, made
+//! **non-persistent**: it exists exactly as long as the descriptor that made it
+//! is open. The elevated `lan-helper serve` holds that descriptor and relays
+//! packets to the unprivileged launcher (`lan_relay.rs`), the same shape as on
+//! Windows — so the adapter, its address and its routes cannot outlive the
+//! launcher, however it ends: a quit, a crash, `kill -9`. The helper sees its
+//! relay drop, exits, and the kernel takes the device away with its last
+//! descriptor.
 //!
-//! - **[`create`] and [`destroy`] need `CAP_NET_ADMIN`**, and are all the
-//!   `lan-helper` binary does here. `create` makes the device *persistent* and
-//!   *owned* by the user, then configures it.
-//! - **[`TunDevice::attach`] does not.** A persistent TUN device owned by a
-//!   user can be opened by that user with no capability at all, so the
-//!   launcher — which runs the room — opens it itself and never elevates.
+//! The helper gets its privilege one of two ways (`open`):
+//!
+//! - **Granted once**: `cap_net_admin` on the helper file, which an installed
+//!   launcher can ask for (`pkexec setcap`). Then no prompt per room.
+//! - **Per room**: nothing granted — the portable case, and the AppImage's,
+//!   whose `nosuid`, owner-only FUSE mount can neither hold a capability nor be
+//!   read by root. The launcher copies the helper into the session's runtime
+//!   directory (`/run/user/<uid>`, memory-backed and cleared at logout), runs
+//!   the copy through `pkexec`, and deletes it as soon as it has connected
+//!   back. Nothing is installed and nothing is left.
 //!
 //! Everything is an ioctl, deliberately: a helper granted `cap_net_admin` by
 //! file capability does not pass it to a child it spawns, so shelling out to
 //! `ip` would work under `sudo` and fail under `setcap`.
 //!
-//! - **The limited-broadcast route is what makes old games find each other.**
-//!   Without it a broadcast to `255.255.255.255` leaves by the default route —
-//!   the real LAN — which is the Hamachi "adapter metric" failure on Linux. It
-//!   also means that while a room is up, *every* program's limited broadcasts
-//!   go to the room; [`destroy`] takes it away with the device.
+//! **The limited-broadcast route is what makes old games find each other.**
+//! Without it a broadcast to `255.255.255.255` leaves by the default route —
+//! the real LAN — which is the Hamachi "adapter metric" failure on Linux. It
+//! also means that while a room is up, *every* program's limited broadcasts go
+//! to the room; the route goes with the device.
 
 use std::ffi::CString;
 use std::io;
@@ -27,30 +37,15 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use tokio::io::unix::AsyncFd;
 
-use super::{invalid, validate_name, AdapterConfig, AdapterSetup};
+use super::{invalid, AdapterConfig, AdapterSetup};
 use crate::lan::LAN_MTU;
+use crate::lan_pump::PacketDevice;
+use crate::lan_relay::{self, RelayToken, RemoteDevice};
 
-/// Create the adapter, persistent and owned by `owner`, and configure it.
-/// Needs `CAP_NET_ADMIN`. Running it again on an existing adapter reconfigures
-/// it, which is how a member whose address changed is moved.
-pub fn create(config: &AdapterConfig, owner: u32) -> io::Result<()> {
-    config.validate()?;
-    let fd = open_tun(&config.name)?;
-    tun_ioctl(&fd, libc::TUNSETPERSIST, 1)?;
-    tun_ioctl(&fd, libc::TUNSETOWNER, owner as libc::c_ulong)?;
-    configure(config)
-}
-
-/// Remove an adapter [`create`] made. Needs `CAP_NET_ADMIN`.
-pub fn destroy(name: &str) -> io::Result<()> {
-    validate_name(name)?;
-    let fd = open_tun(name)?;
-    tun_ioctl(&fd, libc::TUNSETPERSIST, 0)
-}
-
-/// Create and configure a non-persistent adapter and keep it open: for a
-/// process that already holds `CAP_NET_ADMIN` and needs no helper, like a test
-/// inside a user namespace. The device goes when the descriptor does.
+/// Create and configure a non-persistent adapter and keep it open. Needs
+/// `CAP_NET_ADMIN`: this is what `lan-helper serve` does, and what a process
+/// that already holds the capability — a test in a user namespace — does
+/// itself. The device goes when the descriptor does.
 pub fn open_configured(config: &AdapterConfig) -> io::Result<OwnedFd> {
     config.validate()?;
     let fd = open_tun(&config.name)?;
@@ -76,13 +71,6 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
-    /// Open an adapter [`create`] made for this user. Needs no capability.
-    /// Must be called inside a tokio runtime.
-    pub fn attach(name: &str) -> io::Result<Self> {
-        validate_name(name)?;
-        Self::from_fd(open_tun(name)?)
-    }
-
     /// Wrap a descriptor from [`open_configured`]. Must be called inside a
     /// tokio runtime.
     pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
@@ -160,14 +148,6 @@ fn open_tun(name: &str) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
-}
-
-fn tun_ioctl(fd: &OwnedFd, request: libc::Ioctl, arg: libc::c_ulong) -> io::Result<()> {
-    // SAFETY: TUNSETPERSIST and TUNSETOWNER take their argument by value.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn control_socket() -> io::Result<OwnedFd> {
@@ -297,71 +277,167 @@ fn add_limited_broadcast_route(sock: &OwnedFd, name: &str) -> io::Result<()> {
 // Running a room on an adapter
 // ---------------------------------------------------------------------------
 
-impl AdapterSetup {
-    fn up(&self, config: &AdapterConfig) -> anyhow::Result<()> {
-        use anyhow::Context;
+// ---------------------------------------------------------------------------
+// The helper, and the launcher's side of it
+// ---------------------------------------------------------------------------
+
+/// `lan-helper serve`: make the adapter, connect out to the launcher that
+/// started this, and relay until it goes away. The adapter goes with this
+/// process's descriptor, however the launcher ended.
+pub async fn serve(
+    config: &AdapterConfig,
+    launcher: std::net::SocketAddr,
+    token: &RelayToken,
+) -> io::Result<()> {
+    let device = TunDevice::from_fd(open_configured(config)?)?;
+    let stream = lan_relay::connect_to_launcher(launcher, token).await?;
+    lan_relay::relay(&device, stream).await
+}
+
+/// The adapter as the launcher holds it.
+pub enum LinuxAdapter {
+    /// This process made it itself (it already holds the capability).
+    Direct(TunDevice),
+    /// `lan-helper serve` holds it and relays.
+    Relayed(RemoteDevice),
+}
+
+impl PacketDevice for LinuxAdapter {
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::InProcess => {
-                // SAFETY: getuid cannot fail.
-                let uid = unsafe { libc::getuid() };
-                create(config, uid).with_context(|| {
-                    format!(
-                        "creating adapter {} needs CAP_NET_ADMIN; use lan-helper instead",
-                        config.name
-                    )
-                })
-            }
-            Self::Helper(helper) => {
-                let cidr = format!("{}/{}", config.address, config.subnet.prefix_len);
-                let out = std::process::Command::new(helper)
-                    .args(["up", &config.name, &cidr])
-                    .output()
-                    .with_context(|| format!("running {}", helper.display()))?;
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "{} up {} {cidr} failed: {}\nGrant it the one capability it needs: \
-                         sudo setcap cap_net_admin+ep {}",
-                        helper.display(),
-                        config.name,
-                        String::from_utf8_lossy(&out.stderr).trim(),
-                        helper.display()
-                    );
-                }
-                Ok(())
-            }
+            Self::Direct(d) => d.recv(buf).await,
+            Self::Relayed(d) => d.recv(buf).await,
         }
     }
 
-    fn down(&self, name: &str) {
-        let result = match self {
-            Self::InProcess => destroy(name).map_err(|e| e.to_string()),
-            Self::Helper(helper) => std::process::Command::new(helper)
-                .args(["down", name])
-                .status()
-                .map_err(|e| e.to_string())
-                .and_then(|s| if s.success() { Ok(()) } else { Err(format!("exit {s}")) }),
-        };
-        if let Err(e) = result {
-            tracing::warn!(adapter = name, error = %e, "could not remove the room adapter");
+    async fn send(&self, packet: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Direct(d) => d.send(packet).await,
+            Self::Relayed(d) => d.send(packet).await,
         }
     }
+}
+
+/// Whether the helper at `path` already holds its capability.
+fn granted(path: &std::path::Path) -> bool {
+    std::process::Command::new(path)
+        .arg("check")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The program that asks a person for their password and runs one command as
+/// root. `pkexec` is polkit's, and every desktop that can show a password
+/// prompt has it.
+fn elevator() -> Option<std::path::PathBuf> {
+    // A debug build may be pointed at a stand-in, so a test can drive the
+    // per-room path without a person at a polkit prompt. Compiled out of a
+    // release: a release asks polkit, and only polkit.
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os(ELEVATOR_ENV) {
+        return Some(p.into());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).map(|d| d.join("pkexec")).find(|p| p.is_file())
+}
+
+/// The environment variable a debug build reads a stand-in elevator from.
+pub const ELEVATOR_ENV: &str = "GAME_BRIDGE_ELEVATOR";
+
+/// A copy of the helper for one elevated run, deleted when dropped.
+///
+/// It lives in the session's runtime directory — memory-backed, cleared at
+/// logout — under an unguessable name, created exclusively with mode 0700, so
+/// nothing of it survives even a machine that loses power mid-room. It is
+/// dropped as soon as the helper has connected back: a running program does
+/// not need its file.
+pub struct HelperCopy(std::path::PathBuf);
+
+impl HelperCopy {
+    pub fn stage(helper: &std::path::Path) -> io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let bytes = std::fs::read(helper)?;
+        let mut nonce = [0u8; 8];
+        getrandom::getrandom(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
+        let path = dir.join(format!("gpp-lan-helper-{}", hex::encode(nonce)));
+        let mut file =
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&path)?;
+        let copy = Self(path);
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(copy)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for HelperCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Start the helper with `args`: directly when it already holds its
+/// capability, else as a staged copy through the elevator. Returns the copy,
+/// if one was made, for the caller to drop once the helper has connected.
+fn start_helper(path: &std::path::Path, args: Vec<String>) -> io::Result<Option<HelperCopy>> {
+    let forced = cfg!(debug_assertions) && std::env::var_os(ELEVATOR_ENV).is_some();
+    let (program, copy, prefix) = if granted(path) && !forced {
+        (path.to_path_buf(), None, None)
+    } else {
+        let elevator = elevator().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no pkexec to ask for your password. Install polkit, or grant the helper its \
+                     permission once: sudo setcap cap_net_admin+ep {}",
+                    path.display()
+                ),
+            )
+        })?;
+        let copy = HelperCopy::stage(path)?;
+        (elevator, Some(copy.path().to_path_buf()), Some(copy))
+    };
+    let mut cmd = std::process::Command::new(&program);
+    if let Some(copy) = &copy {
+        cmd.arg(copy);
+    }
+    let mut child = cmd.args(&args).stdin(std::process::Stdio::null()).spawn()?;
+    // Reaped on its own thread: the helper lives for the whole room, and an
+    // unwaited child would stay a zombie until the launcher exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(prefix)
 }
 
 /// Bring the adapter up for `config` and open it.
 pub(super) async fn open(
     setup: &AdapterSetup,
     config: &AdapterConfig,
-) -> anyhow::Result<TunDevice> {
-    let (setup, up) = (setup.clone(), config.clone());
-    tokio::task::spawn_blocking(move || setup.up(&up)).await??;
-    Ok(TunDevice::attach(&config.name)?)
-}
-
-/// Take the adapter away. The device must already be closed: a persistent TUN
-/// device cannot be removed while it is attached.
-pub(super) async fn close(setup: &AdapterSetup, name: &str) {
-    let (setup, name) = (setup.clone(), name.to_string());
-    let _ = tokio::task::spawn_blocking(move || setup.down(&name)).await;
+) -> anyhow::Result<LinuxAdapter> {
+    match setup {
+        AdapterSetup::InProcess => {
+            let c = config.clone();
+            let fd = tokio::task::spawn_blocking(move || open_configured(&c)).await??;
+            Ok(LinuxAdapter::Direct(TunDevice::from_fd(fd)?))
+        }
+        AdapterSetup::Helper { path, .. } => {
+            let path = path.clone();
+            let remote =
+                super::relayed(config, Vec::new(), move |args| start_helper(&path, args)).await?;
+            Ok(LinuxAdapter::Relayed(remote))
+        }
+    }
 }
 
 #[cfg(test)]

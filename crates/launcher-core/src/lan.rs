@@ -77,11 +77,19 @@ pub struct LanHelperView {
     pub supported: bool,
     /// Where the launcher expects `lan-helper`.
     pub path: Option<String>,
-    /// The helper is there and able to make an adapter.
+    /// A room can start: the helper is there and has a way to its privilege.
     pub ready: bool,
-    /// The launcher can ask for the permission itself (Linux, via `pkexec`).
+    /// How the helper gets its privilege when a room starts:
+    /// `"granted"` (Linux, permission granted once — no prompt),
+    /// `"per-room"` (Linux, a password prompt each room, nothing installed),
+    /// `"prompt"` (Windows' elevation prompt), or `"none"`.
+    pub mode: String,
+    /// The launcher can grant the permission once, so rooms stop prompting
+    /// (Linux, installed — never portable or AppImage).
     pub can_grant: bool,
-    /// One line for a person: what is missing and what to do about it.
+    /// The permission is granted and the launcher can take it back.
+    pub can_revoke: bool,
+    /// One line for a person: what happens, or what is missing and what to do.
     pub detail: String,
 }
 
@@ -168,87 +176,133 @@ fn on_path(program: &str) -> bool {
         .any(|dir| dir.join(program).is_file())
 }
 
-/// The pure decision behind [`Launcher::lan_helper`], from facts already
-/// gathered, so it is testable without a helper on the machine.
-pub(crate) fn helper_view(
-    supported: bool,
-    path: Option<PathBuf>,
-    exists: bool,
-    check: Option<Result<(), String>>,
-    grant_tools: bool,
-) -> LanHelperView {
-    let path_text = path.as_ref().map(|p| p.display().to_string());
-    if !supported {
-        return LanHelperView {
-            supported: false,
-            path: path_text,
-            ready: false,
-            can_grant: false,
-            detail: "LAN rooms need a room adapter, which this platform does not have yet \
-                     (Linux and Windows do)."
+/// What [`Launcher::lan_helper`] found out, before deciding anything.
+#[derive(Debug, Clone)]
+pub(crate) struct HelperFacts {
+    pub supported: bool,
+    pub windows: bool,
+    pub path: Option<PathBuf>,
+    pub exists: bool,
+    /// The helper's own `check`: its capability on Linux, Wintun on Windows.
+    pub check: Option<Result<(), String>>,
+    pub pkexec: bool,
+    pub setcap: bool,
+    pub portable: bool,
+    pub appimage: bool,
+}
+
+/// The pure decision behind [`Launcher::lan_helper`], testable without a
+/// helper on the machine.
+pub(crate) fn helper_view(f: HelperFacts) -> LanHelperView {
+    let path = f.path.as_ref().map(|p| p.display().to_string());
+    let view = |ready: bool, mode: &str, can_grant: bool, can_revoke: bool, detail: String| {
+        LanHelperView {
+            supported: f.supported,
+            path: path.clone(),
+            ready,
+            mode: mode.to_string(),
+            can_grant,
+            can_revoke,
+            detail,
+        }
+    };
+    if !f.supported {
+        return view(
+            false,
+            "none",
+            false,
+            false,
+            "LAN rooms need a room adapter, which this platform does not have yet (Linux and Windows do)."
                 .to_string(),
+        );
+    }
+    if !f.exists {
+        return view(
+            false,
+            "none",
+            false,
+            false,
+            "lan-helper is not beside this launcher, so it cannot make a room adapter. Reinstall, or \
+             unpack the portable download again."
+                .to_string(),
+        );
+    }
+    let check_ok = matches!(f.check, Some(Ok(())));
+    if f.windows {
+        return if check_ok {
+            view(
+                true,
+                "prompt",
+                false,
+                false,
+                if f.portable {
+                    "Ready. Windows asks for administrator rights when a room starts, for the helper \
+                     only; when the room ends the Wintun driver is removed again."
+                        .to_string()
+                } else {
+                    "Ready. Windows asks for administrator rights when a room starts, for the helper only."
+                        .to_string()
+                },
+            )
+        } else {
+            view(
+                false,
+                "none",
+                false,
+                false,
+                format!("lan-helper cannot run: {}", err_text(&f.check)),
+            )
         };
     }
-    if !exists {
-        return LanHelperView {
-            supported: true,
-            path: path_text,
-            ready: false,
-            can_grant: false,
-            detail: "lan-helper is not installed beside this launcher, so it cannot make a room \
-                     adapter. Reinstall from a release that includes it."
+    // Linux. A capability can only live on an installed helper: an AppImage's
+    // mount ignores it, and portable mode installs nothing by definition.
+    let installed = !f.portable && !f.appimage;
+    if check_ok {
+        return view(
+            true,
+            "granted",
+            false,
+            installed,
+            "Ready. lan-helper has its network permission, so rooms start without asking. Revoke it to \
+             be asked each time instead."
                 .to_string(),
-        };
+        );
     }
-    // An AppImage mounts itself `nosuid`, where a file capability is ignored:
-    // granting would succeed and change nothing.
-    let in_appimage = path.as_ref().is_some_and(|p| p.to_string_lossy().contains("/.mount_"));
-    match check {
-        Some(Ok(())) => LanHelperView {
-            supported: true,
-            path: path_text,
-            ready: true,
-            can_grant: false,
-            detail: if cfg!(windows) {
-                "Ready. Windows will ask for administrator rights when a room starts, for the \
-                 helper only."
+    if f.pkexec {
+        let can_grant = installed && f.setcap;
+        return view(
+            true,
+            "per-room",
+            can_grant,
+            false,
+            if can_grant {
+                "Ready. Your password is asked each time a room starts, and nothing is installed or left \
+                 behind. Grant the permission once to stop being asked."
                     .to_string()
             } else {
-                "Ready.".to_string()
+                "Ready. Your password is asked each time a room starts, and nothing is installed or left \
+                 behind."
+                    .to_string()
             },
-        },
-        _ if in_appimage => LanHelperView {
-            supported: true,
-            path: path_text,
-            ready: false,
-            can_grant: false,
-            detail: "The AppImage cannot hold the network permission a room adapter needs. \
-                     Install the .deb or .rpm to host or join LAN rooms."
-                .to_string(),
-        },
-        Some(Err(why)) => LanHelperView {
-            supported: true,
-            ready: false,
-            can_grant: cfg!(target_os = "linux") && grant_tools,
-            detail: if cfg!(target_os = "linux") {
-                format!(
-                    "LAN rooms need one-time permission for lan-helper to make a network \
-                     adapter (and nothing else). Grant it here, or run: sudo setcap \
-                     cap_net_admin+ep {}",
-                    path_text.as_deref().unwrap_or("lan-helper")
-                )
-            } else {
-                format!("lan-helper cannot run: {why}")
-            },
-            path: path_text,
-        },
-        None => LanHelperView {
-            supported: true,
-            path: path_text,
-            ready: false,
-            can_grant: false,
-            detail: "lan-helper could not be asked whether it is ready.".to_string(),
-        },
+        );
+    }
+    view(
+        false,
+        "none",
+        false,
+        false,
+        format!(
+            "LAN rooms need a way to ask for your password (polkit's pkexec), or a permission granted \
+             once: sudo setcap cap_net_admin+ep {}",
+            path.as_deref().unwrap_or("lan-helper")
+        ),
+    )
+}
+
+fn err_text(check: &Option<Result<(), String>>) -> String {
+    match check {
+        Some(Err(e)) => e.clone(),
+        _ => "it could not be asked".to_string(),
     }
 }
 
@@ -264,42 +318,62 @@ fn run_check(path: &std::path::Path) -> Result<(), String> {
 impl Launcher {
     /// Whether this machine can put a room on an adapter, and if not, why.
     pub async fn lan_helper(&self) -> LanHelperView {
-        let supported = cfg!(any(target_os = "linux", windows));
-        let path = helper_path();
+        let portable = self.portable;
         tokio::task::spawn_blocking(move || {
+            let path = helper_path();
             let exists = path.as_ref().is_some_and(|p| p.is_file());
-            let check = (supported && exists).then(|| run_check(path.as_ref().expect("exists")));
-            helper_view(supported, path, exists, check, on_path("pkexec") && on_path("setcap"))
+            let supported = cfg!(any(target_os = "linux", windows));
+            helper_view(HelperFacts {
+                supported,
+                windows: cfg!(windows),
+                check: (supported && exists).then(|| run_check(path.as_ref().expect("exists"))),
+                path,
+                exists,
+                pkexec: on_path("pkexec"),
+                setcap: on_path("setcap"),
+                portable,
+                appimage: crate::portable::is_appimage(),
+            })
         })
         .await
-        .unwrap_or_else(|_| helper_view(supported, None, false, None, false))
+        .expect("the helper check does not panic")
     }
 
-    /// Ask for the helper's one permission — the opt-in moment on Linux.
-    ///
-    /// `pkexec` shows the desktop's own authentication dialog; the command it
-    /// runs is fixed here and names only the helper beside this launcher.
+    /// Grant the helper its permission once, so rooms stop prompting (Linux,
+    /// installed only). `pkexec` shows the desktop's own authentication dialog;
+    /// the command it runs is fixed here and names only the helper beside this
+    /// launcher.
     pub async fn grant_lan_helper(&self) -> Result<LanHelperView> {
-        if !cfg!(target_os = "linux") {
-            return Err(anyhow!(
-                "only Linux grants the helper a permission; Windows asks when a room starts"
-            ));
+        if !self.lan_helper().await.can_grant {
+            return Err(anyhow!("this launcher cannot grant the helper a permission (portable, an AppImage, or not Linux)"));
         }
+        self.setcap(&["cap_net_admin+ep"]).await?;
+        Ok(self.lan_helper().await)
+    }
+
+    /// Take the granted permission back: rooms prompt again, and nothing of
+    /// the grant is left on the helper.
+    pub async fn revoke_lan_helper(&self) -> Result<LanHelperView> {
+        if !self.lan_helper().await.can_revoke {
+            return Err(anyhow!("the helper holds no permission this launcher granted"));
+        }
+        self.setcap(&["-r"]).await?;
+        Ok(self.lan_helper().await)
+    }
+
+    async fn setcap(&self, args: &'static [&'static str]) -> Result<()> {
         let path = helper_path()
             .filter(|p| p.is_file())
             .ok_or_else(|| anyhow!("lan-helper is not installed beside this launcher"))?;
         let status = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("pkexec")
-                .args(["setcap", "cap_net_admin+ep"])
-                .arg(&path)
-                .status()
+            std::process::Command::new("pkexec").arg("setcap").args(args).arg(&path).status()
         })
         .await?
         .context("running pkexec")?;
         if !status.success() {
-            return Err(anyhow!("the permission was not granted ({status})"));
+            return Err(anyhow!("the change was not made ({status})"));
         }
-        Ok(self.lan_helper().await)
+        Ok(())
     }
 
     /// Open a room for `game_id` and put it on this machine's adapter.
@@ -383,7 +457,14 @@ impl Launcher {
         let session = Arc::new(session);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let (phase_tx, phase_rx) = watch::channel(AdapterPhase::WaitingForSeat);
-        let task = spawn_room(session.clone(), lan.policy(), helper_path, stop_rx, phase_tx);
+        let task = spawn_room(
+            session.clone(),
+            lan.policy(),
+            helper_path,
+            self.portable,
+            stop_rx,
+            phase_tx,
+        );
         inner.room = Some(RoomState {
             role,
             game_id,
@@ -458,6 +539,7 @@ fn spawn_room(
     session: Arc<LanSession>,
     policy: game_bridge::lan_filter::LanPolicy,
     helper: PathBuf,
+    portable: bool,
     stop: oneshot::Receiver<()>,
     phase: watch::Sender<AdapterPhase>,
 ) -> tokio::task::JoinHandle<Result<()>> {
@@ -466,7 +548,7 @@ fn spawn_room(
         session,
         policy,
         ADAPTER_NAME.to_string(),
-        AdapterSetup::Helper(helper),
+        AdapterSetup::Helper { path: helper, portable },
         async move {
             let _ = stop.await;
         },
@@ -479,6 +561,7 @@ fn spawn_room(
     _session: Arc<LanSession>,
     _policy: game_bridge::lan_filter::LanPolicy,
     _helper: PathBuf,
+    _portable: bool,
     _stop: oneshot::Receiver<()>,
     phase: watch::Sender<AdapterPhase>,
 ) -> tokio::task::JoinHandle<Result<()>> {
@@ -522,10 +605,27 @@ mod tests {
         assert_eq!(keys(&m), ["address", "is_self"]);
     }
 
+    fn facts() -> HelperFacts {
+        HelperFacts {
+            supported: true,
+            windows: false,
+            path: Some(PathBuf::from("/usr/bin/lan-helper")),
+            exists: true,
+            check: Some(Err("no CAP_NET_ADMIN".into())),
+            pkexec: true,
+            setcap: true,
+            portable: false,
+            appimage: false,
+        }
+    }
+
     #[test]
     fn helper_view_json_keys_are_the_frontend_contract() {
-        let v = serde_json::to_value(helper_view(true, None, false, None, false)).unwrap();
-        assert_eq!(keys(&v), ["can_grant", "detail", "path", "ready", "supported"]);
+        let v = serde_json::to_value(helper_view(facts())).unwrap();
+        assert_eq!(
+            keys(&v),
+            ["can_grant", "can_revoke", "detail", "mode", "path", "ready", "supported"]
+        );
     }
 
     #[test]
@@ -553,33 +653,61 @@ mod tests {
         assert_eq!(phase_label(&AdapterPhase::Failed("why".into())).1.as_deref(), Some("why"));
     }
 
-    /// Each state a person can be in gets a sentence that says what to do.
+    /// Each state a person can be in gets a sentence that says what happens.
     #[test]
-    fn the_helper_view_says_what_is_missing() {
-        let p = Some(PathBuf::from("/usr/bin/lan-helper"));
-        let unsupported = helper_view(false, p.clone(), true, None, true);
-        assert!(!unsupported.supported && !unsupported.ready);
+    fn an_installed_linux_helper_prompts_per_room_until_granted_and_can_be_revoked() {
+        let per_room = helper_view(facts());
+        assert!(per_room.ready, "pkexec is enough: a room can start");
+        assert_eq!(per_room.mode, "per-room");
+        assert!(per_room.can_grant && !per_room.can_revoke);
+        assert!(per_room.detail.contains("nothing is installed"));
 
-        let missing = helper_view(true, p.clone(), false, None, true);
-        assert!(!missing.ready && missing.detail.contains("not installed"));
+        let granted = helper_view(HelperFacts { check: Some(Ok(())), ..facts() });
+        assert_eq!(granted.mode, "granted");
+        assert!(granted.ready && granted.can_revoke && !granted.can_grant);
 
-        let ready = helper_view(true, p.clone(), true, Some(Ok(())), true);
-        assert!(ready.ready && !ready.can_grant);
+        let stuck = helper_view(HelperFacts { pkexec: false, ..facts() });
+        assert!(
+            !stuck.ready && stuck.detail.contains("setcap cap_net_admin+ep /usr/bin/lan-helper")
+        );
+    }
 
-        let needs = helper_view(true, p.clone(), true, Some(Err("no cap".into())), true);
-        assert!(!needs.ready);
-        if cfg!(target_os = "linux") {
-            assert!(needs.can_grant, "pkexec and setcap present: the launcher can ask");
-            assert!(needs.detail.contains("setcap cap_net_admin+ep /usr/bin/lan-helper"));
-            let no_tools = helper_view(true, p.clone(), true, Some(Err("no cap".into())), false);
-            assert!(!no_tools.can_grant, "without pkexec the command is shown instead");
+    /// Portable and AppImage install nothing: never offer a grant, never a
+    /// revoke, always the per-room prompt.
+    #[test]
+    fn a_portable_or_appimage_launcher_never_offers_to_install_anything() {
+        for f in
+            [HelperFacts { portable: true, ..facts() }, HelperFacts { appimage: true, ..facts() }]
+        {
+            let v = helper_view(f);
+            assert!(v.ready && v.mode == "per-room" && !v.can_grant && !v.can_revoke, "{v:?}");
         }
+        let portable_granted =
+            helper_view(HelperFacts { portable: true, check: Some(Ok(())), ..facts() });
+        assert!(!portable_granted.can_revoke, "a portable launcher granted nothing to revoke");
+    }
 
-        // An AppImage's mount ignores file capabilities: granting would change
-        // nothing, so it is not offered.
-        let appimage = PathBuf::from("/tmp/.mount_MeshGaXYZ/usr/bin/lan-helper");
-        let v = helper_view(true, Some(appimage), true, Some(Err("no cap".into())), true);
-        assert!(!v.can_grant && v.detail.contains(".deb"));
+    #[test]
+    fn windows_asks_at_room_start_and_portable_mode_says_the_driver_goes() {
+        let win = HelperFacts {
+            windows: true,
+            check: Some(Ok(())),
+            pkexec: false,
+            setcap: false,
+            ..facts()
+        };
+        let v = helper_view(win.clone());
+        assert!(v.ready && v.mode == "prompt" && !v.can_grant && !v.can_revoke);
+        let p = helper_view(HelperFacts { portable: true, ..win.clone() });
+        assert!(p.detail.contains("driver is removed"));
+        let no_dll = helper_view(HelperFacts { check: Some(Err("no wintun.dll".into())), ..win });
+        assert!(!no_dll.ready && no_dll.detail.contains("wintun.dll"));
+    }
+
+    #[test]
+    fn a_missing_or_unsupported_helper_says_so() {
+        assert!(!helper_view(HelperFacts { exists: false, ..facts() }).ready);
+        assert!(!helper_view(HelperFacts { supported: false, ..facts() }).supported);
     }
 
     fn shipped_packs() -> Vec<GamePack> {

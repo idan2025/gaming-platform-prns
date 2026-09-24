@@ -327,6 +327,41 @@ jobs:
             echo "$(basename "$img"): dropped the bundled libwayland-client"
           done
 
+      # The portable downloads (PLAN.md §14, step 5b): the launcher, its
+      # helper, the packs and an empty portable-data folder, which is what
+      # makes it portable. Nothing is installed; delete the folder and nothing
+      # is left. Linux needs the system's WebKitGTK 4.1 (the AppImage is the
+      # one that brings its own); macOS has no portable build yet.
+      - name: Portable archive (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' launcher/src-tauri/tauri.conf.json)"
+          arch="$(dpkg --print-architecture)"
+          stage="$RUNNER_TEMP/portable/Mesh Game Servers"
+          mkdir -p "$stage/packs" "$stage/portable-data" dist
+          cp launcher/src-tauri/target/release/mesh-game-servers "$stage/"
+          cp launcher/src-tauri/target/release/lan-helper "$stage/"
+          cp packs/*.toml "$stage/packs/"
+          cp scripts/portable-readme.txt "$stage/portable-data/README.txt"
+          tar -czf "dist/Mesh.Game.Servers_${version}_${arch}-portable.tar.gz" \
+            -C "$RUNNER_TEMP/portable" "Mesh Game Servers"
+
+      - name: Portable archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Get-Content launcher/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $stage = Join-Path $env:RUNNER_TEMP 'portable\Mesh Game Servers'
+          New-Item -ItemType Directory -Force -Path "$stage\packs", "$stage\portable-data", dist | Out-Null
+          Copy-Item launcher/src-tauri/target/release/mesh-game-servers.exe $stage
+          Copy-Item launcher/src-tauri/target/release/lan-helper.exe $stage
+          Copy-Item launcher/src-tauri/binaries/wintun.dll, launcher/src-tauri/binaries/wintun-LICENSE.txt $stage
+          Copy-Item packs/*.toml "$stage\packs"
+          Copy-Item scripts/portable-readme.txt "$stage\portable-data\README.txt"
+          Compress-Archive -Path $stage -DestinationPath "dist/Mesh.Game.Servers_${version}_x64-portable.zip"
+
       - name: Collect bundles
         shell: bash
         run: |

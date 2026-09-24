@@ -109,6 +109,28 @@ Other members reach your machine through a room **only on the game's declared
 ports** and on replies to connections you opened; your own system's background
 broadcasts (mDNS, NetBIOS, SSDP) are not sent into it.
 
+### Portable, and nothing left behind
+
+Rebuilt in place on 2026-09-24, the day it was first published, to add this.
+
+- **Portable downloads**: `Mesh.Game.Servers_0.2.20_x64-portable.zip`
+  (Windows) and `…_amd64-portable.tar.gz` / `…_arm64-portable.tar.gz` (Linux;
+  needs the system's WebKitGTK 4.1). Unpack and run. Everything the launcher
+  keeps — settings, identities, remembered servers, the web view's storage and
+  caches — stays in its `portable-data` folder. The AppImage becomes portable
+  the same way when a `<AppImage>.home` folder sits beside it.
+- **LAN rooms install nothing in portable mode, and on the AppImage**: on Linux
+  your password is asked when a room starts, and the helper runs from a copy
+  that is deleted as soon as it runs; on Windows the Wintun driver is removed
+  again when the room ends. The AppImage can now host and join rooms.
+- **A room leaves nothing behind, however the launcher ends** — a quit, a
+  crash or `kill -9`. On Linux the room's network adapter is no longer
+  persistent (in the first v0.2.20 build a killed launcher left `gbl0` until
+  reboot); it now disappears with the helper, which exits when the launcher is
+  gone.
+- **Installed Linux launchers** can still grant the helper its permission
+  once, to stop being asked per room, and can now **Revoke** it.
+
 ## v0.2.19
 
 Two fixes, either of which on its own stopped a Linux player from getting as

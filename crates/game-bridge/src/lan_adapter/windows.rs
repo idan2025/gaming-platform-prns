@@ -28,7 +28,6 @@ use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 use windows_sys::core::GUID;
@@ -61,9 +60,6 @@ use crate::lan_relay::{self, RelayToken, RemoteDevice};
 const RING_CAPACITY: u32 = 0x40_0000;
 /// Packets read off the adapter and not yet taken by the pump.
 const READ_QUEUE: usize = 1024;
-/// How long to wait for the helper to connect back — long enough for a person
-/// to read and answer the elevation prompt.
-const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// The environment variable a test uses to say where `wintun.dll` is.
 pub const WINTUN_DLL_ENV: &str = "GAME_BRIDGE_WINTUN_DLL";
 
@@ -80,6 +76,7 @@ type ReceivePacketFn = unsafe extern "system" fn(Handle, *mut u32) -> *mut u8;
 type ReleaseReceivePacketFn = unsafe extern "system" fn(Handle, *const u8);
 type AllocateSendPacketFn = unsafe extern "system" fn(Handle, u32) -> *mut u8;
 type SendPacketFn = unsafe extern "system" fn(Handle, *const u8);
+type DeleteDriverFn = unsafe extern "system" fn() -> i32;
 
 struct WintunApi {
     _library: HMODULE,
@@ -93,6 +90,7 @@ struct WintunApi {
     release_receive_packet: ReleaseReceivePacketFn,
     allocate_send_packet: AllocateSendPacketFn,
     send_packet: SendPacketFn,
+    delete_driver: DeleteDriverFn,
 }
 
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
@@ -150,6 +148,7 @@ impl WintunApi {
             release_receive_packet: func!("WintunReleaseReceivePacket", ReleaseReceivePacketFn),
             allocate_send_packet: func!("WintunAllocateSendPacket", AllocateSendPacketFn),
             send_packet: func!("WintunSendPacket", SendPacketFn),
+            delete_driver: func!("WintunDeleteDriver", DeleteDriverFn),
         })
     }
 }
@@ -379,15 +378,40 @@ fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
 /// `lan-helper serve`: create the adapter, connect out to the launcher that
 /// started this, and relay until it goes away. The adapter is closed on
 /// return, however the launcher ended.
+///
+/// `remove_driver` is portable mode: with the adapter closed, uninstall the
+/// Wintun driver too, so the machine is as it was. Wintun refuses while any
+/// adapter — another program's included — still exists, which is right: then
+/// the driver is not only this room's to remove.
 pub async fn serve(
     config: &AdapterConfig,
     launcher: std::net::SocketAddr,
     token: &RelayToken,
     dll: &Path,
+    remove_driver: bool,
 ) -> io::Result<()> {
-    let device = WintunDevice::create(dll, config)?;
-    let stream = lan_relay::connect_to_launcher(launcher, token).await?;
-    lan_relay::relay(&device, stream).await
+    let result = async {
+        let device = WintunDevice::create(dll, config)?;
+        let stream = lan_relay::connect_to_launcher(launcher, token).await?;
+        lan_relay::relay(&device, stream).await
+    }
+    .await;
+    if remove_driver {
+        if let Err(e) = delete_driver(dll) {
+            eprintln!("lan-helper: the Wintun driver was left installed: {e}");
+        }
+    }
+    result
+}
+
+/// Uninstall the Wintun driver. Fails while any Wintun adapter exists.
+pub fn delete_driver(dll: &Path) -> io::Result<()> {
+    let api = WintunApi::load(dll)?;
+    // SAFETY: takes no arguments; documented in wintun.h.
+    if unsafe { (api.delete_driver)() } == 0 {
+        return Err(last_error("removing the Wintun driver"));
+    }
+    Ok(())
 }
 
 /// The adapter as the launcher holds it: directly (already an administrator)
@@ -444,7 +468,11 @@ pub fn is_elevated() -> bool {
 /// moment a person is asked, and the only elevated code is the helper.
 fn start_helper(helper: &Path, args: &[String]) -> io::Result<()> {
     if is_elevated() {
-        std::process::Command::new(helper).args(args).spawn()?;
+        let mut child = std::process::Command::new(helper).args(args).spawn()?;
+        // Reaped on its own thread: the helper lives for the whole room.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
         return Ok(());
     }
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
@@ -482,31 +510,19 @@ pub(super) async fn open(
                 tokio::task::spawn_blocking(move || WintunDevice::create(&dll, &config)).await??;
             Ok(WindowsAdapter::Direct(device))
         }
-        AdapterSetup::Helper(helper) => {
-            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            let port = listener.local_addr()?.port();
-            let token = RelayToken::random()?;
-            let mut args = vec![
-                "serve".to_string(),
-                config.name.clone(),
-                config.cidr(),
-                "--connect".to_string(),
-                format!("127.0.0.1:{port}"),
-                "--token".to_string(),
-                token.to_hex(),
-            ];
+        AdapterSetup::Helper { path, portable } => {
+            let mut extra = Vec::new();
             if let Some(dll) = std::env::var_os(WINTUN_DLL_ENV) {
-                args.push("--wintun".to_string());
-                args.push(dll.to_string_lossy().into_owned());
+                extra.push("--wintun".to_string());
+                extra.push(dll.to_string_lossy().into_owned());
             }
-            start_helper(helper, &args)?;
+            if *portable {
+                extra.push("--remove-driver".to_string());
+            }
+            let helper = path.clone();
             let remote =
-                lan_relay::accept_helper(&listener, &token, HELPER_CONNECT_TIMEOUT).await?;
+                super::relayed(config, extra, move |args| start_helper(&helper, &args)).await?;
             Ok(WindowsAdapter::Relayed(remote))
         }
     }
 }
-
-/// Nothing to do: the adapter closes with the device — directly, or when the
-/// helper sees the relay drop.
-pub(super) async fn close(_setup: &AdapterSetup, _name: &str) {}

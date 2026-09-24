@@ -89,6 +89,34 @@ async fn wait_until(what: &str, within: Duration, mut cond: impl FnMut() -> bool
     }
 }
 
+/// Whether Wintun's driver package is in Windows' driver store.
+///
+/// *Installed*, not *loaded*: Windows unloads the driver the moment no Wintun
+/// adapter exists, while the package stays in the store — which is exactly
+/// what portable mode must remove. Asking whether it was loaded (the first
+/// version of this check) read "gone" after every room, portable or not.
+fn wintun_installed() -> bool {
+    let out =
+        std::process::Command::new("pnputil").arg("/enum-drivers").output().expect("pnputil runs");
+    String::from_utf8_lossy(&out.stdout).to_ascii_lowercase().contains("wintun.inf")
+}
+
+/// Wait until the Wintun driver package is installed (or not).
+async fn wait_driver(want_installed: bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let installed = wintun_installed();
+        if installed == want_installed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the Wintun driver installed is {installed}, wanted {want_installed}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Whether this machine holds `addr` — i.e. whether the adapter carries it.
 fn holds(addr: Ipv4Addr) -> bool {
     UdpSocket::bind((addr, 0)).is_ok()
@@ -129,7 +157,7 @@ async fn a_windows_broadcast_leaves_through_the_room_adapter_and_its_reply_comes
         host.clone(),
         policy,
         "gbl0".to_string(),
-        AdapterSetup::Helper(env!("CARGO_BIN_EXE_lan-helper").into()),
+        AdapterSetup::Helper { path: env!("CARGO_BIN_EXE_lan-helper").into(), portable: false },
         async move {
             let _ = stop_rx.await;
         },
@@ -206,6 +234,29 @@ async fn a_windows_broadcast_leaves_through_the_room_adapter_and_its_reply_comes
     stop_tx.send(()).unwrap();
     runner.await.unwrap().unwrap();
     wait_until("the adapter is gone", Duration::from_secs(30), || !holds(h_addr)).await;
+
+    // An installed launcher keeps the driver: the next room starts faster, and
+    // that is the trade it makes. This is also what makes the portable check
+    // below mean something — the driver is there to be removed.
+    wait_driver(true).await;
+
+    // Portable mode leaves nothing: the helper removes the driver again once
+    // its adapter is gone.
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(run_room_on_adapter(
+        host.clone(),
+        LanPolicy { ports: vec![LanPort { proto: LanProto::Udp, port: GAME_PORT }], any: false },
+        "gbl0".to_string(),
+        AdapterSetup::Helper { path: env!("CARGO_BIN_EXE_lan-helper").into(), portable: true },
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    wait_until("the portable adapter comes up", Duration::from_secs(60), || holds(h_addr)).await;
+    stop_tx.send(()).unwrap();
+    runner.await.unwrap().unwrap();
+    wait_until("the portable adapter is gone", Duration::from_secs(30), || !holds(h_addr)).await;
+    wait_driver(false).await;
 
     eprintln!("lan_wintun: the adapter was up {adapter_up_after:?} after the runner started");
 }

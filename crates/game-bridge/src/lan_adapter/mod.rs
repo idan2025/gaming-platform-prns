@@ -5,13 +5,18 @@
 //! [`run_room_on_adapter`] is too: a platform supplies only how to bring an
 //! adapter up and open it, and how to take it away.
 //!
-//! - **Linux** (`linux.rs`): a TUN device. `lan-helper up` creates it
-//!   persistent and owned by the user, and the launcher opens it with no
-//!   capability at all.
-//! - **Windows** (`windows.rs`): a Wintun adapter. Wintun lets only an
-//!   administrator open one, so the Linux trick does not carry over: the
-//!   elevated `lan-helper serve` holds the adapter for the whole session and
-//!   relays its packets to the unprivileged launcher (`lan_relay.rs`).
+//! On both, the elevated `lan-helper serve` holds the adapter for the session
+//! and relays its packets to the unprivileged launcher (`lan_relay.rs`), and
+//! the adapter is made so that it dies with the helper — which exits when the
+//! relay drops. **Nothing a room creates can outlive the launcher**, not on a
+//! quit, a crash or `kill -9`.
+//!
+//! - **Linux** (`linux.rs`): a non-persistent TUN device. The helper either
+//!   holds a capability granted once, or runs as a copy through `pkexec` per
+//!   room, which installs nothing.
+//! - **Windows** (`windows.rs`): a Wintun adapter, which Wintun lets only an
+//!   administrator open. In portable mode the helper also removes the Wintun
+//!   driver again when the room ends.
 //!
 //! # Rules a later change could quietly break
 //!
@@ -110,14 +115,54 @@ fn invalid(msg: String) -> io::Error {
 /// How the adapter gets its privileged setup.
 #[derive(Debug, Clone)]
 pub enum AdapterSetup {
-    /// Run `lan-helper` at this path — the normal case: this process holds no
-    /// privilege and never elevates itself.
-    Helper(std::path::PathBuf),
+    /// Run `lan-helper` at `path` — the normal case: this process holds no
+    /// privilege and never elevates itself. `portable` means leave nothing on
+    /// the machine afterwards: on Windows, remove the Wintun driver too.
+    Helper { path: std::path::PathBuf, portable: bool },
     /// Make the adapter in this process. Only for a process that already holds
     /// the privilege — root or `CAP_NET_ADMIN` on Linux, an administrator on
     /// Windows — such as a test.
     InProcess,
 }
+
+/// Start a helper and wait for it to connect back and prove itself.
+///
+/// `start` is given the helper's arguments and does the platform's part —
+/// spawn it, or ask for elevation — returning anything that must live until
+/// the helper has connected (a staged copy of it, on Linux).
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) async fn relayed<G, F>(
+    config: &AdapterConfig,
+    extra: Vec<String>,
+    start: F,
+) -> anyhow::Result<crate::lan_relay::RemoteDevice>
+where
+    F: FnOnce(Vec<String>) -> io::Result<G> + Send + 'static,
+    G: Send + 'static,
+{
+    use crate::lan_relay::{accept_helper, RelayToken};
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let token = RelayToken::random()?;
+    let mut args = vec![
+        "serve".to_string(),
+        config.name.clone(),
+        config.cidr(),
+        "--connect".to_string(),
+        format!("127.0.0.1:{port}"),
+        "--token".to_string(),
+        token.to_hex(),
+    ];
+    args.extend(extra);
+    let keep = tokio::task::spawn_blocking(move || start(args)).await??;
+    let remote = accept_helper(&listener, &token, HELPER_CONNECT_TIMEOUT).await;
+    drop(keep);
+    Ok(remote?)
+}
+
+/// How long to wait for the helper to connect back — long enough for a person
+/// to read and answer the password or elevation prompt.
+pub const HELPER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Where a room's adapter is, for a UI to show while it waits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,11 +257,12 @@ pub async fn run_room_on_adapter_reporting(
         let _ = phase.send(AdapterPhase::Up { address });
     };
 
+    // Closing the device is the whole teardown: the adapter was made to die
+    // with it (and with the helper, which sees the relay drop).
     if let Some((_, pump)) = current.take() {
         pump.abort();
         let _ = pump.await;
     }
-    close(&setup, &name).await;
     let _ = phase.send(match &result {
         Ok(()) => AdapterPhase::Stopped,
         Err(e) => AdapterPhase::Failed(format!("{e:#}")),
