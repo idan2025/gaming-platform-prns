@@ -1122,21 +1122,39 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
   elevated.
 - **L3 TUN, IPv4 only, no L2.** No TAP, no ARP, no IPX. An IPX-era game is a
   later, separate decision (`MODES.md`).
-- **Room = a destination plus a GROUP.** A room host announces a normal
-  destination whose `app_data` carries the game id and a LAN flag, so rooms
-  appear in the same browser as servers and cost nothing new on the announce
-  budget. Joining is a Link to the host; after the host's allowlist admits the
-  member, the host hands over the room's GROUP key and the member table over
-  that Link. The key never travels in an announce.
+- **Room = a destination and a star of Links.** A room host announces
+  `<app_name>.lan` with the §3.3 record at `transport_mode = 3` — a value the
+  record already defined — so rooms appear in the same browser as servers and
+  cost nothing new on the announce budget. Each member holds one Link, to the
+  host, and identifies on it.
+- **Corrected 2026-09-24, while building step 1: there is no GROUP.** The first
+  draft of this section put broadcasts on a GROUP destination. The engine does
+  not carry one past the first hop: `maybe_forward` forwards only `Single`
+  destinations (`prns-core/src/routing/ingress/forward.rs`), and ingress drops
+  GROUP data that arrived with more than one hop
+  (`routing/ingress/dispatch/mod.rs:275`, limit 1 at
+  `routing/ingress/outcome.rs:73`). Two players reaching each other through a
+  TCP hub — the Internet setup this is for — are two hops apart, so their
+  broadcasts would never arrive. A GROUP key can also only be registered when a
+  node is built (`prns-runtime/core/src/runtime/node/assembly.rs:370`), after
+  which a member cannot learn one. So **broadcasts ride the member Links and the
+  host fans them out**: no key to hand over, 1400-byte broadcasts instead of
+  383, and host upload that grows with the room — fine for a LAN party's size.
 - **Addresses from identity.** Each member's virtual IPv4 is derived from its
-  identity hash inside `100.64.0.0/10`, with the room host arbitrating the rare
-  collision. No DHCP, no central allocator, works offline.
-- **Unicast rides a Link, opened lazily** on the first packet to a member's
-  virtual address, reusing framing. TUN MTU ~1400 keeps one IP packet inside one
-  1900 B chunk (§2), so IP never fragments across bridge chunks.
-- **Broadcast rides the GROUP.** 383 B, fire-and-forget (§2). A broadcast larger
-  than that is dropped and logged — never split, never reassembled.
-- **No default route, ever.** The adapter carries the room's /10 and the
+  identity hash, and the host arbitrates the rare collision (first seated keeps
+  it). No DHCP, no central allocator, works offline. **The subnet is
+  `198.19.0.0/16`, not the `100.64.0.0/10` first written here**: Tailscale
+  routes all of `100.64/10` to its own adapter, which would shadow the room for
+  anyone running it. The host sends the subnet in every member table, so it is a
+  default and not a wire constant (`lan.rs`, `DEFAULT_ROOM_PREFIX`).
+- **Unicast rides the host too, for now.** Correct on any mesh and simple;
+  a direct member-to-member Link is a latency optimization to measure once a
+  real game runs (step 6). TUN MTU 1400 keeps one IP packet inside one link
+  packet, so IP never fragments across two.
+- **The host checks every packet's source.** A packet whose IPv4 source is not
+  the sender's own address is dropped (`lan::route`); otherwise one member
+  could speak as another.
+- **No default route, ever.** The adapter carries the room's subnet and the
   broadcast addresses, nothing else. It is not a VPN to the internet.
 
 ### 14.2 Rules a later change could quietly break
@@ -1150,9 +1168,10 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
   broadcast ports; broadcasts to any other port are not forwarded. This is
   storm control and scope at once, and it is data — a pack still names no
   program (`GAMES.md` §6).
-- **Storm control ships in the first commit**, not after: per-source rate limit
-  on GROUP sends, dedupe of identical consecutive beacons, and a hard ceiling on
-  GROUP traffic as a fraction of the link budget (`MODES.md`, "The thing that
+- **Storm control ships in the first commit**, not after: per-member rate limit
+  on broadcasts at the host, and dedupe of identical consecutive beacons — both
+  built in step 1 (`lan::BroadcastGate`) — and a ceiling on broadcast traffic as
+  a fraction of the link budget (`MODES.md`, "The thing that
   will kill it"). Answering discovery locally from the member table is the
   follow-up that removes most of it.
 - **Windows sends `255.255.255.255` out of the primary adapter only.** This is
@@ -1165,11 +1184,22 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
 
 ### 14.3 Steps, in build order
 
-1. **Room protocol, no adapter.** Room announce, join over Link, key handover,
-   member table, address derivation and collision arbitration — pure library
-   code, tested between two in-process nodes like `tests/multi_port.rs`.
-2. **Linux helper and a real adapter.** TUN, the Link/GROUP pump, storm
-   control, the inbound rule. Integration test in two network namespaces with a
+1. ~~**Room protocol, no adapter.**~~ **Built 2026-09-24.** `lan.rs` is the
+   pure half — addresses, the member table and its arbitration, the messages,
+   `route`, the broadcast gate — and `lan_session.rs` runs it over a node:
+   `LanSession::host` and `LanSession::join`, each with `send`/`recv` of IPv4
+   packets, which is the surface step 2's adapter sits on.
+   `tests/lan_room.rs` seats a host and two members over a real mesh and
+   carries a broadcast, a unicast and a leave between them; an identity off the
+   allowlist is refused. The key handover this step named is gone with the
+   GROUP (§14.1).
+
+   **Not done here, and named so it is not discovered later:** a launcher that
+   predates rooms lists one as an ordinary row and offers to Join it — the join
+   links to the room and is ignored, because a room reads no game datagram as a
+   message. Step 5 gives rooms their own row.
+2. **Linux helper and a real adapter.** TUN, the pump between it and
+   `LanSession`, the inbound rule. Integration test in two network namespaces with a
    tiny UDP broadcast/echo program — no game, so it runs in CI where
    `CAP_NET_ADMIN` is available and skips where it is not, like the agent's
    Docker tests.
@@ -1180,7 +1210,7 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
 5. **Launcher rooms.** Create/join a LAN room in the browser, the inbound
    warning, the helper install prompt, and whether the helper is running.
 6. **First target game: Need for Speed: Most Wanted (2005)** on Windows, two
-   players on this project's Internet interface. Record latency, GROUP traffic
+   players on this project's Internet interface. Record latency, broadcast traffic
    per minute, and whether the game's own LAN browser lists the room.
 7. **Packs for the rest**, one `[lan]` block each, tested field honest.
 

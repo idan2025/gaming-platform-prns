@@ -18,6 +18,8 @@ pub mod console;
 pub mod content;
 pub mod details;
 pub mod framing;
+pub mod lan;
+pub mod lan_session;
 pub mod launch;
 pub mod pack;
 pub mod profile;

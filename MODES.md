@@ -14,16 +14,18 @@ Measured from the vendored engine, not from the README (which is stale here):
 | Primitive | Plaintext cap | Delivery | Use for |
 | --- | --- | --- | --- |
 | **Link** (`MAX_SEND_TO_LINK_PLAINTEXT_LEN`, `link_mdu(2048)` — our patch; upstream `link_mdu(500)` = 431, `ENGINE.md`) | 1967 B; bridge uses `MAX_CHUNK = 1900` | reliable, ordered, retransmitted | all unicast game traffic |
-| **Group** (`MAX_SEND_GROUP_PLAINTEXT_LEN`) | **383 B** | **fire-and-forget, cannot prove** | LAN broadcast/multicast emulation |
+| **Group** (`MAX_SEND_GROUP_PLAINTEXT_LEN`) | **383 B** | **fire-and-forget, cannot prove, one hop only** | nothing yet — see Mode 3 |
 
 383 B derives from `BROADCAST_MTU = 500` → `BROADCAST_MDU = 464` → minus the
 ephemeral pubkey (32) and token overhead (48), rounded to AES blocks, minus one.
 The `send_group.rs` comment is explicit: *"a GROUP cannot prove, so the send is
 fire-and-forget."*
 
-A shared-key GROUP destination is exactly the right shape for a virtual LAN's
-broadcast domain — one send reaches every member. It is also small and lossy,
-which bounds what Mode 3 can do.
+A shared-key GROUP destination looks like the right shape for a virtual LAN's
+broadcast domain — one send reaches every member. **It is not, measured
+2026-09-24: a GROUP packet never travels past the first hop** (`PLAN.md`
+§14.1 has the engine lines). Mode 3's broadcasts ride Links, fanned out by the
+room's host.
 
 ## Mode 1 — Dedicated server (built)
 
@@ -62,15 +64,15 @@ done over Reticulum.
   only buys non-IP protocols (IPX, NetBIOS); defer that until a specific target
   game demands it.
 - **Deterministic addressing.** Derive each member's virtual IPv4 from its
-  Reticulum identity hash inside a CGNAT-ish range. No DHCP, no central
-  allocator, works offline; the group coordinator only arbitrates the rare
-  collision.
+  Reticulum identity hash inside `198.19.0.0/16` (not CGNAT space: Tailscale
+  owns `100.64/10`). No DHCP, no central allocator, works offline; the room's
+  host only arbitrates the rare collision.
 - **Unicast → Link.** Ordinary IP traffic between two members rides a Reticulum
   Link, reusing the existing framing. Reliable and 1900-byte chunked.
-- **Broadcast/multicast → GROUP.** Packets to `255.255.255.255`, the subnet
-  broadcast, or local multicast go out on the LAN group's shared destination.
-  One send, every member, and E2E encrypted by default — which is a genuine
-  advantage over Hamachi, not a parity feature.
+- **Broadcast/multicast → the host, over Links.** Packets to
+  `255.255.255.255`, the subnet broadcast, or local multicast go to the room's
+  host, which sends them on to every other member. Not a GROUP: a GROUP stops at
+  the first hop (`PLAN.md` §14.1). Still E2E encrypted, link by link.
 - **TUN MTU ~1400.** Keeps one IP datagram inside one link chunk (1900) with
   headroom for framing and IP headers. Fragmenting at both the IP layer and the
   bridge layer would be miserable to debug.
@@ -79,20 +81,19 @@ done over Reticulum.
 ### The thing that will kill it if ignored
 
 **Broadcast storms.** LAN games beacon constantly, some once per second per
-scanned port. Group sends are 383 B, unacknowledged, and hit every member — so
-cost scales with member count and is pure overhead on a constrained mesh.
+scanned port. Every broadcast costs the host one send per member — so cost
+scales with member count and is pure overhead on a constrained mesh.
 Mandatory from the first commit, not bolted on later:
 
-- per-source rate limit on group sends,
+- per-source rate limit on broadcasts,
 - dedupe identical consecutive beacons,
-- a hard ceiling on group traffic as a fraction of the link budget,
+- a hard ceiling on broadcast traffic as a fraction of the link budget,
 - **answer discovery locally where possible** — synthesize beacon replies on each
   member from directory data instead of forwarding the real broadcasts. This is
   the single biggest lever; a game that can be told about peers out-of-band
   doesn't need its broadcasts relayed at all.
 
-Anything over 383 B cannot be reliably split across group sends (fire-and-forget,
-no retransmit). Drop it and log, or move that flow onto a Link. Do not build a
+A broadcast over the 1400-byte room MTU is dropped, never split. Do not build a
 reassembly layer on an unreliable primitive.
 
 ### The distribution cost

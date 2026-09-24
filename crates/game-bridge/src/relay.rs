@@ -327,7 +327,7 @@ pub struct BridgeSession {
 /// for one announce per destination per hour will hold the extras rather than
 /// send them, so a longer burst buys nothing and spends someone's airtime
 /// allowance.
-const EARLY_ANNOUNCE_DELAYS_SECS: [u64; 3] = [2, 6, 14];
+pub(crate) const EARLY_ANNOUNCE_DELAYS_SECS: [u64; 3] = [2, 6, 14];
 
 /// Floor between announces asked for by [`BridgeSession::announce_now`], so a
 /// flapping interface cannot turn into an announce storm.
@@ -1856,7 +1856,7 @@ fn spawn_client_tcp_listener(
 /// Announces can be slow or absent between same-interface peers, and the
 /// datagram client already does this dance inline; the stream client needs the
 /// same behaviour, so it is one function now rather than two copies.
-async fn establish_link_with_path_retry(
+pub(crate) async fn establish_link_with_path_retry(
     handle: &PrnsNodeHandle,
     target: DestinationHash,
 ) -> Option<LinkId> {
@@ -1937,7 +1937,7 @@ fn link_payload(chunk: &[u8], link_id: LinkId) -> Option<SendToLinkPayload> {
 /// returns the handle plus the node's `run()` future; this helper drives that
 /// future, hands the caller the handle + a stop channel, and signals `done`
 /// when the node exits.
-async fn spawn_bridge_node<B, Fut, NodeRun>(
+pub(crate) async fn spawn_bridge_node<B, Fut, NodeRun>(
     role: BridgeRole,
     own_hash: Option<DestinationHash>,
     relay_transit: bool,
@@ -2017,7 +2017,7 @@ where
 /// Insert or refresh a discovered server in the browser list (dedup by hash).
 /// `name` always overwrites — a name change, or a peer that stops sending one,
 /// should show up on the next hear.
-async fn remember_server(
+pub(crate) async fn remember_server(
     list: &Arc<RwLock<Vec<DiscoveredServer>>>,
     destination: DestinationHash,
     hops: u8,
@@ -2049,7 +2049,7 @@ async fn remember_server(
 // =========================================================================
 
 #[derive(Debug)]
-enum BridgeEvent {
+pub(crate) enum BridgeEvent {
     AnnounceHeard {
         destination: DestinationHash,
         hops: u8,
@@ -2065,7 +2065,7 @@ enum BridgeEvent {
     LinkData { link_id: LinkId, bytes: Vec<u8> },
 }
 
-fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
+pub(crate) fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
     match event {
         // The mesh refused to carry an announce — almost always an interface
         // enforcing its own announce rate. Logged rather than swallowed
@@ -2137,7 +2137,7 @@ fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<BridgeEvent>) {
 }
 
 type LinkSenders = Arc<RwLock<std::collections::HashMap<LinkId, mpsc::Sender<Vec<u8>>>>>;
-type ConnectedClients = Arc<RwLock<std::collections::HashMap<LinkId, IdentityHash>>>;
+pub(crate) type ConnectedClients = Arc<RwLock<std::collections::HashMap<LinkId, IdentityHash>>>;
 
 /// Announce app_data used when no display name is configured.
 ///
@@ -2159,7 +2159,7 @@ pub fn server_announce_name_bytes(name: &Option<String>) -> Vec<u8> {
 /// Over-long fields are truncated rather than refused: a server should still
 /// appear in the browser under a shortened name, and refusing to announce over
 /// a 49th character would make it invisible instead.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     let mut end = s.len().min(max);
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -2315,7 +2315,7 @@ pub fn attach_interfaces(node: &PrnsNodeHandle, tcp: Option<&str>, auto: bool) {
 /// that never identify at all are closed on a timer — without that last case
 /// an allowlist would be bypassed by simply staying silent, which is the
 /// obvious attack and the reason a timeout is not optional.
-fn parse_allowlist(entries: &[String]) -> Result<Vec<IdentityHash>> {
+pub(crate) fn parse_allowlist(entries: &[String]) -> Result<Vec<IdentityHash>> {
     entries
         .iter()
         .map(|entry| {
@@ -2333,20 +2333,20 @@ fn parse_allowlist(entries: &[String]) -> Result<Vec<IdentityHash>> {
         .collect()
 }
 
-fn parse_destination_hash(hex: &str) -> Result<DestinationHash> {
+pub(crate) fn parse_destination_hash(hex: &str) -> Result<DestinationHash> {
     let hex = hex.trim();
     let bytes = hex::decode(hex).map_err(|e| anyhow!("invalid hex in server hash: {e}"))?;
     DestinationHash::from_slice(&bytes)
         .ok_or_else(|| anyhow!("server hash must be 16 bytes (32 hex chars)"))
 }
 
-fn load_identity(path: &Path) -> Result<ZeroizingIdentity> {
+pub(crate) fn load_identity(path: &Path) -> Result<ZeroizingIdentity> {
     load_or_create_identity_secret(path)
         .map_err(|e: IdentitySecretFileError| anyhow::Error::from(e))
         .with_context(|| format!("loading identity at {}", path.display()))
 }
 
-type ZeroizingIdentity = Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>;
+pub(crate) type ZeroizingIdentity = Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>;
 
 #[cfg(test)]
 mod tests {

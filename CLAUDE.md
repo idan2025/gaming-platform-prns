@@ -356,6 +356,25 @@ app bundle — the join failed with `loading identity at
 the settings file. Pinned by
 `the_client_identity_never_lands_in_the_working_directory`.
 
+**Mode 3 virtual LAN has started** (2026-09-24, `PLAN.md` §14): step 1, the
+room protocol, is `crates/game-bridge/src/lan.rs` (pure) and `lan_session.rs`
+(over a node), driven by `tests/lan_room.rs`. No adapter yet — that is step 2.
+Rules a later change could quietly break:
+- **A GROUP destination does not reach past one hop.** Ingress drops GROUP data
+  with more than one received hop and only `Single` destinations are
+  forwarded, so broadcasts ride member↔host Links and the host fans them out.
+  Moving them "back" onto a GROUP would pass on a single-hop test mesh and
+  deliver nothing through a TCP hub.
+- **The host believes a packet's IPv4 source only if it is the sender's own
+  address** (`lan::route`). A member's address comes from its identity, never
+  from its request. `a_member_cannot_send_as_another_member` is the one that
+  catches a regression.
+- **The room subnet is `198.19.0.0/16`, not `100.64/10`**, which Tailscale
+  routes to itself. It travels in every member table, so it is a default.
+- **Storm control is at the host, per member**: rate plus dedupe of repeats
+  (`lan::BroadcastGate`). Unicast is not gated — a game's real traffic must not
+  be rationed by a rule written for its beacons.
+
 **The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
 `cargo fmt --all` — it reformats every file, in a style the tree was not written
 in. Format new files with `rustfmt --config use_small_heuristics=Max <file>`,
