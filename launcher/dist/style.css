@@ -636,3 +636,29 @@ input:focus-visible, select:focus-visible {
   opacity: 0.75; pointer-events: none; user-select: none;
   z-index: 50;
 }
+
+/* ---------- Mode 3 LAN rooms (PLAN.md §14) ---------- */
+.badge.room-badge { background: var(--accent-soft); color: var(--accent); }
+.room-banner {
+  margin: 8px 14px 0;
+  padding: 6px 10px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: var(--radius);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.room-banner.hidden { display: none; }
+.room-banner.err { background: var(--error-bg); border-color: color-mix(in srgb, var(--error) 35%, transparent); }
+.room-err { color: var(--error); }
+.warn-line { color: var(--warn); background: var(--warn-bg); padding: 4px 8px; border-radius: var(--radius); margin: 6px 0; }
+.helper-status { display: flex; gap: 10px; align-items: center; padding: 4px 8px; margin: 6px 0; border-radius: var(--radius); font-size: 12px; }
+.helper-status.ok { color: var(--ok); }
+.helper-status.warn { color: var(--warn); background: var(--warn-bg); }
+.room-hash { display: block; font-size: 11px; color: var(--fg-muted); margin: 4px 0; word-break: break-all; }
+

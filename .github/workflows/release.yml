@@ -110,6 +110,10 @@ jobs:
           mkdir -p "dist/$name"
           out="target/${{ matrix.target }}/release"
           cp "$out/game-bridge" "$out/platform-agent" "$out/platform-index" "dist/$name/"
+          # Mode 3's privileged half (PLAN.md §14). Linux only: macOS has no
+          # room adapter yet, and a helper that can only say so is not worth
+          # shipping.
+          if [ "$(uname -s)" = Linux ]; then cp "$out/lan-helper" "dist/$name/"; fi
           cp -r packs "dist/$name/packs"
           cp README.md RELEASE.md ENGINE.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
@@ -123,6 +127,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           $out = "target/${{ matrix.target }}/release"
           Copy-Item "$out/game-bridge.exe","$out/platform-agent.exe","$out/platform-index.exe" "dist/$name/"
+          # Mode 3 on Windows: the helper and the Wintun adapter it loads from
+          # beside itself (PLAN.md §14).
+          Copy-Item "$out/lan-helper.exe" "dist/$name/"
+          ./scripts/fetch-wintun.ps1 "dist/$name"
           Copy-Item -Recurse packs "dist/$name/packs"
           Copy-Item README.md,RELEASE.md,ENGINE.md "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
@@ -232,6 +240,19 @@ jobs:
 
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
+
+      # lan-helper as a sidecar on Linux and Windows, and wintun.dll beside it
+      # on Windows (tauri.linux.conf.json, tauri.windows.conf.json). The
+      # universal macOS bundle carries neither: no room adapter there yet.
+      - name: Stage the LAN helper
+        if: runner.os != 'macOS'
+        shell: bash
+        run: scripts/stage-lan-helper.sh --release
+
+      - name: Stage Wintun
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/fetch-wintun.ps1 launcher/src-tauri/binaries
 
       - name: Bundle
         working-directory: launcher/src-tauri

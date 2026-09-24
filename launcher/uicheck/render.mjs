@@ -82,9 +82,13 @@ const details = {
 };
 
 const calls = [];
+// The arguments of the latest call of each command, for checking what the UI
+// sent and not only that it sent something.
+const lastArgs = new Map();
 function makeInvoke(scenario) {
   return async (cmd, args) => {
     calls.push(cmd);
+    lastArgs.set(cmd, args);
     switch (cmd) {
       case 'browse_status':
         return scenario.status;
@@ -133,6 +137,22 @@ function makeInvoke(scenario) {
       case 'forget_server':
         return null;
       case 'clear_listen_port':
+        return null;
+      // Mode 3 rooms. A scenario without `lanHelper` is a shell that predates
+      // them, and those commands throw exactly as Tauri does for an unknown one.
+      case 'lan_helper':
+      case 'grant_lan_helper':
+        if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
+        return scenario.lanHelper;
+      case 'room_status':
+        if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
+        return scenario.room ?? noRoom;
+      case 'host_room':
+      case 'join_room':
+        scenario.room = scenario.roomAfter;
+        return scenario.roomAfter;
+      case 'leave_room':
+        scenario.room = noRoom;
         return null;
       default:
         throw new Error(`the UI called an unknown command: ${cmd}`);
@@ -514,6 +534,154 @@ await run('browse not running', {
 }, (win, doc) => {
   const t = doc.querySelector('#list').textContent;
   check('a stopped browser explains how to start', t.trim().length > 0, t.slice(0, 200));
+});
+
+// ---------- Mode 3 LAN rooms (PLAN.md §14, step 5) ----------
+
+const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r => setTimeout(r, 0)); };
+
+const noRoom = {
+  active: false, role: null, game_id: null, name: null, room_hash: null, address: null,
+  subnet: null, members: [], adapter: 'none', error: null, refused: null,
+};
+
+const lanGame = (lan) => ({
+  id: 'openttd', display_name: 'OpenTTD', trust: 'unsigned local', trust_detail: 'x',
+  signer: null, signature_expires_at: null,
+  lan: { tested: false, inbound_any: false, ports: ['udp/3979', 'tcp/3979'], ...lan },
+});
+const svenGame = {
+  id: 'sven-coop', display_name: 'Sven Co-op', trust: 'built in', trust_detail: 'x',
+  signer: null, signature_expires_at: null, lan: null,
+};
+
+const roomRow = row({
+  destination_hash: 'feedfacefeedfacefeedfacefeedface',
+  name: 'OpenTTD night', game_id: 'openttd', map: null, players: 2, max_players: 8,
+  dedicated: false, transport_mode: 3,
+});
+
+const readyHelper = { supported: true, path: '/usr/bin/lan-helper', ready: true, can_grant: false, detail: 'Ready.' };
+const needsGrant = {
+  supported: true, path: '/usr/bin/lan-helper', ready: false, can_grant: true,
+  detail: 'LAN rooms need one-time permission for lan-helper to make a network adapter (and nothing else).',
+};
+
+const memberRoom = {
+  active: true, role: 'member', game_id: 'openttd', name: null, room_hash: roomRow.destination_hash,
+  address: '198.19.4.2', subnet: '198.19.0.0/16',
+  members: [{ address: '198.19.1.1', is_self: false }, { address: '198.19.4.2', is_self: true }],
+  adapter: 'up', error: null, refused: null,
+};
+
+await run('a LAN room is a room, not a server', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  roomAfter: memberRoom,
+  rows: () => [row(), roomRow],
+}, async (win, doc) => {
+  const rows = doc.querySelectorAll('#list .row');
+  const roomEl = [...rows].find(r => r.dataset.hash === roomRow.destination_hash);
+  check('a room row is badged as a LAN room', roomEl && roomEl.textContent.includes('LAN room'));
+  check('a server row is not', !rows[0].textContent.includes('LAN room'));
+
+  const probesBefore = calls.filter(c => c === 'server_details').length;
+  roomEl.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  check('opening a room sends no detail probe it could only fail',
+    calls.filter(c => c === 'server_details').length === probesBefore);
+
+  const pane = doc.querySelector('#detail');
+  const t = pane.textContent;
+  const join = doc.querySelector('#detail-join');
+  check('a room is joined as a room', join && join.textContent === 'Join room', join?.textContent);
+  check('and it can be, with the helper ready', join && !join.disabled);
+  check('a room offers no local port — the game talks to the adapter', !doc.querySelector('#detail-port'));
+  check('the game\u2019s own ports are named', t.includes('udp/3979'), t.slice(0, 400));
+  check('an untested game says so before joining', /untested/.test(t), t.slice(0, 400));
+  check('no undefined leaked into a room pane', !t.includes('undefined'), t.slice(0, 400));
+
+  join.click();
+  await settle();
+  const args = lastArgs.get('join_room');
+  check('join_room is sent the room and the game',
+    args && args.destinationHash === roomRow.destination_hash && args.gameId === 'openttd', JSON.stringify(args));
+  check('join_server is not what a room join calls', !calls.includes('join_server') || lastArgs.get('join_server')?.destinationHash !== roomRow.destination_hash);
+
+  const banner = doc.querySelector('#room-banner');
+  check('being in a room shows a banner', banner && !banner.classList.contains('hidden'));
+  check('the banner says where this machine is in it', banner.textContent.includes('198.19.4.2'), banner.textContent);
+  check('the button now says so', doc.querySelector('#detail-join').textContent === 'In this room');
+
+  const leave = doc.querySelector('#room-banner-leave');
+  check('the banner offers to leave', !!leave);
+  leave?.click();
+  await settle();
+  check('leaving takes the banner away', doc.querySelector('#room-banner').classList.contains('hidden'));
+});
+
+await run('a room whose game lets everything in warns before joining', {
+  status: running,
+  games: [lanGame({ inbound_any: true, ports: [] })],
+  lanHelper: readyHelper,
+  rows: () => [roomRow],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const t = doc.querySelector('#detail').textContent;
+  check('the every-port warning is shown', t.includes('every network service'), t.slice(0, 400));
+});
+
+await run('a room cannot be joined until the helper may make an adapter', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: needsGrant,
+  rows: () => [roomRow],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const join = doc.querySelector('#detail-join');
+  check('Join room is disabled without the permission', join && join.disabled);
+  check('the reason is shown', doc.querySelector('#detail').textContent.includes('one-time permission'));
+  check('and the launcher offers to ask for it', !!doc.querySelector('#detail #grant-helper'));
+  const host = doc.querySelector('#host-btn');
+  check('hosting is disabled for the same reason', host && host.disabled);
+});
+
+await run('hosting a room', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  roomAfter: { ...memberRoom, role: 'host', name: 'Friday', members: [{ address: '198.19.1.1', is_self: true }], address: '198.19.1.1', adapter: 'starting' },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const panel = doc.querySelector('#room-panel');
+  check('a shell with rooms shows the room panel', panel && !panel.hidden);
+  const select = doc.querySelector('#host-game');
+  check('only games with a [lan] block can be hosted',
+    select && [...select.options].map(o => o.value).join() === 'openttd',
+    select && [...select.options].map(o => o.value).join());
+  const name = doc.querySelector('#host-name');
+  name.value = 'Friday';
+  name.dispatchEvent(new win.Event('input', { bubbles: true }));
+  win.eval('renderRoomPanel()');
+  check('a half-typed room name survives a poll', doc.querySelector('#host-name').value === 'Friday');
+  doc.querySelector('#host-btn').click();
+  await settle();
+  const args = lastArgs.get('host_room');
+  check('host_room is sent the game and the name', args && args.gameId === 'openttd' && args.name === 'Friday', JSON.stringify(args));
+  const banner = doc.querySelector('#room-banner').textContent;
+  check('the banner says the room is being hosted', banner.includes('Hosting a LAN room for OpenTTD'), banner);
+  check('and that the adapter is still coming up', banner.includes('bringing up the network adapter'), banner);
+});
+
+await run('an older shell shows no room controls at all', {
+  status: running,
+  rows: () => [row()],
+}, (win, doc) => {
+  check('the room panel is hidden', doc.querySelector('#room-panel').hidden);
+  check('and no error is shown for the missing commands', doc.querySelector('#error').classList.contains('hidden'));
 });
 
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);

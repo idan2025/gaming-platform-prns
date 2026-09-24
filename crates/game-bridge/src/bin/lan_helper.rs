@@ -38,8 +38,11 @@ fn main() -> std::process::ExitCode {
             game_bridge::lan_adapter::create(&config, owner()).map_err(|e| e.to_string())
         }),
         ["down", name] => game_bridge::lan_adapter::destroy(name).map_err(|e| e.to_string()),
-        _ => Err("usage: lan-helper up <name> <address>/<prefix-len> | lan-helper down <name>"
-            .to_string()),
+        ["check"] => check(),
+        _ => Err(
+            "usage: lan-helper up <name> <address>/<prefix-len> | lan-helper down <name> | lan-helper check"
+                .to_string(),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -47,6 +50,31 @@ fn main() -> std::process::ExitCode {
             eprintln!("lan-helper: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Whether this helper can make an adapter: it holds `CAP_NET_ADMIN`,
+/// whether granted by file capability or by running as root. The launcher asks
+/// before offering a room, rather than finding out when one fails.
+///
+/// A capability granted to a binary on a `nosuid` mount — an AppImage's, for
+/// one — is silently not applied, and this is where that shows: `setcap`
+/// succeeds and `check` still says no.
+#[cfg(target_os = "linux")]
+fn check() -> Result<(), String> {
+    const CAP_NET_ADMIN: u32 = 12;
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
+    let eff = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+        .ok_or("could not read this process's capabilities")?;
+    if eff & (1 << CAP_NET_ADMIN) != 0 {
+        println!("ok");
+        Ok(())
+    } else {
+        Err("no CAP_NET_ADMIN: grant it with `sudo setcap cap_net_admin+ep` on this file"
+            .to_string())
     }
 }
 
@@ -94,7 +122,20 @@ fn serve(args: &[String]) -> Result<(), String> {
     use game_bridge::lan_adapter::{default_wintun_dll, AdapterConfig};
     use game_bridge::lan_relay::RelayToken;
 
-    let usage = "usage: lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> --token <hex> [--wintun <dll>]";
+    let usage = "usage: lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> --token <hex> [--wintun <dll>] | lan-helper check";
+    // `check` needs no elevation: it only says whether `serve` could find
+    // Wintun. The elevation prompt is `serve`'s, at the moment a room starts.
+    if let [cmd] = args {
+        if cmd == "check" {
+            let dll = default_wintun_dll().map_err(|e| e.to_string())?;
+            return if dll.is_file() {
+                println!("ok");
+                Ok(())
+            } else {
+                Err(format!("no wintun.dll at {}", dll.display()))
+            };
+        }
+    }
     let [cmd, name, cidr, rest @ ..] = args else { return Err(usage.to_string()) };
     if cmd != "serve" {
         return Err(usage.to_string());

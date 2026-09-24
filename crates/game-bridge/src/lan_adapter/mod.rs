@@ -119,6 +119,21 @@ pub enum AdapterSetup {
     InProcess,
 }
 
+/// Where a room's adapter is, for a UI to show while it waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterPhase {
+    /// Not seated yet — the adapter's address *is* the seat.
+    WaitingForSeat,
+    /// Bringing the adapter up: on Windows this is where the elevation prompt
+    /// is showing, so a person may be the thing being waited for.
+    Starting,
+    Up {
+        address: Ipv4Addr,
+    },
+    Stopped,
+    Failed(String),
+}
+
 /// Put `session`'s room on a local adapter and pump it until `stop` resolves
 /// or the room ends; then take the adapter away again.
 ///
@@ -134,8 +149,23 @@ pub async fn run_room_on_adapter(
     setup: AdapterSetup,
     stop: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<()> {
+    let (phase, _) = tokio::sync::watch::channel(AdapterPhase::WaitingForSeat);
+    run_room_on_adapter_reporting(session, policy, name, setup, stop, phase).await
+}
+
+/// [`run_room_on_adapter`], saying where it is on `phase` as it goes.
+#[cfg(any(target_os = "linux", windows))]
+pub async fn run_room_on_adapter_reporting(
+    session: std::sync::Arc<crate::lan_session::LanSession>,
+    policy: crate::lan_filter::LanPolicy,
+    name: String,
+    setup: AdapterSetup,
+    stop: impl std::future::Future<Output = ()>,
+    phase: tokio::sync::watch::Sender<AdapterPhase>,
+) -> anyhow::Result<()> {
     validate_name(&name)?;
     tokio::pin!(stop);
+    let _ = phase.send(AdapterPhase::WaitingForSeat);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut current: Option<(AdapterConfig, tokio::task::JoinHandle<io::Result<()>>)> = None;
 
@@ -163,7 +193,14 @@ pub async fn run_room_on_adapter(
             pump.abort();
             let _ = pump.await;
         }
-        let device = std::sync::Arc::new(open(&setup, &wanted).await?);
+        let _ = phase.send(AdapterPhase::Starting);
+        // Not `?`: a failed open may have half-made the adapter (Linux's
+        // helper creates it before this process attaches), and only the
+        // cleanup below takes it away again.
+        let device = match open(&setup, &wanted).await {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => break Err(e),
+        };
         tracing::info!(
             adapter = %name,
             address = %address,
@@ -172,6 +209,7 @@ pub async fn run_room_on_adapter(
         );
         let pump = tokio::spawn(crate::lan_pump::pump(device, session.clone(), policy.clone()));
         current = Some((wanted, pump));
+        let _ = phase.send(AdapterPhase::Up { address });
     };
 
     if let Some((_, pump)) = current.take() {
@@ -179,6 +217,10 @@ pub async fn run_room_on_adapter(
         let _ = pump.await;
     }
     close(&setup, &name).await;
+    let _ = phase.send(match &result {
+        Ok(()) => AdapterPhase::Stopped,
+        Err(e) => AdapterPhase::Failed(format!("{e:#}")),
+    });
     result
 }
 

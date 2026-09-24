@@ -66,6 +66,20 @@
     <div id="index-list"></div>
   </details>
 
+  <!-- Mode 3 (PLAN.md §14): a virtual LAN for games that only find each other
+       by LAN broadcast. Hidden by the script when the shell has no room
+       commands. -->
+  <details id="room-panel" class="index-panel" hidden>
+    <summary>LAN rooms <span id="room-summary" class="muted"></span></summary>
+    <p class="index-help">A LAN room makes everyone in it look like one local
+      network, for older games that only find each other by LAN broadcast. It
+      runs over the mesh like everything else; a small helper puts it on a
+      virtual network adapter on this machine, and only the game's own ports are
+      reachable through it.</p>
+    <div id="room-body"></div>
+  </details>
+  <div id="room-banner" class="room-banner hidden" role="status"></div>
+
   <main class="main">
     <section class="list-wrap" aria-label="Server list">
       <div class="list-head" role="row">

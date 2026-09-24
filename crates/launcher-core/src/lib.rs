@@ -18,6 +18,7 @@
 //! JavaScript reads a missing property as `undefined` rather than failing. The
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
+pub mod lan;
 pub mod settings;
 pub mod steam;
 
@@ -240,6 +241,9 @@ pub struct GameSummary {
     /// so a signature can be refreshed before it lapses rather than at the
     /// moment something stops working.
     pub signature_expires_at: Option<u64>,
+    /// Whether this game can be played in a Mode 3 LAN room, and what that
+    /// exposes (`lan.rs`). `None` means no room is offered for it.
+    pub lan: Option<lan::LanSupport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,6 +419,8 @@ struct Inner {
     /// [`Launcher::play`] knows which port and game to start against without the
     /// UI having to hand it all back. Cleared by [`Launcher::leave`].
     last_join: Option<JoinState>,
+    /// The LAN room this launcher is in, if any (`lan.rs`). One at a time.
+    room: Option<lan::RoomState>,
 }
 
 /// The address a live join is pointed at, kept so Play can start a game against
@@ -540,6 +546,7 @@ impl Launcher {
                 browse_opts: None,
                 client: None,
                 last_join: None,
+                room: None,
             })),
             packs,
             settings: Arc::new(Mutex::new(settings)),
@@ -613,6 +620,7 @@ impl Launcher {
                 trust_detail: p.trust.explanation().to_string(),
                 signer: p.trust.signer().map(|s| hex::encode(s.as_bytes())),
                 signature_expires_at: p.expires_at,
+                lan: lan::lan_support(&p.pack),
             })
             .collect()
     }
@@ -1731,7 +1739,7 @@ mod tests {
     fn game_summary_json_keys_are_the_frontend_contract() {
         let games = Launcher::new(Vec::new()).list_games();
         let v = serde_json::to_value(&games[0]).unwrap();
-        for key in ["id", "display_name", "trust", "trust_detail", "signer", "signature_expires_at"]
+        for key in ["id", "display_name", "trust", "trust_detail", "signer", "signature_expires_at", "lan"]
         {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
         }

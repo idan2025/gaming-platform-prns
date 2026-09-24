@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": ["binaries/lan-helper"],
+    "resources": {
+      "../../packs/*.toml": "packs/",
+      "binaries/wintun.dll": "wintun.dll",
+      "binaries/wintun-LICENSE.txt": "wintun-LICENSE.txt"
+    }
+  }
+}

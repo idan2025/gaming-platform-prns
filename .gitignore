@@ -1,3 +1,4 @@
 /target
 /launcher/src-tauri/target
 /launcher/src-tauri/gen/schemas
+/launcher/src-tauri/binaries

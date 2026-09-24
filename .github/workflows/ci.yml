@@ -112,19 +112,12 @@ jobs:
         with:
           key: ci-lan-windows
 
-      # WireGuard's prebuilt, signed wintun.dll. Pinned and digest-checked: the
-      # digest decides, never the URL — same rule as a pack's archive driver.
+      # WireGuard's prebuilt, signed wintun.dll, digest-checked by the script.
       - name: Wintun
         shell: pwsh
         run: |
-          $zip = "$env:RUNNER_TEMP\wintun.zip"
-          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile $zip
-          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-          if ($hash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {
-            throw "wintun-0.14.1.zip digest mismatch: $hash"
-          }
-          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wintun"
-          "GAME_BRIDGE_WINTUN_DLL=$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" | Out-File -FilePath $env:GITHUB_ENV -Append
+          ./scripts/fetch-wintun.ps1 "$env:RUNNER_TEMP\wintun"
+          "GAME_BRIDGE_WINTUN_DLL=$env:RUNNER_TEMP\wintun\wintun.dll" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # A new adapter is an "unidentified network", which Windows files under
       # the Public profile and firewalls. On a player's machine the game asks
@@ -186,6 +179,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev
+
+      # The launcher ships lan-helper as a sidecar on Linux and Windows, and
+      # wintun.dll beside it on Windows (tauri.linux.conf.json,
+      # tauri.windows.conf.json). The shell's build script refuses to start
+      # without them, so staging them here is also what proves the bundle
+      # config names files that exist.
+      - name: Stage the LAN helper
+        if: runner.os != 'macOS'
+        shell: bash
+        run: scripts/stage-lan-helper.sh
+
+      - name: Stage Wintun
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/fetch-wintun.ps1 launcher/src-tauri/binaries
 
       # Build, not bundle. Bundling is the release's job and needs packaging
       # toolchains; what CI has to catch is a launcher that stopped compiling —

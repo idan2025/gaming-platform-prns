@@ -32,6 +32,15 @@ const state = {
   // assumed, because the core is where the pack default and the player's saved
   // choice are reconciled.
   listenPorts: new Map(),
+  // Mode 3 LAN rooms (PLAN.md §14). `roomsAvailable` is false for an older
+  // shell without the room commands, which then shows no room UI at all
+  // rather than buttons that throw.
+  room: null,
+  lanHelper: null,
+  roomsAvailable: false,
+  roomBusy: false,
+  hostDraft: { game_id: null, name: '' },
+  roomPanelSig: null,
 };
 
 const LINK_CLASS = { 1: 'Low-rate', 2: 'TCP / bursty', 3: 'High-bitrate' };
@@ -235,10 +244,19 @@ function updateRowEl(e, row) {
     if (row.passworded === true) nameV.parentElement.appendChild(el('span', 'badge pw', 'pw'));
     if (row.allowlisted === true) nameV.parentElement.appendChild(el('span', 'badge lock', 'list'));
     if (row.dedicated === true) nameV.parentElement.appendChild(el('span', 'badge ded', 'ded'));
+    // A LAN room is not a server: its destination speaks the room protocol,
+    // and joining it puts this machine on a virtual LAN (PLAN.md §14).
+    if (isRoom(row)) {
+      const b = el('span', 'badge room-badge', 'LAN room');
+      b.title = 'A LAN room: joining it makes the players in it look like one local network.';
+      nameV.parentElement.appendChild(b);
+    }
   }
 
   e.querySelector('[data-cell="game"]').textContent = legacy ? 'Unknown' : (row.game_id || 'Unknown');
-  e.querySelector('[data-cell="map"]').textContent = legacy ? 'Unknown' : (row.map || 'Unknown');
+  // A room has no map; "Unknown" would suggest it has one nobody reported.
+  e.querySelector('[data-cell="map"]').textContent =
+    isRoom(row) ? '\u2014' : (legacy ? 'Unknown' : (row.map || 'Unknown'));
 
   const playersCell = e.querySelector('[data-cell="players"]');
   if (legacy || row.players == null) {
@@ -451,6 +469,14 @@ function openDetail(hash) {
     joinMsg: null,
   };
   renderList();
+  // A room answers no detail probe — it has no such endpoint — so asking
+  // would only ever render "No direct response" under a room that is fine.
+  if (isRoom(row)) {
+    state.detail.loading = false;
+    renderDetail();
+    $('detail').hidden = false;
+    return;
+  }
   renderDetail();
   $('detail').hidden = false;
   invoke('server_details', { destinationHash: hash })
@@ -525,12 +551,14 @@ function renderDetail() {
   const kv = el('div', 'kv');
   const legacy = a.legacy;
   kvRow(kv, 'Game', legacy ? null : (a.game_id || null), 'Unknown');
-  kvRow(kv, 'Map', legacy ? null : (a.map || null), 'Unknown');
+  if (!isRoom(a)) kvRow(kv, 'Map', legacy ? null : (a.map || null), 'Unknown');
+  // A room counts members, not players in a game.
+  const who = isRoom(a) ? 'Members' : 'Players';
   if (legacy || a.players == null) {
-    kvRow(kv, 'Players', null, 'Unknown', true);
+    kvRow(kv, who, null, 'Unknown', true);
   } else {
     const max = a.max_players == null ? '?' : a.max_players;
-    kvRow(kv, 'Players', a.players + '/' + max + '  (as of ' + fmtSeen(a.last_seen_secs) + ')', null);
+    kvRow(kv, who, a.players + '/' + max + '  (as of ' + fmtSeen(a.last_seen_secs) + ')', null);
   }
   kvRow(kv, 'Mesh hops', String(a.hops) + (a.hops === 1 ? ' hop' : ' hops'), null);
   kvRow(kv, 'Heard on', a.interface_label || null, 'Unknown');
@@ -539,7 +567,8 @@ function renderDetail() {
   if (legacy) {
     kvRow(kv, 'Type', null, 'Legacy peer');
   } else {
-    kvRow(kv, 'Transport', a.transport_mode == null ? null : ('Mode ' + a.transport_mode), 'Unknown');
+    kvRow(kv, 'Transport', a.transport_mode == null ? null
+      : (isRoom(a) ? 'LAN room (Mode 3)' : 'Mode ' + a.transport_mode), 'Unknown');
   }
   announceSec.appendChild(kv);
 
@@ -563,8 +592,13 @@ function renderDetail() {
   }
   body.appendChild(announceSec);
 
+  if (isRoom(a)) {
+    body.appendChild(renderRoomSection(d));
+  }
+
   // live probe
   const probeSec = el('div', 'section');
+  if (isRoom(a)) probeSec.hidden = true;
   probeSec.appendChild(el('h3', '', 'Live probe'));
   if (d.loading) {
     const p = el('div', 'probe-pending');
@@ -646,12 +680,19 @@ function renderDetail() {
   if (a.remembered) body.appendChild(renderRememberedNote(d));
   if (!a.game_id) body.appendChild(renderGamePicker(d));
   body.appendChild(renderPackSection(gameId));
-  if (gameId) body.appendChild(renderPortSection(d, gameId));
+  // A room binds no local port: the game talks to the virtual adapter.
+  if (gameId && !isRoom(a)) body.appendChild(renderPortSection(d, gameId));
 
   pane.appendChild(body);
 
   // foot
   const foot = el('div', 'detail-foot');
+  if (isRoom(a)) {
+    renderRoomFoot(foot, d, gameId);
+    pane.appendChild(foot);
+    restoreDetailFocus(pane, prevScroll, keepId, selStart, selEnd);
+    return;
+  }
   const join = el('button', 'btn-join', 'Join server');
   join.id = 'detail-join';
   join.onclick = joinServer;
@@ -691,6 +732,10 @@ function renderDetail() {
   }
   pane.appendChild(foot);
 
+  restoreDetailFocus(pane, prevScroll, keepId, selStart, selEnd);
+}
+
+function restoreDetailFocus(pane, prevScroll, keepId, selStart, selEnd) {
   // Put the reader back where they were. Order matters: the scroll offset is
   // restored before focus, because focusing an element the browser considers
   // off-screen scrolls it into view and would undo the line above.
@@ -1186,6 +1231,7 @@ async function pollServers() {
 async function pollAll() {
   await pollStatus();
   await pollServers();
+  await pollRoom();
 }
 
 // ---------- indexes ----------
@@ -1422,6 +1468,8 @@ async function init() {
     if (state.savedOpts.tcp && !state.tcpPeer) state.tcpPeer = state.savedOpts.tcp;
     if (state.savedOpts.auto) state.autoDiscover = true;
   } catch (_) { /* an older backend simply has none */ }
+  await loadLanHelper();
+  wireRoomPanel();
   await pollAll();
   state.pollTimer = setInterval(pollAll, 2000);
 }
@@ -1473,4 +1521,286 @@ function renderInterfaceList() {
     wrap.appendChild(row);
   });
   return wrap;
+}
+
+
+// ---------- LAN rooms (PLAN.md §14, step 5) ----------
+//
+// A LAN room makes the players in it look like one local network, for games
+// that only find each other by LAN broadcast. Everything that decides anything
+// is in launcher-core (`lan.rs`); this shows it. Two rules carry over from
+// there: a room row is never joined as a server, and the pack's warnings —
+// every port reachable, or never tested — are shown before joining, unsoftened.
+
+function isRoom(r) { return !!r && r.transport_mode === 3; }
+function lanGames() { return (state.games || []).filter(g => g.lan); }
+function gameById(id) { return (state.games || []).find(g => g.id === id) || null; }
+
+const ADAPTER_TEXT = {
+  none: '',
+  waiting: 'waiting for a seat in the room…',
+  starting: 'bringing up the network adapter… (on Windows, approve the administrator prompt)',
+  up: 'network adapter up',
+  stopped: 'network adapter stopped',
+  failed: 'network adapter failed',
+};
+
+async function loadLanHelper() {
+  try {
+    state.lanHelper = await invoke('lan_helper');
+  } catch (_) {
+    state.lanHelper = null; // an older shell has no rooms
+  }
+}
+
+async function pollRoom() {
+  try {
+    state.room = await invoke('room_status');
+    state.roomsAvailable = true;
+  } catch (_) {
+    state.room = null;
+    state.roomsAvailable = false;
+  }
+  renderRoomBanner();
+  renderRoomPanel();
+}
+
+function roomLine(r) {
+  const g = gameById(r.game_id);
+  const who = r.role === 'host' ? 'Hosting a LAN room' : 'In a LAN room';
+  const parts = [who + ' for ' + (g ? g.display_name : (r.game_id || 'a game'))];
+  if (r.address) parts.push('as ' + r.address);
+  const adapter = ADAPTER_TEXT[r.adapter];
+  if (adapter) parts.push(adapter);
+  parts.push(r.members.length + (r.members.length === 1 ? ' member' : ' members'));
+  return parts.join(' — ');
+}
+
+function renderRoomBanner() {
+  const b = $('room-banner');
+  if (!b) return;
+  const r = state.room;
+  if (!r || !r.active) { b.classList.add('hidden'); b.textContent = ''; return; }
+  b.classList.remove('hidden');
+  b.classList.toggle('err', r.adapter === 'failed' || !!r.refused);
+  b.textContent = '';
+  const text = el('span', '', roomLine(r));
+  if (r.error) text.appendChild(el('span', 'room-err', ' — ' + r.error));
+  if (r.refused) text.appendChild(el('span', 'room-err', ' — refused: ' + r.refused));
+  b.appendChild(text);
+  const leave = el('button', 'quiet', 'Leave room');
+  leave.type = 'button';
+  leave.id = 'room-banner-leave';
+  leave.onclick = leaveRoom;
+  b.appendChild(leave);
+}
+
+function renderHelperStatus(parent) {
+  const h = state.lanHelper;
+  if (!h) return;
+  const box = el('div', 'helper-status ' + (h.ready ? 'ok' : 'warn'));
+  box.appendChild(el('span', '', h.detail));
+  if (!h.ready && h.can_grant) {
+    const g = el('button', 'quiet', 'Grant permission');
+    g.type = 'button';
+    g.id = 'grant-helper';
+    g.onclick = grantHelper;
+    box.appendChild(g);
+  }
+  parent.appendChild(box);
+}
+
+function renderLanWarnings(parent, gameId) {
+  const g = gameById(gameId);
+  if (!g || !g.lan) {
+    parent.appendChild(el('p', 'warn-line',
+      'This launcher has no LAN room support for this game, so it cannot join this room.'));
+    return;
+  }
+  if (g.lan.inbound_any) {
+    parent.appendChild(el('p', 'warn-line',
+      'While you are in this room, other members can reach every network service on this '
+      + 'machine through it — this game’s ports cannot be predicted. Only join rooms of people you trust.'));
+  } else {
+    parent.appendChild(el('p', 'muted small',
+      'Other members can reach this machine only on the game’s own ports: ' + g.lan.ports.join(', ') + '.'));
+  }
+  if (!g.lan.tested) {
+    parent.appendChild(el('p', 'warn-line',
+      'Nobody has played ' + g.display_name + ' in a LAN room yet. It may work; it is untested.'));
+  }
+}
+
+function renderRoomSection(d) {
+  const sec = el('div', 'section');
+  sec.appendChild(el('h3', '', 'LAN room'));
+  sec.appendChild(el('p', '',
+    'Joining puts this machine on a virtual LAN with the room’s members. Start the game yourself and '
+    + 'use its own LAN or local-network server list: the room makes the other players look local.'));
+  renderLanWarnings(sec, effectiveGameId(d));
+  renderHelperStatus(sec);
+  return sec;
+}
+
+function renderRoomFoot(foot, d, gameId) {
+  const r = state.room;
+  const here = r && r.active && r.room_hash === d.hash;
+  const g = gameById(gameId);
+  const helperReady = !!(state.lanHelper && state.lanHelper.ready);
+  const join = el('button', 'btn-join', here ? 'In this room' : (d.joining ? 'Joining…' : 'Join room'));
+  join.id = 'detail-join';
+  join.onclick = joinRoom;
+  join.disabled = here || !!d.joining || !g || !g.lan || !helperReady;
+  if (!helperReady && state.lanHelper) join.title = state.lanHelper.detail;
+  foot.appendChild(join);
+  // Leaving is the banner's button, always on screen while in a room.
+  if (d.joinMsg) foot.appendChild(el('span', 'join-msg ' + (d.joinErr ? 'err' : 'ok'), d.joinMsg));
+}
+
+async function joinRoom() {
+  const d = state.detail;
+  if (!d || d.joining) return;
+  const gameId = effectiveGameId(d);
+  d.joining = true;
+  d.joinMsg = null;
+  d.joinErr = false;
+  renderDetail();
+  try {
+    state.room = await invoke('join_room', { destinationHash: d.hash, gameId });
+    d.joinMsg = 'Joining the room. When the adapter is up, start the game and open its LAN server list.';
+  } catch (err) {
+    d.joinErr = true;
+    d.joinMsg = 'Could not join the room: ' + String(err && err.message || err);
+  } finally {
+    d.joining = false;
+    renderRoomBanner();
+    renderRoomPanel(true);
+    renderDetail();
+  }
+}
+
+async function hostRoom() {
+  const games = lanGames();
+  const gameId = state.hostDraft.game_id || (games[0] && games[0].id);
+  if (!gameId || state.roomBusy) return;
+  state.roomBusy = true;
+  renderRoomPanel(true);
+  try {
+    const name = (state.hostDraft.name || '').trim();
+    state.room = await invoke('host_room', { gameId, name: name || null });
+    hideError();
+  } catch (err) {
+    showError('Could not open the room: ' + String(err && err.message || err));
+  } finally {
+    state.roomBusy = false;
+    renderRoomBanner();
+    renderRoomPanel(true);
+  }
+}
+
+async function leaveRoom() {
+  try {
+    await invoke('leave_room');
+    hideError();
+  } catch (err) {
+    showError('Could not leave the room: ' + String(err && err.message || err));
+  }
+  await pollRoom();
+  if (state.detail) renderDetail();
+}
+
+async function grantHelper() {
+  try {
+    state.lanHelper = await invoke('grant_lan_helper');
+    hideError();
+  } catch (err) {
+    showError('The permission was not granted: ' + String(err && err.message || err));
+  }
+  renderRoomPanel(true);
+  if (state.detail) renderDetail();
+}
+
+// Rebuilt only when what it shows changed, so a room name being typed and a
+// game being picked survive the two-second poll.
+function renderRoomPanel(force) {
+  const panel = $('room-panel');
+  const body = $('room-body');
+  if (!panel || !body) return;
+  panel.hidden = !state.roomsAvailable;
+  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, lanGames().map(g => g.id)]);
+  if (!force && sig === state.roomPanelSig) return;
+  state.roomPanelSig = sig;
+
+  const summary = $('room-summary');
+  const r = state.room;
+  if (summary) summary.textContent = r && r.active ? '(in a room)' : '';
+  body.textContent = '';
+  renderHelperStatus(body);
+
+  if (r && r.active) {
+    body.appendChild(el('p', '', roomLine(r)));
+    if (r.room_hash) {
+      const code = el('code', 'room-hash', r.room_hash);
+      code.title = 'This room’s address. Others find it in their server list.';
+      body.appendChild(code);
+    }
+    const ul = el('ul', 'player-list');
+    r.members.forEach(m => ul.appendChild(el('li', '', m.address + (m.is_self ? ' (you)' : ''))));
+    body.appendChild(ul);
+    const leave = el('button', 'quiet', 'Leave room');
+    leave.type = 'button';
+    leave.id = 'room-leave';
+    leave.onclick = leaveRoom;
+    body.appendChild(leave);
+    return;
+  }
+
+  const games = lanGames();
+  if (!games.length) {
+    body.appendChild(el('p', 'muted small', 'No installed game offers LAN rooms.'));
+    return;
+  }
+  if (!state.hostDraft.game_id || !gameById(state.hostDraft.game_id)?.lan) {
+    state.hostDraft.game_id = games[0].id;
+  }
+  const form = el('div', 'index-add');
+  const select = el('select');
+  select.id = 'host-game';
+  select.setAttribute('aria-label', 'Game for the room');
+  games.forEach(g => {
+    const o = el('option', '', g.display_name);
+    o.value = g.id;
+    o.selected = g.id === state.hostDraft.game_id;
+    select.appendChild(o);
+  });
+  select.onchange = () => { state.hostDraft.game_id = select.value; renderRoomPanel(true); };
+  form.appendChild(select);
+  const name = el('input');
+  name.id = 'host-name';
+  name.type = 'text';
+  name.placeholder = 'room name';
+  name.setAttribute('aria-label', 'Room name');
+  name.value = state.hostDraft.name || '';
+  name.oninput = () => { state.hostDraft.name = name.value; };
+  form.appendChild(name);
+  const host = el('button', 'quiet', state.roomBusy ? 'Opening…' : 'Host a LAN room');
+  host.type = 'button';
+  host.id = 'host-btn';
+  host.disabled = state.roomBusy || !(state.lanHelper && state.lanHelper.ready);
+  host.onclick = hostRoom;
+  form.appendChild(host);
+  body.appendChild(form);
+  renderLanWarnings(body, state.hostDraft.game_id);
+}
+
+function wireRoomPanel() {
+  const panel = $('room-panel');
+  if (!panel) return;
+  // Opening the panel is when a player acts on the helper's state, so ask
+  // again then: a permission granted in a terminal shows up without a restart.
+  panel.addEventListener('toggle', async () => {
+    if (!panel.open) return;
+    await loadLanHelper();
+    renderRoomPanel(true);
+  });
 }

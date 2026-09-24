@@ -1306,8 +1306,44 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    installer's opt-in (the launcher's, step 5), and a firewall rule — CI
    turns the firewall off on its throwaway runner; on a player's machine the
    game asks for its own rule, as it does on a real LAN.
-5. **Launcher rooms.** Create/join a LAN room in the browser, the inbound
-   warning, the helper install prompt, and whether the helper is running.
+5. ~~**Launcher rooms.**~~ **Built 2026-09-24.** `launcher-core/src/lan.rs`
+   holds a room for the UI — host, join, leave, status — on the same
+   `run_room_on_adapter` the CLI uses, which now reports its phase (waiting
+   for a seat, starting, up, failed) so the UI can say what it is waiting
+   for; on Windows "starting" is the elevation prompt. A failed adapter open
+   no longer returns past the cleanup that removes a half-made one.
+
+   - **A room row is never joined as a server.** It carries a "LAN room"
+     badge, its detail pane sends no detail probe (a room has no such
+     endpoint, so the probe could only ever say "No direct response"), and
+     its button is **Join room**, which calls `join_room`. This closes the
+     gap step 1 named, for this launcher onward — one built before step 5
+     still lists a room as an ordinary row.
+   - **The pack's warnings are shown before joining**, unsoftened: the ports
+     other members can reach, the every-port warning for `inbound = "any"`,
+     and "untested" for a game nobody has played in a room.
+   - **The helper is asked, not assumed.** `lan-helper check` says whether it
+     can make an adapter (Linux: it holds `CAP_NET_ADMIN`; Windows: `wintun.dll`
+     is beside it). On Linux the launcher offers **Grant permission**, which
+     runs `pkexec setcap cap_net_admin+ep` on the helper beside it — the
+     opt-in moment; otherwise it shows the command. An AppImage cannot hold a
+     file capability (its mount is `nosuid`), so there it says to install the
+     `.deb` or `.rpm` instead of offering a grant that would change nothing.
+   - **The helper ships in the bundle.** `tauri.linux.conf.json` and
+     `tauri.windows.conf.json` add it as a sidecar, and Windows' adds
+     `wintun.dll` and its license beside it; macOS carries neither.
+     `scripts/stage-lan-helper.sh` and `scripts/fetch-wintun.ps1` stage them,
+     and CI's launcher job runs them — the shell's build script refuses to
+     start without them, so a bundle config naming a missing file fails CI.
+     A local `cargo tauri build --bundles deb` put `/usr/bin/lan-helper` beside
+     `/usr/bin/mesh-game-servers`. The release's Windows CLI zip carries the
+     helper and `wintun.dll` too.
+
+   `uicheck` drives it: a room row joins as a room and sends no probe, the
+   warnings appear, Join room and Host stay disabled until the helper is
+   ready, a typed room name survives a poll, and an older shell shows no room
+   controls at all. Breaking the room branch of the detail pane fails it on
+   seven checks.
 6. **First target game: Need for Speed: Most Wanted (2005)** on Windows, two
    players on this project's Internet interface. Record latency, broadcast traffic
    per minute, and whether the game's own LAN browser lists the room.

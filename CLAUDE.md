@@ -401,6 +401,14 @@ Rules a later change could quietly break:
   token; a squatter without it is dropped and the real helper still gets in.
   Only packets cross — never add a message that asks the helper to *do*
   something.
+- **The launcher never joins a room row as a server, and never elevates.**
+  Rooms are `launcher-core/src/lan.rs`; a room row's pane sends no probe and
+  its button calls `join_room`. The helper is asked with `lan-helper check`;
+  on Linux the only grant is `pkexec setcap` on the helper beside the launcher.
+- **`lan-helper` ships as a Tauri sidecar on Linux and Windows**, staged by
+  `scripts/stage-lan-helper.sh` (and `scripts/fetch-wintun.ps1` on Windows).
+  Building `launcher/src-tauri` there fails until they are staged — on
+  purpose, so a bundle can never ship without its helper.
 - **`lan_wintun.rs` proves the metric fix only because CI pins the runner's
   network to metric 2 first.** Left alone the runner's Wintun already wins and
   a branch without the fix passes; at 1 the room ties and loses. Removing that

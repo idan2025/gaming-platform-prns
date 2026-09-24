@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use launcher_core::lan::{LanHelperView, RoomView};
 use launcher_core::{
     error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
     GameSummary, JoinResult, Launcher, PlayResult, ServerDetailsView, ServerRow,
@@ -253,6 +254,47 @@ async fn set_player_name(state: tauri::State<'_, AppState>, name: String) -> Res
 
 /// Where game packs live: next to the executable in a shipped build, and at the
 /// repo's `packs/` when running from a checkout.
+// ---- Mode 3 LAN rooms (`PLAN.md` §14, step 5). All of it is in
+// `launcher-core/src/lan.rs`; these only forward. ----
+
+#[tauri::command]
+async fn lan_helper(state: tauri::State<'_, AppState>) -> Result<LanHelperView, String> {
+    Ok(state.launcher.lan_helper().await)
+}
+
+#[tauri::command]
+async fn grant_lan_helper(state: tauri::State<'_, AppState>) -> Result<LanHelperView, String> {
+    state.launcher.grant_lan_helper().await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn host_room(
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+    name: Option<String>,
+) -> Result<RoomView, String> {
+    state.launcher.host_room(&game_id, name).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn join_room(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+    game_id: String,
+) -> Result<RoomView, String> {
+    state.launcher.join_room(&destination_hash, &game_id).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn leave_room(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.launcher.leave_room().await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, String> {
+    Ok(state.launcher.room_status().await)
+}
+
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
         let candidate = dir.join("packs");
@@ -305,6 +347,12 @@ pub fn run() {
             remove_interface,
             saved_browse_opts,
             set_player_name,
+            lan_helper,
+            grant_lan_helper,
+            host_room,
+            join_room,
+            leave_room,
+            room_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");
