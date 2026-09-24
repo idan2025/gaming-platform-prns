@@ -74,6 +74,41 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.20
+
+### LAN rooms (Mode 3)
+
+For games that only find each other by LAN broadcast — the Hamachi and
+Tunngle back catalogue — the launcher can now host or join a **LAN room**
+(`PLAN.md` §14). Everyone in a room looks like one local network: the game's
+own LAN browser finds the others, over the mesh, with no central server. The
+room's host is just a player.
+
+- **In the launcher**: a "LAN rooms" panel to host one, a "LAN room" badge and a
+  **Join room** button on a room in the list, and a banner while in one. The
+  game's pack says which ports other members may reach, and the launcher shows
+  that — and "untested", for a game nobody has played in a room yet — before
+  anyone joins.
+- **Linux**: the launcher never runs as root. `lan-helper`, installed beside it,
+  makes the network adapter, and needs one permission once: the launcher offers
+  **Grant permission** (a `pkexec` prompt), or run
+  `sudo setcap cap_net_admin+ep /usr/bin/lan-helper`. **The AppImage cannot
+  hold that permission** (its mount ignores it); install the `.deb` or `.rpm`
+  for rooms.
+- **Windows**: `lan-helper.exe` and WireGuard's signed `wintun.dll` ship beside
+  the launcher. Windows asks for administrator rights when a room starts, for
+  the helper only. `lan-helper.exe` is not code-signed, so SmartScreen may warn.
+- **macOS**: no rooms yet.
+- **Games**: OpenTTD (`packs/openttd.toml`) is the first, played end to end in
+  CI with a real server and client. It is marked untested until a person has
+  played it in a room. Old Need for Speed titles are next.
+- **The CLI** has `game-bridge lan-host <game>` and `lan-join <game>`, and the
+  Windows zip now carries `lan-helper.exe` and `wintun.dll`.
+
+Other members reach your machine through a room **only on the game's declared
+ports** and on replies to connections you opened; your own system's background
+broadcasts (mDNS, NetBIOS, SSDP) are not sent into it.
+
 ## v0.2.19
 
 Two fixes, either of which on its own stopped a Linux player from getting as
