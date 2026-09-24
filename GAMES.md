@@ -201,3 +201,102 @@ cheaper to discover that against a GoldSrc sibling than against a JVM TCP game.
   created it.
 - `platform-api` filters the deploy catalog by what a node can actually run:
   link class, runtime arch, and whether the operator supplied content credentials.
+
+## 9. Roadmap — which games, in which order
+
+Recorded 2026-09-24, after a live run over an Internet-exposed TCP interface
+held 40–50 ms. At that latency the link is not the constraint; what a game
+needs from the platform is. Waves are ordered by **how much new Rust each game
+forces**, the same rule as §7: data first, new protocol words later.
+
+A game can be embedded at all only if **all** of these hold:
+
+- A **dedicated server** that runs headless in a container.
+- The client can **join by `host:port`** — the player's bridge is `127.0.0.1`.
+- It speaks **UDP or TCP** (both relays and multi-port are built, §2, §3).
+- Joining does **not** need a central service to broker the connection. Steam
+  ticket validation is fine (a bridged GoldSrc player validates, `CLAUDE.md`);
+  Steam Datagram Relay, P2P lobbies, or a vendor token that must approve the
+  server are not — that is Non-negotiable #1.
+
+Nothing in this section is measured yet. Store app ids and default ports are
+deliberately not written here: look each one up and put it in the pack, with a
+`file:line`-grade source, when the pack is written.
+
+### Wave 0 — shipped
+
+Sven Co-op, Half-Life DM, Counter-Strike 1.6, Condition Zero (zbot), and the
+Team Fortress 2 pack (runs once an operator supplies a Source image).
+
+### Wave 1 — pure data, no Rust
+
+Every one of these is a `.toml` and, for Source, an operator image. `query =
+"a2s"`, `console` and `LaunchKind` already have the words.
+
+- **GoldSrc on app 90:** Day of Defeat, Team Fortress Classic, Opposing Force.
+  The mod is `HLDS_MOD`; mind the `SteamAppId` rule (must be the app the player
+  owns).
+- **Valve Source:** Counter-Strike: Source, Garry's Mod, HL2 Deathmatch, Day of
+  Defeat: Source, Left 4 Dead 2.
+- **Non-Valve games on Source** — the cheapest non-Valve wins in the whole
+  list, because they inherit A2S, the `source` console and the Source launch
+  kind: Insurgency (2014), Day of Infamy, No More Room in Hell, Fistful of
+  Frags, Black Mesa, Zombie Panic! Source, Pirates, Vikings & Knights II,
+  NEOTOKYO, Nuclear Dawn, Synergy. Check per game that the dedicated server is
+  an anonymous steamcmd pull; one that is not is a `manual` pack (§5).
+
+One shared Source image, parametrized by operator env the way `images/goldsrc`
+takes `HLDS_MOD`, would serve most of this wave.
+
+### Wave 2 — non-Steam, `archive` driver, no query
+
+Free or open-source servers, fetched by digest (`PLAN.md` §11.2). `query` is
+omitted (`pack.rs:82`), so `players_now` is `None` and the reaper exempts them.
+All tier 1 UDP, the best fit after GoldSrc.
+
+- **Arena shooters:** Xonotic, OpenArena, Urban Terror, Warsow/Warfork, Red
+  Eclipse, Cube 2: Sauerbraten, AssaultCube, Unvanquished.
+- **Classic id-tech:** QuakeWorld (mvdsv, shareware data), Doom via Zandronum
+  or Odamex with Freedoom. Commercial Quake/Doom/UT data is the player's own and
+  so a `manual` pack on the node.
+- **Other:** Teeworlds / DDNet, Soldat, Luanti (Minetest) — which is §7 step 3.
+
+What this wave adds: a player-count probe per protocol (Quake `getstatus`
+covers most of the arena list) is optional polish, and each launch needs a
+`LaunchKind` before one-click join; until then the player types the address.
+
+### Wave 3 — new protocol words (Rust per family)
+
+- **Minecraft Java** — TCP, JVM. Needs an SLP `QueryProtocol`, the EULA
+  pre-start gate, and a `LaunchKind`. §7 step 4.
+- **Minecraft Bedrock** — UDP (RakNet), free server download; PC clients can
+  add `127.0.0.1`, consoles cannot.
+- **Terraria / tModLoader**, **Starbound** — TCP.
+- **Factorio** — UDP, free headless download.
+- **Mindustry**, **OpenTTD**, **OpenRA**, **Battle for Wesnoth**, **Hedgewars**,
+  **Freeciv**, **Veloren** — open source, TCP or UDP, low rate; strategy games
+  are the kindest traffic in this file.
+
+### Wave 4 — heavier Steam survival/sandbox
+
+Anonymous-steamcmd dedicated servers with direct-IP join, but tier 2–3 rate
+and multi-gigabyte content: Project Zomboid, 7 Days to Die, Barotrauma,
+Unturned, Space Engineers, V Rising, Satisfactory (TCP API beside UDP game —
+multi-port), Sons of the Forest, Valheim. Each must declare
+`min_link_class = 3` where it earns it; fine over this Internet interface,
+never over radio (§4). Verify direct-IP join per game before writing the pack —
+several of these default to Steam networking.
+
+### Not embeddable, and why
+
+- **A vendor token must approve the server:** Counter-Strike 2 public servers
+  (GSLT), Don't Starve Together (Klei cluster token), games on EOS/PlayFab-only
+  session auth.
+- **No dedicated server, or P2P/Steam-networking-only join:** Stardew Valley,
+  Core Keeper, most co-op titles without an IP field.
+- **Server files require a login:** not refused — they are `manual` packs on a
+  node whose operator owns the game (§5). Central hosting cannot offer them.
+
+A TCP interface carries every datagram in order, so one lost segment stalls
+everything behind it. Tier 1 games absorb it; Source and wave 4 show it as
+spikes under loss even when mean latency reads well.
