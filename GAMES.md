@@ -273,7 +273,9 @@ covers most of the arena list) is optional polish, and each launch needs a
   add `127.0.0.1`, consoles cannot.
 - **Terraria / tModLoader**, **Starbound** — TCP.
 - **Factorio** — UDP, free headless download.
-- **Mindustry**, **OpenTTD**, **OpenRA**, **Battle for Wesnoth**, **Hedgewars**,
+- **OpenTTD — done 2026-09-24**, as a Mode 1 pack and the first Mode 3 LAN
+  room game (`packs/openttd.toml`, `PLAN.md` §14.3 step 3).
+- **Mindustry**, **OpenRA**, **Battle for Wesnoth**, **Hedgewars**,
   **Freeciv**, **Veloren** — open source, TCP or UDP, low rate; strategy games
   are the kindest traffic in this file.
 

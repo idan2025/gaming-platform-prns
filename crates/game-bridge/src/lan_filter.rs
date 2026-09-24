@@ -134,6 +134,9 @@ fn lan_proto(protocol: u8) -> Option<LanProto> {
 
 /// A flow this side opened: protocol, its own port, the far address and port.
 type FlowKey = (LanProto, u16, Ipv4Addr, u16);
+/// The far address of a flow a broadcast opened: any member may answer it.
+/// `0.0.0.0` is never a member's address, so it cannot collide with one.
+const ANY_MEMBER: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 /// A fragmented datagram: sender, IP id, protocol.
 type FragmentKey = (Ipv4Addr, u16, u8);
 
@@ -158,7 +161,20 @@ impl LanFilter {
             // Only the game's own beacons. A later fragment of a broadcast is
             // rare enough that sending it is not worth a table.
             return match (lan_proto(p.protocol), p.ports) {
-                (Some(proto), Some((_, dport))) => self.policy.declares(proto, dport),
+                (Some(proto), Some((sport, dport))) => {
+                    let allowed = self.policy.declares(proto, dport);
+                    if allowed {
+                        // A search is a broadcast, and its answers are
+                        // unicasts from whoever heard it — OpenTTD's LAN
+                        // browser searches from a random port and is
+                        // answered there. So the broadcast opens a flow whose
+                        // far address is anyone in the room, still pinned to
+                        // both ports. Linux's own firewall needs a helper for
+                        // exactly this (`nf_conntrack_broadcast`).
+                        self.remember_flow((proto, sport, ANY_MEMBER, dport), now);
+                    }
+                    allowed
+                }
                 (Some(_), None) => self.policy.any || p.fragment == Fragment::Rest,
                 (None, _) => self.policy.any,
             };
@@ -185,21 +201,25 @@ impl LanFilter {
         }
         let Some(proto) = lan_proto(p.protocol) else { return self.policy.any };
         let Some((sport, dport)) = p.ports else { return false };
-        let allowed = self.policy.declares(proto, dport) || {
-            let flow = (proto, dport, p.src, sport);
-            match self.flows.get_mut(&flow) {
-                Some(seen) if now.duration_since(*seen) < FLOW_IDLE => {
-                    *seen = now;
-                    true
-                }
-                _ => false,
-            }
-        };
+        let allowed = self.policy.declares(proto, dport)
+            || self.refresh_flow((proto, dport, p.src, sport), now)
+            || self.refresh_flow((proto, dport, ANY_MEMBER, sport), now);
         if allowed && p.fragment == Fragment::First {
             self.fragments.retain(|_, t| now.duration_since(*t) < FRAGMENT_WINDOW);
             self.fragments.insert(key, now);
         }
         allowed
+    }
+
+    /// Whether `key` is a live flow, keeping it alive if so.
+    fn refresh_flow(&mut self, key: FlowKey, now: Instant) -> bool {
+        match self.flows.get_mut(&key) {
+            Some(seen) if now.duration_since(*seen) < FLOW_IDLE => {
+                *seen = now;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn remember_flow(&mut self, key: FlowKey, now: Instant) {
@@ -296,6 +316,28 @@ mod tests {
         );
         let other = Ipv4Addr::new(198, 19, 3, 3);
         assert!(!f.inbound(&tcp(other, 7000, ME, 50000), now), "another member is not the flow");
+    }
+
+    /// OpenTTD's LAN search, found by `tests/lan_openttd.rs` against the real
+    /// game: a broadcast from a random port to the game's port, answered by a
+    /// unicast back to that random port.
+    #[test]
+    fn a_reply_to_a_broadcast_this_side_sent_is_admitted() {
+        let mut f = game();
+        let s = RoomSubnet::default();
+        let now = Instant::now();
+        assert!(f.outbound(&udp(ME, 41234, s.broadcast(), 9999), &s, now));
+        assert!(f.inbound(&udp(PEER, 9999, ME, 41234), now), "the answer to the search");
+        let other = Ipv4Addr::new(198, 19, 3, 3);
+        assert!(f.inbound(&udp(other, 9999, ME, 41234), now), "any member may answer a broadcast");
+        assert!(
+            !f.inbound(&udp(PEER, 9998, ME, 41234), now),
+            "but only from the port it was sent to"
+        );
+        assert!(!f.inbound(&udp(PEER, 9999, ME, 41235), now), "and only to the port it came from");
+        // An undeclared broadcast was never sent, so it opens nothing.
+        assert!(!f.outbound(&udp(ME, 5353, s.broadcast(), 5353), &s, now));
+        assert!(!f.inbound(&udp(PEER, 5353, ME, 5353), now));
     }
 
     #[test]

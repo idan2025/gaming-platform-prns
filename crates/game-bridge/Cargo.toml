@@ -11,7 +11,7 @@ description = "Game-agnostic Reticulum bridge. Generalizes the Sven Co-op bridge
 [dependencies]
 personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "backbone", "wifi-auto", "shared-instance"] }
 prns-core = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 anyhow = "1"
 hex = "0.4"
 tracing = "0.1"

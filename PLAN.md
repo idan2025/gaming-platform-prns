@@ -1227,11 +1227,44 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    broadcast route each fail it. It skips where unprivileged user namespaces
    are off (Ubuntu's AppArmor default among them).
 
-   **Not done here:** the policy is passed in by the caller — no pack carries
-   a `[lan]` block yet, and nothing outside the test calls the pump. Step 3
-   is the first caller.
-3. **First free game, native Linux.** A game with LAN-broadcast discovery that
-   needs no purchase (OpenTTD or Xonotic LAN browse), measured end to end.
+   Its callers came with step 3: the policy is now a pack's `[lan]` block, and
+   `game-bridge lan-host` / `lan-join` run the pump.
+3. ~~**First free game, native Linux.**~~ **Built 2026-09-24, with OpenTTD
+   15.3.** A pack now says whether a game gets a room: `[lan]` lists its ports
+   (`ports`, `inbound = "declared" | "any"`, `tested`), a block that admits
+   nothing is a broken pack, and a game without one is refused a room.
+   `packs/openttd.toml` is the first, and an ordinary Mode 1 pack too.
+   `game-bridge lan-host <game>` / `lan-join <game>` are the first callers of
+   step 2: wait for a seat, run `lan-helper` (found beside the binary), attach,
+   pump, move the adapter if the seat moves, and remove it on Ctrl-C.
+   `run_room_on_adapter` in `lan_adapter.rs` is that logic, for the launcher
+   to reuse in step 5.
+
+   `tests/lan_openttd.rs` is the whole product with nothing stood in: two
+   network namespaces joined only by a veth pair, the real `game-bridge` and
+   `lan-helper` binaries in each, a real OpenTTD dedicated server behind the
+   host and a real headless OpenTTD client behind the member. The member
+   finds the room by its announce, finds the server with OpenTTD's own LAN
+   search packet sent to the subnet broadcast, and the client joins the
+   address that answered, downloads the map and starts a company; then
+   `lan-join` gets Ctrl-C and must leave no adapter behind.
+   `scripts/fetch-openttd.sh` fetches the pinned build, digest-checked; the
+   test skips without `OPENTTD_DIR`, so CI does not run it yet.
+
+   **What it found:** the inbound rule dropped every answer to a LAN search.
+   A search is a broadcast from a random port and its answer is a unicast
+   back to that port — not a flow the filter had seen, because only unicasts
+   opened flows. A broadcast to a declared port now opens a flow any member
+   may answer, pinned to both ports (the same gap Linux's firewall closes
+   with `nf_conntrack_broadcast`). The stand-in UDP test in step 2 could not
+   have found it: it answered on the game's own port.
+
+   **Measured**, on that loopback veth (one hop, so these are the platform's
+   own overhead, not an Internet's): seated with the adapter up about 2.4 s
+   after `lan-join` starts — mostly waiting for the room's announce; LAN
+   search answered in 4–8 ms; the client joined, map included, within
+   0.4 s (the test polls every 200 ms, so that is a ceiling). Three runs of
+   three.
 4. **Windows helper.** Wintun, signing, the installer's opt-in, the metric
    fix and its test. This is where the real cost is.
 5. **Launcher rooms.** Create/join a LAN room in the browser, the inbound

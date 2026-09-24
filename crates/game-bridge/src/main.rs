@@ -32,6 +32,8 @@ usage: game-bridge server <game-id> [options]
        game-bridge client <game-id> [options]
        game-bridge relay  [options]
        game-bridge browse [options]
+       game-bridge lan-host <game-id> [options]
+       game-bridge lan-join <game-id> [options]
        game-bridge sign   <pack.toml> [options]
        game-bridge verify <pack.toml> [options]
        game-bridge --help | --version
@@ -43,6 +45,9 @@ roles (PLAN.md §1)
            announced server
   relay    donate transit and nothing else: no game, no announced destination
   browse   listen and list; binds no port, holds no identity, forwards nothing
+  lan-host open a Mode 3 LAN room for a game whose pack has a [lan] block,
+           and put it on this machine's adapter (PLAN.md §14; Linux today)
+  lan-join join a LAN room and put it on this machine's adapter
   sign     write a detached signature beside a pack (PLAN.md §11.3)
   verify   check the signature beside a pack, and say which tier it earns
 
@@ -69,6 +74,19 @@ client options
                      announcing this game.
   --listen PORT      local port the game client connects to (default: the
                      pack's own port)
+
+lan options
+  --name NAME        the room's name in the browser (lan-host)
+  --max-members N    most members, host included (lan-host, default 8)
+  --allow HASH       identity hash that may be seated; repeatable (lan-host)
+  --room HASH        room to join; absent means the first one announcing this
+                     game (lan-join)
+  --adapter NAME     adapter to create, gbl* (default: gbl0)
+  --helper PATH      lan-helper to create it with (default: beside this binary;
+                     grant it once: sudo setcap cap_net_admin+ep lan-helper)
+  --no-transit / --transit
+                     whether to carry other people's traffic (host default on,
+                     member default off)
 
 sign options
   --identity PATH    the signing key (generated on first run, like any role's)
@@ -114,6 +132,7 @@ fn main() -> Result<()> {
         "browse" => BridgeConfig::Browse(build_browse(&args[1..])?),
         // Neither of these starts a bridge, so both return before the runtime
         // is built.
+        "lan-host" | "lan-join" => return run_lan(role, &args[1..]),
         "sign" => return sign_pack(&args[1..]),
         "verify" => return verify_pack_cli(&args[1..]),
         other => bail!("unknown role {other:?}\n\n{USAGE}"),
@@ -144,6 +163,11 @@ fn parse_num<T: std::str::FromStr>(raw: &str, flag: &str) -> Result<T> {
 /// usual cause is a pack directory that was never copied next to the binary,
 /// and an empty list says that far more clearly than "unknown game".
 fn profile_for(pack_dir: &Path, game_id: &str) -> Result<game_bridge::profile::GameProfile> {
+    let pack = pack_for(pack_dir, game_id)?;
+    pack.to_profile().map_err(|e| anyhow!("pack {game_id:?} is not usable: {e}"))
+}
+
+fn pack_for(pack_dir: &Path, game_id: &str) -> Result<GamePack> {
     let loaded = GamePack::load_dir(pack_dir)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("loading packs from {}", pack_dir.display()))?;
@@ -162,7 +186,7 @@ fn profile_for(pack_dir: &Path, game_id: &str) -> Result<game_bridge::profile::G
                 if known.is_empty() { "none".to_string() } else { known.join(", ") }
             )
         })?;
-    pack.to_profile().map_err(|e| anyhow!("pack {game_id:?} is not usable: {e}"))
+    Ok(pack.clone())
 }
 
 fn build_game_role(role: &str, rest: &[String]) -> Result<BridgeConfig> {
@@ -268,6 +292,134 @@ fn build_browse(rest: &[String]) -> Result<BrowserArgs> {
         }
     }
     Ok(args)
+}
+
+// ---------------------------------------------------------------------------
+// Mode 3 LAN rooms (PLAN.md §14)
+// ---------------------------------------------------------------------------
+
+fn run_lan(role: &str, rest: &[String]) -> Result<()> {
+    use game_bridge::lan_session::{LanHostArgs, LanMemberArgs};
+
+    let mut it = rest.iter();
+    let game_id = it
+        .next()
+        .cloned()
+        .filter(|g| !g.starts_with('-'))
+        .ok_or_else(|| anyhow!("game-bridge {role} needs a game id first, e.g. openttd\n\n{USAGE}"))?;
+    let flags: Vec<String> = it.cloned().collect();
+
+    let mut pack_dir = PathBuf::from("packs");
+    let mut tcp = None;
+    let mut auto = false;
+    let mut identity = PathBuf::from("./game-bridge-lan.identity");
+    let mut name = None;
+    let mut max_members: usize = 8;
+    let mut allow = Vec::new();
+    let mut room = None;
+    let mut adapter = "gbl0".to_string();
+    let mut helper: Option<PathBuf> = None;
+    let mut transit = role == "lan-host";
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--packs" => pack_dir = PathBuf::from(value(&mut it, "--packs")?),
+            "--tcp" => tcp = Some(value(&mut it, "--tcp")?),
+            "--auto" => auto = true,
+            "--identity" => identity = PathBuf::from(value(&mut it, "--identity")?),
+            "--name" if role == "lan-host" => name = Some(value(&mut it, "--name")?),
+            "--max-members" if role == "lan-host" => {
+                max_members = parse_num(&value(&mut it, "--max-members")?, "--max-members")?
+            }
+            "--allow" if role == "lan-host" => allow.push(value(&mut it, "--allow")?),
+            "--room" if role == "lan-join" => room = Some(value(&mut it, "--room")?),
+            "--adapter" => adapter = value(&mut it, "--adapter")?,
+            "--helper" => helper = Some(PathBuf::from(value(&mut it, "--helper")?)),
+            "--no-transit" => transit = false,
+            "--transit" => transit = true,
+            other => bail!("unknown option {other:?} for game-bridge {role}\n\n{USAGE}"),
+        }
+    }
+
+    let pack = pack_for(&pack_dir, &game_id)?;
+    // Only a game that says which ports it uses on a LAN gets a room: those
+    // ports are all the adapter will let in (`lan_filter.rs`).
+    let lan = pack.lan.clone().ok_or_else(|| {
+        anyhow!("pack {game_id:?} has no [lan] block, so it is not offered as a LAN room")
+    })?;
+    if !lan.tested {
+        tracing::warn!(game = %game_id, "nobody has played this game in a LAN room yet; it is untested");
+    }
+    if lan.inbound == game_bridge::pack::PackLanInbound::Any {
+        tracing::warn!(
+            game = %game_id,
+            "this game's pack admits every port: other members can reach any service on this machine while the room is up"
+        );
+    }
+    let profile = pack.to_profile().map_err(|e| anyhow!("pack {game_id:?} is not usable: {e}"))?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the tokio runtime")?;
+    runtime.block_on(async move {
+        let session = if role == "lan-host" {
+            let mut args = LanHostArgs::new(profile);
+            args.identity = identity;
+            args.tcp = tcp;
+            args.auto = auto;
+            args.name = name;
+            args.max_members = max_members;
+            args.allowlist = allow;
+            args.relay_transit = transit;
+            game_bridge::lan_session::LanSession::host(args).await?
+        } else {
+            let mut args = LanMemberArgs::new(profile);
+            args.identity = identity;
+            args.tcp = tcp;
+            args.auto = auto;
+            args.room_hash = room;
+            args.relay_transit = transit;
+            game_bridge::lan_session::LanSession::join(args).await?
+        };
+        if let Some(hash) = session.room_hash() {
+            println!("room {}", hex::encode(hash.as_bytes()));
+        }
+        run_lan_adapter(std::sync::Arc::new(session), lan.policy(), adapter, helper).await
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn run_lan_adapter(
+    session: std::sync::Arc<game_bridge::lan_session::LanSession>,
+    policy: game_bridge::lan_filter::LanPolicy,
+    adapter: String,
+    helper: Option<PathBuf>,
+) -> Result<()> {
+    use game_bridge::lan_adapter::{run_room_on_adapter, AdapterSetup};
+
+    let helper = helper.or_else(|| {
+        let beside = std::env::current_exe().ok()?.with_file_name("lan-helper");
+        beside.exists().then_some(beside)
+    });
+    let setup = match helper {
+        Some(path) => AdapterSetup::Helper(path),
+        None => AdapterSetup::InProcess,
+    };
+    let stop = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    run_room_on_adapter(session, policy, adapter, setup, stop).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_lan_adapter(
+    _session: std::sync::Arc<game_bridge::lan_session::LanSession>,
+    _policy: game_bridge::lan_filter::LanPolicy,
+    _adapter: String,
+    _helper: Option<PathBuf>,
+) -> Result<()> {
+    bail!("this platform's LAN room adapter is not built yet (PLAN.md §14.3)")
 }
 
 // ---------------------------------------------------------------------------

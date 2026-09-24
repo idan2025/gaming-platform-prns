@@ -156,6 +156,84 @@ pub struct GamePack {
     /// `launch.rs`'s module docs for the four rules that carry it.
     #[serde(default)]
     pub launch: Option<LaunchProfile>,
+    /// Whether, and how, this game plays in a Mode 3 LAN room
+    /// (`PLAN.md` §14). Absent means no LAN room is offered for it: only a
+    /// game that declares its LAN ports gets a virtual adapter.
+    ///
+    /// Ports, never a program: a member's adapter admits other members only to
+    /// these, and broadcasts only to these (`lan_filter.rs`).
+    #[serde(default)]
+    pub lan: Option<PackLan>,
+}
+
+/// A pack's `[lan]` block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackLan {
+    /// The ports this game uses on a LAN — for discovery and for play.
+    #[serde(default)]
+    pub ports: Vec<PackLanPort>,
+    /// `"declared"` (the default): other members reach only `ports`.
+    /// `"any"`: every port, for a game whose ports cannot be predicted — and a
+    /// launcher says so before a player joins with it.
+    #[serde(default)]
+    pub inbound: PackLanInbound,
+    /// Whether somebody has actually played this game in a room. Untested
+    /// says untested (`MODES.md`, "Anti-cheat, honestly").
+    #[serde(default)]
+    pub tested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackLanPort {
+    pub port: u16,
+    pub transport: PackTransport,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackLanInbound {
+    #[default]
+    Declared,
+    Any,
+}
+
+/// More LAN ports than any game needs; a list longer than this is a mistake.
+pub const MAX_LAN_PORTS: usize = 16;
+
+impl PackLan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ports.is_empty() && self.inbound == PackLanInbound::Declared {
+            return Err("[lan] declares no ports, so nothing could reach the game".to_string());
+        }
+        if self.ports.len() > MAX_LAN_PORTS {
+            return Err(format!("[lan] declares {} ports; at most {MAX_LAN_PORTS}", self.ports.len()));
+        }
+        if self.ports.iter().any(|p| p.port == 0) {
+            return Err("[lan] port 0 is not a port".to_string());
+        }
+        Ok(())
+    }
+
+    /// What a member's adapter admits (`lan_filter.rs`).
+    pub fn policy(&self) -> crate::lan_filter::LanPolicy {
+        use crate::lan_filter::{LanPort, LanProto};
+        crate::lan_filter::LanPolicy {
+            ports: self
+                .ports
+                .iter()
+                .map(|p| LanPort {
+                    proto: match p.transport {
+                        PackTransport::Udp => LanProto::Udp,
+                        PackTransport::Tcp => LanProto::Tcp,
+                    },
+                    port: p.port,
+                })
+                .collect(),
+            any: self.inbound == PackLanInbound::Any,
+        }
+    }
 }
 
 /// One extra port, as it appears in a pack's `[[extra_ports]]`.
@@ -272,6 +350,8 @@ pub enum PackError {
     Signature(SigFileError),
     /// The pack's `[launch]` block is not usable.
     InvalidLaunch(LaunchError),
+    /// The pack's `[lan]` block is not usable.
+    InvalidLan(String),
 }
 
 impl core::fmt::Display for PackError {
@@ -287,6 +367,7 @@ impl core::fmt::Display for PackError {
             Self::InvalidContent(e) => write!(f, "pack describes unusable content: {e}"),
             Self::Signature(e) => write!(f, "pack signature: {e}"),
             Self::InvalidLaunch(e) => write!(f, "pack describes an unusable launch: {e}"),
+            Self::InvalidLan(e) => write!(f, "pack describes an unusable LAN: {e}"),
         }
     }
 }
@@ -347,6 +428,8 @@ impl GamePack {
                 steam_app_id: Some(225840),
                 args: vec!["+connect {address}".to_string(), "+password {password}".to_string()],
             }),
+            // Sven Co-op joins by address, so it is Mode 1, not a LAN room.
+            lan: None,
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -371,6 +454,9 @@ impl GamePack {
         // than at the moment a player presses Join.
         if let Some(launch) = &pack.launch {
             launch.validate().map_err(PackError::InvalidLaunch)?;
+        }
+        if let Some(lan) = &pack.lan {
+            lan.validate().map_err(PackError::InvalidLan)?;
         }
         Ok(pack)
     }
@@ -737,6 +823,42 @@ query = "a2s"
                  directory over every map the install ships",
                 pack.id
             );
+        }
+    }
+
+    /// A `[lan]` block that names no port and does not say `any` would give a
+    /// room nothing to let in, so it is a broken pack, reported at load.
+    #[test]
+    fn a_lan_block_that_admits_nothing_is_refused() {
+        let empty = format!("{NO_CONTENT_TOML}\n[lan]\nports = []\n");
+        assert!(matches!(GamePack::parse(&empty), Err(PackError::InvalidLan(_))));
+        let zero = format!("{NO_CONTENT_TOML}\n[lan]\nports = [{{ port = 0, transport = \"udp\" }}]\n");
+        assert!(matches!(GamePack::parse(&zero), Err(PackError::InvalidLan(_))));
+        let any = format!("{NO_CONTENT_TOML}\n[lan]\ninbound = \"any\"\n");
+        assert!(GamePack::parse(&any).unwrap().lan.unwrap().policy().any);
+    }
+
+    /// A `[lan]` block carries ports, never a program: an unknown key is a
+    /// parse error, like everywhere else in a pack.
+    #[test]
+    fn a_lan_block_cannot_carry_anything_but_ports() {
+        let cmd = format!(
+            "{NO_CONTENT_TOML}\n[lan]\nports = [{{ port = 1, transport = \"udp\" }}]\ncommand = \"x\"\n"
+        );
+        assert!(matches!(GamePack::parse(&cmd), Err(PackError::Parse(_))));
+    }
+
+    /// Every shipped pack that offers a LAN room lets the room reach it:
+    /// found by the property, not by a game's id.
+    #[test]
+    fn every_shipped_lan_pack_admits_something() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let loaded = GamePack::load_dir(&dir).unwrap();
+        let lan: Vec<_> = loaded.packs.iter().filter_map(|p| p.lan.as_ref().map(|l| (p, l))).collect();
+        assert!(!lan.is_empty(), "at least one shipped pack offers a LAN room");
+        for (pack, block) in lan {
+            let policy = block.policy();
+            assert!(policy.any || !policy.ports.is_empty(), "{} offers a room nothing can reach", pack.id);
         }
     }
 

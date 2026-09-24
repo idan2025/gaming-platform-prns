@@ -386,6 +386,14 @@ Rules a later change could quietly break:
   Only declared ports and replies to flows this side opened get in; only
   declared ports get broadcast. `tests/lan_adapter.rs` runs real adapters in
   two network namespaces under `unshare -rn`, no root needed.
+- **A broadcast this side sends opens a flow any member may answer**, pinned
+  to both ports. A LAN search is a broadcast from a random port answered by
+  unicast to it; without this every OpenTTD search went unanswered. Caught by
+  `a_reply_to_a_broadcast_this_side_sent_is_admitted`, and found only by the
+  real game (`tests/lan_openttd.rs` — needs `OPENTTD_DIR`, see
+  `scripts/fetch-openttd.sh`).
+- **Only a pack with a `[lan]` block gets a room**, and `[lan]` is ports, never
+  a program. `lan-host` / `lan-join` refuse a game without one.
 
 **The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
 `cargo fmt --all` — it reformats every file, in a style the tree was not written

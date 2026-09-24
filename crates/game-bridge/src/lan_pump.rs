@@ -28,30 +28,31 @@ pub async fn pump<D>(device: Arc<D>, room: Arc<LanSession>, policy: LanPolicy) -
 where
     D: PacketDevice + Send + Sync + 'static,
 {
-    let filter = Arc::new(Mutex::new(LanFilter::new(policy)));
+    let filter = Mutex::new(LanFilter::new(policy));
 
-    let up = {
-        let (device, room, filter) = (device.clone(), room.clone(), filter.clone());
-        tokio::spawn(async move {
-            // A TUN read returns one packet; the adapter's MTU bounds it, but
-            // a buffer smaller than a packet would silently truncate one.
-            let mut buf = vec![0u8; 65536];
-            loop {
-                let n = device.recv(&mut buf).await?;
-                let packet = &buf[..n];
-                let subnet = room.subnet();
-                let allowed =
-                    filter.lock().expect("filter lock").outbound(packet, &subnet, Instant::now());
-                if !allowed {
-                    continue;
-                }
-                match room.send(packet.to_vec()) {
-                    Ok(()) => {}
-                    Err(LanSendError::Stopped) => return Ok(()),
-                    Err(e) => debug!(error = %e, "not sending a packet into the room"),
-                }
+    // Both halves are futures of this one task, not a spawned one: dropping
+    // the pump must close the device at once. A spawned half outlives an
+    // aborted pump, keeps the descriptor open, and the adapter cannot be
+    // removed ("Device or resource busy").
+    let up = async {
+        // A TUN read returns one packet; the adapter's MTU bounds it, but a
+        // buffer smaller than a packet would silently truncate one.
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = device.recv(&mut buf).await?;
+            let packet = &buf[..n];
+            let subnet = room.subnet();
+            let allowed =
+                filter.lock().expect("filter lock").outbound(packet, &subnet, Instant::now());
+            if !allowed {
+                continue;
             }
-        })
+            match room.send(packet.to_vec()) {
+                Ok(()) => {}
+                Err(LanSendError::Stopped) => return Ok::<(), io::Error>(()),
+                Err(e) => debug!(error = %e, "not sending a packet into the room"),
+            }
+        }
     };
 
     let down = async {
@@ -66,12 +67,8 @@ where
         Ok::<(), io::Error>(())
     };
 
-    let mut up = up;
-    let result = tokio::select! {
-        r = &mut up => r.unwrap_or(Ok(())),
+    tokio::select! {
+        r = up => r,
         r = down => r,
-    };
-    // Dropping a JoinHandle detaches the task rather than stopping it.
-    up.abort();
-    result
+    }
 }

@@ -398,3 +398,136 @@ mod tests {
         assert_eq!(std::mem::size_of::<RtEntry>(), 120);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Running a room on an adapter
+// ---------------------------------------------------------------------------
+
+/// How the adapter gets its privileged setup.
+#[derive(Debug, Clone)]
+pub enum AdapterSetup {
+    /// Run `lan-helper` at this path — the normal case: this process holds no
+    /// capability and never elevates.
+    Helper(std::path::PathBuf),
+    /// Call [`create`] and [`destroy`] directly. Only for a process that
+    /// already holds `CAP_NET_ADMIN`, such as root or a test in a user
+    /// namespace.
+    InProcess,
+}
+
+impl AdapterSetup {
+    fn up(&self, config: &AdapterConfig) -> anyhow::Result<()> {
+        use anyhow::Context;
+        match self {
+            Self::InProcess => {
+                // SAFETY: getuid cannot fail.
+                let uid = unsafe { libc::getuid() };
+                create(config, uid).with_context(|| {
+                    format!(
+                        "creating adapter {} needs CAP_NET_ADMIN; use lan-helper instead",
+                        config.name
+                    )
+                })
+            }
+            Self::Helper(helper) => {
+                let cidr = format!("{}/{}", config.address, config.subnet.prefix_len);
+                let out = std::process::Command::new(helper)
+                    .args(["up", &config.name, &cidr])
+                    .output()
+                    .with_context(|| format!("running {}", helper.display()))?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "{} up {} {cidr} failed: {}\nGrant it the one capability it needs: \
+                         sudo setcap cap_net_admin+ep {}",
+                        helper.display(),
+                        config.name,
+                        String::from_utf8_lossy(&out.stderr).trim(),
+                        helper.display()
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn down(&self, name: &str) {
+        let result = match self {
+            Self::InProcess => destroy(name).map_err(|e| e.to_string()),
+            Self::Helper(helper) => std::process::Command::new(helper)
+                .args(["down", name])
+                .status()
+                .map_err(|e| e.to_string())
+                .and_then(|s| if s.success() { Ok(()) } else { Err(format!("exit {s}")) }),
+        };
+        if let Err(e) = result {
+            tracing::warn!(adapter = name, error = %e, "could not remove the room adapter");
+        }
+    }
+}
+
+/// Put `session`'s room on a local adapter and pump it until `stop` resolves
+/// or the room ends; then take the adapter away again.
+///
+/// Waits to be seated first — the adapter's address *is* the seat. If the
+/// room seats this member somewhere else later (it lost the link and came back
+/// to find its address taken), the adapter is moved to the new address rather
+/// than left answering for the old one.
+pub async fn run_room_on_adapter(
+    session: std::sync::Arc<crate::lan_session::LanSession>,
+    policy: crate::lan_filter::LanPolicy,
+    name: String,
+    setup: AdapterSetup,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
+    validate_name(&name)?;
+    tokio::pin!(stop);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut current: Option<(AdapterConfig, tokio::task::JoinHandle<io::Result<()>>)> = None;
+
+    let result = loop {
+        tokio::select! {
+            _ = &mut stop => break Ok(()),
+            _ = tick.tick() => {}
+        }
+        if let Some((_, pump)) = &current {
+            if pump.is_finished() {
+                break Err(anyhow::anyhow!("the room adapter's pump stopped"));
+            }
+        }
+        let view = session.view();
+        if let Some(refusal) = view.refused {
+            break Err(anyhow::anyhow!("the room refused this member: {refusal}"));
+        }
+        let Some(address) = view.own_address else { continue };
+        let wanted = AdapterConfig { name: name.clone(), address, subnet: view.subnet };
+        if current.as_ref().is_some_and(|(config, _)| *config == wanted) {
+            continue;
+        }
+        // Detach before reconfiguring: a TUN device takes one reader, and the
+        // helper opens it too.
+        if let Some((_, pump)) = current.take() {
+            pump.abort();
+            let _ = pump.await;
+        }
+        let setup_for_up = setup.clone();
+        let config = wanted.clone();
+        tokio::task::spawn_blocking(move || setup_for_up.up(&config)).await??;
+        let device = std::sync::Arc::new(TunDevice::attach(&name)?);
+        tracing::info!(
+            adapter = %name,
+            address = %address,
+            prefix_len = view.subnet.prefix_len,
+            "the room is on this machine's adapter"
+        );
+        let pump = tokio::spawn(crate::lan_pump::pump(device, session.clone(), policy.clone()));
+        current = Some((wanted, pump));
+    };
+
+    if let Some((_, pump)) = current.take() {
+        pump.abort();
+        let _ = pump.await;
+    }
+    let setup_for_down = setup.clone();
+    let _ = tokio::task::spawn_blocking(move || setup_for_down.down(&name)).await;
+    result
+}

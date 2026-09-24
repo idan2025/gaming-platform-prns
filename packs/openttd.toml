@@ -1,0 +1,37 @@
+# Game pack #6, and the first with a `[lan]` block: OpenTTD is the first game
+# played in a Mode 3 LAN room (`PLAN.md` §14.3, step 3). It is also an ordinary
+# Mode 1 game — its client joins by address — so it gets both.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "openttd"
+display_name = "OpenTTD"
+app_name = "openttd"
+default_port = 3979
+transport = "tcp"
+# Tier 2 (`GAMES.md` §4): play is a lockstep command stream and light, but a
+# join downloads the whole map, which is a burst.
+min_link_class = 2
+notes = "Open source (GPL). Dedicated server: `openttd -D`, needs a base graphics set such as OpenGFX even headless. Discovery is UDP 3979 broadcast, play is TCP 3979."
+
+# OpenTTD's LAN, read out of its 15.3 source:
+# - A client finds servers by broadcasting PACKET_UDP_CLIENT_FIND_SERVER to UDP
+#   3979 on each interface's *subnet* broadcast address
+#   (`src/network/network_udp.cpp`, `NetworkUDPBroadCast`), and a server
+#   answers with an empty PACKET_UDP_SERVER_RESPONSE.
+# - It then asks for the game's details, and joins, over TCP 3979
+#   (`src/network/core/tcp_game.h`, PACKET_CLIENT_GAME_INFO).
+# So both are declared: other members reach this machine only on these, and
+# this machine broadcasts only to these (`lan_filter.rs`).
+[lan]
+ports = [
+    { port = 3979, transport = "udp" },
+    { port = 3979, transport = "tcp" },
+]
+# `tests/lan_openttd.rs` runs a real OpenTTD 15.3 server and a real headless
+# client in two network namespaces, and the client joins over the room — but a
+# test joining is not a person playing, so this stays false until one has.
+tested = false
