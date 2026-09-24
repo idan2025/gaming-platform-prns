@@ -22,6 +22,7 @@ pub mod lan;
 pub mod lan_adapter;
 pub mod lan_filter;
 pub mod lan_pump;
+pub mod lan_relay;
 pub mod lan_session;
 pub mod launch;
 pub mod pack;

@@ -46,7 +46,8 @@ roles (PLAN.md §1)
   relay    donate transit and nothing else: no game, no announced destination
   browse   listen and list; binds no port, holds no identity, forwards nothing
   lan-host open a Mode 3 LAN room for a game whose pack has a [lan] block,
-           and put it on this machine's adapter (PLAN.md §14; Linux today)
+           and put it on this machine's adapter (PLAN.md §14; Linux and
+           Windows)
   lan-join join a LAN room and put it on this machine's adapter
   sign     write a detached signature beside a pack (PLAN.md §11.3)
   verify   check the signature beside a pack, and say which tier it earns
@@ -82,8 +83,10 @@ lan options
   --room HASH        room to join; absent means the first one announcing this
                      game (lan-join)
   --adapter NAME     adapter to create, gbl* (default: gbl0)
-  --helper PATH      lan-helper to create it with (default: beside this binary;
-                     grant it once: sudo setcap cap_net_admin+ep lan-helper)
+  --helper PATH      lan-helper to create it with (default: beside this binary).
+                     Linux: grant it once, sudo setcap cap_net_admin+ep lan-helper.
+                     Windows: it asks for administrator rights when the room
+                     starts, and needs wintun.dll beside it.
   --no-transit / --transit
                      whether to carry other people's traffic (host default on,
                      member default off)
@@ -389,7 +392,7 @@ fn run_lan(role: &str, rest: &[String]) -> Result<()> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 async fn run_lan_adapter(
     session: std::sync::Arc<game_bridge::lan_session::LanSession>,
     policy: game_bridge::lan_filter::LanPolicy,
@@ -399,7 +402,9 @@ async fn run_lan_adapter(
     use game_bridge::lan_adapter::{run_room_on_adapter, AdapterSetup};
 
     let helper = helper.or_else(|| {
-        let beside = std::env::current_exe().ok()?.with_file_name("lan-helper");
+        let beside = std::env::current_exe()
+            .ok()?
+            .with_file_name(format!("lan-helper{}", std::env::consts::EXE_SUFFIX));
         beside.exists().then_some(beside)
     });
     let setup = match helper {
@@ -412,7 +417,7 @@ async fn run_lan_adapter(
     run_room_on_adapter(session, policy, adapter, setup, stop).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 async fn run_lan_adapter(
     _session: std::sync::Arc<game_bridge::lan_session::LanSession>,
     _policy: game_bridge::lan_filter::LanPolicy,

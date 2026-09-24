@@ -1265,8 +1265,47 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    search answered in 4–8 ms; the client joined, map included, within
    0.4 s (the test polls every 200 ms, so that is a ceiling). Three runs of
    three.
-4. **Windows helper.** Wintun, signing, the installer's opt-in, the metric
-   fix and its test. This is where the real cost is.
+4. ~~**Windows helper.**~~ **Built 2026-09-24, and proven on CI's Windows
+   runner.** Two facts changed the shape from Linux's:
+
+   - **Only an administrator can open a Wintun adapter**, not just create one,
+     so Linux's "create owned, open unprivileged" has no Windows equivalent.
+     `lan-helper serve` runs elevated (started through Windows' own elevation
+     prompt), holds the adapter for the session, and relays its packets to the
+     unprivileged launcher over `lan_relay.rs`: the launcher listens on
+     loopback, the helper connects *out* and proves itself with a one-time
+     token, and only packets cross. The adapter goes when the relay drops,
+     however the launcher ended. The room, filter and pump stay in the
+     launcher, shared with Linux; `lan_adapter/mod.rs` now holds one
+     `run_room_on_adapter` and each platform supplies only open and close.
+   - **Wintun is bound from `wintun.h` directly** — ten functions, loaded from
+     an absolute path only — and its signed DLL ships unmodified beside the
+     helper, as its prebuilt-binaries license allows.
+
+   **The metric fix, and what it does and does not do.** The adapter gets
+   interface metric 1 and its own host route to `255.255.255.255`.
+   `tests/lan_wintun.rs` drives a real limited broadcast from a plain Windows
+   socket and requires the room's other member to receive it, then the reply
+   back, then an undeclared port shut, then the adapter gone on stop. CI's
+   `lan-windows` job runs it with Wintun 0.14.1, digest-checked. Three things
+   were measured by running it against a branch with the metric and route
+   deleted:
+   - **Left alone, the runner proved nothing**: Wintun reports a fast link, so
+     Windows' automatic metric already preferred it and the broken branch
+     passed. Hamachi's adapter reported a slow one, which is why its users
+     had to fix the metric by hand.
+   - **With the runner's own network pinned to metric 1, both failed**: the
+     room's 1 only ties, and the tie went to the real network. So the fix
+     does not beat a network someone pinned to 1 by hand.
+   - **With it at 2** — cheaper than any automatic metric Windows assigns (its
+     lowest is 5), dearer than the room's 1 — **the fix passes and the broken
+     branch fails** with "never reached the room". That is what CI now runs.
+
+   **Not done here:** code signing (`lan-helper.exe` is unsigned, so
+   SmartScreen warns; a certificate is a purchase and the owner's call), the
+   installer's opt-in (the launcher's, step 5), and a firewall rule — CI
+   turns the firewall off on its throwaway runner; on a player's machine the
+   game asks for its own rule, as it does on a real LAN.
 5. **Launcher rooms.** Create/join a LAN room in the browser, the inbound
    warning, the helper install prompt, and whether the helper is running.
 6. **First target game: Need for Speed: Most Wanted (2005)** on Windows, two

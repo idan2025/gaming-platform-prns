@@ -394,6 +394,17 @@ Rules a later change could quietly break:
   `scripts/fetch-openttd.sh`).
 - **Only a pack with a `[lan]` block gets a room**, and `[lan]` is ports, never
   a program. `lan-host` / `lan-join` refuse a game without one.
+- **On Windows the helper holds the adapter; it never listens.** Only an
+  administrator can open a Wintun adapter, so `lan-helper serve` stays up and
+  relays packets to the launcher (`lan_relay.rs`). The launcher listens on
+  loopback and the helper connects out and proves itself with a one-time
+  token; a squatter without it is dropped and the real helper still gets in.
+  Only packets cross — never add a message that asks the helper to *do*
+  something.
+- **`lan_wintun.rs` proves the metric fix only because CI pins the runner's
+  network to metric 2 first.** Left alone the runner's Wintun already wins and
+  a branch without the fix passes; at 1 the room ties and loses. Removing that
+  CI step makes the test vacuous without failing anything.
 
 **The repo is not `cargo fmt`-clean** and has no `rustfmt.toml`. Do not run
 `cargo fmt --all` — it reformats every file, in a style the tree was not written

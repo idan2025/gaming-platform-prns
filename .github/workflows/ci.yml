@@ -86,6 +86,73 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 
+  # Mode 3 on Windows (PLAN.md §14.3 step 4): a real Wintun adapter, made by the
+  # real lan-helper, with a limited broadcast proven to leave through it. Its
+  # own job because it needs what the test job must not assume: an
+  # administrator (a hosted runner is one), wintun.dll, and a firewall that
+  # lets a test's socket be reached on a new adapter.
+  lan-windows:
+    name: LAN room adapter (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Windows long paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CARGO_HOME=C:\cg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\cg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          New-Item -ItemType Directory -Force -Path C:\cg | Out-Null
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-lan-windows
+
+      # WireGuard's prebuilt, signed wintun.dll. Pinned and digest-checked: the
+      # digest decides, never the URL — same rule as a pack's archive driver.
+      - name: Wintun
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\wintun.zip"
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($hash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {
+            throw "wintun-0.14.1.zip digest mismatch: $hash"
+          }
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wintun"
+          "GAME_BRIDGE_WINTUN_DLL=$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # A new adapter is an "unidentified network", which Windows files under
+      # the Public profile and firewalls. On a player's machine the game asks
+      # for its own rule; on a throwaway runner, off is the honest equivalent.
+      - name: Firewall off (ephemeral runner)
+        shell: pwsh
+        run: netsh advfirewall set allprofiles state off
+
+      # The Hamachi situation, on purpose. Left alone, Windows' automatic
+      # metric already prefers Wintun (it reports a fast link) over the
+      # runner's virtual Ethernet, so a limited broadcast went through the room
+      # even with the fix removed — measured on a branch with the metric and
+      # route deleted, which passed. So the runner's own network is made
+      # cheaper than any *automatic* metric (Windows never assigns one below 5)
+      # while staying dearer than the room's 1: exactly the claim the fix
+      # makes. Pinned to 1 it ties the room's adapter and the tie goes to the
+      # real network — measured too, and recorded as the fix's limit.
+      - name: Make the runner's own network the cheapest route
+        shell: pwsh
+        run: |
+          Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected |
+            Where-Object { $_.InterfaceAlias -notlike 'Loopback*' } |
+            Set-NetIPInterface -InterfaceMetric 2
+          Get-NetIPInterface -AddressFamily IPv4 | Format-Table InterfaceAlias, InterfaceMetric, ConnectionState
+
+      - name: Test
+        run: cargo test -p game-bridge --test lan_wintun -- --nocapture
+
   launcher:
     name: launcher builds ${{ matrix.os }}
     strategy:

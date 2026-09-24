@@ -17,6 +17,8 @@ hex = "0.4"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# The one-time token a LAN helper proves itself with (`lan_relay.rs`).
+getrandom = "0.2"
 # For the `game-bridge` binary's logging only. The library never installs a
 # subscriber — a launcher that links this crate owns that decision.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -24,6 +26,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # The Mode 3 adapter (`src/lan_adapter.rs`) is TUN ioctls, Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# The Mode 3 adapter on Windows: Wintun, loaded at runtime, and the IP Helper
+# calls that configure it (`src/lan_adapter/windows.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = ["serde"]

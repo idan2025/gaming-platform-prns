@@ -1,10 +1,10 @@
-//! Mode 3, virtual LAN: the Linux adapter (`PLAN.md` §14, step 2).
+//! The Linux room adapter: a TUN device (`PLAN.md` §14, step 2).
 //!
 //! A layer-3 TUN device carrying the room's subnet and nothing else. The split
 //! that keeps the launcher unprivileged (`PLAN.md` §14.1):
 //!
 //! - **[`create`] and [`destroy`] need `CAP_NET_ADMIN`**, and are all the
-//!   `lan-helper` binary does. `create` makes the device *persistent* and
+//!   `lan-helper` binary does here. `create` makes the device *persistent* and
 //!   *owned* by the user, then configures it.
 //! - **[`TunDevice::attach`] does not.** A persistent TUN device owned by a
 //!   user can be opened by that user with no capability at all, so the
@@ -14,22 +14,11 @@
 //! file capability does not pass it to a child it spawns, so shelling out to
 //! `ip` would work under `sudo` and fail under `setcap`.
 //!
-//! # Rules a later change could quietly break
-//!
-//! - **Only `gbl*` names, only the room range.** The helper is privileged and
-//!   its arguments are the caller's. [`AdapterConfig::validate`] refuses any
-//!   other device name — so it cannot be pointed at `eth0` — and any subnet
-//!   outside `198.18.0.0/15` (`lan::RoomSubnet::new`), so it cannot route a
-//!   real LAN into a room.
-//! - **No default route.** The device gets its subnet and one host route for
-//!   the limited broadcast `255.255.255.255`, and nothing else.
 //! - **The limited-broadcast route is what makes old games find each other.**
 //!   Without it a broadcast to `255.255.255.255` leaves by the default route —
 //!   the real LAN — which is the Hamachi "adapter metric" failure on Linux. It
 //!   also means that while a room is up, *every* program's limited broadcasts
 //!   go to the room; [`destroy`] takes it away with the device.
-
-#![cfg(target_os = "linux")]
 
 use std::ffi::CString;
 use std::io;
@@ -38,54 +27,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use tokio::io::unix::AsyncFd;
 
-use crate::lan::{RoomSubnet, LAN_MTU};
-
-/// Every adapter this platform makes is named with this prefix.
-pub const ADAPTER_PREFIX: &str = "gbl";
-
-/// What the adapter is given once its member is seated.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterConfig {
-    pub name: String,
-    pub address: Ipv4Addr,
-    pub subnet: RoomSubnet,
-}
-
-impl AdapterConfig {
-    /// Refuse anything the helper must not be talked into.
-    pub fn validate(&self) -> io::Result<()> {
-        validate_name(&self.name)?;
-        if RoomSubnet::new(self.subnet.prefix, self.subnet.prefix_len) != Some(self.subnet) {
-            return Err(invalid(format!(
-                "{}/{} is not a room subnet (rooms live in 198.18.0.0/15)",
-                self.subnet.prefix, self.subnet.prefix_len
-            )));
-        }
-        if !self.subnet.contains(self.address) || self.address == self.subnet.broadcast() {
-            return Err(invalid(format!("{} is not a member address in its subnet", self.address)));
-        }
-        Ok(())
-    }
-}
-
-/// An adapter name: `gbl` and then letters, digits or `-`, within the
-/// kernel's 15 bytes.
-pub fn validate_name(name: &str) -> io::Result<()> {
-    let ok = name.starts_with(ADAPTER_PREFIX)
-        && name.len() < libc::IFNAMSIZ
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    if ok {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "{name:?} is not a room adapter name ({ADAPTER_PREFIX}*, at most 15 bytes)"
-        )))
-    }
-}
-
-fn invalid(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, msg)
-}
+use super::{invalid, validate_name, AdapterConfig, AdapterSetup};
+use crate::lan::LAN_MTU;
 
 /// Create the adapter, persistent and owned by `owner`, and configure it.
 /// Needs `CAP_NET_ADMIN`. Running it again on an existing adapter reconfigures
@@ -350,70 +293,9 @@ fn add_limited_broadcast_route(sock: &OwnedFd, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config(name: &str, prefix: Ipv4Addr, len: u8, address: Ipv4Addr) -> AdapterConfig {
-        AdapterConfig {
-            name: name.to_string(),
-            address,
-            subnet: RoomSubnet { prefix, prefix_len: len },
-        }
-    }
-
-    #[test]
-    fn the_helper_cannot_be_pointed_at_a_real_interface() {
-        for name in
-            ["eth0", "lo", "wlan0", "tailscale0", "gbl0; rm", "gbl0/../x", "gbl-this-is-too-long"]
-        {
-            assert!(validate_name(name).is_err(), "{name}");
-        }
-        assert!(validate_name("gbl0").is_ok());
-        assert!(validate_name("gbl-room-1").is_ok());
-    }
-
-    #[test]
-    fn the_helper_cannot_route_a_real_lan() {
-        let lan = config("gbl0", Ipv4Addr::new(192, 168, 1, 0), 24, Ipv4Addr::new(192, 168, 1, 7));
-        assert!(lan.validate().is_err());
-        // A prefix that is not masked is not a subnet `RoomSubnet::new` made.
-        let unmasked =
-            config("gbl0", Ipv4Addr::new(198, 19, 3, 4), 16, Ipv4Addr::new(198, 19, 3, 4));
-        assert!(unmasked.validate().is_err());
-        let ok = config("gbl0", Ipv4Addr::new(198, 19, 0, 0), 16, Ipv4Addr::new(198, 19, 3, 4));
-        assert!(ok.validate().is_ok());
-        let outside =
-            config("gbl0", Ipv4Addr::new(198, 19, 0, 0), 16, Ipv4Addr::new(198, 18, 3, 4));
-        assert!(outside.validate().is_err(), "an address outside its own subnet");
-        let bcast =
-            config("gbl0", Ipv4Addr::new(198, 19, 0, 0), 16, Ipv4Addr::new(198, 19, 255, 255));
-        assert!(bcast.validate().is_err(), "the broadcast address is nobody's");
-    }
-
-    #[test]
-    fn rtentry_matches_the_kernels_size() {
-        // x86_64 and aarch64: 120 bytes (include/uapi/linux/route.h).
-        #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<RtEntry>(), 120);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Running a room on an adapter
 // ---------------------------------------------------------------------------
-
-/// How the adapter gets its privileged setup.
-#[derive(Debug, Clone)]
-pub enum AdapterSetup {
-    /// Run `lan-helper` at this path — the normal case: this process holds no
-    /// capability and never elevates.
-    Helper(std::path::PathBuf),
-    /// Call [`create`] and [`destroy`] directly. Only for a process that
-    /// already holds `CAP_NET_ADMIN`, such as root or a test in a user
-    /// namespace.
-    InProcess,
-}
 
 impl AdapterSetup {
     fn up(&self, config: &AdapterConfig) -> anyhow::Result<()> {
@@ -465,69 +347,31 @@ impl AdapterSetup {
     }
 }
 
-/// Put `session`'s room on a local adapter and pump it until `stop` resolves
-/// or the room ends; then take the adapter away again.
-///
-/// Waits to be seated first — the adapter's address *is* the seat. If the
-/// room seats this member somewhere else later (it lost the link and came back
-/// to find its address taken), the adapter is moved to the new address rather
-/// than left answering for the old one.
-pub async fn run_room_on_adapter(
-    session: std::sync::Arc<crate::lan_session::LanSession>,
-    policy: crate::lan_filter::LanPolicy,
-    name: String,
-    setup: AdapterSetup,
-    stop: impl std::future::Future<Output = ()>,
-) -> anyhow::Result<()> {
-    validate_name(&name)?;
-    tokio::pin!(stop);
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-    let mut current: Option<(AdapterConfig, tokio::task::JoinHandle<io::Result<()>>)> = None;
+/// Bring the adapter up for `config` and open it.
+pub(super) async fn open(
+    setup: &AdapterSetup,
+    config: &AdapterConfig,
+) -> anyhow::Result<TunDevice> {
+    let (setup, up) = (setup.clone(), config.clone());
+    tokio::task::spawn_blocking(move || setup.up(&up)).await??;
+    Ok(TunDevice::attach(&config.name)?)
+}
 
-    let result = loop {
-        tokio::select! {
-            _ = &mut stop => break Ok(()),
-            _ = tick.tick() => {}
-        }
-        if let Some((_, pump)) = &current {
-            if pump.is_finished() {
-                break Err(anyhow::anyhow!("the room adapter's pump stopped"));
-            }
-        }
-        let view = session.view();
-        if let Some(refusal) = view.refused {
-            break Err(anyhow::anyhow!("the room refused this member: {refusal}"));
-        }
-        let Some(address) = view.own_address else { continue };
-        let wanted = AdapterConfig { name: name.clone(), address, subnet: view.subnet };
-        if current.as_ref().is_some_and(|(config, _)| *config == wanted) {
-            continue;
-        }
-        // Detach before reconfiguring: a TUN device takes one reader, and the
-        // helper opens it too.
-        if let Some((_, pump)) = current.take() {
-            pump.abort();
-            let _ = pump.await;
-        }
-        let setup_for_up = setup.clone();
-        let config = wanted.clone();
-        tokio::task::spawn_blocking(move || setup_for_up.up(&config)).await??;
-        let device = std::sync::Arc::new(TunDevice::attach(&name)?);
-        tracing::info!(
-            adapter = %name,
-            address = %address,
-            prefix_len = view.subnet.prefix_len,
-            "the room is on this machine's adapter"
-        );
-        let pump = tokio::spawn(crate::lan_pump::pump(device, session.clone(), policy.clone()));
-        current = Some((wanted, pump));
-    };
+/// Take the adapter away. The device must already be closed: a persistent TUN
+/// device cannot be removed while it is attached.
+pub(super) async fn close(setup: &AdapterSetup, name: &str) {
+    let (setup, name) = (setup.clone(), name.to_string());
+    let _ = tokio::task::spawn_blocking(move || setup.down(&name)).await;
+}
 
-    if let Some((_, pump)) = current.take() {
-        pump.abort();
-        let _ = pump.await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtentry_matches_the_kernels_size() {
+        // x86_64 and aarch64: 120 bytes (include/uapi/linux/route.h).
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<RtEntry>(), 120);
     }
-    let setup_for_down = setup.clone();
-    let _ = tokio::task::spawn_blocking(move || setup_for_down.down(&name)).await;
-    result
 }
