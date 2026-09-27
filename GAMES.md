@@ -290,6 +290,89 @@ multi-port), Sons of the Forest, Valheim. Each must declare
 never over radio (§4). Verify direct-IP join per game before writing the pack —
 several of these default to Steam networking.
 
+### Wave 5 — candidates added 2026-09-27
+
+Nothing here is written yet or verified. Each joins by `host:port` with a
+dedicated (or listen) server; what varies is where the content comes from.
+Commercial game data is the player's own, so on a node it is a `manual` pack
+the operator installs (§5). Check per game, before its pack, that a join does
+not need a live master server or account service — a master *list* that is
+only for browsing is fine, since the announce replaces it — and that the
+server fetches anonymously where the list says steamcmd.
+
+*More Source — the shared Source image of wave 1 serves these too:*
+
+- **Left 4 Dead** (the first) beside Left 4 Dead 2 — co-op campaigns.
+- **Alien Swarm: Reactive Drop** — co-op campaigns, free.
+- **Obsidian Conflict** — a Half-Life 2 co-op mod with its own campaigns.
+- **Contagion** — co-op scenario campaigns.
+- **Open Fortress**, **Team Fortress 2 Classic** — Source mods.
+- **Natural Selection 2** (Spark, not Source; its own dedicated server).
+- **Black Mesa** co-op mods — check they are maintained.
+- **Garry's Mod** co-op game modes (Half-Life 2 campaign co-op) ride the Garry's
+  Mod pack already in wave 1.
+
+*Open source — `archive` driver, and a CI run with the real game is possible:*
+
+- **Wolfenstein: Enemy Territory** via ET: Legacy, **Tremulous**, **BZFlag**.
+- **SuperTuxKart**, **Warzone 2100**, **0 A.D.**, **Speed Dreams**.
+- **Descent** via DXX-Rebirth.
+- **Serious Sam Classic** (First and Second Encounter, on the open-source
+  Serious Engine) — campaign co-op is the heart of the series.
+- **Doom, Doom II, Heretic, Hexen** co-op campaigns ride Zandronum (wave 2) —
+  a server setting, not a new pack family. **Quake 1/2** co-op via source
+  ports, likewise.
+- **Blood** via NBlood, **Duke Nukem 3D** via EDuke32, **Hexen II** via uHexen2
+  — co-op campaigns; check each port's netplay, some are rough.
+- **DevilutionX** (the Diablo engine) — campaign co-op by IP; the game data is
+  the player's own.
+
+*Community multiplayer for commercial games:*
+
+- **GTA: San Andreas via open.mp / SA-MP**, and **Multi Theft Auto: San
+  Andreas** — free servers, very large communities, join by IP.
+- **TES3MP** (Morrowind co-op on OpenMW) and **Skyrim Together Reborn** —
+  community servers; the player brings the game.
+- **Kerbal Space Program via LunaMultiplayer**.
+- **Space Station 13** (BYOND) — check whether a hub login is needed to join.
+
+*Commercial servers, join by IP (`manual` content):*
+
+- **Unreal Tournament 2004 and UT99**, and **Unreal (1998)**, whose whole
+  campaign runs co-op on a server — the OldUnreal community patches.
+- **Call of Duty 2**, **Call of Duty 4**, and **Call of Duty: World at War**,
+  whose campaign is four-player co-op (`connect <ip>`).
+- **Star Wars Jedi Knight: Jedi Academy** (OpenJK), **Quake III Arena**,
+  **Return to Castle Wolfenstein**, **Soldier of Fortune II**.
+- **Serious Sam 3 and 4 / Fusion** — campaign co-op; check join by IP.
+- **System Shock 2** (NewDark) — four-player campaign co-op.
+- **Diablo II** — its "TCP/IP" game is join-by-IP, so it is Mode 1, not a room.
+- **Baldur's Gate 1/2** and **Icewind Dale 1/2**, the original releases —
+  party campaign in multiplayer by IP. (The Enhanced Editions join through
+  store lobbies; check before counting them.)
+- **Neverwinter Nights** and **Neverwinter Nights 2** — campaigns and modules
+  in co-op, by IP; both also have LAN browsers (below).
+- **Mount & Blade: Warband**.
+- **Tom Clancy's Rainbow Six 3: Raven Shield**, **Operation Flashpoint**,
+  **ArmA**, **Arma 2 / Operation Arrowhead** and **Arma 3** — co-op missions
+  and campaigns on dedicated servers; check BattlEye on Arma 3.
+- **SCP: Secret Laboratory** — check whether its server verification is only
+  for listing.
+- **Assetto Corsa** — free dedicated server on several ports (multi-port is
+  built, §3).
+- **Killing Floor (2009)** and **Killing Floor 2** (`open <ip>` from the
+  console).
+
+*Survival and crafting with dedicated servers* (beside wave 4's):
+
+- **Palworld** — dedicated server, join by IP; the largest audience here.
+- **Necesse** — light, join by IP, cheap on the link.
+- **Astroneer**, **Conan Exiles**.
+- **Vintage Story** — logs in against its own account server, as a Steam
+  ticket check does; confirm join by IP.
+- **Enshrouded**, **Abiotic Factor**, **Soulmask** — dedicated servers exist;
+  check each can be joined by IP and not only from a store listing.
+
 ### The LAN back catalogue — Mode 3 rooms
 
 Games that only find each other by LAN broadcast, the Hamachi and Tunngle
@@ -309,7 +392,6 @@ one hard is knowing its ports and testing it with people.
   ports from nfsu2relay's captures; its ports are proven through real adapters
   by `tests/lan_pack_ports.rs`, the game itself by nobody yet, so
   `tested = false`.
-- **Underground 1, Carbon, Hot Pursuit 2** — same family, after these two.
 - **Saints Row 2 (PC)** — only if a LAN or direct-IP path survived GameSpy's
   shutdown; check before writing a pack.
 - **Saints Row The Third / IV** — co-op is Steam networking (Mode 4) as
@@ -320,6 +402,58 @@ one hard is knowing its ports and testing it with people.
   packs, once the NFS test has shown a commercial game through a room.
 - **IPX-era games** (NFS III, early Command & Conquer) need a layer-2 room,
   which is deliberately not built (`MODES.md`).
+
+Candidates added 2026-09-27, nothing written yet. Ports are deliberately not
+listed: capture them, or find a source that did, when the pack is written. For
+each, check that the LAN mode is IPv4 and survived the game's online services
+shutting down (GameSpy, Ubisoft's and EA's).
+
+*Both modes at once* — a server joined by IP **and** a broadcast LAN browser,
+like OpenTTD, so one pack covers both. The open-source ones can be played by
+CI for real, which makes them the cheapest second real-game room test:
+
+- **SuperTuxKart**, **Warzone 2100**, **Teeworlds**.
+- **SWAT 4**, **Neverwinter Nights / NWN 2**, **Call of Duty: World at War**,
+  **System Shock 2** (if its LAN browser works on NewDark).
+
+*Broadcast discovery on fixed ports — the shape the NFS packs already have:*
+
+- **RTS:** **Command & Conquer: Generals / Zero Hour** (a classic LAN-emulator
+  target), **Warcraft III** (classic versions, before Reforged; its co-op
+  custom maps come with it), **StarCraft 1.16** ("Local Area Network (UDP)"),
+  **Command & Conquer 3**, **Red Alert 3** (every campaign mission is
+  two-player co-op), **Company of Heroes** (2006), **Dawn of War** (the first),
+  **Supreme Commander**, **Rise of Nations**, **Empire Earth**, **Men of War**
+  (co-op campaign missions).
+- **Shooters:** **Halo: Combat Evolved / Custom Edition** (PC), **Call of Duty
+  1/2**, **Battlefield 1942**, **Unreal Tournament** and **Unreal Tournament
+  3**, **Far Cry** (2004), **F.E.A.R.**, **Doom 3 / Quake 4**, **Crysis**,
+  **Serious Sam First/Second Encounter**.
+- **Tactical co-op:** **SWAT 4**, **Rainbow Six Vegas 2** (two-player story
+  campaign and Terrorist Hunt), **Ghost Recon Advanced Warfighter 2**,
+  **Splinter Cell: Chaos Theory** (co-op story missions).
+- **Racing:** **NFS Carbon**, **Underground 1**, **Hot Pursuit 2** (likely Most
+  Wanted's protocol), **FlatOut 2**, **TrackMania Nations Forever** and
+  **TrackMania United**, **Blur**, **GRID** (2008), **Split/Second**, the
+  **Colin McRae Rally / DiRT** titles.
+- **Co-op campaigns and action RPGs:** **Borderlands (2009)** — the whole story
+  in four-player co-op, its online was GameSpy, its LAN still works — **Titan
+  Quest**, **Torchlight II**, **Grim Dawn**, **Sacred** and **Sacred 2**,
+  **Dungeon Siege 1/2**.
+
+*Each needs a platform decision first:*
+
+- **DirectPlay games** (Age of Empires II original, Age of Mythology — whose
+  co-op skirmish is the draw — **Stronghold Crusader**, many 1998–2004 titles)
+  pick ports from a range at run time, so they need `inbound = "any"` and the
+  launcher's every-port warning.
+- **Minecraft Java "Open to LAN"** announces on **multicast** (224.0.2.60), not
+  broadcast. A room drops it today: the host routes only the subnet or limited
+  broadcast and member addresses (`lan::route`), so a multicast destination is
+  `UnknownDestination`. Carrying it is a new rule — which groups, and fanned out
+  like a broadcast under the same gate — decided before the pack, not in it.
+- **Red Alert 2 / Yuri's Revenge, Heroes of Might and Magic III** — IPX in
+  their LAN mode, so the layer-2 rule above applies.
 
 ### Not embeddable, and why
 
