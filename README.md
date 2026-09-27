@@ -18,9 +18,9 @@ account, no port forwarding, no central service, and no internet required.
 > | 3 | One node, many servers | done — `platform-agent` runs many servers off one shared copy of the content, loopback-only local API, no central service; a server starts on a chosen map and its map can be changed live without dropping players |
 > | 4 | Index + hosting | done — identity challenge/response bound to the verifying index, an index served over both HTTP and Reticulum with quotas, hosted deploy, and multi-node over an agent uplink that needs no inbound port |
 > | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance; a GoldSrc node image, so Counter-Strike 1.6 and Half-Life actually host |
-> | Mode 3 | LAN rooms | started — a virtual LAN over Reticulum for games that only find each other by LAN broadcast (`PLAN.md` §14): rooms, a Linux and a Windows adapter, OpenTTD played end to end, and rooms in the launcher |
+> | Mode 3 | LAN rooms | started — a virtual LAN over Reticulum for games that only find each other by LAN broadcast (`PLAN.md` §14): rooms, a Linux and a Windows adapter, OpenTTD played end to end, rooms in the launcher, a room check that says what failed, and Need for Speed: Underground 2 as a pack |
 >
-> Current release: **v0.2.20**. What changed, release by release, is in
+> Current release: **v0.2.21**. What changed, release by release, is in
 > [`RELEASE.md`](RELEASE.md); building and tagging one is in there too.
 >
 > The working single-host implementation this generalizes is
@@ -197,6 +197,10 @@ the launcher as soon as it starts (v0.2.12). Every binary also answers
 Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
 the last three.
 
+- **v0.2.21** — Check room: a real LAN broadcast from this machine, answered
+  by every member, that says whether the fault is this machine's routing, its
+  firewall, or a member. And Need for Speed: Underground 2 gets a LAN room pack
+  (untested with people yet).
 - **v0.2.20** — LAN rooms. A game that only finds others by LAN broadcast can
   now be played across the mesh: host or join a room in the launcher, and the
   players in it look like one local network. Linux and Windows; OpenTTD is the
@@ -207,9 +211,6 @@ the last three.
   pressing Start hung on "Starting…" forever once any server had been
   remembered, because the remembered-server sweep asked the mesh about each one
   in sequence, unbounded, holding the lock the status poll needed.
-- **v0.2.18** — `docker stop` stops the agent. As PID 1 it never handled
-  SIGTERM, so every redeploy waited out Docker's 10-second timeout and ended in
-  a kill. Game servers are separate containers and keep running, as always.
 
 ## The idea
 

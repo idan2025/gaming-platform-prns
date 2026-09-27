@@ -74,6 +74,36 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.21
+
+### Check a LAN room before you play
+
+A room that does not work on your machine looks exactly like a game with
+nobody hosting: an empty LAN list. The room panel now has **Check room**. It
+sends a real LAN broadcast on the game's own port from this machine, every
+member's launcher answers, and it tells you what failed:
+
+- **your broadcast left by another network** — on Windows, a VPN, Hamachi or
+  a virtual machine's adapter is preferred over the room's;
+- **a firewall on this machine** is stopping the room's answers;
+- **a member answered nothing** — their room adapter is not up, or their
+  launcher is older than 0.2.21 (everyone should update).
+
+Run it before starting the game. It proves the room, not the game: if the
+check passes and the game still lists nothing, allow the game through the
+firewall on every machine. From a terminal, `game-bridge lan-host` /
+`lan-join` take `--check`, which reruns it whenever the members change.
+
+### Need for Speed: Underground 2
+
+`packs/nfs-underground-2.toml` is the second game with LAN rooms, and the
+first commercial one (Windows). Host a LAN race in the game; the others pick
+it from the game's own LAN list. Its ports come from people who captured the
+game's LAN traffic in 2004 and are carried end to end by CI in network
+namespaces — but **nobody has raced in a room yet**, so it is marked
+untested. If the game warns that it cannot test connection quality, or the
+host appears with the wrong address, that is worth reporting.
+
 ## v0.2.20
 
 ### LAN rooms (Mode 3)
