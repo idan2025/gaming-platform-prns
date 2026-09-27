@@ -661,4 +661,7 @@ input:focus-visible, select:focus-visible {
 .helper-status.ok { color: var(--ok); }
 .helper-status.warn { color: var(--warn); background: var(--warn-bg); }
 .room-hash { display: block; font-size: 11px; color: var(--fg-muted); margin: 4px 0; word-break: break-all; }
+.room-check { margin: 6px 0; }
+.room-check p { margin: 4px 0; }
+.check-ok { color: var(--ok); }
 

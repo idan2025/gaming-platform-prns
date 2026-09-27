@@ -151,12 +151,57 @@ pub(crate) fn phase_label(phase: &AdapterPhase) -> (&'static str, Option<String>
     }
 }
 
+/// What the room check found (`game_bridge::lan_check`), as the UI shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomCheckView {
+    /// Every member heard this machine's broadcasts and answered.
+    pub ok: bool,
+    /// This machine's address in the room.
+    pub address: String,
+    /// The game's UDP port the probes went to.
+    pub port: u16,
+    /// What went wrong, in words a player can act on — or that nothing did.
+    /// The first line is the verdict.
+    pub findings: Vec<String>,
+    pub members: Vec<RoomCheckMemberView>,
+}
+
+/// One other member, as the check saw it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomCheckMemberView {
+    pub address: String,
+    pub ok: bool,
+    /// Fastest answer there and back, when it answered at all.
+    pub round_trip_ms: Option<u64>,
+}
+
+impl From<game_bridge::lan_check::CheckReport> for RoomCheckView {
+    fn from(r: game_bridge::lan_check::CheckReport) -> Self {
+        Self {
+            ok: r.ok(),
+            address: r.address.to_string(),
+            port: r.port,
+            findings: r.findings(),
+            members: r
+                .members
+                .iter()
+                .map(|m| RoomCheckMemberView {
+                    address: m.address.to_string(),
+                    ok: m.ok(),
+                    round_trip_ms: m.round_trip.map(|d| d.as_millis() as u64),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A running room, held by the launcher.
 pub(crate) struct RoomState {
     role: &'static str,
     game_id: String,
     name: Option<String>,
     session: Arc<LanSession>,
+    policy: game_bridge::lan_filter::LanPolicy,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
     phase: watch::Receiver<AdapterPhase>,
@@ -470,6 +515,7 @@ impl Launcher {
             game_id,
             name,
             session,
+            policy: lan.policy(),
             stop: Some(stop_tx),
             task,
             phase: phase_rx,
@@ -488,11 +534,40 @@ impl Launcher {
         let _ = tokio::time::timeout(LEAVE_TIMEOUT, &mut room.task).await;
         room.task.abort();
         // The runner held the only other reference; with it finished, the
-        // session can be stopped and its node's thread joined.
-        if let Ok(mut session) = Arc::try_unwrap(room.session) {
-            session.stop().await;
+        // session can be stopped and its node's thread joined. A room check
+        // still running holds one too, for a few seconds at most.
+        let mut session = room.session;
+        let deadline = tokio::time::Instant::now() + LEAVE_TIMEOUT;
+        loop {
+            match Arc::try_unwrap(session) {
+                Ok(mut s) => {
+                    s.stop().await;
+                    break;
+                }
+                Err(still_shared) if tokio::time::Instant::now() < deadline => {
+                    session = still_shared;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => break,
+            }
         }
         Ok(())
+    }
+
+    /// Check the room from this machine: a real broadcast on the game's own
+    /// port, which every member's launcher answers (`game_bridge::lan_check`).
+    /// Takes a few seconds; the room stays usable meanwhile.
+    pub async fn check_room(&self) -> Result<RoomCheckView> {
+        let (session, policy) = {
+            let inner = self.inner.lock().await;
+            let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
+            if !matches!(*room.phase.borrow(), AdapterPhase::Up { .. }) {
+                return Err(anyhow!("the room's network adapter is not up yet"));
+            }
+            (room.session.clone(), room.policy.clone())
+        };
+        let report = game_bridge::lan_check::check_room(&session, &policy).await?;
+        Ok(report.into())
     }
 
     /// The room this launcher is in, as the UI shows it.
@@ -617,6 +692,36 @@ mod tests {
             portable: false,
             appimage: false,
         }
+    }
+
+    #[test]
+    fn room_check_json_keys_are_the_frontend_contract() {
+        let report = game_bridge::lan_check::CheckReport {
+            address: "198.19.0.1".parse().unwrap(),
+            port: 9999,
+            members: vec![game_bridge::lan_check::MemberCheck {
+                address: "198.19.0.2".parse().unwrap(),
+                heard_limited_broadcast: true,
+                heard_subnet_broadcast: true,
+                answered_unicast: true,
+                round_trip: Some(std::time::Duration::from_millis(12)),
+            }],
+            limited_broadcast_left: true,
+            subnet_broadcast_left: true,
+            answers_blocked_here: false,
+        };
+        let v = serde_json::to_value(RoomCheckView::from(report)).unwrap();
+        assert_eq!(keys(&v), ["address", "findings", "members", "ok", "port"]);
+        assert_eq!(keys(&v["members"][0]), ["address", "ok", "round_trip_ms"]);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["members"][0]["round_trip_ms"], 12);
+    }
+
+    #[tokio::test]
+    async fn checking_outside_a_room_says_so() {
+        let launcher = Launcher::new(shipped_packs());
+        let err = launcher.check_room().await.unwrap_err().to_string();
+        assert!(err.contains("not in a LAN room"), "{err}");
     }
 
     #[test]

@@ -156,6 +156,9 @@ function makeInvoke(scenario) {
       case 'leave_room':
         scenario.room = noRoom;
         return null;
+      case 'check_room':
+        if (!scenario.roomCheck) throw new Error(`unknown command ${cmd}`);
+        return scenario.roomCheck;
       default:
         throw new Error(`the UI called an unknown command: ${cmd}`);
     }
@@ -717,6 +720,48 @@ await run('a granted permission can be taken back', {
   check('revoke_lan_helper was called', calls.includes('revoke_lan_helper'));
   check('and the panel goes back to asking per room',
     doc.querySelector('#room-body').textContent.includes('asked each time'), doc.querySelector('#room-body').textContent);
+});
+
+// The room check: what a game's empty LAN list cannot say, said in words.
+await run('checking a room shows what failed and who answered', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: memberRoom,
+  roomCheck: {
+    ok: false, address: '198.19.4.2', port: 3979,
+    findings: [
+      'The room does not work fully from this machine:',
+      'A broadcast to 255.255.255.255 did not go through the room\u2019s adapter \u2014 this machine sent it out another network.',
+    ],
+    members: [{ address: '198.19.1.1', ok: false, round_trip_ms: 31 }],
+  },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const btn = doc.querySelector('#room-body #room-check');
+  check('Check room is offered in a room with another member', btn && !btn.disabled);
+  btn?.click();
+  await settle();
+  check('check_room was called', calls.includes('check_room'));
+  const out = doc.querySelector('#room-check-result');
+  const t = out ? out.textContent : '';
+  check('the verdict is shown', t.includes('does not work fully'), t);
+  check('and what failed', t.includes('another network'), t);
+  check('and each member, with its round trip', t.includes('198.19.1.1') && t.includes('did not answer everything'), t);
+  win.eval('renderRoomPanel()');
+  check('the result survives a poll', !!doc.querySelector('#room-check-result')?.textContent.includes('another network'));
+});
+
+await run('a room check needs somebody to answer', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: { ...memberRoom, members: [{ address: '198.19.4.2', is_self: true }] },
+  roomCheck: { ok: true, address: '198.19.4.2', port: 3979, findings: [], members: [] },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const btn = doc.querySelector('#room-body #room-check');
+  check('Check room is disabled when alone in the room', btn && btn.disabled);
 });
 
 await run('an older shell shows no room controls at all', {

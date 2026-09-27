@@ -1386,12 +1386,51 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
      portable Linux launcher would have found no packs — Tauri's
      `resource_dir` never points beside the executable on Linux — so the
      launcher now looks there first.
-6. **First target game: Need for Speed: Most Wanted (2005)** on Windows, two
-   players on this project's Internet interface. Record latency, broadcast traffic
-   per minute, and whether the game's own LAN browser lists the room.
-7. **Packs for the rest**, one `[lan]` block each, tested field honest.
+5c. **The room check. Built 2026-09-27**, asked for with the first
+   commercial pack: CI proves rooms on its own machines, and a player's
+   machine is where they fail — silently, as an empty LAN list.
+   `lan_check.rs` sends a probe from an ordinary `0.0.0.0` socket, as a game
+   does, to `255.255.255.255`, to the subnet broadcast and to each member, on
+   the game's first declared UDP port; every member's pump answers it instead
+   of handing it to the game there. The pump also logs which probes left
+   through the adapter and which answers it delivered, so a failure names its
+   place: **sent out of another network** (the Windows metric problem, or a
+   missing route), **stopped on this machine** (a firewall between adapter and
+   program), or **a member that answered nothing** (adapter down, or a launcher
+   from before the check). The launcher shows it as **Check room** in the room
+   panel; `lan-host`/`lan-join --check` print it whenever the members change.
+   It proves the room, not the game, and says so: a member's firewall rule for
+   the game itself, or a game advertising its real LAN address, are beyond it.
 
-**Where this stands (2026-09-24, v0.2.20 released):** steps 1–5 and 5b are
+   `tests/lan_pack_ports.rs` runs three members in three namespaces for every
+   shipped `[lan]` pack, found by property: each declared UDP port carries a
+   384-byte broadcast from that port and the unicast answers, each declared
+   TCP port connects from every member to every other (host → client
+   included), an undeclared port stays shut, and the check passes from every
+   member without its probe reaching the game's sockets. Then it breaks the
+   room twice — the limited-broadcast route pointed at `lo`, and a seated
+   member with no adapter — and requires the check to name each. Removing the
+   pump's answer or the filter's TCP admission each fails it. What it cannot
+   catch is a *missing* port in a pack: it carries the list it is given.
+6. **First target game: Need for Speed** on Windows, two players on this
+   project's Internet interface: Underground 2 now has a pack (below), Most
+   Wanted (2005) after it. Run the room check first, then record latency,
+   broadcast traffic per minute, and whether the game's own LAN browser lists
+   the host.
+7. **Packs for the rest**, one `[lan]` block each, tested field honest.
+   **`packs/nfs-underground-2.toml`, 2026-09-27**, the first commercial one:
+   UDP 9999 discovery (a limited broadcast, 9999 → 9999, 384 B), TCP 9900 to
+   the host, TCP 3282/3284/3285 from the host back to each client, UDP
+   3658/3659 both ways — from nfsu2relay's 2004 captures, since the game has
+   no source. `tested = false`: no person has raced in a room, and the relay's
+   author suspected more ports. Two things only the game can show: whether
+   the host's server list entry carries the room address (NFSU2's `server.cfg`
+   `ADDR` is what it tells clients to connect to, and on a machine with two
+   networks it may pick the real one), and whether the connection-quality
+   test wants a port nobody captured.
+
+**Where this stands (2026-09-24, v0.2.20 released; 5c and the NFSU2 pack
+since):** steps 1–5 and 5b are
 built and shipped, and CI proves each on real adapters — Linux in network
 namespaces, including a real OpenTTD game; Windows on a real Wintun adapter
 with the metric fix and the driver removal. Steps 6 and 7 need people and

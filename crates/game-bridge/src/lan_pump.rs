@@ -47,6 +47,7 @@ where
             if !allowed {
                 continue;
             }
+            room.probe_log().saw_outbound(packet);
             match room.send(packet.to_vec()) {
                 Ok(()) => {}
                 Err(LanSendError::Stopped) => return Ok::<(), io::Error>(()),
@@ -58,11 +59,21 @@ where
     let down = async {
         while let Some(packet) = room.recv().await {
             let allowed = filter.lock().expect("filter lock").inbound(&packet, Instant::now());
-            if allowed {
-                device.send(&packet).await?;
-            } else {
+            if !allowed {
                 debug!("the room delivered a packet this member does not admit; dropped");
+                continue;
             }
+            // A room check's probe is answered here, never handed to the
+            // game listening on its port (`lan_check.rs`).
+            if crate::lan_check::is_probe(&packet) {
+                let reply = room.own_address().and_then(|own| crate::lan_check::answer(&packet, own));
+                if let Some(reply) = reply {
+                    let _ = room.send(reply);
+                }
+                continue;
+            }
+            device.send(&packet).await?;
+            room.probe_log().saw_delivered(&packet);
         }
         Ok::<(), io::Error>(())
     };

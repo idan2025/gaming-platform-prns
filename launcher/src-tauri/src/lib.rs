@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use launcher_core::lan::{LanHelperView, RoomView};
+use launcher_core::lan::{LanHelperView, RoomCheckView, RoomView};
 use launcher_core::{
     error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
     GameSummary, JoinResult, Launcher, PlayResult, ServerDetailsView, ServerRow,
@@ -300,6 +300,11 @@ async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, Stri
     Ok(state.launcher.room_status().await)
 }
 
+#[tauri::command]
+async fn check_room(state: tauri::State<'_, AppState>) -> Result<RoomCheckView, String> {
+    state.launcher.check_room().await.map_err(fmt_err)
+}
+
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     // Beside the executable first: that is the portable layout, and on Linux
     // `resource_dir` never points there outside a cargo `target/` — it resolves
@@ -399,6 +404,7 @@ pub fn run() {
             join_room,
             leave_room,
             room_status,
+            check_room,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");

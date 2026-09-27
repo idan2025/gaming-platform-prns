@@ -39,6 +39,8 @@ const state = {
   lanHelper: null,
   roomsAvailable: false,
   roomBusy: false,
+  // The last room check (`check_room`), for the room it was run in.
+  roomCheck: { busy: false, result: null, error: null, hash: null },
   hostDraft: { game_id: null, name: '' },
   roomPanelSig: null,
 };
@@ -1707,6 +1709,52 @@ async function hostRoom() {
   }
 }
 
+// The room check sends a real broadcast on the game's own port from this
+// machine and every member's launcher answers it, so it finds what a game's
+// empty LAN list cannot say: a broadcast sent out of another network, a
+// firewall here, or a member whose adapter is not up.
+async function checkRoom() {
+  const r = state.room;
+  if (!r || !r.active || state.roomCheck.busy) return;
+  state.roomCheck = { busy: true, result: null, error: null, hash: r.room_hash };
+  renderRoomPanel(true);
+  try {
+    state.roomCheck.result = await invoke('check_room');
+  } catch (err) {
+    state.roomCheck.error = String(err && err.message || err);
+  }
+  state.roomCheck.busy = false;
+  renderRoomPanel(true);
+}
+
+function renderRoomCheck(parent, r) {
+  const c = state.roomCheck;
+  const btn = el('button', 'quiet', c.busy ? 'Checking…' : 'Check room');
+  btn.type = 'button';
+  btn.id = 'room-check';
+  const others = r.members.filter(m => !m.is_self).length;
+  btn.disabled = c.busy || r.adapter !== 'up' || others === 0;
+  btn.title = others === 0
+    ? 'Needs another member in the room to answer.'
+    : 'Send a LAN broadcast on this game’s port and see who answers. Run it before starting the game.';
+  btn.onclick = checkRoom;
+  parent.appendChild(btn);
+  if (c.hash !== r.room_hash) return;
+  const out = el('div', 'room-check');
+  out.id = 'room-check-result';
+  if (c.error) {
+    out.appendChild(el('p', 'room-err', 'The check could not run: ' + c.error));
+  } else if (c.result) {
+    const res = c.result;
+    res.findings.forEach((line, i) => out.appendChild(el('p', i === 0 ? (res.ok ? 'check-ok' : 'room-err') : 'small', line)));
+    const ul = el('ul', 'player-list');
+    res.members.forEach(m => ul.appendChild(el('li', '',
+      m.address + ' — ' + (m.ok ? 'answered' + (m.round_trip_ms != null ? ' in ' + m.round_trip_ms + ' ms' : '') : 'did not answer everything'))));
+    out.appendChild(ul);
+  }
+  parent.appendChild(out);
+}
+
 async function leaveRoom() {
   try {
     await invoke('leave_room');
@@ -1747,7 +1795,7 @@ function renderRoomPanel(force) {
   const body = $('room-body');
   if (!panel || !body) return;
   panel.hidden = !state.roomsAvailable;
-  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, lanGames().map(g => g.id)]);
+  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, lanGames().map(g => g.id)]);
   if (!force && sig === state.roomPanelSig) return;
   state.roomPanelSig = sig;
 
@@ -1767,6 +1815,7 @@ function renderRoomPanel(force) {
     const ul = el('ul', 'player-list');
     r.members.forEach(m => ul.appendChild(el('li', '', m.address + (m.is_self ? ' (you)' : ''))));
     body.appendChild(ul);
+    renderRoomCheck(body, r);
     const leave = el('button', 'quiet', 'Leave room');
     leave.type = 'button';
     leave.id = 'room-leave';

@@ -206,7 +206,9 @@ fn inside_a_user_namespace() {
 
     // The member, finding the room by its announce alone.
     let mut cmd = Command::new(bridge);
-    cmd.args(["lan-join", "openttd", "--tcp", &format!("10.77.0.1:{MESH_PORT}")])
+    // `--check`: the room check (`lan_check.rs`) runs from the real binary
+    // too, beside a real game on the port it probes.
+    cmd.args(["lan-join", "openttd", "--check", "--tcp", &format!("10.77.0.1:{MESH_PORT}")])
         .arg("--packs")
         .arg(packs_dir())
         .arg("--identity")
@@ -298,6 +300,16 @@ fn inside_a_user_namespace() {
     wait_for("the client starts a company", Duration::from_secs(60), || {
         server_log().contains("room-member has started a new company").then_some(())
     });
+
+    let member_log = || std::fs::read_to_string(dir.join("member-bridge.log")).unwrap_or_default();
+    wait_for("lan-join --check reports", Duration::from_secs(30), || {
+        member_log().contains("room check from").then_some(())
+    });
+    assert!(
+        member_log().contains("The room works"),
+        "the room check from lan-join failed\n{}",
+        logs()
+    );
 
     eprintln!(
         "lan_openttd measurements (loopback veth, one hop):\n  \

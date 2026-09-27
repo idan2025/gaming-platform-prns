@@ -429,6 +429,18 @@ Rules a later change could quietly break:
   `scripts/stage-lan-helper.sh` (and `scripts/fetch-wintun.ps1` on Windows).
   Building `launcher/src-tauri` there fails until they are staged — on
   purpose, so a bundle can never ship without its helper.
+- **The room check (`lan_check.rs`) sends from an OS socket bound to
+  `0.0.0.0`, never into the pump.** Routing is the thing under test; an
+  injected probe passes on exactly the machine where the game fails. Every
+  pump answers a probe (to its source only) and swallows it rather than hand
+  it to the game, and logs what left and what it delivered — which is how the
+  check tells "sent out another network" from "a firewall here" from "that
+  member answered nothing". `tests/lan_pack_ports.rs` breaks both halves on
+  purpose and requires the check to name each.
+- **A `[lan]` pack's port list is proven carried, not proven complete.**
+  `lan_pack_ports.rs` crosses every declared port for every shipped `[lan]`
+  pack (found by property), so it cannot notice a port the pack left out;
+  only the game can. `tested` stays false until a person has played.
 - **`lan_wintun.rs` proves the metric fix only because CI pins the runner's
   network to metric 2 first.** Left alone the runner's Wintun already wins and
   a branch without the fix passes; at 1 the room ties and loses. Removing that

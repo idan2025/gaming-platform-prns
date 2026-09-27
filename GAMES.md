@@ -303,7 +303,11 @@ one hard is knowing its ports and testing it with people.
 - **Need for Speed: Most Wanted (2005) — next** (`PLAN.md` §14.3 step 6): two
   Windows players over the Internet interface. Needs its LAN ports, captured
   while hosting, or a first pack with `inbound = "any"` narrowed afterwards.
-- **Underground 1/2, Carbon, Hot Pursuit 2** — same family, after Most Wanted.
+- **Underground 2 — pack shipped 2026-09-27** (`packs/nfs-underground-2.toml`),
+  ports from nfsu2relay's captures; its ports are proven through real adapters
+  by `tests/lan_pack_ports.rs`, the game itself by nobody yet, so
+  `tested = false`.
+- **Underground 1, Carbon, Hot Pursuit 2** — same family, after Most Wanted.
 - **Saints Row 2 (PC)** — only if a LAN or direct-IP path survived GameSpy's
   shutdown; check before writing a pack.
 - **Saints Row The Third / IV** — co-op is Steam networking (Mode 4) as

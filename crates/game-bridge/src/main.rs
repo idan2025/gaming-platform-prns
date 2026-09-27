@@ -90,6 +90,9 @@ lan options
   --no-transit / --transit
                      whether to carry other people's traffic (host default on,
                      member default off)
+  --check            check the room from this machine whenever its members
+                     change, and print what works and what does not: a real
+                     broadcast on the game's own port, answered by every member
 
 sign options
   --identity PATH    the signing key (generated on first run, like any role's)
@@ -323,6 +326,7 @@ fn run_lan(role: &str, rest: &[String]) -> Result<()> {
     let mut adapter = "gbl0".to_string();
     let mut helper: Option<PathBuf> = None;
     let mut transit = role == "lan-host";
+    let mut check = false;
     let mut it = flags.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -340,6 +344,7 @@ fn run_lan(role: &str, rest: &[String]) -> Result<()> {
             "--helper" => helper = Some(PathBuf::from(value(&mut it, "--helper")?)),
             "--no-transit" => transit = false,
             "--transit" => transit = true,
+            "--check" => check = true,
             other => bail!("unknown option {other:?} for game-bridge {role}\n\n{USAGE}"),
         }
     }
@@ -388,7 +393,7 @@ fn run_lan(role: &str, rest: &[String]) -> Result<()> {
         if let Some(hash) = session.room_hash() {
             println!("room {}", hex::encode(hash.as_bytes()));
         }
-        run_lan_adapter(std::sync::Arc::new(session), lan.policy(), adapter, helper).await
+        run_lan_adapter(std::sync::Arc::new(session), lan.policy(), adapter, helper, check).await
     })
 }
 
@@ -398,8 +403,9 @@ async fn run_lan_adapter(
     policy: game_bridge::lan_filter::LanPolicy,
     adapter: String,
     helper: Option<PathBuf>,
+    check: bool,
 ) -> Result<()> {
-    use game_bridge::lan_adapter::{run_room_on_adapter, AdapterSetup};
+    use game_bridge::lan_adapter::{run_room_on_adapter_reporting, AdapterPhase, AdapterSetup};
 
     let helper = helper.or_else(|| {
         let beside = std::env::current_exe()
@@ -414,7 +420,44 @@ async fn run_lan_adapter(
     let stop = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    run_room_on_adapter(session, policy, adapter, setup, stop).await
+    let (phase, phase_rx) = tokio::sync::watch::channel(AdapterPhase::WaitingForSeat);
+    if check {
+        tokio::spawn(check_room_on_change(session.clone(), policy.clone(), phase_rx));
+    }
+    run_room_on_adapter_reporting(session, policy, adapter, setup, stop, phase).await
+}
+
+/// `--check`: run the room check (`lan_check.rs`) each time the room's members
+/// change while the adapter is up, and print what it found.
+#[cfg(any(target_os = "linux", windows))]
+async fn check_room_on_change(
+    session: std::sync::Arc<game_bridge::lan_session::LanSession>,
+    policy: game_bridge::lan_filter::LanPolicy,
+    phase: tokio::sync::watch::Receiver<game_bridge::lan_adapter::AdapterPhase>,
+) {
+    use game_bridge::lan_adapter::AdapterPhase;
+    let mut checked: Option<Vec<std::net::Ipv4Addr>> = None;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if !matches!(*phase.borrow(), AdapterPhase::Up { .. }) {
+            continue;
+        }
+        let mut members: Vec<_> = session.view().members.iter().map(|m| m.address).collect();
+        members.sort();
+        if members.len() < 2 || checked.as_ref() == Some(&members) {
+            continue;
+        }
+        match game_bridge::lan_check::check_room(&session, &policy).await {
+            Ok(report) => {
+                println!("room check from {} on UDP {}:", report.address, report.port);
+                for line in report.findings() {
+                    println!("  {line}");
+                }
+            }
+            Err(e) => println!("room check: {e:#}"),
+        }
+        checked = Some(members);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -423,6 +466,7 @@ async fn run_lan_adapter(
     _policy: game_bridge::lan_filter::LanPolicy,
     _adapter: String,
     _helper: Option<PathBuf>,
+    _check: bool,
 ) -> Result<()> {
     bail!("this platform's LAN room adapter is not built yet (PLAN.md §14.3)")
 }

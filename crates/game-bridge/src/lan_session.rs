@@ -196,6 +196,7 @@ pub struct LanSession {
     outbound: mpsc::UnboundedSender<Vec<u8>>,
     inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     room_hash: Arc<Mutex<Option<DestinationHash>>>,
+    probes: crate::lan_check::ProbeLog,
 }
 
 impl LanSession {
@@ -234,6 +235,11 @@ impl LanSession {
     /// (once known) on a member.
     pub fn room_hash(&self) -> Option<DestinationHash> {
         *self.room_hash.lock().expect("room hash lock")
+    }
+
+    /// What this member's pump saw of a room check (`lan_check.rs`).
+    pub fn probe_log(&self) -> &crate::lan_check::ProbeLog {
+        &self.probes
     }
 
     /// Rooms and servers this node has heard announce.
@@ -376,6 +382,7 @@ impl LanSession {
             outbound: out_tx,
             inbound: tokio::sync::Mutex::new(in_rx),
             room_hash: Arc::new(Mutex::new(Some(room_hash))),
+            probes: Default::default(),
         })
     }
 
@@ -447,6 +454,7 @@ impl LanSession {
             outbound: out_tx,
             inbound: tokio::sync::Mutex::new(in_rx),
             room_hash,
+            probes: Default::default(),
         })
     }
 }
