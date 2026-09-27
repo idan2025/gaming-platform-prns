@@ -74,6 +74,22 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.22
+
+### Need for Speed: Most Wanted (2005)
+
+`packs/nfs-most-wanted-2005.toml` is the third game with LAN rooms — the 2005
+game, not the 2012 one, which has no LAN mode. Host a LAN race in the game;
+the others pick it from the game's own LAN list. Allow `speed.exe` through
+the firewall, and press **Check room** before starting the game.
+
+Its LAN search and its host port were seen for Most Wanted itself; its other
+ports are Underground 2's, on the word of the person who carried both games'
+LAN across networks in 2005 that the two speak the same protocol. CI carries
+all of them through real adapters, but **nobody has raced it in a room yet**,
+so it is marked untested. If a race is found but will not start, that is
+worth reporting.
+
 ## v0.2.21
 
 ### Check a LAN room before you play
