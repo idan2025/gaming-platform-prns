@@ -1413,8 +1413,8 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    pump's answer or the filter's TCP admission each fails it. What it cannot
    catch is a *missing* port in a pack: it carries the list it is given.
 6. **First target game: Need for Speed** on Windows, two players on this
-   project's Internet interface: Underground 2 now has a pack (below), Most
-   Wanted (2005) after it. Run the room check first, then record latency,
+   project's Internet interface: Underground 2 and Most Wanted (2005) both
+   have packs (below). Run the room check first, then record latency,
    broadcast traffic per minute, and whether the game's own LAN browser lists
    the host.
 7. **Packs for the rest**, one `[lan]` block each, tested field honest.
@@ -1428,6 +1428,11 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    `ADDR` is what it tells clients to connect to, and on a machine with two
    networks it may pick the real one), and whether the connection-quality
    test wants a port nobody captured.
+   **`packs/nfs-most-wanted-2005.toml`, the same day**: the relay's author
+   tested MW in December 2005 and found it "uses the same protocols as NFSU2",
+   and saw its 9999 discovery; NFSMW_LanIP confirms UDP 3658 as the host's
+   port. Its TCP 9900/3282–3285 and UDP 3659 are inherited from U2's captures,
+   and the pack says so. UDP 9901 is left out — only an online patch opens it.
 
 **Where this stands (2026-09-24, v0.2.20 released; 5c and the NFSU2 pack
 since):** steps 1–5 and 5b are

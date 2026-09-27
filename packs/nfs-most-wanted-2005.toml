@@ -1,0 +1,61 @@
+# Game pack #8, the third with a `[lan]` block: Need for Speed: Most Wanted —
+# the 2005 game (EA Black Box), not Criterion's 2012 one of the same name,
+# which has no LAN mode. Its online service is gone; its LAN mode needs none,
+# and a Mode 3 room is a LAN (`PLAN.md` §14).
+#
+# Like Underground 2 (`nfs-underground-2.toml`) there is no dedicated server
+# and no address to type: a player hosts a LAN race in the game and the others
+# find it in the game's own LAN list. So this pack is for rooms, and
+# `default_port`/`transport` are the in-game host's listener, there because
+# every pack has one.
+#
+# `app_name` is a wire contract. Freeze it now: every room announcing under it
+# becomes undiscoverable if it changes. The year is in it because the name is
+# not unique.
+
+schema_version = 1
+
+id = "nfs-most-wanted-2005"
+display_name = "Need for Speed: Most Wanted (2005)"
+app_name = "nfs-most-wanted-2005"
+default_port = 9900
+transport = "tcp"
+# Tier 1 by design, not by measurement, like Underground 2: nobody has
+# measured it through a room yet (`PLAN.md` §14.3 step 6 does).
+min_link_class = 1
+notes = "Windows, EA 2005 (not the 2012 game). No dedicated server: host a LAN race in the game and the others pick it from the game's LAN list. Same LAN protocol as Underground 2: UDP 9999 broadcast discovery, TCP 9900 to the host, UDP 3658/3659 both ways, TCP 3282/3284/3285 back to each client. Allow speed.exe through the firewall, and run the launcher's room check before starting the game."
+
+# Most Wanted's LAN, and how much of it was seen for this game rather than
+# inherited from Underground 2 — the game has no source:
+# - Discovery, seen for MW: client and host broadcast 384 bytes from UDP 9999
+#   to 255.255.255.255:9999, and the receiver answers the sender's source
+#   address (abatis.org.uk/nfsu3relay.html, December 2005 — the same capture
+#   as Underground 2's, which is why the page says "NFSMW uses the same
+#   protocols as NFSU2").
+# - UDP 3658, seen for MW: the game's host port. xan1242's NFSMW_LanIP maps
+#   exactly this one over UPnP for its host ("Opens a port mapping via UPnP on
+#   UDP port 3658", `dllmain.cpp`), and portforward.com lists it for the PC
+#   game.
+# - TCP 9900 to the host, TCP 3282/3284/3285 back to each client and UDP 3659:
+#   **inherited from Underground 2's captures** on that same page's word. MW
+#   ships the same `server.dll` lobby design (`PORT=` in its `server.cfg`, per
+#   NFSLAN), but nobody captured these for MW.
+# Not declared: UDP 9901 (a local-challenge port only NFSLAN/NFSMW_LanIP's
+# online patch opens — the unmodified game never does), and TCP 13505 and
+# 30900–30999 (EA's online lobby servers, shut down).
+[lan]
+ports = [
+    { port = 9999, transport = "udp" },
+    { port = 3658, transport = "udp" },
+    { port = 3659, transport = "udp" },
+    { port = 9900, transport = "tcp" },
+    { port = 3282, transport = "tcp" },
+    { port = 3284, transport = "tcp" },
+    { port = 3285, transport = "tcp" },
+]
+# `tests/lan_pack_ports.rs` carries every port above through real adapters in
+# network namespaces and runs the room check, with stand-in sockets, not the
+# game. False until two people have raced in a room — and if the race will not
+# start, the inherited ports are the first suspects; `inbound = "any"` is the
+# diagnostic, not the fix.
+tested = false

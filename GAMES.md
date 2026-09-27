@@ -300,14 +300,16 @@ one hard is knowing its ports and testing it with people.
 
 - **OpenTTD — shipped**, played end to end by CI with a real server and client.
   `tested = false` until a person has played it in a room.
-- **Need for Speed: Most Wanted (2005) — next** (`PLAN.md` §14.3 step 6): two
-  Windows players over the Internet interface. Needs its LAN ports, captured
-  while hosting, or a first pack with `inbound = "any"` narrowed afterwards.
+- **Need for Speed: Most Wanted (2005) — pack shipped 2026-09-27**
+  (`packs/nfs-most-wanted-2005.toml`): discovery and UDP 3658 seen for MW; its
+  other ports inherited from Underground 2 on nfsu3relay's word that the
+  protocols are the same. Carried by `tests/lan_pack_ports.rs`,
+  `tested = false`. Step 6 (`PLAN.md` §14.3) is two players racing it.
 - **Underground 2 — pack shipped 2026-09-27** (`packs/nfs-underground-2.toml`),
   ports from nfsu2relay's captures; its ports are proven through real adapters
   by `tests/lan_pack_ports.rs`, the game itself by nobody yet, so
   `tested = false`.
-- **Underground 1, Carbon, Hot Pursuit 2** — same family, after Most Wanted.
+- **Underground 1, Carbon, Hot Pursuit 2** — same family, after these two.
 - **Saints Row 2 (PC)** — only if a LAN or direct-IP path survived GameSpy's
   shutdown; check before writing a pack.
 - **Saints Row The Third / IV** — co-op is Steam networking (Mode 4) as
