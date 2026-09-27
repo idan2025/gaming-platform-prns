@@ -398,8 +398,6 @@ one hard is knowing its ports and testing it with people.
   shipped. A player who replaces the game's Steam layer with a LAN emulator on
   their own copy produces ordinary LAN traffic a room carries; the platform
   never ships, names or links to such an emulator.
-- **Warcraft III, StarCraft, Age of Empires II** and the rest of the RTS era —
-  packs, once the NFS test has shown a commercial game through a room.
 - **IPX-era games** (NFS III, early Command & Conquer) need a layer-2 room,
   which is deliberately not built (`MODES.md`).
 
