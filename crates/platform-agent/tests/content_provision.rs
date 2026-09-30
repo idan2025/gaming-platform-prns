@@ -14,6 +14,7 @@ use game_bridge::content::PackContent;
 
 const OK_IMAGE: &str = "gpp-test-steamcmd-ok:latest";
 const FAIL_IMAGE: &str = "gpp-test-steamcmd-fail:latest";
+const FLAKY_IMAGE: &str = "gpp-test-steamcmd-flaky:latest";
 
 async fn docker_or_skip() -> Option<DockerRuntime> {
     let rt = DockerRuntime::connect().ok()?;
@@ -56,6 +57,15 @@ ENTRYPOINT ["/fake"]
 
 const FAIL_DOCKERFILE: &str = r#"FROM busybox
 ENTRYPOINT ["/bin/sh", "-c", "echo 'ERROR! app_update failed: No subscription' >&2; exit 8"]
+"#;
+
+/// Fails the way real steamcmd fails a fresh install now and then — `Missing
+/// configuration`, exit 8, nothing downloaded — the first time it runs in a
+/// given `$HOME`, and installs on the second. The marker lives in `$HOME`
+/// because that is the state the agent keeps between the two attempts.
+const FLAKY_DOCKERFILE: &str = r#"FROM busybox
+RUN printf '#!/bin/sh\nif [ ! -e "$HOME/tried" ]; then touch "$HOME/tried"; echo "ERROR! Failed to install app 232250 (Missing configuration)"; exit 8; fi\nwhile [ "$1" != "+force_install_dir" ]; do shift || exit 3; done\nshift\nmkdir -p "$1/game"\necho installed > "$1/game/data.txt"\n' > /fake && chmod +x /fake
+ENTRYPOINT ["/fake"]
 "#;
 
 fn sven() -> ContentRef {
@@ -145,4 +155,30 @@ async fn a_provisioning_run_leaves_no_container_behind() {
         .await
         .unwrap();
     assert_eq!(docker.list_managed().await.unwrap().len(), before);
+}
+
+/// The one steamcmd failure that clears on a second try is retried; the
+/// "No subscription" case above still fails on its first attempt, so this
+/// does not turn every failure into two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_configuration_failure_is_retried_once_and_installs() {
+    let Some(docker) = docker_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_image(FLAKY_IMAGE, FLAKY_DOCKERFILE) {
+        eprintln!("skipping: could not build the stand-in image");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = StoreLayout::new(tmp.path().to_path_buf());
+    let provisioner = Provisioner::new(layout.clone(), true, Some(FLAKY_IMAGE.to_string()));
+    let spec = PackContent::Steamcmd { app_id: 232250, mod_dir: None };
+
+    let out = provisioner.ensure(&sven(), &spec, Some(&docker)).await.unwrap();
+    assert!(matches!(out, Provisioned::Installed { .. }), "{out:?}");
+    let dir = layout.content_dir(&sven()).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("game/data.txt")).unwrap().trim(), "installed");
+    // steamcmd's own state stays out of the content, retry or not.
+    assert!(!dir.join("tried").exists());
 }

@@ -169,6 +169,14 @@ const TASK_INSTALL_DIR: &str = "/content";
 /// does — one runaway job on a shared node must not take the others down.
 const TASK_MEMORY_LIMIT_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
+/// How many times a steamcmd run is tried when it fails with
+/// [`STEAMCMD_TRANSIENT`]. Two: the error has only ever been seen on a first
+/// run, and the second is what cleared it.
+const STEAMCMD_ATTEMPTS: u32 = 2;
+
+/// The one steamcmd failure that is retried rather than reported.
+const STEAMCMD_TRANSIENT: &str = "(Missing configuration)";
+
 pub struct Provisioner {
     layout: StoreLayout,
     /// Whether this node may download. Off by default: a pack is a file
@@ -310,31 +318,47 @@ impl Provisioner {
                 cmd.push(app_id.to_string());
                 cmd.push("validate".to_string());
                 cmd.push("+quit".to_string());
-                let name = format!(
-                    "gpp-content-{}-{}",
-                    app_id,
-                    staging.file_name().and_then(|n| n.to_str()).unwrap_or("task")
-                );
-                let outcome = docker
-                    .run_to_completion(
-                        &name,
-                        &image,
-                        cmd,
-                        &mounts,
-                        Some(TASK_MEMORY_LIMIT_BYTES),
-                        &[format!("HOME={TASK_HOME_DIR}")],
-                    )
-                    .await;
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(e) => {
-                        let _ = fs::remove_dir_all(&staging);
-                        return Err(ProvisionError::ToolFailed {
-                            tool: "steamcmd",
-                            exit_code: -1,
-                            output: format!("{e:#}"),
-                        });
+                let task = staging.file_name().and_then(|n| n.to_str()).unwrap_or("task").to_string();
+                // steamcmd fails a fresh install now and then with `ERROR!
+                // Failed to install app '<id>' (Missing configuration)`, before
+                // a byte is downloaded — measured 2026-09-30 as two fresh runs
+                // in three for app 232250 (TF2), and the identical command then
+                // succeeded. Every run here starts from a fresh `$HOME`, so
+                // without a retry a node fails a TF2 install as often as not.
+                // One more attempt, for that error only, in the same staging
+                // directory and home: any other failure is reported as it was.
+                let mut attempt = 0;
+                let outcome = loop {
+                    attempt += 1;
+                    let name = format!("gpp-content-{app_id}-{task}-{attempt}");
+                    let outcome = docker
+                        .run_to_completion(
+                            &name,
+                            &image,
+                            cmd.clone(),
+                            &mounts,
+                            Some(TASK_MEMORY_LIMIT_BYTES),
+                            &[format!("HOME={TASK_HOME_DIR}")],
+                        )
+                        .await;
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            let _ = fs::remove_dir_all(&staging);
+                            return Err(ProvisionError::ToolFailed {
+                                tool: "steamcmd",
+                                exit_code: -1,
+                                output: format!("{e:#}"),
+                            });
+                        }
+                    };
+                    if outcome.exit_code != 0
+                        && attempt < STEAMCMD_ATTEMPTS
+                        && outcome.output.contains(STEAMCMD_TRANSIENT)
+                    {
+                        continue;
                     }
+                    break outcome;
                 };
                 if outcome.exit_code != 0 {
                     // A partial download is not content. Same rule as a failed
