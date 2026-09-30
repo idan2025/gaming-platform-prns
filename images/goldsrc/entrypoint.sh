@@ -5,8 +5,10 @@
 # set by the agent from a validated instance spec. A pack cannot reach these: a
 # pack describes a game, and what a node executes is the operator's choice of
 # image. `HLDS_MOD` is the one knob that is not GPP_-prefixed, because it is
-# the operator's, not the spec's — one steamcmd app 90 install runs Half-Life,
-# Counter-Strike 1.6, DoD or TFC depending on it.
+# the operator's, not the spec's — one steamcmd app 90 image runs Half-Life,
+# Counter-Strike 1.6, DoD, TFC or Opposing Force depending on it. The *content*
+# differs: a default app 90 install carries only `valve` and `cstrike`, and
+# each other mod is its own download (`[content] mod` in its pack).
 set -eu
 
 CONTENT="${GPP_CONTENT_ROOT:-/game}"
@@ -57,6 +59,7 @@ if [ -z "$MAP" ]; then
         czero)   MAP="de_dust2" ;;
         dod)     MAP="dod_avalanche" ;;
         tfc)     MAP="2fort" ;;
+        gearbox) MAP="op4_bootcamp" ;;
         *)       MAP="crossfire" ;;
     esac
 fi
@@ -87,6 +90,10 @@ case "$MOD" in
     valve)   MOD_APP_ID=70 ;;
     tfc)     MOD_APP_ID=20 ;;
     dod)     MOD_APP_ID=30 ;;
+    # Opposing Force's directory is `gearbox`, after the studio, not `op4` —
+    # and without this line it would fall through to 90 below, which boots
+    # cleanly and then rejects every player.
+    gearbox) MOD_APP_ID=50 ;;
     # An unknown mod is somebody's own: it has no Steam app of its own to
     # authenticate as, so fall back to the dedicated server's. Such a server
     # can still be joined with HLDS_SV_LAN=1.

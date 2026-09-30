@@ -46,8 +46,9 @@ notes = "GoldSrc. Same steamcmd app (90) as half-life.toml; a different mod dire
 #
 # steamcmd app 90 is the Half-Life Dedicated Server, and it fetches anonymously
 # — the condition `GAMES.md` §5 puts on unattended content. Which mod the
-# server runs (valve, cstrike, dod, tfc) is a runtime argument, so it is the
-# node operator's config, not a pack field: one download, several packs.
+# server runs is a runtime argument, so it is the node operator's config, not a
+# pack field. A default install carries `valve` and `cstrike` and nothing else;
+# every other app 90 mod names its depots with `[content] mod`.
 [content]
 driver = "steamcmd"
 app_id = 90

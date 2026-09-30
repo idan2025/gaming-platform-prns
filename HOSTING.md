@@ -252,6 +252,38 @@ and runs after the command line, so a Counter-Strike server calls itself
 `Counter-Strike 1.6 Server` in an A2S reply no matter what you named it. The
 name people browse by — the one in the announce — is the name you gave it.
 
+## Day of Defeat, Team Fortress Classic, Opposing Force
+
+Same image, same shape, one difference: each is its own download. A default
+app 90 install carries only `valve` and `cstrike`, so these packs name their mod
+in `[content]` and the agent fetches it (about 1.1–1.3 GB each, whole install).
+The `env` is still yours:
+
+```toml
+[games.day-of-defeat]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-dod"
+env = { HLDS_MOD = "dod" }
+
+[games.team-fortress-classic]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-tfc"
+env = { HLDS_MOD = "tfc" }
+
+[games.opposing-force]
+image = "gpp/goldsrc:1"
+content_root = "/game"
+content_version = "app90-gearbox"
+env = { HLDS_MOD = "gearbox" }
+```
+
+Opposing Force's directory is **`gearbox`**, after the studio, not `op4`. Rebuild
+the image if yours predates 2026-09-30: an older entrypoint has no app id for
+`gearbox`, falls back to 90, and turns every player away with
+`STEAM validation rejected` from a server whose log looks healthy.
+
 ## Bots: Condition Zero, and only Condition Zero
 
 Valve's Z-Bot is compiled into the Counter-Strike server library and gated on
@@ -259,7 +291,7 @@ an internal Condition Zero flag, so on a `cstrike` server `bot_add` adds nothing
 and reports nothing. Condition Zero is the same steamcmd app (90) with a
 different set of depots, and it brings the bot profiles and the 55 nav meshes
 the bots need — so `packs/condition-zero.toml` is the one shipped pack that
-declares bots, and its `[content]` block is the one that names a `mod`.
+declares bots.
 
 ```
 docker build -t gpp/goldsrc:1 images/goldsrc

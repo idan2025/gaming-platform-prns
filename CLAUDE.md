@@ -258,10 +258,12 @@ Rules a later change could quietly break:
 
 **Counter-Strike 1.6 actually runs on a node** (2026-09-07): `images/goldsrc` is
 a bare HLDS image in the same shape as `images/sven-coop`, and one steamcmd app
-90 install (~930 MB) serves Counter-Strike, Half-Life, DoD and TFC — the mod
-directory is a start argument, so it is `[games.<id>].env`'s `HLDS_MOD` and not
-a pack field. `HOSTING.md` has the operator's copy. Rules a later change could
-quietly break:
+90 install (~930 MB) serves Counter-Strike and Half-Life — the mod directory is
+a start argument, so it is `[games.<id>].env`'s `HLDS_MOD` and not a pack field.
+Every other mod on app 90 (czero, dod, tfc, gearbox) is its own set of depots, so
+its pack carries `[content] mod`; a default install has only `valve` and
+`cstrike` (measured 2026-09-30). `HOSTING.md` has the operator's copy. Rules a
+later change could quietly break:
 - **`SteamAppId` must be set, and must be the app the *player* owns.** Unset,
   the engine reaches the Steam client interfaces and dies with
   `FATAL ERROR (shutting down): Unable to initialize Steam` on the line after a
