@@ -74,6 +74,43 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.23
+
+### A server's name can no longer type at its console — rebuild and upgrade
+
+**Node operators: upgrade the agent.** Until this release a server's name went
+to the game unchecked, and both engines read parts of it as commands. A name
+like `fun; sv_password x` set the server's password, `fun +rcon_password x`
+set RCON's, and `fun -insecure` turned VAC off — on GoldSrc and Source alike,
+measured on a node. Anyone who could create a server could do it, including a
+user hosting through an index on your node.
+
+A node now refuses a name containing `;`, `"`, `+`, a control character, or a
+word starting with `-` (a lone `-`, or one inside a word, is fine), and says
+which. An index refuses the same names before it asks a node. Servers created
+before the upgrade keep their names until they are recreated.
+
+### Team Fortress 2 hosts
+
+`images/source` is a Source dedicated-server image, and TF2 runs in it: secure,
+VAC on, findable, and its map changes from the UI. Build it and point the game
+at it — `HOSTING.md` has the config. The TF2 pack itself had a bug that only a
+real server shows: it mounted an empty folder over the game's config
+directory, so a server started fine and then never left its first map. Fixed.
+
+steamcmd fails a fresh TF2 install now and then with `Missing configuration`
+before downloading anything. The node retries that once by itself.
+
+### Day of Defeat, Team Fortress Classic, Opposing Force
+
+Three more GoldSrc games as packs. Each was booted on a node secure and
+answering as its own Steam app. They need their own download — the standard
+Half-Life server install has only Half-Life and Counter-Strike — which the
+packs now ask for. **Rebuild `images/goldsrc`** before hosting Opposing Force:
+an older image turns every player away.
+
+Nobody has played any of the four new games through the mesh yet.
+
 ## v0.2.22
 
 ### Need for Speed: Most Wanted (2005)
