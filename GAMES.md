@@ -252,10 +252,25 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
   needs" below.
 - **Non-Valve games on Source** — the cheapest non-Valve wins in the whole
   list, because they inherit A2S, the `source` console and the Source launch
-  kind: Insurgency (2014), Day of Infamy, No More Room in Hell, Fistful of
-  Frags, Black Mesa, Zombie Panic! Source, Pirates, Vikings & Knights II,
-  NEOTOKYO, Nuclear Dawn, Synergy. Check per game that the dedicated server is
-  an anonymous steamcmd pull; one that is not is a `manual` pack (§5).
+  kind. **All of them are Mode 1** (`MODES.md`): a dedicated server players join
+  by address, never a LAN room — a game that takes `connect <address>` does not
+  need Mode 3, the same rule as Diablo II below. Measured 2026-09-30:
+  - **Shipped (6):** Insurgency (2014), Day of Infamy, No More Room in Hell,
+    Fistful of Frags, Black Mesa, Pirates, Vikings & Knights II — each booted
+    in `images/source` secure, answering as its own app, changing maps over
+    the console. Caveats live in the packs: NMRiH needs `content_root` two
+    directories deep, Fistful of Frags skips maps whose slot limit is below
+    the server's, PVKII runs its 32-bit loader.
+  - **Blocked, to revisit:** **Zombie Panic! Source** installs (app 17505) and
+    segfaults at start, with or without its `bin_linux_extra` libraries.
+    **Synergy** (app 17525) has no Linux server depot — `(Invalid platform)`.
+    **Nuclear Dawn** (app 111710) installs 143 MB with no maps in its Linux
+    depot. All three are Steam games with a Windows server, so the route back
+    is Windows depots under Wine (the typed steamcmd platform option L4D2
+    needs, plus a Wine image), measured per game.
+  - **Dismissed:** NEOTOKYO. Its server is Windows-only and a 2006-engine
+    build; under Wine it loaded its map, then needed Steam's Windows client
+    library and hung once given one.
 
 `images/source` is that shared image, parametrized by `SRCDS_GAME` the way
 `images/goldsrc` takes `HLDS_MOD`. TF2, CS:S, Garry's Mod, HL2: Deathmatch and

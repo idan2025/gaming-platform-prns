@@ -284,7 +284,7 @@ the image if yours predates 2026-09-30: an older entrypoint has no app id for
 `gearbox`, falls back to 90, and turns every player away with
 `STEAM validation rejected` from a server whose log looks healthy.
 
-## Source games: TF2, CS:S, Garry's Mod, HL2: Deathmatch, DoD: Source
+## Source games
 
 `images/source` is a bare Source dedicated server (srcds), the same shape as
 `images/goldsrc`. The pack fetches steamcmd app 232250 — about 14 GB — and the
@@ -339,7 +339,18 @@ query, and an HL2: Deathmatch server calls itself "Half-Life 2 Deathmatch" in
 game whatever you named it — the game sets that itself. The name players
 browse by is still the one you gave it.
 
-Other Source games can run in this image too, but only these five are measured.
+Six non-Valve Source games run in it too, each with its own `SRCDS_GAME`:
+Insurgency (2014) `insurgency`, Day of Infamy `doi`, No More Room in Hell
+`nmrih`, Fistful of Frags `fof`, Black Mesa `bms` (29 GB), and Pirates,
+Vikings, and Knights II `pvkii`. Two need care:
+
+- **No More Room in Hell** exits at start if `content_root` is only one
+  directory deep (`/game`), logging `tried to ".." past the root`. Use
+  something like `/opt/game` for it.
+- **Fistful of Frags** maps have their own slot limits; a server with more
+  slots than a map allows skips that map. 16 slots was measured to work.
+
+Other Source games can run in this image too, but only these eleven are measured.
 Set `SRCDS_GAME` to the game directory, `SRCDS_APP_ID` to the `appID` line of
 its `steam.inf`, and pick a starting map — the image refuses to guess.
 

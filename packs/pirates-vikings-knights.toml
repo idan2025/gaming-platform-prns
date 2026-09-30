@@ -1,0 +1,109 @@
+# Game pack #21, a Source-engine pack like Team Fortress 2 (#4) — GAMES.md §7 step 2.
+# Mode 1: a dedicated server players join by address (`connect`), not a LAN room.
+#
+# The rung is the one #4 climbed: a Source server wants its game port and an
+# RCON admin channel reachable, and both ride one Reticulum destination
+# (GAMES.md §3), so this is still only data — `[[extra_ports]]` and framing
+# generation 2 were the Rust half and they are built. What is not data is the
+# runtime: which container image runs a Source server is the node operator's
+# config, because an image selects the code a node executes
+# (crates/game-bridge/src/pack.rs).
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "pirates-vikings-knights"
+display_name = "Pirates, Vikings, and Knights II"
+app_name = "pirates-vikings-knights"
+default_port = 27015
+transport = "udp"
+min_link_class = 2
+query = "a2s"
+
+# Which console a node may talk to this game's running server through, so an
+# operator can change the map without restarting it and dropping everyone.
+# `source` selects words the build already carries (crates/game-bridge/src/console.rs);
+# the pack does not and cannot write the command. A pack that could write a
+# console line could type anything at a dedicated server's console on somebody
+# else's node.
+# Where this game's maps live, relative to its install directory, so a node can
+# offer them as a list instead of asking someone to remember a name. Data the
+# node validates as a relative path and only ever *lists*; a pack cannot reach
+# outside the content copy, and listing a directory runs nothing. The install
+# ships 30 maps and the server starts on `bt_glacier`, first in its shipped
+# `mapcycle.txt`.
+maps_dir = "pvkii/maps"
+
+console = "source"
+
+# Tier 2, not tier 1 (GAMES.md §4) — the same rung as Team Fortress 2, because
+# it is the same engine: Source sustains several times a GoldSrc server's rate
+# per player and its map/asset transfer on join is a burst, so a link that
+# carries a tier-1 game comfortably is not evidence this will play. The number
+# is ordering rather than a measurement, like every other tier in §4.
+
+# Nothing is writable, and `pvkii/cfg` must never be. A writable path is an
+# empty per-instance directory mounted *over* the content, and a steamcmd
+# install of app 17575 ships 10 files in `pvkii/cfg` — `server.cfg` among them,
+# and it sets `hostname "PVKII Dedicated Server"`, so the in-game name is
+# best-effort. Listing the directory hides all of them behind an empty mount:
+# the bug the Team Fortress 2 pack shipped with, where the server still booted
+# secure, so nothing looked wrong. Same bug as a writable `maps_dir`, in the
+# directory next to it.
+#
+# A fully read-only server was measured to boot, log `Connection to Steam
+# servers successful.` and `VAC secure mode is activated.`, answer A2S, change
+# maps and stop in about 2.2 s with exit 0. `pvkii/logs` does not exist after
+# an install, so it is not here either.
+writable_paths = []
+
+# Why this game needs a current images/source: the image runs its 32-bit loader
+# `srcds_linux32` — its `srcds_linux` picks 64-bit from `launch_settings.txt`
+# and fails, and its 64-bit server hung after `Console initialized.`.
+
+notes = "Source engine. Game on UDP 27015 with A2S on the same port, RCON on TCP 27015 beside it; A2S reports \"PVKII: Booty\", its game mode. The operator sets SRCDS_GAME = \"pvkii\" in the node's [games.pirates-vikings-knights].env and runs it from images/source."
+
+# RCON: TCP, and on the same number as the UDP game port — Source binds both,
+# measured from /proc/net/tcp inside the container, same as Team Fortress 2.
+# That is not a conflict here, because a channel is what separates them on the
+# wire; the number is only what the server binds on its own host. The local
+# port this side listens on is `listen_port + channel` by default, never 27015
+# again (GAMES.md §3).
+#
+# `name` is for a human reading the pack. It selects nothing: a pack that could
+# say "run the RCON handler" would be naming what runs, and RCON here is a byte
+# stream forwarded to a port like any other.
+[[extra_ports]]
+channel = 1
+name = "rcon"
+port = 27015
+transport = "tcp"
+
+# steamcmd app 17575 is the Pirates, Vikings, and Knights II dedicated server
+# and it fetches anonymously — the condition GAMES.md §5 puts on unattended
+# content — 5.5 GB installed, no separate mod app to fetch. As always the pack
+# supplies a number and the agent builds the whole command line; there is no
+# login field, because a pack is a file people share. On a fresh steamcmd home
+# this one installed on the first attempt, so there was no `Missing
+# configuration` retry (measured 2026-09-30).
+[content]
+driver = "steamcmd"
+app_id = 17575
+
+# How a launcher starts the player's own copy and points it at a server
+# (PLAN.md §13.1). Note what is NOT here: no executable, no path, no command.
+# The program comes from the player's own Pirates, Vikings, and Knights II
+# installation; `steam_app_id` only helps the launcher find it in a Steam
+# library the player already has — 17570, agreed on by the store API and the
+# shipped steam.inf.
+#
+# `args` is a template over a fixed vocabulary — address, port, password, name —
+# substituted into an argument vector that is spawned directly. Nothing is ever
+# passed to a shell, which is what makes characters like `;` and `$()` inert
+# text rather than syntax. A node never reads this block.
+[launch]
+kind = "source"
+steam_app_id = 17570
+args = ["+connect {address}", "+password {password}"]

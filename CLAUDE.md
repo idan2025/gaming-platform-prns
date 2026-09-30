@@ -301,7 +301,8 @@ later change could quietly break:
 
 **Source runs on a node** (2026-09-30): `images/source` is a bare srcds image
 in the same shape as `images/goldsrc`, measured against TF2 build 10828683,
-Counter-Strike: Source, Garry's Mod, HL2: Deathmatch and DoD: Source. Their
+Counter-Strike: Source, Garry's Mod, HL2: Deathmatch, DoD: Source, and six
+non-Valve Source games (`GAMES.md` §9 lists them and the three still blocked). Their
 packs after TF2 were drafted by glm-5.3-flash from a verified fact sheet,
 checked by script and reviewed. Left 4 Dead 2 is deliberately absent:
 `GAMES.md` §9 says why.
@@ -324,6 +325,10 @@ Rules a later change could quietly break:
   `validate_server_name` refuses `"`; the two rules stand or fall together.
 - **`steamclient.so` is in `bin/` for TF2 and CS:S, at the install root for
   Garry's Mod.** The image looks in both and refuses to start with neither.
+- **PVKII runs `srcds_linux32`.** Its `srcds_linux` is a launcher that reads
+  `launch_settings.txt`, picks 64-bit and fails on a 32-bit `dedicated.so`.
+  The image also puts `$GAME/bin` on the library path, as every mod's own
+  `srcds_run` does.
 - **32-bit `srcds_linux`, not `srcds_linux64`.** The 64-bit server wants a
   64-bit `steamclient.so` and the dedicated-server app ships none.
 - **`libcurl3-gnutls:i386` is required**; without it srcds dies on `Could not

@@ -47,6 +47,13 @@ case "$GAME" in
     garrysmod) GAME_APP_ID=4000 ;;
     hl2mp)     GAME_APP_ID=320 ;;
     dod)       GAME_APP_ID=300 ;;
+    insurgency) GAME_APP_ID=222880 ;;
+    doi)       GAME_APP_ID=447820 ;;
+    nmrih)     GAME_APP_ID=224260 ;;
+    fof)       GAME_APP_ID=265630 ;;
+    bms)       GAME_APP_ID=362890 ;;
+    zps)       GAME_APP_ID=17500 ;;
+    pvkii)     GAME_APP_ID=17570 ;;
     *)         GAME_APP_ID="" ;;
 esac
 SteamAppId="${SRCDS_APP_ID:-$GAME_APP_ID}"
@@ -65,6 +72,13 @@ if [ -z "$MAP" ]; then
         garrysmod) MAP="gm_construct" ;;
         hl2mp)     MAP="dm_lockdown" ;;
         dod)       MAP="dod_argentan" ;;
+        insurgency) MAP="panj" ;;
+        doi)       MAP="bastogne" ;;
+        nmrih)     MAP="nmo_anxiety" ;;
+        fof)       MAP="fof_cripplecreek" ;;
+        bms)       MAP="dm_bounce" ;;
+        zps)       MAP="zph_pithole" ;;
+        pvkii)     MAP="bt_glacier" ;;
         *)
             echo "No default map for game '$GAME'; the instance must name one." >&2
             exit 1
@@ -82,7 +96,7 @@ fi
 # app does not ship one — it fails with `wrong ELF class: ELFCLASS32` on the
 # only copy there is.
 STEAMCLIENT=""
-for candidate in "$CONTENT/bin/steamclient.so" "$CONTENT/steamclient.so"; do
+for candidate in "$CONTENT/bin/steamclient.so" "$CONTENT/steamclient.so" "$CONTENT/bin/steam/steamclient.so"; do
     if [ -f "$candidate" ]; then
         STEAMCLIENT="$candidate"
         break
@@ -95,8 +109,20 @@ fi
 mkdir -p "$HOME/.steam/sdk32"
 ln -sf "$STEAMCLIENT" "$HOME/.steam/sdk32/steamclient.so"
 
+# Which binary. `srcds_linux` for every game measured except PVKII, whose
+# `srcds_linux` is a launcher that reads `launch_settings.txt`, picks 64-bit,
+# and then fails with `dedicated.so: wrong ELF class: ELFCLASS32`; its 64-bit
+# server was measured to hang after `Console initialized.`. Its 32-bit loader,
+# `srcds_linux32`, runs it secure.
+case "$GAME" in
+    pvkii) BIN="srcds_linux32" ;;
+    *)     BIN="srcds_linux" ;;
+esac
+export BIN
+
 cd "$CONTENT"
-LD_LIBRARY_PATH="$CONTENT:$CONTENT/bin:${LD_LIBRARY_PATH:-}"
+# `$GAME/bin` is what every Source mod's own `srcds_run` puts on the path.
+LD_LIBRARY_PATH="$CONTENT:$CONTENT/bin:$CONTENT/$GAME/bin:${LD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH
 
 echo "Starting Source: game=$GAME port=$PORT maxplayers=$MAXPLAYERS map=$MAP app=$SteamAppId name=$NAME"
@@ -126,4 +152,4 @@ echo "Starting Source: game=$GAME port=$PORT maxplayers=$MAXPLAYERS map=$MAP app
 # next one, which the node would then publish nothing for. `-e` makes `script`
 # exit with srcds's status, and it passes the SIGTERM of `docker stop` through.
 export PORT MAXPLAYERS GAME MAP NAME
-exec script -qfec 'exec ./srcds_linux -game "$GAME" -port "$PORT" -strictportbind +maxplayers "$MAXPLAYERS" +map "$MAP" +hostname "\"$NAME\""' /dev/null
+exec script -qfec 'exec ./"$BIN" -game "$GAME" -port "$PORT" -strictportbind +maxplayers "$MAXPLAYERS" +map "$MAP" +hostname "\"$NAME\""' /dev/null
