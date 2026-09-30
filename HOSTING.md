@@ -284,7 +284,7 @@ the image if yours predates 2026-09-30: an older entrypoint has no app id for
 `gearbox`, falls back to 90, and turns every player away with
 `STEAM validation rejected` from a server whose log looks healthy.
 
-## Team Fortress 2: the Source image
+## Team Fortress 2, Counter-Strike: Source, Garry's Mod: the Source image
 
 `images/source` is a bare Source dedicated server (srcds), the same shape as
 `images/goldsrc`. The pack fetches steamcmd app 232250 — about 14 GB — and the
@@ -314,7 +314,27 @@ What the image does for you:
 steamcmd sometimes fails a fresh TF2 install with `Missing configuration`
 before downloading anything; the agent retries that once by itself.
 
-Other Source games can run in this image, but only TF2 has been measured.
+Counter-Strike: Source (app 232330, about 2.3 GB) and Garry's Mod (app 4020,
+about 6.5 GB) run in the same image; only the game directory differs:
+
+```toml
+[games.counter-strike-source]
+image = "gpp/source:1"
+content_root = "/game"
+content_version = "app232330"
+env = { SRCDS_GAME = "cstrike" }
+
+[games.garrys-mod]
+image = "gpp/source:1"
+content_root = "/game"
+content_version = "app4020"
+env = { SRCDS_GAME = "garrysmod" }
+```
+
+A Garry's Mod server reports its gamemode, "Sandbox", as its game in a server
+query; the name players browse by is still the one you gave it.
+
+Other Source games can run in this image too, but only these three are measured.
 Set `SRCDS_GAME` to the game directory, `SRCDS_APP_ID` to the `appID` line of
 its `steam.inf`, and pick a starting map — the image refuses to guess.
 

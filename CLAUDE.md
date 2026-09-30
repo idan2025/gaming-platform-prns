@@ -300,7 +300,9 @@ later change could quietly break:
   which the agent sets from the spec.
 
 **Source runs on a node** (2026-09-30): `images/source` is a bare srcds image
-in the same shape as `images/goldsrc`, measured against TF2 build 10828683.
+in the same shape as `images/goldsrc`, measured against TF2 build 10828683,
+Counter-Strike: Source and Garry's Mod. The CS:S and GMod packs were drafted by
+glm-5.3-flash from a verified fact sheet and reviewed.
 Rules a later change could quietly break:
 - **`SteamAppId` must be set, to the app players own** (440 for TF2, the
   `appID` in `tf/steam.inf`). Unset, srcds logs `Unable to load Steam support
@@ -314,6 +316,12 @@ Rules a later change could quietly break:
   exit 0).
 - **The `script -c` string is a constant.** It references quoted variables
   only; building it from the values would make a server name shell code.
+- **The name goes to srcds wrapped in literal quotes.** srcds rebuilds its
+  command line from argv unquoted, so a bare `+hostname "$NAME"` named a
+  server "verify css" "verify". The quotes are safe only because
+  `validate_server_name` refuses `"`; the two rules stand or fall together.
+- **`steamclient.so` is in `bin/` for TF2 and CS:S, at the install root for
+  Garry's Mod.** The image looks in both and refuses to start with neither.
 - **32-bit `srcds_linux`, not `srcds_linux64`.** The 64-bit server wants a
   64-bit `steamclient.so` and the dedicated-server app ships none.
 - **`libcurl3-gnutls:i386` is required**; without it srcds dies on `Could not
