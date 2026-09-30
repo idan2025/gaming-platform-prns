@@ -196,9 +196,100 @@ pub fn validate_map_name(map: &str) -> Result<(), MapNameError> {
     Ok(())
 }
 
+/// Why a server name was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerNameError {
+    /// A character that starts or ends a console command: `;`, `"`, `+`, or
+    /// a control character such as a newline.
+    NotAllowed(char),
+    /// A word beginning with `-`, which the engine reads as an option.
+    Option(String),
+}
+
+impl core::fmt::Display for ServerNameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotAllowed(c) => write!(
+                f,
+                "server name contains {c:?}; ';', '\"', '+' and control characters are \
+                 not allowed, because the name reaches the game's own console"
+            ),
+            Self::Option(word) => write!(
+                f,
+                "server name contains the word {word:?}; a word may not begin with '-', \
+                 because the game reads it as a start option"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ServerNameError {}
+
+/// Judge a server's display name before it reaches a game.
+///
+/// A name is free text, so unlike [`validate_map_name`] this is a denylist of
+/// exactly what the engines treat as syntax. Every image passes the name as
+/// `+hostname "<name>"` (or writes `hostname "<name>"` into a config), and
+/// the engine rebuilds its command line and splits it again. Measured
+/// 2026-09-30 on GoldSrc and on Source (TF2) alike:
+///
+/// * **`;`** ends a console command, so `x; sv_password y` sets a password.
+/// * **`"`** closes the quoted value, and the rest of the line is commands.
+/// * **`+`** starts a command — on GoldSrc even mid-word: `a+sv_password`
+///   ran `sv_password`.
+/// * **A word starting with `-`** is an engine option: ` -insecure` turned
+///   VAC off on both engines. A `-` inside a word, or alone, is harmless and
+///   allowed, so "Bob's - CS 24/7" is a fine name.
+/// * **Control characters**, a newline above all: a console reads one command
+///   per line.
+///
+/// Refused, never rewritten — the same rule as a map name.
+pub fn validate_server_name(name: &str) -> Result<(), ServerNameError> {
+    if let Some(c) = name.chars().find(|c| matches!(c, ';' | '"' | '+') || c.is_control()) {
+        return Err(ServerNameError::NotAllowed(c));
+    }
+    if let Some(word) = name.split_whitespace().find(|w| w.starts_with('-') && w.len() > 1) {
+        return Err(ServerNameError::Option(word.to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each of these was measured running a console command or an engine
+    /// option on a real GoldSrc or Source server when passed as its name.
+    #[test]
+    fn a_server_name_can_never_chain_a_console_command() {
+        for bad in [
+            "probe; sv_password injected",
+            "x\" ; rcon_password y",
+            "probe +sv_password plusinjected",
+            "probe+sv_password+nospace",
+            "probe -insecure",
+            "-insecure",
+            "line\nquit",
+            "tab\there",
+        ] {
+            assert!(validate_server_name(bad).is_err(), "{bad:?} should have been refused");
+        }
+    }
+
+    /// A name is free text for people. What the engines do not treat as
+    /// syntax stays allowed, including a lone dash and one inside a word.
+    #[test]
+    fn an_ordinary_server_name_is_accepted() {
+        for good in [
+            "Bob's - CS 24/7",
+            "verify-gearbox",
+            "Friday night [EU] #3",
+            "Ünïcode ok",
+            "50% off / no rules",
+        ] {
+            assert_eq!(validate_server_name(good), Ok(()), "{good:?}");
+        }
+    }
 
     /// The quota is what a caller asks for, and the join cvar is what makes it
     /// visible. A build that sent only the quota would leave an operator

@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use game_bridge::console::{validate_map_name, MapNameError, MAX_BOTS};
+use game_bridge::console::{
+    validate_map_name, validate_server_name, MapNameError, ServerNameError, MAX_BOTS,
+};
 use game_bridge::profile::GameTransport;
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +177,8 @@ pub enum SpecError {
     IdNotAllowed(String),
     EmptyGameId,
     EmptyName,
+    /// A display name the game would read as console commands or options.
+    BadName(ServerNameError),
     /// The requested starting map is not a usable map name.
     BadMap(MapNameError),
     /// More bots than this build will ask any server for.
@@ -195,6 +199,7 @@ impl core::fmt::Display for SpecError {
             ),
             Self::EmptyGameId => write!(f, "spec names no game"),
             Self::EmptyName => write!(f, "spec has no display name"),
+            Self::BadName(e) => write!(f, "{e}"),
             Self::BadMap(e) => write!(f, "{e}"),
             Self::TooManyBots(n) => {
                 write!(f, "{n} bots is over this build's limit of {MAX_BOTS}")
@@ -239,6 +244,11 @@ impl InstanceSpec {
         if self.name.trim().is_empty() {
             return Err(SpecError::EmptyName);
         }
+        // The name becomes `+hostname "<name>"` on a game's command line, and
+        // both engines split that line again: `;`, `+` and a leading `-` turn
+        // the rest of a name into commands and options. Checked here so both
+        // front doors, the loopback API and the uplink, refuse it.
+        validate_server_name(&self.name).map_err(SpecError::BadName)?;
         // Judged here, with the rest of the spec, so a bad map name is refused
         // at the API's front door rather than at the moment it is interpolated
         // into a container's environment.
@@ -329,6 +339,17 @@ mod tests {
         let mut s = spec("ok");
         s.name = "   ".to_string();
         assert_eq!(s.validate(), Err(SpecError::EmptyName));
+    }
+
+    /// The spec is where both front doors meet, so this is the test that fails
+    /// if `validate_server_name` is ever defined and no longer called.
+    #[test]
+    fn a_spec_whose_name_would_type_at_the_console_is_refused() {
+        let mut s = spec("ok");
+        s.name = "probe; sv_password injected".to_string();
+        assert!(matches!(s.validate(), Err(SpecError::BadName(_))));
+        s.name = "probe -insecure".to_string();
+        assert!(matches!(s.validate(), Err(SpecError::BadName(_))));
     }
 
     /// `Unknown` must round-trip as its own thing: a caller that cannot tell it

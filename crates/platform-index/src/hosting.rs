@@ -361,6 +361,10 @@ impl Hosting {
         if request.name.trim().is_empty() {
             return Err(anyhow!("a server needs a name"));
         }
+        // The node refuses it too; refusing here means a caller hears why
+        // before any quota is spent or node is picked.
+        game_bridge::console::validate_server_name(&request.name)
+            .map_err(|e| anyhow!("{e}"))?;
 
         let existing = self.all_instances().await?;
         let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
@@ -762,6 +766,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not offer hosting"), "{err}");
+    }
+
+    /// Refused before a node is picked: the config's node is unreachable, so
+    /// reaching it would fail with a different error than this one.
+    #[tokio::test]
+    async fn a_name_that_would_type_at_the_console_is_refused_at_the_index() {
+        let h = Hosting::new(config());
+        let err = h
+            .deploy(
+                &AccountId("aa".into()),
+                &DeployRequest {
+                    game_id: "sven-coop".into(),
+                    name: "fun +rcon_password mine".into(),
+                    max_players: 8,
+                    map: None,
+                },
+                std::time::SystemTime::now(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server name"), "{err}");
     }
 
     /// Ids are generated, not supplied, and are not guessable.
