@@ -74,6 +74,37 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.24
+
+### Four more Source games
+
+Counter-Strike: Source, Garry's Mod, Half-Life 2: Deathmatch and Day of
+Defeat: Source join Team Fortress 2 as games a node can host, all in the same
+`images/source` image — **rebuild it**, since this release teaches it their
+settings. Each was booted on a node before its pack was written: secure, VAC
+on, answering as its own Steam app, and changing maps from the UI.
+`HOSTING.md` has the config for each.
+
+Two things you may notice. A Garry's Mod server reports its gamemode,
+"Sandbox", as its game in a server query. An HL2: Deathmatch server calls
+itself "Half-Life 2 Deathmatch" in game whatever you named it — the game sets
+that itself. In both cases the name players browse by is still the one you
+gave it.
+
+### A server's full name reaches the game
+
+A Source server named "verify css" showed up in game as "verify": the engine
+cut the name at the first space. The image now passes it whole — "Bob's CS -
+24/7 [EU]" arrives as written.
+
+### Left 4 Dead 2: not yet
+
+Its server will not install on Linux the way the node installs games, and it
+is built to refuse players who connect by address, which is how the mesh
+joins. What it would take is written down in `GAMES.md` §9.
+
+Nobody has played any of the four new games through the mesh yet.
+
 ## v0.2.23
 
 ### A server's name can no longer type at its console — rebuild and upgrade
