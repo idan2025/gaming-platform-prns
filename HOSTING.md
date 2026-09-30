@@ -284,7 +284,7 @@ the image if yours predates 2026-09-30: an older entrypoint has no app id for
 `gearbox`, falls back to 90, and turns every player away with
 `STEAM validation rejected` from a server whose log looks healthy.
 
-## Team Fortress 2, Counter-Strike: Source, Garry's Mod: the Source image
+## Source games: TF2, CS:S, Garry's Mod, HL2: Deathmatch, DoD: Source
 
 `images/source` is a bare Source dedicated server (srcds), the same shape as
 `images/goldsrc`. The pack fetches steamcmd app 232250 — about 14 GB — and the
@@ -331,10 +331,15 @@ content_version = "app4020"
 env = { SRCDS_GAME = "garrysmod" }
 ```
 
-A Garry's Mod server reports its gamemode, "Sandbox", as its game in a server
-query; the name players browse by is still the one you gave it.
+Half-Life 2: Deathmatch (app 232370, `SRCDS_GAME = "hl2mp"`) and Day of
+Defeat: Source (app 232290, `SRCDS_GAME = "dod"`) follow the same pattern.
 
-Other Source games can run in this image too, but only these three are measured.
+A Garry's Mod server reports its gamemode, "Sandbox", as its game in a server
+query, and an HL2: Deathmatch server calls itself "Half-Life 2 Deathmatch" in
+game whatever you named it — the game sets that itself. The name players
+browse by is still the one you gave it.
+
+Other Source games can run in this image too, but only these five are measured.
 Set `SRCDS_GAME` to the game directory, `SRCDS_APP_ID` to the `appID` line of
 its `steam.inf`, and pick a starting map — the image refuses to guess.
 

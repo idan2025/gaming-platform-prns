@@ -246,7 +246,14 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
 - **Valve Source:** ~~Counter-Strike: Source, Garry's Mod~~ **shipped
   2026-09-30** (`packs/counter-strike-source.toml`, `packs/garrys-mod.toml`),
   each booted in `images/source` secure and answering as its own app (240,
-  4000). Still to do: HL2 Deathmatch, Day of Defeat: Source, Left 4 Dead 2.
+  4000). ~~HL2 Deathmatch, Day of Defeat: Source~~ shipped the same day
+  (`packs/half-life-2-deathmatch.toml`, `packs/day-of-defeat-source.toml`;
+  apps 320, 300). **Left 4 Dead 2 is not data.** Its dedicated server (app
+  222860) fails on Linux with `ERROR! Failed to install app '222860' (Invalid
+  platform)`; it installs only if steamcmd is first forced to the Windows
+  platform and then back to Linux, which the steamcmd driver cannot express
+  from a pack. It also boots with `sv_allow_lobby_connect_only 1` and 4 visible
+  slots — built around Valve's lobby, not a typed-in address.
 - **Non-Valve games on Source** — the cheapest non-Valve wins in the whole
   list, because they inherit A2S, the `source` console and the Source launch
   kind: Insurgency (2014), Day of Infamy, No More Room in Hell, Fistful of
@@ -255,8 +262,8 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
   an anonymous steamcmd pull; one that is not is a `manual` pack (§5).
 
 `images/source` is that shared image, parametrized by `SRCDS_GAME` the way
-`images/goldsrc` takes `HLDS_MOD`. TF2, CS:S and Garry's Mod are measured in
-it; another game
+`images/goldsrc` takes `HLDS_MOD`. TF2, CS:S, Garry's Mod, HL2: Deathmatch and
+DoD: Source are measured in it; another game
 needs its `SRCDS_APP_ID` (the `appID` in its `steam.inf`) and a starting map
 until it is measured and given defaults.
 

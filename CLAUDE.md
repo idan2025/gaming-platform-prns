@@ -301,8 +301,10 @@ later change could quietly break:
 
 **Source runs on a node** (2026-09-30): `images/source` is a bare srcds image
 in the same shape as `images/goldsrc`, measured against TF2 build 10828683,
-Counter-Strike: Source and Garry's Mod. The CS:S and GMod packs were drafted by
-glm-5.3-flash from a verified fact sheet and reviewed.
+Counter-Strike: Source, Garry's Mod, HL2: Deathmatch and DoD: Source. Their
+packs after TF2 were drafted by glm-5.3-flash from a verified fact sheet,
+checked by script and reviewed. Left 4 Dead 2 is deliberately absent:
+`GAMES.md` §9 says why.
 Rules a later change could quietly break:
 - **`SteamAppId` must be set, to the app players own** (440 for TF2, the
   `appID` in `tf/steam.inf`). Unset, srcds logs `Unable to load Steam support

@@ -45,6 +45,8 @@ case "$GAME" in
     tf)        GAME_APP_ID=440 ;;
     cstrike)   GAME_APP_ID=240 ;;
     garrysmod) GAME_APP_ID=4000 ;;
+    hl2mp)     GAME_APP_ID=320 ;;
+    dod)       GAME_APP_ID=300 ;;
     *)         GAME_APP_ID="" ;;
 esac
 SteamAppId="${SRCDS_APP_ID:-$GAME_APP_ID}"
@@ -61,6 +63,8 @@ if [ -z "$MAP" ]; then
         tf)        MAP="cp_badlands" ;;
         cstrike)   MAP="de_dust2" ;;
         garrysmod) MAP="gm_construct" ;;
+        hl2mp)     MAP="dm_lockdown" ;;
+        dod)       MAP="dod_argentan" ;;
         *)
             echo "No default map for game '$GAME'; the instance must name one." >&2
             exit 1
