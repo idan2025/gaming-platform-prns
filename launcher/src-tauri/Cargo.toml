@@ -1,6 +1,6 @@
 [package]
 name = "launcher"
-version = "0.2.24"
+version = "0.2.25"
 publish = false
 edition = "2021"
 rust-version = "1.90"

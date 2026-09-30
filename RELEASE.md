@@ -74,6 +74,35 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.25
+
+### Six more Source games
+
+Insurgency (2014), Day of Infamy, No More Room in Hell, Fistful of Frags,
+Black Mesa and Pirates, Vikings, and Knights II can now be hosted, in the same
+`images/source` image — **rebuild it**, since this release teaches it their
+settings. Each was booted on a node before its pack was written: secure, VAC
+on, answering as its own Steam app, and changing maps from the UI. All six are
+joined by address, like every other Source game here.
+
+Two need care, and `HOSTING.md` says how:
+
+- **No More Room in Hell** will not start if the node mounts its content only
+  one folder deep (`/game`). Mount it deeper, such as `/opt/game`.
+- **Fistful of Frags** maps have their own player limits, and a server with
+  more slots than a map allows skips it. 16 slots works.
+
+Several of these name themselves in game from their own config (Fistful of
+Frags, Black Mesa, PVKII); the name players browse by is still yours.
+
+### Not yet
+
+Zombie Panic! Source, Synergy and Nuclear Dawn have no working Linux server
+today. All three have a Windows one, so they are waiting on running Windows
+servers under Wine; `GAMES.md` §9 records what was found.
+
+Nobody has played any of the six through the mesh yet.
+
 ## v0.2.24
 
 ### Four more Source games
