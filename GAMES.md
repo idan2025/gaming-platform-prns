@@ -159,9 +159,10 @@ Each step is chosen to exercise exactly one new axis:
    are the entire change, with no Rust touched.
    `crates/game-bridge/tests/second_game.rs` runs a bridge server from a pack
    read off disk and makes a browse node list it; `every_shipped_pack_plans_an_instance`
-   does the node-side half. Which mod runs (valve, cstrike, dod, tfc) is a
-   runtime argument, so DoD and TFC are two more files whenever somebody wants
-   them.
+   does the node-side half. Which mod runs is a runtime argument (`HLDS_MOD`);
+   which mod is *downloaded* is not — a default app 90 install carries only
+   `valve` and `cstrike`, so DoD, TFC and Opposing Force each name a
+   `[content] mod`. They landed 2026-09-30 as three more files.
 2. ~~**Team Fortress 2 / CS:S / Garry's Mod** (Source).~~ **The pack landed
    2026-08-31**: `packs/team-fortress-2.toml`, and again no Rust changed —
    blocker B (multi-port, §3) had already been paid for, which is exactly what
@@ -176,7 +177,7 @@ Each step is chosen to exercise exactly one new axis:
    dedicated server image, in `[games.team-fortress-2]`. A pack cannot name one
    (§1), so the ladder's step-2 claim is honestly "the pack is data", not "TF2
    runs on any node today". CS:S and Garry's Mod are two more files whenever
-   somebody wants them, the same way DoD and TFC are.
+   somebody wants them, the same way DoD and TFC were.
 3. **Minetest.** New: non-Steam content source (plain download), no A2S probe.
    Forces the probe and content-source abstractions apart.
 4. **Minecraft Java.** New: TCP transport, JVM runtime, SLP probe,
@@ -234,9 +235,13 @@ since v0.2.20, both as a server and as the first LAN-room game.
 Every one of these is a `.toml` and, for Source, an operator image. `query =
 "a2s"`, `console` and `LaunchKind` already have the words.
 
-- **GoldSrc on app 90:** Day of Defeat, Team Fortress Classic, Opposing Force.
-  The mod is `HLDS_MOD`; mind the `SteamAppId` rule (must be the app the player
-  owns).
+- ~~**GoldSrc on app 90:** Day of Defeat, Team Fortress Classic, Opposing Force.~~
+  **Shipped 2026-09-30**: `packs/day-of-defeat.toml`,
+  `packs/team-fortress-classic.toml`, `packs/opposing-force.toml`. Each booted
+  on a node secure (VAC on) and answered A2S with its own app id (30, 20, 50).
+  Each needs `[content] mod` — a default app 90 install has neither — and
+  Opposing Force needed an image change, because its directory is `gearbox` and
+  the entrypoint had no app id for it.
 - **Valve Source:** Counter-Strike: Source, Garry's Mod, HL2 Deathmatch, Day of
   Defeat: Source, Left 4 Dead 2.
 - **Non-Valve games on Source** — the cheapest non-Valve wins in the whole
