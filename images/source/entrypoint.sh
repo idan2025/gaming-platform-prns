@@ -38,12 +38,14 @@ fi
 # is activated.` Measured 2026-09-30 against TF2 build 10828683.
 #
 # Only games measured on a node are listed. The value is the *client's* app
-# (440 for TF2, which is also `appID` in tf/steam.inf), not the dedicated
-# server's (232250) — the GoldSrc image documents why that difference is a
-# trap. Any other game names its own with `SRCDS_APP_ID`.
+# — the `appID` line of the game's own steam.inf — not the dedicated server's
+# (232250 for TF2), which the GoldSrc image documents as a trap. Any other
+# game names its own with `SRCDS_APP_ID`.
 case "$GAME" in
-    tf) GAME_APP_ID=440 ;;
-    *)  GAME_APP_ID="" ;;
+    tf)        GAME_APP_ID=440 ;;
+    cstrike)   GAME_APP_ID=240 ;;
+    garrysmod) GAME_APP_ID=4000 ;;
+    *)         GAME_APP_ID="" ;;
 esac
 SteamAppId="${SRCDS_APP_ID:-$GAME_APP_ID}"
 if [ -z "$SteamAppId" ]; then
@@ -56,7 +58,9 @@ export SteamAppId
 
 if [ -z "$MAP" ]; then
     case "$GAME" in
-        tf) MAP="cp_badlands" ;;
+        tf)        MAP="cp_badlands" ;;
+        cstrike)   MAP="de_dust2" ;;
+        garrysmod) MAP="gm_construct" ;;
         *)
             echo "No default map for game '$GAME'; the instance must name one." >&2
             exit 1
@@ -65,15 +69,27 @@ if [ -z "$MAP" ]; then
 fi
 
 # srcds dlopens the Steam client from `$HOME/.steam/sdk32`. The 32-bit one
-# ships in the install's `bin/`; the content mount is read-only and shared,
-# so the link is made in this container's own home.
+# ships in the install — in `bin/` for TF2 and CS:S, at the root for Garry's
+# Mod — and the content mount is read-only and shared, so the link is made in
+# this container's own home.
 #
 # 32-bit, not `srcds_linux64`, although the install carries both: the 64-bit
 # server wants a 64-bit `steamclient.so` in `sdk64`, and the dedicated-server
 # app does not ship one — it fails with `wrong ELF class: ELFCLASS32` on the
 # only copy there is.
+STEAMCLIENT=""
+for candidate in "$CONTENT/bin/steamclient.so" "$CONTENT/steamclient.so"; do
+    if [ -f "$candidate" ]; then
+        STEAMCLIENT="$candidate"
+        break
+    fi
+done
+if [ -z "$STEAMCLIENT" ]; then
+    echo "No steamclient.so in $CONTENT/bin or $CONTENT; is this a Source install?" >&2
+    exit 1
+fi
 mkdir -p "$HOME/.steam/sdk32"
-ln -sf "$CONTENT/bin/steamclient.so" "$HOME/.steam/sdk32/steamclient.so"
+ln -sf "$STEAMCLIENT" "$HOME/.steam/sdk32/steamclient.so"
 
 cd "$CONTENT"
 LD_LIBRARY_PATH="$CONTENT:$CONTENT/bin:${LD_LIBRARY_PATH:-}"
@@ -95,8 +111,15 @@ echo "Starting Source: game=$GAME port=$PORT maxplayers=$MAXPLAYERS map=$MAP app
 # out of the values instead would turn `x; rm -rf /game` in a server name into
 # a command.
 #
+# The name is passed *with* literal quotes around it. srcds rebuilds its
+# command line from argv without quoting, so a bare `+hostname "$NAME"` gave a
+# server named "verify css" the name "verify" (measured). The quotes are safe
+# only because a node refuses any name containing `"`
+# (`console::validate_server_name`) — that rule is what keeps this from being
+# a way to close the quote and type commands.
+#
 # `-strictportbind`: fail if the port is taken rather than quietly binding the
 # next one, which the node would then publish nothing for. `-e` makes `script`
 # exit with srcds's status, and it passes the SIGTERM of `docker stop` through.
 export PORT MAXPLAYERS GAME MAP NAME
-exec script -qfec 'exec ./srcds_linux -game "$GAME" -port "$PORT" -strictportbind +maxplayers "$MAXPLAYERS" +map "$MAP" +hostname "$NAME"' /dev/null
+exec script -qfec 'exec ./srcds_linux -game "$GAME" -port "$PORT" -strictportbind +maxplayers "$MAXPLAYERS" +map "$MAP" +hostname "\"$NAME\""' /dev/null
