@@ -248,12 +248,8 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
   each booted in `images/source` secure and answering as its own app (240,
   4000). ~~HL2 Deathmatch, Day of Defeat: Source~~ shipped the same day
   (`packs/half-life-2-deathmatch.toml`, `packs/day-of-defeat-source.toml`;
-  apps 320, 300). **Left 4 Dead 2 is not data.** Its dedicated server (app
-  222860) fails on Linux with `ERROR! Failed to install app '222860' (Invalid
-  platform)`; it installs only if steamcmd is first forced to the Windows
-  platform and then back to Linux, which the steamcmd driver cannot express
-  from a pack. It also boots with `sv_allow_lobby_connect_only 1` and 4 visible
-  slots — built around Valve's lobby, not a typed-in address.
+  apps 320, 300). **Left 4 Dead 2 is not data** — see "Left 4 Dead 2: what it
+  needs" below.
 - **Non-Valve games on Source** — the cheapest non-Valve wins in the whole
   list, because they inherit A2S, the `source` console and the Source launch
   kind: Insurgency (2014), Day of Infamy, No More Room in Hell, Fistful of
@@ -266,6 +262,64 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
 DoD: Source are measured in it; another game
 needs its `SRCDS_APP_ID` (the `appID` in its `steam.inf`) and a starting map
 until it is measured and given defaults.
+
+### Left 4 Dead 2: what it needs
+
+Measured 2026-09-30 on a node, and deliberately not shipped. Everything below
+was seen, not assumed; the last item is the one nobody here could check.
+
+**What already works.** Installed by hand (below), the server boots in
+`images/source` with `SteamAppId=550`: `Connection to Steam servers
+successful.`, `VAC secure mode is activated.`, and an A2S reply with app id
+550, folder `left4dead2`, map `c1m1_hotel` (45 maps ship, no map cycle, so the
+first campaign's first map is the start). `steamclient.so` is in `bin/`, the
+binary is 32-bit `srcds_linux`, it answers the console through the image's
+terminal, and it changes map with `changelevel`. The client app is 550 (Steam
+store API and the game's own `steam.inf` agree); the dedicated server is app
+222860.
+
+**Need 1 — the content driver cannot install it.** `app_update 222860` on
+Linux fails every time with `ERROR! Failed to install app '222860' (Invalid
+platform)` — twice in a row, so the one-shot retry for `Missing configuration`
+does not cover it and must not be widened to. What installs it (9.3 GB) is
+forcing steamcmd's platform to Windows for one update and back for a
+validating one, in a single run:
+
+```
++force_install_dir <dir> +login anonymous
++@sSteamCmdForcePlatformType windows +app_update 222860
++@sSteamCmdForcePlatformType linux   +app_update 222860 validate +quit
+```
+
+The install then carries a few Windows leftovers (`left4dead2.exe`, 360 KB; no
+Windows libraries), which the Linux server ignores. A pack cannot ask for this
+today: `PackContent::Steamcmd` is an app id and a mod, and the agent builds
+every argument (`crates/platform-agent/src/content.rs`). The fix that keeps
+"a pack cannot name what runs" intact is a typed field the agent translates —
+for example a `platform_bootstrap = "windows"` enum on the steamcmd driver,
+validated at load like `mod` — never a pass-through of steamcmd arguments.
+Until then the only route is a `manual` pack with the command above in
+`HOSTING.md`.
+
+**Need 2 — it is lobby-only by default.** It boots with
+`sv_allow_lobby_connect_only 1`, a setting built to refuse players who connect
+by address rather than through Valve's matchmaking lobby — and an address is
+exactly how a player's bridge joins (`127.0.0.1`). `+sv_allow_lobby_connect_only
+0` on the command line takes (`"0" ( def. "1" )`, measured) and the server stays
+secure, so the image would add it for `left4dead2`, beside the app id (550) and
+first map (`c1m1_hotel`).
+
+**Need 3 — the slots are the game's.** A2S reports `0/4`, and
+`maxplayers` is pinned at 18 (`absolute_maxplayers`, `default_maxplayers` and
+`mininum_maxplayers` all 18); the node's `max_players` does not move it. Four is
+the co-op campaign's team; versus needs eight. The pack's notes would say so
+rather than let a hosting form promise 24.
+
+**Need 4 — a real join, which nobody here has done.** No L4D2 client was
+available, so whether a player connecting by address gets in once lobby-only is
+off is unmeasured. That is the check that decides the pack's worth, and it is
+the reason Needs 1–3 were not built speculatively: the driver change is Rust and
+a pack-format addition, paid for by one game that might still refuse the join.
 
 ### Wave 2 — non-Steam, `archive` driver, no query
 
