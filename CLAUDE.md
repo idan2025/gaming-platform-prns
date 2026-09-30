@@ -160,9 +160,8 @@ numbers separately, and each port is published in its own transport. Rules:
 change** — `GAMES.md` §7 steps 1 and 2. TF2 is the first shipped pack with
 `[[extra_ports]]`, so the first to announce framing generation 2; its RCON rides
 channel 1 as TCP beside a UDP game port, on the same port *number*, because the
-channel is what separates them on the wire. It still needs a Source
-dedicated-server image in the node's config before it runs anywhere: a pack
-cannot name what runs.
+channel is what separates them on the wire. Its runtime is `images/source`
+(2026-09-30), chosen in the node's config: a pack cannot name what runs.
 
 `tests/second_game.rs` and `ports::tests::every_shipped_pack_gets_its_whole_port_set_or_nothing`
 pin this, and **none of them name a game in code** — they find their subject by
@@ -299,6 +298,44 @@ later change could quietly break:
   `+hostname` loses; `-servercfgfile logs/…` loads nothing at all and `+exec`
   runs too early (both measured). What a player browses by is the announce,
   which the agent sets from the spec.
+
+**Source runs on a node** (2026-09-30): `images/source` is a bare srcds image
+in the same shape as `images/goldsrc`, measured against TF2 build 10828683.
+Rules a later change could quietly break:
+- **`SteamAppId` must be set, to the app players own** (440 for TF2, the
+  `appID` in `tf/steam.inf`). Unset, srcds logs `Unable to load Steam support
+  library` and `This server will operate in LAN mode only`, and nothing
+  outside can query it. Same trap as GoldSrc's, different symptom.
+- **srcds reads its console only from a terminal.** A `changelevel` on the
+  plain stdin pipe the agent writes is accepted and ignored; through a
+  pseudo-terminal it works. The image runs srcds under `script` rather than
+  asking the agent for a TTY, so every engine keeps one console mechanism and
+  `docker logs` stays text. `script` passes `docker stop`'s SIGTERM on (2.3 s,
+  exit 0).
+- **The `script -c` string is a constant.** It references quoted variables
+  only; building it from the values would make a server name shell code.
+- **32-bit `srcds_linux`, not `srcds_linux64`.** The 64-bit server wants a
+  64-bit `steamclient.so` and the dedicated-server app ships none.
+- **`libcurl3-gnutls:i386` is required**; without it srcds dies on `Could not
+  load: replay_srv.so`, a file that is there, failing on its dependency.
+- **`tf/cfg` must never be writable** — it ships ~70 files, the map cycle among
+  them. The TF2 pack shipped with it and booted fine, never rotating maps.
+- **steamcmd is retried once on `Missing configuration`**, and on nothing else
+  (`content.rs`). Two fresh TF2 installs in three hit it before downloading a
+  byte; the same command then succeeded. Caught by
+  `a_missing_configuration_failure_is_retried_once_and_installs`.
+
+**A server name is data, and the engines disagree** (2026-09-30). Every image
+passes the name as `+hostname "<name>"`, and both GoldSrc and Source rebuild
+their command line and split it again. Measured: `;` and `+` in a name ran
+console commands (`sv_password` set, on both), `"` closes the quote, a word
+starting with `-` is an engine option (` -insecure` turned VAC off, on both),
+and GoldSrc starts a command at a `+` even mid-word.
+`console::validate_server_name` refuses those, never rewrites them, and
+`InstanceSpec::validate` and the index's `deploy` both call it. Caught by
+`a_server_name_can_never_chain_a_console_command` and, for the caller,
+`a_spec_whose_name_would_type_at_the_console_is_refused`. Instances created by
+an older agent keep whatever name they had.
 
 **The shipped launcher had no packs and an unusable "any game" filter**
 (2026-09-07): `pack_dir` looks beside the executable and then falls back to a

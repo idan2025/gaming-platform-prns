@@ -284,6 +284,48 @@ the image if yours predates 2026-09-30: an older entrypoint has no app id for
 `gearbox`, falls back to 90, and turns every player away with
 `STEAM validation rejected` from a server whose log looks healthy.
 
+## Team Fortress 2: the Source image
+
+`images/source` is a bare Source dedicated server (srcds), the same shape as
+`images/goldsrc`. The pack fetches steamcmd app 232250 — about 14 GB — and the
+game directory is your `env`:
+
+```
+docker build -t gpp/source:1 images/source
+```
+
+```toml
+[games.team-fortress-2]
+image = "gpp/source:1"
+content_root = "/game"
+content_version = "app232250"
+env = { SRCDS_GAME = "tf" }
+```
+
+What the image does for you:
+
+- **`SteamAppId=440`**, the app your players own. Without it srcds runs in
+  LAN mode only and nobody outside can find it.
+- **A terminal for the console.** srcds ignores console input from a pipe, so
+  the image gives it one; map changes from the UI need it.
+- **32-bit srcds.** The install ships a 64-bit server too, but not the 64-bit
+  Steam library it needs.
+
+steamcmd sometimes fails a fresh TF2 install with `Missing configuration`
+before downloading anything; the agent retries that once by itself.
+
+Other Source games can run in this image, but only TF2 has been measured.
+Set `SRCDS_GAME` to the game directory, `SRCDS_APP_ID` to the `appID` line of
+its `steam.inf`, and pick a starting map — the image refuses to guess.
+
+## Server names
+
+A server's name reaches the game's own console at start, so a node refuses
+names containing `;`, `"`, `+`, a control character, or a word that begins with
+`-` (a lone `-` is fine). Each of those was measured turning part of a name
+into a console command or a start option — setting a password, or turning VAC
+off. Refused, never rewritten.
+
 ## Bots: Condition Zero, and only Condition Zero
 
 Valve's Z-Bot is compiled into the Counter-Strike server library and gated on

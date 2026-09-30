@@ -173,10 +173,11 @@ Each step is chosen to exercise exactly one new axis:
    and `ports::tests::every_shipped_pack_gets_its_whole_port_set_or_nothing`
    pin the two halves, and neither names the game.
 
-   **What is left is the runtime**, which was always the operator's: a Source
-   dedicated server image, in `[games.team-fortress-2]`. A pack cannot name one
-   (§1), so the ladder's step-2 claim is honestly "the pack is data", not "TF2
-   runs on any node today". CS:S and Garry's Mod are two more files whenever
+   **The runtime landed 2026-09-30**: `images/source`, the operator's image
+   for `[games.team-fortress-2]` (a pack still cannot name one, §1). TF2 was
+   booted in it on a node — secure, VAC on, answering A2S as app 440, changing
+   maps over the console — and doing so found the pack's writable `tf/cfg`
+   hiding the server's map cycle (fixed; `HOSTING.md`). CS:S and Garry's Mod are two more files whenever
    somebody wants them, the same way DoD and TFC were.
 3. **Minetest.** New: non-Steam content source (plain download), no A2S probe.
    Forces the probe and content-source abstractions apart.
@@ -227,7 +228,7 @@ deliberately not written here: look each one up and put it in the pack, with a
 ### Wave 0 — shipped
 
 Sven Co-op, Half-Life DM, Counter-Strike 1.6, Condition Zero (zbot), and the
-Team Fortress 2 pack (runs once an operator supplies a Source image). OpenTTD
+Team Fortress 2 (with `images/source` since 2026-09-30). OpenTTD
 since v0.2.20, both as a server and as the first LAN-room game.
 
 ### Wave 1 — pure data, no Rust
@@ -251,8 +252,10 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
   NEOTOKYO, Nuclear Dawn, Synergy. Check per game that the dedicated server is
   an anonymous steamcmd pull; one that is not is a `manual` pack (§5).
 
-One shared Source image, parametrized by operator env the way `images/goldsrc`
-takes `HLDS_MOD`, would serve most of this wave.
+`images/source` is that shared image, parametrized by `SRCDS_GAME` the way
+`images/goldsrc` takes `HLDS_MOD`. Only TF2 is measured in it; another game
+needs its `SRCDS_APP_ID` (the `appID` in its `steam.inf`) and a starting map
+until it is measured and given defaults.
 
 ### Wave 2 — non-Steam, `archive` driver, no query
 

@@ -40,17 +40,20 @@ console = "source"
 # link that carries Sven Co-op comfortably is not evidence this will play. The
 # number is ordering rather than a measurement, like every other tier in §4.
 
-# Both directories exist immediately after a steamcmd install of app 232250,
-# which is what makes them usable: a writable bind nested inside the read-only
-# content mount cannot create its own mountpoint, so a path listed here that the
-# install does not already contain fails the instance at start rather than being
-# created. `tf/logs` is deliberately absent for exactly that reason — the
-# install does not create it, and a server that cannot write a log file still
-# runs. An operator who wants on-disk logs makes the directory once and adds it.
-# `tf/maps` is NOT here, and must not be: the install ships maps in it, and a
-# writable path is an empty per-instance directory mounted *over* the content,
-# so listing it hides every shipped map. Same rule as `svencoop/maps`.
-writable_paths = ["tf/cfg"]
+# Nothing is writable, and `tf/cfg` must never be. A writable path is an empty
+# per-instance directory mounted *over* the content, and a steamcmd install of
+# app 232250 ships about 70 files in `tf/cfg`. With it listed — as this pack
+# first shipped — the server still boots secure, so nothing looks wrong, but it
+# logs `Error loading cfg/trusted_keys_base.txt`, `pure_server_minimal.txt` and
+# `vscript_convar_allowlist.txt`, and `Map cycle file 'cfg/mapcycle.txt' was not
+# found`: a server that never leaves its first map (measured 2026-09-30, build
+# 10828683). Same bug as a writable `maps_dir`, in the directory next to it.
+#
+# A fully read-only server was measured to boot, answer A2S, connect to Steam
+# with VAC on and change maps. It cannot persist `modelsounds.cache` and says
+# so; that costs a little start-up time, not correctness. `tf/logs` does not
+# exist after an install, so it is not here either.
+writable_paths = []
 
 notes = "Source engine. Game on UDP 27015 with A2S on the same port, RCON on TCP 27015 beside it. First pack to use extra_ports, so the first to announce framing generation 2."
 

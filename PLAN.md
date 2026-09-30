@@ -617,8 +617,8 @@ bridge.
   (2026-08-31)** and both were pure data: `packs/half-life.toml`,
   `packs/counter-strike-16.toml`, and `packs/team-fortress-2.toml`, the last
   being the first pack to use `[[extra_ports]]` and so the first to announce
-  framing generation 2. TF2 still needs a Source dedicated-server *image* in the
-  node's config before it runs anywhere, because a pack cannot name what runs.
+  framing generation 2. TF2's runtime, `images/source`, landed 2026-09-30 —
+  operator config, because a pack cannot name what runs.
   **Minetest is the next rung**, and it is the first that is not free: it has no
   A2S probe, which forces the query protocol and the content source apart
   (`a2s.rs` is one implementation, not yet a `GameQuery` trait — one
