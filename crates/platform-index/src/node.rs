@@ -170,7 +170,9 @@ pub async fn start(
                     // carries transit for others too. Unlike a player's client,
                     // it opted into being infrastructure.
                     transport_identity: Some(identity),
-                    remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                    remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                        personal_rns::remote_control::RemoteControlService::Unavailable,
+                    ),
                     pre_configured_destinations: [destination],
                     app_state: state,
                     storage: GrowableHeap,

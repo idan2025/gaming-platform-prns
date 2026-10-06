@@ -9,16 +9,17 @@ next to the dependency.
 | | |
 | --- | --- |
 | Fork | `https://github.com/idan2025/Prns` (fork of `KenAKAFrosty/Prns`) |
-| Branch | `platform/0.3.7-hotfix.5` |
-| Rev | `71e02528ff112eda3eea1948fed53d3c7b6c8554` |
-| Base | upstream tag **`v0.3.7-hotfix.5`** (= upstream `main` for the engine) |
+| Branch | `platform/main-2026-10-06` |
+| Rev | `fe63af994562016747be050c2d93078c3daf9bee` |
+| Base | upstream **`main` at `d2c799d9a`** (untagged: `v0.3.7-hotfix.5-1536-gd2c799d9a`; crates report `0.3.8`) |
 | Declared in | `Cargo.toml` `[workspace.dependencies]` |
 
 **The platform and `svencoop-prns` no longer run the same engine tree.** The
 standalone app's vendored copy (`/home/pi/svencoop-prns-clone/vendor`) is still
 upstream `v0.3.7` plus the two patches below; the platform moved to
-`hotfix.5` on 2026-09-23. The old pin (`platform/0.3.7`, `33f0a839`) is kept on
-the fork so that tree stays reproducible.
+`hotfix.5` on 2026-09-23 and to untagged upstream `main` on 2026-10-06. The old
+pins (`platform/0.3.7` at `33f0a839`, `platform/0.3.7-hotfix.5` at `71e02528`)
+are kept on the fork so those trees stay reproducible.
 
 That makes the wire-compatibility requirement in `PLAN.md` §5 something to
 *measure*, not something inherited. It was measured before the move, with the
@@ -30,13 +31,19 @@ over a TCP interface, with a UDP echo server standing in for the game:
 | --- | --- | --- | --- |
 | v0.1.10 (`v0.3.7`) | platform (`hotfix.5`) | yes | all three |
 | platform (`hotfix.5`) | v0.1.10 (`v0.3.7`) | yes | all three |
+| v0.1.10 (`v0.3.7`) | platform (`main` `fe63af99`) | yes | all three |
+| platform (`main` `fe63af99`) | v0.1.10 (`v0.3.7`) | yes | all three |
+
+(The `fe63af99` rows were run 2026-10-06, `sc-rns-bridge` built from
+`svencoop-prns-clone` at `1efb4a5`, whose `src/` and `vendor/` are unchanged
+since `v0.1.10`.)
 
 No test in `cargo test` crosses engine versions, so **repeat that run before
 every pin move** — a green suite on one engine proves nothing about the other.
 
 ## What the fork adds
 
-One commit on top of `v0.3.7-hotfix.5`. It began as an unrecorded edit inside
+One commit on top of upstream `main` (`d2c799d9a`). It began as an unrecorded edit inside
 the vendored copy in `svencoop-prns` (`c9ec90b` and earlier); as a real commit it
 rebases onto a future Prns release with conflicts shown instead of silently
 lost.
@@ -44,7 +51,7 @@ lost.
 ### Retired: `c393bae7` — expose announce `app_data` on `Diagnostic::AnnounceHeard`
 
 **Upstream carries this now**, as `app_data: &'a [u8]`
-(`prns-runtime/core/src/runtime/event.rs:137` at `hotfix.5`), so the patch was
+(`prns-runtime/core/src/runtime/event.rs:145` at `fe63af99`), so the patch was
 dropped rather than rebased. The only caller change was a borrow: the field is
 a slice, not an owned buffer. What follows is kept because it is why the field
 matters.
@@ -61,9 +68,10 @@ signature, so the metadata is tamper-evident for free (`PLAN.md` §3.2).
 
 Plausibly useful upstream; worth offering as a PR.
 
-### `71e02528` — size the link plaintext cap for game-sized datagrams
+### `fe63af99` — size the link plaintext cap for game-sized datagrams
 
-(`33f0a839` on the old pin; cherry-picked onto `hotfix.5` without conflict.)
+(`33f0a839` on `platform/0.3.7`, `71e02528` on `platform/0.3.7-hotfix.5`;
+cherry-picked onto each base without conflict. It now sits at `link.rs:28`.)
 Still needed: upstream `main` and `trunk` both still size it off
 `BROADCAST_MTU` (`prns-core/src/engine/commands/link.rs:23`).
 
@@ -142,9 +150,21 @@ simpler and states the truth: we do not run a published version.
 - **Crypto crates.** The engine moved to `ed25519-dalek`/`x25519-dalek` 3.x.
   None of our crates names either directly, so `Cargo.lock` holds one copy.
 
-Upstream `trunk` is further ahead again (unreleased), and building against it
-adds a required `RemoteControlHostControls` bound on each role's app state. Wait
-for it to reach a tag.
+### What moving to untagged `main` cost (2026-10-06)
+
+Upstream had not tagged a release past `hotfix.5`, so this pin is a `main`
+commit rather than a tag; the branch is named for the date instead.
+
+- **`RemoteControlNodeSetup`.** `PrnsNodeRecipe.remote_control` now takes a
+  `RemoteControlNodeSetup` rather than a bare `RemoteControlService`
+  (`prns-runtime/core/src/runtime/remote_control.rs:665`). Every role wraps the
+  same `RemoteControlService::Unavailable` in `RemoteControlNodeSetup::new`,
+  which pairs it with `NoRemoteControlHostControls` — remote control stays off.
+  The `RemoteControlHostControls` bound once feared from `trunk` did not land as
+  a requirement: `new` supplies the no-op controls.
+- Nothing else: `cargo test`, clippy, `scripts/live_roundtrip.py`, the launcher
+  (`cargo check` in `launcher/src-tauri`) and the cross-engine run above all
+  passed without further change.
 
 ## Offline builds
 

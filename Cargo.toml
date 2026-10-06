@@ -19,8 +19,8 @@ repository = "https://github.com/idan2025/gaming-platform-prns"
 # published personal-rns does not carry the link-MTU patch the platform needs
 # (ENGINE.md "What the fork adds").
 [workspace.dependencies]
-personal-rns = { git = "https://github.com/idan2025/Prns.git", rev = "71e02528ff112eda3eea1948fed53d3c7b6c8554" }
-prns-core = { git = "https://github.com/idan2025/Prns.git", rev = "71e02528ff112eda3eea1948fed53d3c7b6c8554" }
+personal-rns = { git = "https://github.com/idan2025/Prns.git", rev = "fe63af994562016747be050c2d93078c3daf9bee" }
+prns-core = { git = "https://github.com/idan2025/Prns.git", rev = "fe63af994562016747be050c2d93078c3daf9bee" }
 
 [profile.release]
 codegen-units = 1

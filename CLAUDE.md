@@ -550,7 +550,7 @@ the doc and say so in the commit.
 ## Measure the engine, never quote its README
 
 Prns facts in this repo are read out of the pinned fork, checked out at
-`/home/pi/prns-fork` (branch `platform/0.3.7-hotfix.5`, `ENGINE.md`). That is
+`/home/pi/prns-fork` (branch `platform/main-2026-10-06`, `ENGINE.md`). That is
 **not** the tree vendored in `svencoop-prns` at
 `/home/pi/svencoop-prns-clone/vendor`, which is still `v0.3.7` — read engine
 facts from the fork, and read the vendor copy only for what a deployed v0.1.10

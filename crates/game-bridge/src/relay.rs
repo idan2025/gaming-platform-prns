@@ -672,7 +672,9 @@ impl BridgeSession {
                 // bridge is administered by whoever runs it, and a node's
                 // control surface is the agent's uplink — never a second one
                 // the operator did not ask for.
-                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                    personal_rns::remote_control::RemoteControlService::Unavailable,
+                ),
                 pre_configured_destinations: [destination],
                 app_state: state.clone(),
                 storage: GrowableHeap,
@@ -1095,7 +1097,9 @@ impl BridgeSession {
                 // installed this to join one server should not be forwarding
                 // strangers' traffic on a metered connection without knowing.
                 transport_identity: args.relay_transit.then_some(identity),
-                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                    personal_rns::remote_control::RemoteControlService::Unavailable,
+                ),
                 pre_configured_destinations: [destination],
                 app_state: (),
                 storage: GrowableHeap,
@@ -1253,7 +1257,9 @@ impl BridgeSession {
             let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
             let node = PrnsNode::new(PrnsNodeRecipe {
                 transport_identity: Some(identity),
-                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                    personal_rns::remote_control::RemoteControlService::Unavailable,
+                ),
                 // The whole point of the role: no game, no destination.
                 pre_configured_destinations: [] as [PreConfiguredDestination; 0],
                 app_state: (),
@@ -1304,7 +1310,9 @@ impl BridgeSession {
                 // No transport identity, so this node forwards nothing for
                 // anyone. That is structural, not a setting — see BrowserArgs.
                 transport_identity: None,
-                remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                    personal_rns::remote_control::RemoteControlService::Unavailable,
+                ),
                 pre_configured_destinations: [] as [PreConfiguredDestination; 0],
                 app_state: (),
                 storage: GrowableHeap,

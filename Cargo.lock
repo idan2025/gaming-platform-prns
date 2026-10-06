@@ -770,7 +770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1681,6 +1681,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1828,8 +1840,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "personal-rns"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "cfg-if",
  "prns-core",
@@ -1967,8 +1979,8 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "prns-core"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "aes",
  "cbc",
@@ -1983,6 +1995,7 @@ dependencies = [
  "hmac",
  "hybrid-array",
  "md-5",
+ "memchr",
  "prns-macros",
  "rand_core",
  "rmp",
@@ -1994,8 +2007,8 @@ dependencies = [
 
 [[package]]
 name = "prns-interfaces-embassy"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "embassy-futures",
  "embassy-net",
@@ -2010,8 +2023,8 @@ dependencies = [
 
 [[package]]
 name = "prns-interfaces-tokio"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
@@ -2027,13 +2040,13 @@ dependencies = [
 
 [[package]]
 name = "prns-macros"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 
 [[package]]
 name = "prns-runtime"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "bzip2",
  "cfg-if",
@@ -2044,8 +2057,8 @@ dependencies = [
 
 [[package]]
 name = "prns-runtime-embassy"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "critical-section",
  "embassy-futures",
@@ -2061,12 +2074,14 @@ dependencies = [
 
 [[package]]
 name = "prns-runtime-tokio"
-version = "0.3.7"
-source = "git+https://github.com/idan2025/Prns.git?rev=71e02528ff112eda3eea1948fed53d3c7b6c8554#71e02528ff112eda3eea1948fed53d3c7b6c8554"
+version = "0.3.8"
+source = "git+https://github.com/idan2025/Prns.git?rev=fe63af994562016747be050c2d93078c3daf9bee#fe63af994562016747be050c2d93078c3daf9bee"
 dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "heapless 0.8.0",
+ "nix",
+ "portable-atomic",
  "prns-core",
  "prns-runtime",
  "rtrb",
@@ -2144,7 +2159,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2323,7 +2338,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2735,7 +2750,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3226,7 +3241,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

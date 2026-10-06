@@ -281,7 +281,9 @@ impl LanSession {
                 let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
                 let node = PrnsNode::new(PrnsNodeRecipe {
                     transport_identity: args.relay_transit.then_some(secret.clone()),
-                    remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                    remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                        personal_rns::remote_control::RemoteControlService::Unavailable,
+                    ),
                     pre_configured_destinations: [room_config(
                         &args.profile.app_name,
                         &[ASPECT_LAN],
@@ -412,7 +414,9 @@ impl LanSession {
                 let (event_tx, event_rx) = mpsc::unbounded_channel::<BridgeEvent>();
                 let node = PrnsNode::new(PrnsNodeRecipe {
                     transport_identity: args.relay_transit.then_some(secret.clone()),
-                    remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                    remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                        personal_rns::remote_control::RemoteControlService::Unavailable,
+                    ),
                     pre_configured_destinations: [room_config(
                         &args.profile.app_name,
                         &[ASPECT_LAN_MEMBER],

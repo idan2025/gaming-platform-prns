@@ -395,7 +395,9 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
                     // An agent is infrastructure: it carries transit for others,
                     // like the index node, unlike a player's client.
                     transport_identity: Some(secret),
-                    remote_control: personal_rns::remote_control::RemoteControlService::Unavailable,
+                    remote_control: personal_rns::runtime::RemoteControlNodeSetup::new(
+                        personal_rns::remote_control::RemoteControlService::Unavailable,
+                    ),
                     pre_configured_destinations: [destination],
                     app_state: state,
                     storage: GrowableHeap,
