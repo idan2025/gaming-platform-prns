@@ -74,6 +74,26 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.26
+
+The engine underneath moved again: Prns `v0.3.7-hotfix.5` to upstream `main`
+as of 2026-10-06. Upstream has not tagged a release since hotfix.5, so this pin
+is a commit, not a tag; `ENGINE.md` says which. Nothing to reconfigure, and
+nothing a player or operator sees changes.
+
+### Still compatible with what is already deployed
+
+Tested the same way as v0.2.16: the v0.1.10 `sc-rns-bridge` and this
+`game-bridge` found each other by announce and passed 32, 600 and 1400-byte
+datagrams both ways, each side taking a turn as the server.
+
+### Still one patch, and remote control is still off
+
+The fork still carries one commit, the one that lets a link packet hold a whole
+game datagram (1967 B instead of 431); it applied to the new base unchanged.
+Prns changed how a node's remote control is set up, and every role here sets it
+up switched off, exactly as before.
+
 ## v0.2.25
 
 ### Six more Source games
