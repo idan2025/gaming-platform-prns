@@ -136,8 +136,9 @@ jobs:
           "GAME_BRIDGE_WINTUN_DLL=$env:RUNNER_TEMP\wintun\wintun.dll" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # A new adapter is an "unidentified network", which Windows files under
-      # the Public profile and firewalls. On a player's machine the game asks
-      # for its own rule; on a throwaway runner, off is the honest equivalent.
+      # the Public profile and firewalls. Off here, for the adapter test alone;
+      # the firewall test below turns it back on, because "the game asks for
+      # its own rule" turned out not to be true on a player's machine.
       - name: Firewall off (ephemeral runner)
         shell: pwsh
         run: netsh advfirewall set allprofiles state off
@@ -161,6 +162,20 @@ jobs:
 
       - name: Test
         run: cargo test -p game-bridge --test lan_wintun -- --nocapture
+
+      # Then the firewall a player actually has: on, and blocking every
+      # inbound connection nothing allows. The first real NFSU2 race in a room
+      # hung on exactly this, and the "off" above had hidden it — so this proves
+      # the room notices, opens it (lan-helper), and lifts a program's Block
+      # rule (`tests/lan_wintun_firewall.rs`).
+      - name: Firewall on, blocking inbound
+        shell: pwsh
+        run: |
+          netsh advfirewall set allprofiles state on
+          netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound
+
+      - name: Test with the firewall on
+        run: cargo test -p game-bridge --test lan_wintun_firewall -- --nocapture
 
   launcher:
     name: launcher builds ${{ matrix.os }}

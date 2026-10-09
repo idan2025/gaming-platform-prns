@@ -455,7 +455,7 @@ mod tests {
                 assert_eq!(r.tlvs[0].kind, 0xFE);
                 assert_eq!(r.tlvs[0].data, vec![1, 2, 3]);
                 assert_eq!(r.tlvs[1].kind, 0xFF);
-                assert_eq!(r.tlvs[1].data, vec![]);
+                assert_eq!(r.tlvs[1].data, Vec::<u8>::new());
             }
             _ => panic!("expected Record"),
         }

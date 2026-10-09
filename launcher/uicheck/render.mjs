@@ -159,6 +159,12 @@ function makeInvoke(scenario) {
       case 'check_room':
         if (!scenario.roomCheck) throw new Error(`unknown command ${cmd}`);
         return scenario.roomCheck;
+      case 'fix_room_firewall':
+      case 'unblock_room_programs':
+        if (scenario.firewallFails) throw new Error(scenario.firewallFails);
+        if (!scenario.roomAfterFix) throw new Error(`unknown command ${cmd}`);
+        scenario.room = scenario.roomAfterFix;
+        return scenario.roomAfterFix;
       default:
         throw new Error(`the UI called an unknown command: ${cmd}`);
     }
@@ -173,6 +179,7 @@ async function run(label, scenario, assertions) {
   const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole });
   const { window } = dom;
   window.__TAURI__ = { core: { invoke: makeInvoke(scenario) } };
+  scenario.beforeApp?.(window);
   window.eval(appJs);
   // init() runs a few awaits deep; let the microtask queue drain.
   for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
@@ -548,7 +555,7 @@ const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r =>
 const noRoom = {
   active: false, role: null, game_id: null, name: null, room_hash: null, address: null,
   subnet: null, members: [], adapter: 'none', error: null, refused: null,
-  firewall: { dropped: [], advice: null, heads_up: null, command: null },
+  firewall: { dropped: [], advice: null, heads_up: null, command: null, can_fix: false, blocking_programs: [], other_firewalls: [] },
 };
 
 const lanGame = (lan) => ({
@@ -586,8 +593,9 @@ const memberRoom = {
   address: '198.19.4.2', subnet: '198.19.0.0/16',
   members: [{ address: '198.19.1.1', is_self: false }, { address: '198.19.4.2', is_self: true }],
   adapter: 'up', error: null, refused: null,
-  firewall: { dropped: [], advice: null, heads_up: null, command: null },
+  firewall: { dropped: [], advice: null, heads_up: null, command: null, can_fix: false, blocking_programs: [], other_firewalls: [] },
 };
+const fw = (over) => ({ ...memberRoom.firewall, ...over });
 
 await run('a LAN room is a room, not a server', {
   status: running,
@@ -756,43 +764,93 @@ await run('checking a room shows what failed and who answered', {
 
 // The first real NFSU2 race: the host's ufw dropped the member's join, and the
 // member saw the race in the game and hung joining it. The host's pane must
-// say so, and give the command, without being asked.
-await run('a firewall here dropping the room is shown, with the command', {
+// say so in plain words, and fix it with one click.
+const blockedHost = {
+  ...memberRoom, role: 'host',
+  firewall: fw({
+    dropped: [{ port: 9900, transport: 'tcp', from: '198.19.4.2' }],
+    advice: 'ufw is refusing incoming connections here. Allow the room\u2019s adapter once, in a terminal:',
+    heads_up: 'ufw is on here and refuses incoming connections by default',
+    command: 'sudo ufw allow in on gbl0',
+    can_fix: true,
+  }),
+};
+
+await run('a firewall here dropping the room is said plainly, and fixed with one click', {
   status: running,
   games: [lanGame()],
   lanHelper: readyHelper,
-  room: {
-    ...memberRoom, role: 'host',
-    firewall: {
-      dropped: [{ port: 9900, transport: 'tcp', from: '198.19.4.2' }],
-      advice: 'ufw is refusing incoming connections here. Allow the room\u2019s adapter once, in a terminal:',
-      heads_up: 'ufw is on here and refuses incoming connections by default',
-      command: 'sudo ufw allow in on gbl0',
-    },
-  },
+  room: blockedHost,
+  roomAfterFix: { ...blockedHost, firewall: fw({ can_fix: true, command: 'sudo ufw allow in on gbl0' }) },
   rows: () => [row()],
 }, async (win, doc) => {
   const box = doc.querySelector('#room-body #room-firewall');
   const t = box ? box.textContent : '';
-  check('the dropped connection is named', t.includes('198.19.4.2') && t.includes('TCP 9900'), t);
-  check('with the advice, not the heads-up', t.includes('refusing incoming') && !t.includes('by default'), t);
-  check('and the command, on its own', doc.querySelector('#room-firewall-command')?.textContent === 'sudo ufw allow in on gbl0');
+  check('the blocked join is named, without jargon first', t.includes('198.19.4.2 tried to join a game on this computer') && t.includes('blocked'), t);
+  check('the verdict says not ready', doc.querySelector('#room-verdict')?.textContent.includes('cannot join'));
+  check('the by-hand command is still there, tucked away', doc.querySelector('#room-firewall-command')?.textContent === 'sudo ufw allow in on gbl0');
   const banner = doc.querySelector('#room-banner');
   check('the banner says the room is blocked', banner.classList.contains('err') && banner.textContent.includes('firewall'), banner.textContent);
+  const fix = doc.querySelector('#room-fix');
+  check('a Fix button is offered', fix && !fix.disabled);
+  fix?.click();
+  await settle();
+  check('Fix calls the launcher', calls.includes('fix_room_firewall'));
+  const after = doc.querySelector('#room-firewall')?.textContent || '';
+  check('and says it is done', after.includes('Done'), after);
+  check('and the warning is gone', !after.includes('tried to join'), after);
+  check('and the banner is calm again', !doc.querySelector('#room-banner').classList.contains('err'));
+});
+
+await run('a Fix that was refused says so', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: blockedHost,
+  firewallFails: 'the password prompt was cancelled',
+  rows: () => [row()],
+}, async (win, doc) => {
+  doc.querySelector('#room-fix')?.click();
+  await settle();
+  const t = doc.querySelector('#room-firewall')?.textContent || '';
+  check('the refusal is shown', t.includes('Not changed') && t.includes('cancelled'), t);
+  check('and the warning stays', t.includes('tried to join'), t);
+});
+
+await run('Windows blocking the game, and a third-party firewall, are named', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: {
+    ...memberRoom,
+    firewall: fw({
+      dropped: [{ port: 3282, transport: 'tcp', from: '198.19.1.1' }],
+      can_fix: true,
+      blocking_programs: [{ program: 'speed2.exe', path: 'C:\\Games\\speed2.exe' }],
+      other_firewalls: ['Norton Firewall'],
+    }),
+  },
+  roomAfterFix: memberRoom,
+  rows: () => [row()],
+}, async (win, doc) => {
+  const t = doc.querySelector('#room-firewall')?.textContent || '';
+  check('the blocked program is named', t.includes('Windows is blocking speed2.exe'), t);
+  check('the third-party firewall is named, with what to do', t.includes('Norton Firewall is on') && t.includes('allow Mesh Game Servers'), t);
+  doc.querySelector('#room-unblock')?.click();
+  await settle();
+  check('Unblock calls the launcher', calls.includes('unblock_room_programs'));
 });
 
 await run('a firewall that bites by default is warned about before anything is dropped', {
   status: running,
   games: [lanGame()],
   lanHelper: readyHelper,
-  room: {
-    ...memberRoom,
-    firewall: { dropped: [], advice: null, heads_up: 'ufw is on here and refuses incoming connections by default.', command: 'sudo ufw allow in on gbl0' },
-  },
+  room: { ...memberRoom, firewall: fw({ heads_up: 'ufw is on here.', command: 'sudo ufw allow in on gbl0', can_fix: true }) },
   rows: () => [row()],
 }, async (win, doc) => {
   const t = doc.querySelector('#room-firewall')?.textContent || '';
-  check('the heads-up is shown', t.includes('by default'), t);
+  check('the heads-up is shown', t.includes('may stop the others'), t);
+  check('with a Fix button', !!doc.querySelector('#room-fix'));
   check('the banner is not an error yet', !doc.querySelector('#room-banner').classList.contains('err'));
 });
 
@@ -804,6 +862,26 @@ await run('no firewall to speak of shows nothing', {
   rows: () => [row()],
 }, async (win, doc) => {
   check('no firewall box', !doc.querySelector('#room-firewall'));
+});
+
+// Nobody should have to know there is a check: it runs when someone joins.
+await run('the room checks itself when someone joins, and says ready', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: memberRoom,
+  roomCheck: {
+    ok: true, address: '198.19.4.2', port: 3979,
+    findings: ['The room works: every member heard this machine\u2019s LAN broadcasts and answered.'],
+    members: [{ address: '198.19.1.1', ok: true, round_trip_ms: 31, tcp_unanswered: [] }],
+  },
+  rows: () => [row()],
+  beforeApp: (win) => { win.GPP_AUTO_CHECK_DELAY_MS = 0; },
+}, async (win, doc) => {
+  await new Promise(r => setTimeout(r, 20));
+  await settle();
+  check('check_room ran without a click', calls.includes('check_room'));
+  check('the verdict is ready to play', doc.querySelector('#room-verdict')?.textContent.includes('Ready to play'), doc.querySelector('#room-verdict')?.textContent);
 });
 
 await run('a room check needs somebody to answer', {

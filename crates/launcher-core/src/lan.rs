@@ -126,6 +126,13 @@ pub struct RoomView {
 }
 
 /// This machine's firewall, as far as the room can tell (`game_bridge::lan_firewall`).
+///
+/// The room's helper opens the firewall itself where it runs with full
+/// privilege (Windows, and a Linux room through `pkexec`), so most players
+/// never see this. What is left for the UI: a **Fix** button where the helper
+/// could not ([`Launcher::fix_room_firewall`]), Windows' own Block rules for a
+/// program ([`Launcher::unblock_room_programs`]), and third-party firewalls,
+/// which only the player can open.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RoomFirewallView {
     /// Members' connections that reached this machine and that nothing here
@@ -139,8 +146,27 @@ pub struct RoomFirewallView {
     /// known to refuse incoming connections (ufw, firewalld); `command` again.
     pub heads_up: Option<String>,
     /// The command that opens this machine's firewall to the room adapter, when
-    /// the firewall is one it knows. Lines are separate commands.
+    /// the firewall is one it knows: the by-hand way, for whoever wants it.
     pub command: Option<String>,
+    /// Whether the Fix button can do it for the player — one password or
+    /// administrator prompt.
+    pub can_fix: bool,
+    /// Windows Block rules for a program, which beat any allow: what Windows
+    /// made when someone clicked "Cancel" on that program's firewall prompt.
+    /// Read once something was dropped.
+    pub blocking_programs: Vec<RoomBlockView>,
+    /// Third-party firewalls Windows reports as on. They ignore Windows
+    /// Firewall's rules: only the player can open them.
+    pub other_firewalls: Vec<String>,
+}
+
+/// One Windows Block rule, as the room pane names it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomBlockView {
+    /// The program's file name, e.g. `speed2.exe`.
+    pub program: String,
+    /// Where it is.
+    pub path: String,
 }
 
 /// One connection nothing here answered.
@@ -241,6 +267,21 @@ pub(crate) struct RoomState {
     phase: watch::Receiver<AdapterPhase>,
     /// Which firewall this machine runs, read once when the room opens.
     firewall: game_bridge::lan_firewall::LocalFirewall,
+    /// The room's helper runs with full privilege (Windows; Linux through
+    /// `pkexec`), so it opened the firewall itself.
+    helper_opened_firewall: bool,
+    /// Windows' firewall facts, read once something is dropped.
+    facts: Arc<std::sync::Mutex<FactsState>>,
+}
+
+/// [`RoomState::facts`]: read in the background, since PowerShell takes a
+/// second or two and the room pane polls.
+#[derive(Debug, Default)]
+pub(crate) enum FactsState {
+    #[default]
+    Unread,
+    Reading,
+    Read(game_bridge::lan_firewall::WindowsFacts),
 }
 
 /// Where `lan-helper` ships: beside this executable, on every platform the
@@ -428,8 +469,84 @@ impl Launcher {
         if !self.lan_helper().await.can_grant {
             return Err(anyhow!("this launcher cannot grant the helper a permission (portable, an AppImage, or not Linux)"));
         }
-        self.setcap(&["cap_net_admin+ep"]).await?;
+        // The helper grants itself and opens the firewall to the rooms, under
+        // one password prompt. Run in place: the capability lands on this file.
+        self.run_helper_elevated(vec!["grant".to_string()], true).await?;
+        self.mark_room_firewall_opened().await;
         Ok(self.lan_helper().await)
+    }
+
+    /// Open this machine's firewall to LAN rooms, for good: the room pane's
+    /// Fix. One password (Linux) or administrator (Windows) prompt.
+    pub async fn fix_room_firewall(&self) -> Result<RoomView> {
+        if self.portable {
+            return Err(anyhow!("a portable launcher changes nothing outside its folder; its rooms open the firewall for themselves"));
+        }
+        self.run_helper_elevated(vec!["allow-rooms".to_string()], false).await?;
+        self.mark_room_firewall_opened().await;
+        self.forget_firewall_findings().await;
+        Ok(self.room_status().await)
+    }
+
+    /// Disable the Windows Block rules the room pane listed — which beat any
+    /// allow — through one administrator prompt.
+    pub async fn unblock_room_programs(&self) -> Result<RoomView> {
+        let names: Vec<String> = {
+            let inner = self.inner.lock().await;
+            let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
+            let facts = room.facts.lock().expect("facts lock");
+            match &*facts {
+                FactsState::Read(f) => f.blocks.iter().map(|b| hex::encode(b.name.as_bytes())).collect(),
+                _ => Vec::new(),
+            }
+        };
+        if names.is_empty() {
+            return Err(anyhow!("Windows reports no program blocked"));
+        }
+        let mut args = vec!["unblock".to_string()];
+        args.extend(names);
+        self.run_helper_elevated(args, false).await?;
+        self.forget_firewall_findings().await;
+        Ok(self.room_status().await)
+    }
+
+    async fn run_helper_elevated(&self, args: Vec<String>, in_place: bool) -> Result<String> {
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            let path = helper_path()
+                .filter(|p| p.is_file())
+                .ok_or_else(|| anyhow!("lan-helper is not beside this launcher"))?;
+            tokio::task::spawn_blocking(move || {
+                game_bridge::lan_adapter::run_helper_elevated(&path, &args, in_place)
+            })
+            .await?
+            .map_err(|e| anyhow!("{e}"))
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = (args, in_place);
+            Err(anyhow!("LAN rooms are not built for this platform yet"))
+        }
+    }
+
+    async fn mark_room_firewall_opened(&self) {
+        let mut settings = self.settings.lock().await;
+        if !settings.room_firewall_opened {
+            settings.room_firewall_opened = true;
+            if let Err(e) = self.persist(&settings) {
+                tracing::debug!(error = %e, "remembering that the firewall was opened");
+            }
+        }
+    }
+
+    /// The firewall just changed: drop the old warnings and read Windows'
+    /// facts again next time something is dropped.
+    async fn forget_firewall_findings(&self) {
+        let inner = self.inner.lock().await;
+        if let Some(room) = &inner.room {
+            room.session.connect_watch().forget();
+            *room.facts.lock().expect("facts lock") = FactsState::Unread;
+        }
     }
 
     /// Take the granted permission back: rooms prompt again, and nothing of
@@ -549,6 +666,7 @@ impl Launcher {
         let firewall = tokio::task::spawn_blocking(game_bridge::lan_firewall::detect)
             .await
             .unwrap_or(game_bridge::lan_firewall::LocalFirewall::Unknown);
+        let helper_opened_firewall = helper.mode != "granted";
         inner.room = Some(RoomState {
             role,
             game_id,
@@ -559,6 +677,8 @@ impl Launcher {
             task,
             phase: phase_rx,
             firewall,
+            helper_opened_firewall,
+            facts: Default::default(),
         });
         drop(inner);
         Ok(self.room_status().await)
@@ -612,6 +732,7 @@ impl Launcher {
 
     /// The room this launcher is in, as the UI shows it.
     pub async fn room_status(&self) -> RoomView {
+        let inner_flag = self.settings.lock().await.room_firewall_opened;
         let inner = self.inner.lock().await;
         let Some(room) = &inner.room else { return RoomView::none() };
         let view = room.session.view();
@@ -635,7 +756,7 @@ impl Launcher {
             adapter: adapter.to_string(),
             error,
             refused: view.refused.map(|r| r.to_string()),
-            firewall: firewall_view(room),
+            firewall: firewall_view(room, self.portable, inner_flag),
         }
     }
 
@@ -645,9 +766,28 @@ impl Launcher {
     }
 }
 
+/// Whether the Fix button can open the firewall, and whether to warn before
+/// anything is dropped.
+///
+/// A portable launcher installs nothing, so its Fix would be the per-room
+/// helper's job — which already ran. The heads-up is only for a room whose
+/// helper could not open the firewall itself: a capability-granted Linux
+/// helper cannot run ufw. Once the player has opened it, it stops.
+pub(crate) fn fix_and_heads_up(
+    firewall: game_bridge::lan_firewall::LocalFirewall,
+    portable: bool,
+    helper_present: bool,
+    helper_opened_firewall: bool,
+    opened_before: bool,
+) -> (bool, bool) {
+    let can_fix =
+        firewall != game_bridge::lan_firewall::LocalFirewall::Unknown && !portable && helper_present;
+    (can_fix, can_fix && !helper_opened_firewall && !opened_before)
+}
+
 /// What the room's firewall watch has seen, and what to tell the player.
-fn firewall_view(room: &RoomState) -> RoomFirewallView {
-    use game_bridge::lan_firewall::{advice, fix_command, heads_up};
+fn firewall_view(room: &RoomState, portable: bool, opened_before: bool) -> RoomFirewallView {
+    use game_bridge::lan_firewall::{advice, fix_command, heads_up, LocalFirewall};
     let dropped: Vec<RoomDroppedView> = room
         .session
         .connect_watch()
@@ -655,12 +795,54 @@ fn firewall_view(room: &RoomState) -> RoomFirewallView {
         .into_iter()
         .map(|d| RoomDroppedView { port: d.port, transport: "tcp", from: d.from.to_string() })
         .collect();
-    RoomFirewallView {
+    let (can_fix, warn_first) = fix_and_heads_up(
+        room.firewall,
+        portable,
+        helper_path().is_some_and(|p| p.is_file()),
+        room.helper_opened_firewall,
+        opened_before,
+    );
+    let mut view = RoomFirewallView {
         advice: (!dropped.is_empty()).then(|| advice(room.firewall, ADAPTER_NAME)),
-        heads_up: heads_up(room.firewall),
+        heads_up: warn_first.then(|| heads_up(room.firewall)).flatten(),
         command: fix_command(room.firewall, ADAPTER_NAME),
+        can_fix,
+        blocking_programs: Vec::new(),
+        other_firewalls: Vec::new(),
         dropped,
+    };
+    if room.firewall == LocalFirewall::Windows && !view.dropped.is_empty() {
+        let mut facts = room.facts.lock().expect("facts lock");
+        match &*facts {
+            FactsState::Unread => {
+                *facts = FactsState::Reading;
+                let slot = room.facts.clone();
+                tokio::task::spawn_blocking(move || {
+                    let read = game_bridge::lan_firewall::windows_facts(&game_bridge::lan_firewall::System)
+                        .unwrap_or_default();
+                    *slot.lock().expect("facts lock") = FactsState::Read(read);
+                });
+            }
+            FactsState::Reading => {}
+            FactsState::Read(f) => {
+                view.blocking_programs = f
+                    .blocks
+                    .iter()
+                    .map(|b| RoomBlockView {
+                        program: b
+                            .program
+                            .rsplit(['\\', '/'])
+                            .next()
+                            .unwrap_or(&b.program)
+                            .to_string(),
+                        path: b.program.clone(),
+                    })
+                    .collect();
+                view.other_firewalls = f.other_firewalls.clone();
+            }
+        }
     }
+    view
 }
 
 enum RoomRequest {
@@ -743,10 +925,28 @@ mod tests {
             advice: Some("ufw is refusing incoming connections here.".into()),
             heads_up: None,
             command: Some("sudo ufw allow in on gbl0".into()),
+            can_fix: true,
+            blocking_programs: vec![RoomBlockView {
+                program: "speed2.exe".into(),
+                path: "C:\\Games\\speed2.exe".into(),
+            }],
+            other_firewalls: vec!["Norton Firewall".into()],
         })
         .unwrap();
-        assert_eq!(keys(&f), ["advice", "command", "dropped", "heads_up"]);
+        assert_eq!(
+            keys(&f),
+            [
+                "advice",
+                "blocking_programs",
+                "can_fix",
+                "command",
+                "dropped",
+                "heads_up",
+                "other_firewalls"
+            ]
+        );
         assert_eq!(keys(&f["dropped"][0]), ["from", "port", "transport"]);
+        assert_eq!(keys(&f["blocking_programs"][0]), ["path", "program"]);
     }
 
     fn facts() -> HelperFacts {
@@ -791,6 +991,19 @@ mod tests {
         assert_eq!(v["ok"], false, "an unanswered TCP port fails the member");
         assert_eq!(v["members"][0]["tcp_unanswered"][0], 9900);
         assert_eq!(v["members"][0]["round_trip_ms"], 12);
+    }
+
+    /// The player who granted the helper before the launcher opened firewalls
+    /// is the one a heads-up is for; nobody whose room already did it.
+    #[test]
+    fn a_heads_up_is_only_for_a_room_whose_helper_could_not_open_the_firewall() {
+        use game_bridge::lan_firewall::LocalFirewall::{Ufw, Unknown, Windows};
+        assert_eq!(fix_and_heads_up(Ufw, false, true, false, false), (true, true), "granted, never opened");
+        assert_eq!(fix_and_heads_up(Ufw, false, true, true, false), (true, false), "per-room: the helper did it");
+        assert_eq!(fix_and_heads_up(Ufw, false, true, false, true), (true, false), "opened before");
+        assert_eq!(fix_and_heads_up(Ufw, true, true, false, false), (false, false), "portable installs nothing");
+        assert_eq!(fix_and_heads_up(Unknown, false, true, false, false), (false, false));
+        assert_eq!(fix_and_heads_up(Windows, false, false, true, false), (false, false), "no helper");
     }
 
     #[tokio::test]

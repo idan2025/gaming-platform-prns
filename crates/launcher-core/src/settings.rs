@@ -79,6 +79,11 @@ pub struct LauncherSettings {
     /// bootstrap problem every time.
     #[serde(default)]
     pub interfaces: Vec<LauncherInterface>,
+    /// This launcher has opened the firewall to LAN rooms once (the grant, or
+    /// the room pane's Fix). Only stops a heads-up from repeating; the room's
+    /// own watch still says if something is dropped.
+    #[serde(default)]
+    pub room_firewall_opened: bool,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.

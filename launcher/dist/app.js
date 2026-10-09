@@ -41,9 +41,17 @@ const state = {
   roomBusy: false,
   // The last room check (`check_room`), for the room it was run in.
   roomCheck: { busy: false, result: null, error: null, hash: null },
+  // The room pane's Fix and Unblock, while one runs and what it said.
+  firewallAction: { busy: false, message: null, error: false },
+  // Which member set the room was last checked for by itself.
+  autoCheckSig: null,
+  autoCheckTimer: null,
   hostDraft: { game_id: null, name: '' },
   roomPanelSig: null,
 };
+
+// The headless render check shortens it before this script loads.
+const AUTO_CHECK_DELAY_MS = window.GPP_AUTO_CHECK_DELAY_MS ?? 3000;
 
 const LINK_CLASS = { 1: 'Low-rate', 2: 'TCP / bursty', 3: 'High-bitrate' };
 
@@ -1565,6 +1573,7 @@ async function pollRoom() {
   }
   renderRoomBanner();
   renderRoomPanel();
+  maybeAutoCheck();
 }
 
 function roomLine(r) {
@@ -1715,31 +1724,128 @@ function roomFirewallDropped(r) {
   return (r && r.firewall && r.firewall.dropped) || [];
 }
 
-// This machine's firewall (`game_bridge::lan_firewall`). A member's connection
-// that reached the room adapter and that nothing here answered was dropped by
-// a firewall on this machine: the others see a game hosted here and hang
-// joining it. The launcher never changes the firewall itself — a rule would
-// outlive the room — so it says what to run, where it can be copied.
+// This machine's firewall (`game_bridge::lan_firewall`). The room's helper
+// opens it on its own wherever it already runs with full privilege, so most
+// players never see this. What is left: a member's connection that reached
+// this machine and that nothing here answered — the others see a game hosted
+// here and hang joining it — with a Fix button that opens the firewall under
+// one password or administrator prompt; Windows' own block on a program; and
+// a third-party firewall, which only the player can open.
 function renderRoomFirewall(parent, r) {
   const f = r.firewall;
   if (!f) return; // an older shell
   const dropped = roomFirewallDropped(r);
-  const text = dropped.length ? f.advice : f.heads_up;
-  if (!dropped.length && !text) return;
+  const blocks = f.blocking_programs || [];
+  const others = f.other_firewalls || [];
+  const fw = state.firewallAction;
+  if (!dropped.length && !f.heads_up && !fw.message) return;
   const box = el('div', 'room-firewall');
   box.id = 'room-firewall';
   dropped.forEach(d => box.appendChild(el('p', 'room-err',
-    d.from + ' tried to connect to this machine on ' + d.transport.toUpperCase() + ' ' + d.port
-    + ' and nothing here answered: a firewall on this machine is dropping the room’s connections, '
-    + 'so the others can see a game hosted here but not join it.')));
-  if (text) box.appendChild(el('p', dropped.length ? 'small' : 'warn-line', text));
-  if (f.command) {
+    d.from + ' tried to join a game on this computer (' + d.transport.toUpperCase() + ' ' + d.port
+    + '), but this computer’s firewall blocked it.')));
+  if (!dropped.length && f.heads_up) {
+    box.appendChild(el('p', 'warn-line',
+      'This computer’s firewall may stop the others from joining games you host here.'));
+  }
+  if (others.length) {
+    box.appendChild(el('p', 'room-err',
+      others.join(' and ') + (others.length === 1 ? ' is' : ' are')
+      + ' on, and blocks the room no matter what Windows allows. Open it and allow Mesh Game Servers '
+      + 'and your game, or switch it off while you play.'));
+  }
+  if (blocks.length) {
+    box.appendChild(el('p', 'room-err',
+      'Windows is blocking ' + blocks.map(b => b.program).join(', ')
+      + ' — somebody once said no to its firewall question.'));
+    const u = el('button', 'btn-join', fw.busy ? 'Working…' : 'Unblock');
+    u.type = 'button';
+    u.id = 'room-unblock';
+    u.disabled = fw.busy;
+    u.title = 'Windows asks for administrator rights once.';
+    u.onclick = () => firewallAction('unblock_room_programs');
+    box.appendChild(u);
+  }
+  if (f.can_fix && (dropped.length || f.heads_up)) {
+    const b = el('button', 'btn-join', fw.busy ? 'Working…' : 'Fix it');
+    b.type = 'button';
+    b.id = 'room-fix';
+    b.disabled = fw.busy;
+    b.title = 'Lets LAN rooms through this computer’s firewall, for good. You are asked for your '
+      + 'password (or administrator rights) once.';
+    b.onclick = () => firewallAction('fix_room_firewall');
+    box.appendChild(b);
+  }
+  if (fw.message) box.appendChild(el('p', fw.error ? 'room-err' : 'check-ok', fw.message));
+  if (f.command && (dropped.length || f.heads_up)) {
+    const manual = el('details', 'small');
+    manual.appendChild(el('summary', '', 'Or do it yourself'));
+    if (f.advice) manual.appendChild(el('p', 'small', f.advice));
     const pre = el('pre', 'room-command', f.command);
     pre.id = 'room-firewall-command';
-    pre.title = 'Copy this and run it yourself. The launcher does not change your firewall.';
-    box.appendChild(pre);
+    manual.appendChild(pre);
+    box.appendChild(manual);
   }
   parent.appendChild(box);
+}
+
+async function firewallAction(cmd) {
+  if (state.firewallAction.busy) return;
+  state.firewallAction = { busy: true, message: null, error: false };
+  renderRoomPanel(true);
+  try {
+    state.room = await invoke(cmd);
+    state.firewallAction = { busy: false, error: false,
+      message: 'Done. Ask the others to try joining again.' };
+    // What was wrong may now be right: check again.
+    state.autoCheckSig = null;
+  } catch (err) {
+    state.firewallAction = { busy: false, error: true,
+      message: 'Not changed: ' + String(err && err.message || err) };
+  }
+  renderRoomBanner();
+  renderRoomPanel(true);
+}
+
+// One line a player can read without knowing what a port is.
+function renderRoomVerdict(parent, r) {
+  const others = r.members.filter(m => !m.is_self).length;
+  const c = state.roomCheck;
+  let text = null, cls = 'small';
+  if (roomFirewallDropped(r).length) {
+    text = 'Not ready: the others cannot join games on this computer yet.';
+    cls = 'room-err';
+  } else if (r.adapter !== 'up') {
+    return;
+  } else if (!others) {
+    text = 'Waiting for someone to join the room.';
+  } else if (c.busy) {
+    text = 'Checking the room…';
+  } else if (c.result && c.hash === r.room_hash) {
+    text = c.result.ok ? 'Ready to play. Start the game and use its LAN list.' : 'Not ready yet — see below.';
+    cls = c.result.ok ? 'check-ok' : 'room-err';
+  }
+  if (!text) return;
+  const p = el('p', cls, text);
+  p.id = 'room-verdict';
+  parent.appendChild(p);
+}
+
+// Check the room by itself whenever someone joins or leaves, so nobody has to
+// know there is a check to run. A few seconds after the change: the newcomer's
+// adapter needs a moment to come up and answer.
+function maybeAutoCheck() {
+  const r = state.room;
+  if (!r || !r.active || r.adapter !== 'up') return;
+  const others = r.members.filter(m => !m.is_self).map(m => m.address).sort();
+  if (!others.length) return;
+  const sig = r.room_hash + '|' + others.join(',');
+  if (sig === state.autoCheckSig) return;
+  state.autoCheckSig = sig;
+  clearTimeout(state.autoCheckTimer);
+  state.autoCheckTimer = setTimeout(() => {
+    if (state.room && state.room.active && !state.roomCheck.busy) checkRoom();
+  }, AUTO_CHECK_DELAY_MS);
 }
 
 // The room check sends a real broadcast on the game's own port from this
@@ -1790,6 +1896,8 @@ function renderRoomCheck(parent, r) {
 }
 
 async function leaveRoom() {
+  state.firewallAction = { busy: false, message: null, error: false };
+  state.autoCheckSig = null;
   try {
     await invoke('leave_room');
     hideError();
@@ -1829,7 +1937,7 @@ function renderRoomPanel(force) {
   const body = $('room-body');
   if (!panel || !body) return;
   panel.hidden = !state.roomsAvailable;
-  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, lanGames().map(g => g.id)]);
+  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, state.firewallAction, lanGames().map(g => g.id)]);
   if (!force && sig === state.roomPanelSig) return;
   state.roomPanelSig = sig;
 
@@ -1841,6 +1949,7 @@ function renderRoomPanel(force) {
 
   if (r && r.active) {
     body.appendChild(el('p', '', roomLine(r)));
+    renderRoomVerdict(body, r);
     if (r.room_hash) {
       const code = el('code', 'room-hash', r.room_hash);
       code.title = 'This room’s address. Others find it in their server list.';

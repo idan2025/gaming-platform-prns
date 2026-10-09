@@ -1294,6 +1294,7 @@ dependencies = [
  "personal-rns",
  "prns-core",
  "serde",
+ "serde_json",
  "tokio",
  "toml 0.8.23",
  "tracing",

@@ -455,7 +455,7 @@ impl CheckReport {
                 out.push(format!(
                     "{} did not answer a connection to TCP {}, though the room reaches it: a firewall on \
                      that machine is dropping them, so a game hosted there can be seen but not joined. The \
-                     launcher there names the command that opens it.",
+                     launcher there offers to fix it.",
                     m.address,
                     tcp_ports(&unanswered)
                 ));

@@ -439,9 +439,15 @@ Rules a later change could quietly break:
   a persistent TUN device (`TUNSETPERSIST`): that was v0.2.20's, and a killed
   launcher left `gbl0` behind until reboot. `tests/lan_no_garbage.rs` kills the
   launcher with `SIGKILL` and fails if the adapter or the helper survives.
-- **`lan-helper` does only `serve` and `check`, only on `gbl*` names, with
-  ioctls.** Do not shell out to `ip` from it: file capabilities are not
-  inherited by children.
+  **One exception, decided by the user on 2026-10-09 so rooms are dummy-proof:
+  an installed launcher's firewall rule stays** (see the firewall bullet). A
+  portable launcher's goes with the room.
+- **`lan-helper` does `serve` and `check`, plus `allow-rooms`, `grant` and
+  `unblock` for the firewall, only on `gbl*` names, with ioctls for the
+  adapter.** It runs another program (ufw, firewall-cmd, netsh, setcap,
+  PowerShell) only when fully privileged — root or an administrator — never
+  under a granted `cap_net_admin` alone: file capabilities are not inherited
+  by children. Do not shell out to `ip` from it.
 - **The inbound rule lives in the pump (`lan_filter.rs`), not the firewall.**
   Only declared ports and replies to flows this side opened get in; only
   declared ports get broadcast. `tests/lan_adapter.rs` runs real adapters in
@@ -461,10 +467,12 @@ Rules a later change could quietly break:
   token; a squatter without it is dropped and the real helper still gets in.
   Only packets cross — never add a message that asks the helper to *do*
   something.
-- **The launcher never joins a room row as a server, and never elevates.**
-  Rooms are `launcher-core/src/lan.rs`; a room row's pane sends no probe and
-  its button calls `join_room`. On Linux the helper runs either with a
-  capability granted once (`pkexec setcap`, revocable) or per room through
+- **The launcher never joins a room row as a server, and never elevates
+  itself.** Rooms are `launcher-core/src/lan.rs`; a room row's pane sends no
+  probe and its button calls `join_room`. Only the helper is elevated, and
+  only through the OS prompt. On Linux the helper runs either with a
+  capability granted once (`pkexec lan-helper grant`, run in place so the
+  capability lands on the installed file; revocable) or per room through
   `pkexec`, as a copy staged in `$XDG_RUNTIME_DIR` and deleted the moment it
   has connected back. The stand-in elevator (`GAME_BRIDGE_ELEVATOR`) that
   tests use is compiled out of release builds; keep it that way.
@@ -491,20 +499,39 @@ Rules a later change could quietly break:
   check tells "sent out another network" from "a firewall here" from "that
   member answered nothing". `tests/lan_pack_ports.rs` breaks both halves on
   purpose and requires the check to name each.
-- **The OS firewall can still drop what the pump admits, and the launcher
-  says so rather than fixing it** (2026-10-09, `lan_firewall.rs`). The first
-  real NFSU2 race: the member saw the race and hung joining it, because the
-  CachyOS host's ufw (on, deny incoming, by default) dropped TCP 9900 — a
-  broadcast check cannot see that. The pump's `ConnectWatch` flags a SYN it
-  delivered that the stack never answered (a reset *is* an answer, so a game
-  not hosting yet is never blamed); the room check also connects to every
-  declared TCP port on every member. The room pane shows the command
-  (`sudo ufw allow in on gbl0`, firewalld's, or on Windows one rule for
-  `-RemoteAddress 198.18.0.0/15` — never `-InterfaceAlias`, because every
-  room's Wintun adapter is new). Run once, it covers every room and game.
-  **Never run it for the player**: a
-  rule outlives the room, and the helper only moves packets. Pinned by fault 3
-  in `tests/lan_pack_ports.rs`, a blackhole route standing in for the firewall.
+- **The OS firewall can still drop what the pump admits, so the room opens
+  it** (2026-10-09, `lan_firewall.rs`). The first real NFSU2 race: the member
+  saw the race and hung joining it, because the CachyOS host's ufw (on, deny
+  incoming, by default) dropped TCP 9900 — a broadcast check cannot see that.
+  - **The helper opens it on its own, where it already holds privilege**:
+    every Windows room's `serve` (it is elevated anyway) and a Linux room
+    through `pkexec`; `grant` does it in the same password prompt. No prompt
+    a player would not have seen already. A capability-granted Linux helper
+    cannot run ufw, so those rooms get a heads-up and a **Fix** button
+    (`allow-rooms` through `pkexec`).
+  - **What is opened is the room, never the machine**: ufw/firewalld on the
+    `gbl0` name; on Windows one rule for `remoteip=198.18.0.0/15`, never the
+    adapter — every room's Wintun adapter is new, with a new GUID. The pump
+    still admits only declared ports behind it.
+  - **Installed keeps, portable removes only its own.** Windows' portable rule
+    has its own name (`PORTABLE_RULE_NAME`), replaced at the next portable
+    start if a crash left it; a ufw rule that was already there ("Skipping
+    adding existing rule") is never deleted — it may be the player's.
+  - **Only packets cross the relay still.** The helper opens the firewall as
+    part of `serve` or because a person ran a subcommand through the prompt;
+    the launcher never asks it to over the relay.
+  - **What it cannot open, it names.** The pump's `ConnectWatch` flags a SYN
+    it delivered that the stack never answered (a reset *is* an answer, so a
+    game not hosting yet is never blamed); then on Windows the launcher reads
+    Block rules for a program (a "Cancel" on a firewall prompt — a block beats
+    any allow) and offers **Unblock**, which *disables* them, and names a
+    third-party firewall from Windows Security. The room check also connects
+    to every declared TCP port on every member, and runs by itself when
+    someone joins.
+  - Pinned by fault 3 in `tests/lan_pack_ports.rs` (a blackhole route standing
+    in for the firewall) and, with Windows Firewall **on**, by
+    `tests/lan_wintun_firewall.rs` in CI's `lan-windows` job. The Linux ufw and
+    firewalld paths are unit-tested against a stand-in only.
 - **A `[lan]` pack's port list is proven carried, not proven complete.**
   `lan_pack_ports.rs` crosses every declared port for every shipped `[lan]`
   pack (found by property), so it cannot notice a port the pack left out;

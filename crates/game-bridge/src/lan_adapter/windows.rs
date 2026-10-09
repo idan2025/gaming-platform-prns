@@ -498,6 +498,60 @@ fn start_helper(helper: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// Run the helper once with administrator rights, through Windows' own
+/// prompt, and wait for it: the launcher's "Fix" and "Unblock". `in_place` is
+/// Linux's distinction; here the helper always runs where it is. Its output is
+/// not visible through the prompt, so success is its exit code.
+pub fn run_helper_elevated(helper: &Path, args: &[String], _in_place: bool) -> io::Result<String> {
+    if is_elevated() {
+        let out = std::process::Command::new(helper).args(args).output()?;
+        return if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+        };
+    }
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let verb = wide(std::ffi::OsStr::new("runas"));
+    let file = wide(helper.as_os_str());
+    // Every argument is a word or hex: none needs quoting.
+    let params = wide(std::ffi::OsStr::new(&args.join(" ")));
+    // SAFETY: plain data, filled below; the strings outlive the call.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = SW_HIDE;
+    // SAFETY: a fully initialized SHELLEXECUTEINFOW.
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the administrator prompt was declined",
+        ));
+    }
+    if info.hProcess.is_null() {
+        return Err(io::Error::other("the helper started without a process handle"));
+    }
+    let mut code = 1u32;
+    // SAFETY: a process handle ShellExecuteExW opened for us, closed after.
+    unsafe {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        GetExitCodeProcess(info.hProcess, &mut code);
+        CloseHandle(info.hProcess);
+    }
+    if code == 0 {
+        Ok(String::new())
+    } else {
+        Err(io::Error::other(format!("lan-helper {} failed (exit {code})", args.join(" "))))
+    }
+}
+
 pub(super) async fn open(
     setup: &AdapterSetup,
     config: &AdapterConfig,
@@ -516,8 +570,10 @@ pub(super) async fn open(
                 extra.push("--wintun".to_string());
                 extra.push(dll.to_string_lossy().into_owned());
             }
+            // Portable: the Wintun driver and this room's firewall rule both go
+            // when the room does.
             if *portable {
-                extra.push("--remove-driver".to_string());
+                extra.push("--portable".to_string());
             }
             let helper = path.clone();
             let remote =

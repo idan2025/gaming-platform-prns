@@ -305,6 +305,16 @@ async fn check_room(state: tauri::State<'_, AppState>) -> Result<RoomCheckView, 
     state.launcher.check_room().await.map_err(fmt_err)
 }
 
+#[tauri::command]
+async fn fix_room_firewall(state: tauri::State<'_, AppState>) -> Result<RoomView, String> {
+    state.launcher.fix_room_firewall().await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn unblock_room_programs(state: tauri::State<'_, AppState>) -> Result<RoomView, String> {
+    state.launcher.unblock_room_programs().await.map_err(fmt_err)
+}
+
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     // Beside the executable first: that is the portable layout, and on Linux
     // `resource_dir` never points there outside a cargo `target/` — it resolves
@@ -405,6 +415,8 @@ pub fn run() {
             leave_room,
             room_status,
             check_room,
+            fix_room_firewall,
+            unblock_room_programs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");

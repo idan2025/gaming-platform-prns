@@ -420,6 +420,39 @@ fn start_helper(path: &std::path::Path, args: Vec<String>) -> io::Result<Option<
     Ok(prefix)
 }
 
+/// Run the helper once as root, through the desktop's password prompt, and
+/// wait for it: the launcher's "Fix" and the one-time grant. `in_place` runs
+/// the file itself — the grant, whose capability must land on it — and
+/// otherwise a staged copy, which root can read even out of an AppImage.
+/// Returns what it printed.
+pub fn run_helper_elevated(
+    path: &std::path::Path,
+    args: &[String],
+    in_place: bool,
+) -> io::Result<String> {
+    let elevator = elevator().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no pkexec to ask for your password; install polkit")
+    })?;
+    let copy = if in_place { None } else { Some(HelperCopy::stage(path)?) };
+    let program = copy.as_ref().map_or(path, |c| c.path());
+    let out = std::process::Command::new(&elevator)
+        .arg(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    drop(copy);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    match out.status.code() {
+        Some(0) => Ok(stdout),
+        // pkexec's own: the dialog was dismissed, or the password was wrong.
+        Some(126) | Some(127) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the password prompt was cancelled",
+        )),
+        _ => Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string())),
+    }
+}
+
 /// Bring the adapter up for `config` and open it.
 pub(super) async fn open(
     setup: &AdapterSetup,
@@ -431,10 +464,12 @@ pub(super) async fn open(
             let fd = tokio::task::spawn_blocking(move || open_configured(&c)).await??;
             Ok(LinuxAdapter::Direct(TunDevice::from_fd(fd)?))
         }
-        AdapterSetup::Helper { path, .. } => {
+        AdapterSetup::Helper { path, portable } => {
             let path = path.clone();
+            // Portable: the helper closes the firewall again after the room.
+            let extra = if *portable { vec!["--portable".to_string()] } else { Vec::new() };
             let remote =
-                super::relayed(config, Vec::new(), move |args| start_helper(&path, args)).await?;
+                super::relayed(config, extra, move |args| start_helper(&path, args)).await?;
             Ok(LinuxAdapter::Relayed(remote))
         }
     }
