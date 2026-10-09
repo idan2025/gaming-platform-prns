@@ -338,7 +338,10 @@ jobs:
         run: |
           set -euo pipefail
           version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' launcher/src-tauri/tauri.conf.json)"
-          arch="$(dpkg --print-architecture)"
+          # x86_64/aarch64, never dpkg's amd64/arm64: those two differ by one
+          # letter, and a CachyOS user ran the arm64 build and got only "the
+          # file could not be run by the operating system".
+          arch="$(uname -m)"
           stage="$RUNNER_TEMP/portable/Mesh Game Servers"
           mkdir -p "$stage/packs" "$stage/portable-data" dist
           cp launcher/src-tauri/target/release/mesh-game-servers "$stage/"
@@ -374,6 +377,16 @@ jobs:
           find launcher/src-tauri/target -type f -path '*/bundle/*' \
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) \
             -exec cp {} dist/ \;
+          # Tauri names the .deb and the AppImage with Debian's amd64/arm64 (the
+          # rpm already says x86_64/aarch64). Rename them so every Linux asset
+          # spells its architecture one way. Only the file name changes; the
+          # .deb's own Architecture field stays what dpkg requires.
+          for f in dist/*_amd64.* dist/*_arm64.*; do
+            [ -e "$f" ] || continue
+            to="${f/_amd64./_x86_64.}"
+            to="${to/_arm64./_aarch64.}"
+            mv "$f" "$to"
+          done
           ls -la dist
 
       - name: Upload to the release
