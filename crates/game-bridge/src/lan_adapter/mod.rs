@@ -93,6 +93,35 @@ impl AdapterConfig {
     }
 }
 
+/// The GUID a room adapter named `name` is created with, as
+/// `(data1, data2, data3, data4)`: the same name, the same GUID, every time.
+///
+/// Wintun with no GUID picks a random one, and Windows treats every adapter
+/// with a new GUID as a new network card: the second room's adapter came up
+/// as "gbl0 2", the third as "gbl0 3", each with a new "Network N" profile
+/// that is Public until someone says otherwise. With the GUID fixed, every
+/// room is the same adapter to Windows. **Never change [`ADAPTER_GUID_BASE`]**:
+/// every installed launcher's adapter would come up as a new one once more.
+pub fn adapter_guid(name: &str) -> (u32, u16, u16, [u8; 8]) {
+    let (d1, d2, d3, base4) = ADAPTER_GUID_BASE;
+    // FNV-1a over the name, folded into the last eight bytes, so another
+    // `gbl*` name gets its own fixed GUID too.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut d4 = base4;
+    for (i, b) in h.to_be_bytes().iter().enumerate() {
+        d4[i] ^= b;
+    }
+    (d1, d2, d3, d4)
+}
+
+/// This project's own GUID, which every room adapter's is derived from.
+pub const ADAPTER_GUID_BASE: (u32, u16, u16, [u8; 8]) =
+    (0x6f1c_2b9e, 0x4a7d, 0x4f3e, [0x9b, 0x21, 0x5c, 0x0d, 0x8e, 0x7a, 0x3f, 0x10]);
+
 /// An adapter name: `gbl` and then letters, digits or `-`, within the 15 bytes
 /// Linux allows (Windows allows more; one rule for both).
 pub fn validate_name(name: &str) -> io::Result<()> {
@@ -273,6 +302,23 @@ pub async fn run_room_on_adapter_reporting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fix for "gbl0 2", "gbl0 3"…: the same name is the same adapter to
+    /// Windows, room after room. Frozen — a changed value renames every
+    /// installed launcher's adapter once more.
+    #[test]
+    fn a_room_adapter_has_the_same_guid_every_time() {
+        assert_eq!(adapter_guid("gbl0"), adapter_guid("gbl0"));
+        assert_ne!(adapter_guid("gbl0"), adapter_guid("gbl1"));
+        assert_eq!(
+            adapter_guid("gbl0"),
+            (0x6f1c_2b9e, 0x4a7d, 0x4f3e, adapter_guid("gbl0").3),
+            "the base is this project's"
+        );
+        assert_eq!(format!("{:02x?}", adapter_guid("gbl0").3), FROZEN_GBL0_DATA4);
+    }
+
+    const FROZEN_GBL0_DATA4: &str = "[ea, a5, 99, 7c, 78, 7c, 89, a0]";
 
     fn config(name: &str, prefix: Ipv4Addr, len: u8, address: Ipv4Addr) -> AdapterConfig {
         AdapterConfig {

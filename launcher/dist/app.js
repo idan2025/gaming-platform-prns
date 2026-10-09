@@ -43,6 +43,8 @@ const state = {
   roomCheck: { busy: false, result: null, error: null, hash: null },
   // The room pane's Fix and Unblock, while one runs and what it said.
   firewallAction: { busy: false, message: null, error: false },
+  // The pack-gaps pane's Allow and Undo, while one runs and what it said.
+  portsAction: { busy: false, message: null, error: false },
   // Which member set the room was last checked for by itself.
   autoCheckSig: null,
   autoCheckTimer: null,
@@ -1731,12 +1733,42 @@ function roomPackGaps(r) {
 // one, so it is said plainly, with a report the player can send.
 function renderRoomPackGaps(parent, r) {
   const g = r.pack_gaps;
-  if (!g || !(g.ports || []).length) return;
+  if (!g) return; // an older shell
+  const missing = g.ports || [];
+  const allowed = g.allowed || [];
+  const act = state.portsAction;
+  if (!missing.length && !allowed.length && !act.message) return;
   const box = el('div', 'room-firewall');
   box.id = 'room-pack-gaps';
-  box.appendChild(el('p', 'room-err',
-    'This game used ports its pack does not list, so the room blocked them. That is probably why '
-    + 'joining fails. Ports it needs: ' + g.ports.join(', ') + '.'));
+  if (missing.length) {
+    box.appendChild(el('p', 'room-err',
+      'This game used ports its pack does not list, so the room blocked them. That is probably why '
+      + 'joining fails. Ports it needs: ' + missing.join(', ') + '.'));
+  }
+  if ((g.can_allow || []).length) {
+    const b = el('button', 'btn-join', act.busy ? 'Working…' : 'Allow on this computer');
+    b.type = 'button';
+    b.id = 'room-allow-ports';
+    b.disabled = act.busy;
+    b.title = 'Lets ' + g.can_allow.join(', ') + ' through for this game on this computer, and opens '
+      + 'its firewall to the room if it is not already. Only room members can use them. Undo any time.';
+    b.onclick = () => portsAction('allow_room_ports', {});
+    box.appendChild(b);
+    box.appendChild(el('p', 'small',
+      'The other computer may need the same: its room pane will offer it after the next try.'));
+  }
+  if (allowed.length) {
+    const line = el('p', 'small', 'Also allowed on this computer for this game: ' + allowed.join(', ') + ' ');
+    const undo = el('button', 'quiet', 'Undo');
+    undo.type = 'button';
+    undo.id = 'room-reset-ports';
+    undo.disabled = act.busy;
+    undo.onclick = () => portsAction('reset_room_ports', {});
+    line.appendChild(undo);
+    box.appendChild(line);
+  }
+  if (act.message) box.appendChild(el('p', act.error ? 'room-err' : 'check-ok', act.message));
+  if (!missing.length) { parent.appendChild(box); return; }
   const ul = el('ul', 'player-list');
   (g.seen || []).forEach(line => ul.appendChild(el('li', 'small', line)));
   box.appendChild(ul);
@@ -1758,6 +1790,43 @@ function renderRoomPackGaps(parent, r) {
     box.appendChild(copy);
   }
   parent.appendChild(box);
+}
+
+// The last resort, for a join that hangs with nothing named: every port above
+// 1024 for this game on this computer. Never system ports, never the OS's own
+// chatter — the launcher refuses those whatever is asked.
+function renderRoomWideOpen(parent, r) {
+  const g = r.pack_gaps;
+  if (!g || r.adapter !== 'up') return;
+  const act = state.portsAction;
+  if (g.wide_open) {
+    const p = el('p', 'warn-line',
+      'Every port above 1024 is open to this room’s members for this game on this computer. ');
+    p.id = 'room-wide-open';
+    const off = el('button', 'quiet', 'Turn off');
+    off.type = 'button';
+    off.id = 'room-wide-off';
+    off.disabled = act.busy;
+    off.onclick = () => portsAction('set_room_wide_open', { on: false });
+    p.appendChild(off);
+    parent.appendChild(p);
+    return;
+  }
+  if (!r.members.some(m => !m.is_self)) return;
+  const d = el('details', 'small');
+  d.id = 'room-still-stuck';
+  d.appendChild(el('summary', '', 'Still can’t join?'));
+  d.appendChild(el('p', 'small',
+    'If the game shows up but joining hangs and nothing above names a port, let this game use every '
+    + 'port above 1024 on this computer. Only room members can reach them; system ports stay shut. '
+    + 'Do it on both computers, then try again.'));
+  const on = el('button', 'quiet', act.busy ? 'Working…' : 'Open more ports for this game');
+  on.type = 'button';
+  on.id = 'room-wide-on';
+  on.disabled = act.busy;
+  on.onclick = () => portsAction('set_room_wide_open', { on: true });
+  d.appendChild(on);
+  parent.appendChild(d);
 }
 
 function roomFirewallDropped(r) {
@@ -1827,6 +1896,31 @@ function renderRoomFirewall(parent, r) {
     box.appendChild(manual);
   }
   parent.appendChild(box);
+}
+
+const PORTS_DONE = {
+  allow_room_ports: 'Allowed. Try joining again — and please still send the report, so the game gets fixed for everyone.',
+  reset_room_ports: 'Done: only the game’s own ports again.',
+  wide_on: 'Every port above 1024 is open to the room for this game. Try joining again.',
+  wide_off: 'Done: only the game’s own ports again.',
+};
+
+async function portsAction(cmd, args) {
+  if (state.portsAction.busy) return;
+  state.portsAction = { busy: true, message: null, error: false };
+  renderRoomPanel(true);
+  const key = cmd === 'set_room_wide_open' ? (args.on ? 'wide_on' : 'wide_off') : cmd;
+  try {
+    state.room = await invoke(cmd, args);
+    state.portsAction = { busy: false, error: false, message: PORTS_DONE[key] };
+    state.autoCheckSig = null;
+  } catch (err) {
+    state.portsAction = { busy: false, error: true,
+      message: 'Not changed: ' + String(err && err.message || err) };
+    try { state.room = await invoke('room_status'); } catch (_) { /* keep the last view */ }
+  }
+  renderRoomBanner();
+  renderRoomPanel(true);
 }
 
 async function firewallAction(cmd) {
@@ -1940,6 +2034,7 @@ function renderRoomCheck(parent, r) {
 
 async function leaveRoom() {
   state.firewallAction = { busy: false, message: null, error: false };
+  state.portsAction = { busy: false, message: null, error: false };
   state.autoCheckSig = null;
   try {
     await invoke('leave_room');
@@ -1980,7 +2075,7 @@ function renderRoomPanel(force) {
   const body = $('room-body');
   if (!panel || !body) return;
   panel.hidden = !state.roomsAvailable;
-  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, state.firewallAction, lanGames().map(g => g.id)]);
+  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, state.firewallAction, state.portsAction, lanGames().map(g => g.id)]);
   if (!force && sig === state.roomPanelSig) return;
   state.roomPanelSig = sig;
 
@@ -2003,6 +2098,7 @@ function renderRoomPanel(force) {
     body.appendChild(ul);
     renderRoomFirewall(body, r);
     renderRoomPackGaps(body, r);
+    renderRoomWideOpen(body, r);
     renderRoomCheck(body, r);
     const leave = el('button', 'quiet', 'Leave room');
     leave.type = 'button';

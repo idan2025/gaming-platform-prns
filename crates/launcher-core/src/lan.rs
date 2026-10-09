@@ -139,28 +139,78 @@ pub struct RoomPackGapsView {
     pub seen: Vec<String>,
     /// The whole finding as one paragraph, for a bug report.
     pub report: Option<String>,
+    /// Of `ports`, those the Allow button would open: none below 1024, none
+    /// already allowed.
+    pub can_allow: Vec<String>,
+    /// Ports this machine already allows for this game on top of its pack's,
+    /// which Undo takes back.
+    pub allowed: Vec<String>,
+    /// The last-resort switch is on: every port above 1024 is open to room
+    /// members for this game, on this machine.
+    pub wide_open: bool,
+}
+
+/// `"udp/3660"`, as settings keep an allowed port.
+fn port_key(p: &game_bridge::lan_filter::LanPort) -> String {
+    match p.proto {
+        game_bridge::lan_filter::LanProto::Udp => format!("udp/{}", p.port),
+        game_bridge::lan_filter::LanProto::Tcp => format!("tcp/{}", p.port),
+    }
+}
+
+/// `"UDP 3660"`, as the pane names a port.
+fn port_label(p: &game_bridge::lan_filter::LanPort) -> String {
+    match p.proto {
+        game_bridge::lan_filter::LanProto::Udp => format!("UDP {}", p.port),
+        game_bridge::lan_filter::LanProto::Tcp => format!("TCP {}", p.port),
+    }
+}
+
+/// A settings key back into a port; anything else is ignored, so a hand-edited
+/// settings file cannot stop a room starting.
+pub(crate) fn parse_port_key(key: &str) -> Option<game_bridge::lan_filter::LanPort> {
+    use game_bridge::lan_filter::{LanPort, LanProto, LOWEST_ALLOWABLE_PORT};
+    let (proto, port) = key.split_once('/')?;
+    let proto = match proto {
+        "udp" => LanProto::Udp,
+        "tcp" => LanProto::Tcp,
+        _ => return None,
+    };
+    let port: u16 = port.parse().ok()?;
+    (port >= LOWEST_ALLOWABLE_PORT).then_some(LanPort { proto, port })
+}
+
+/// The ports a refused-traffic log says a pack is missing, by its fixed end.
+fn suggested_ports(refused: &[game_bridge::lan_filter::Refused]) -> Vec<game_bridge::lan_filter::LanPort> {
+    let mut out: Vec<game_bridge::lan_filter::LanPort> = Vec::new();
+    for r in refused {
+        let p = game_bridge::lan_filter::LanPort { proto: r.proto, port: r.suggested_port() };
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 impl RoomPackGapsView {
-    fn from_refused(refused: &[game_bridge::lan_filter::Refused]) -> Self {
-        if refused.is_empty() {
-            return Self::default();
-        }
-        let mut ports = Vec::new();
-        for r in refused {
-            let proto = match r.proto {
-                game_bridge::lan_filter::LanProto::Udp => "UDP",
-                game_bridge::lan_filter::LanProto::Tcp => "TCP",
-            };
-            let p = format!("{proto} {}", r.suggested_port());
-            if !ports.contains(&p) {
-                ports.push(p);
-            }
-        }
+    fn from_refused(
+        refused: &[game_bridge::lan_filter::Refused],
+        allowed: &[game_bridge::lan_filter::LanPort],
+    ) -> Self {
+        let suggested = suggested_ports(refused);
         Self {
-            ports,
+            ports: suggested.iter().map(port_label).collect(),
             seen: refused.iter().map(|r| r.describe()).collect(),
-            report: Some(game_bridge::lan_check::missing_ports_finding(refused)),
+            report: (!refused.is_empty())
+                .then(|| game_bridge::lan_check::missing_ports_finding(refused)),
+            can_allow: suggested
+                .iter()
+                .filter(|p| p.port >= game_bridge::lan_filter::LOWEST_ALLOWABLE_PORT)
+                .filter(|p| !allowed.contains(p))
+                .map(port_label)
+                .collect(),
+            allowed: allowed.iter().map(port_label).collect(),
+            wide_open: false,
         }
     }
 }
@@ -551,6 +601,103 @@ impl Launcher {
         Ok(self.room_status().await)
     }
 
+    /// Let the ports the room named as missing through, for this game, on this
+    /// machine, from now on: the room pane's Allow. Never a port below 1024.
+    pub async fn allow_room_ports(&self) -> Result<RoomView> {
+        let (game_id, ports) = {
+            let inner = self.inner.lock().await;
+            let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
+            let mut ports = room.session.extra_ports().ports();
+            let new: Vec<_> = suggested_ports(&room.session.refused_log().refused(std::time::Instant::now()))
+                .into_iter()
+                .filter(|p| p.port >= game_bridge::lan_filter::LOWEST_ALLOWABLE_PORT)
+                .filter(|p| !ports.contains(p))
+                .collect();
+            if new.is_empty() {
+                return Err(anyhow!("the room has no missing port to allow"));
+            }
+            room.session.refused_log().forget(&new);
+            ports.extend(new);
+            room.session
+                .extra_ports()
+                .set(ports.clone())
+                .map_err(|p| anyhow!("port {p} is a system port and is never allowed"))?;
+            (room.game_id.clone(), ports)
+        };
+        self.save_extra_ports(&game_id, &ports).await?;
+        self.open_os_firewall_if_needed().await
+    }
+
+    /// The last resort, for a join that fails with no missing port named: let
+    /// every port above 1024 through for this room's game on this machine (or
+    /// stop). Never a system port, never the OS's own chatter; remembered per
+    /// game. Turning it on also opens this computer's firewall to the room if
+    /// it is not open yet, for whichever firewall it runs.
+    pub async fn set_room_wide_open(&self, on: bool) -> Result<RoomView> {
+        let game_id = {
+            let inner = self.inner.lock().await;
+            let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
+            room.session.extra_ports().set_any_high(on);
+            room.game_id.clone()
+        };
+        {
+            let mut settings = self.settings.lock().await;
+            if on {
+                settings.lan_wide_open.insert(game_id);
+            } else {
+                settings.lan_wide_open.remove(&game_id);
+            }
+            self.persist(&settings)?;
+        }
+        if on {
+            return self.open_os_firewall_if_needed().await;
+        }
+        Ok(self.room_status().await)
+    }
+
+    /// The operating system's firewall is the second gate after the room's
+    /// filter. Its room rule covers every port — ufw and firewalld trust the
+    /// room adapter, Windows' rule the room range — so it needs opening only
+    /// if it is not open yet: one password or administrator prompt.
+    async fn open_os_firewall_if_needed(&self) -> Result<RoomView> {
+        let view = self.room_status().await;
+        let f = &view.firewall;
+        if f.can_fix && (f.heads_up.is_some() || !f.dropped.is_empty()) {
+            self.fix_room_firewall().await.map_err(|e| {
+                anyhow!("allowed in the room, but this computer's firewall was not opened: {e}")
+            })?;
+            return Ok(self.room_status().await);
+        }
+        Ok(view)
+    }
+
+    /// Take back every port allowed for this room's game: the pack's own
+    /// ports only, again.
+    pub async fn reset_room_ports(&self) -> Result<RoomView> {
+        let game_id = {
+            let inner = self.inner.lock().await;
+            let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
+            let _ = room.session.extra_ports().set(Vec::new());
+            room.game_id.clone()
+        };
+        self.save_extra_ports(&game_id, &[]).await?;
+        Ok(self.room_status().await)
+    }
+
+    async fn save_extra_ports(
+        &self,
+        game_id: &str,
+        ports: &[game_bridge::lan_filter::LanPort],
+    ) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        if ports.is_empty() {
+            settings.lan_extra_ports.remove(game_id);
+        } else {
+            settings.lan_extra_ports.insert(game_id.to_string(), ports.iter().map(port_key).collect());
+        }
+        self.persist(&settings)
+    }
+
     async fn run_helper_elevated(&self, args: Vec<String>, in_place: bool) -> Result<String> {
         #[cfg(any(target_os = "linux", windows))]
         {
@@ -694,6 +841,19 @@ impl Launcher {
             }
         };
         let session = Arc::new(session);
+        // Ports this player allowed for this game before, on top of its pack's.
+        let extra: Vec<_> = self
+            .settings
+            .lock()
+            .await
+            .lan_extra_ports
+            .get(&game_id)
+            .map(|keys| keys.iter().filter_map(|k| parse_port_key(k)).collect())
+            .unwrap_or_default();
+        let _ = session.extra_ports().set(extra);
+        if self.settings.lock().await.lan_wide_open.contains(&game_id) {
+            session.extra_ports().set_any_high(true);
+        }
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let (phase_tx, phase_rx) = watch::channel(AdapterPhase::WaitingForSeat);
         let task = spawn_room(
@@ -765,7 +925,13 @@ impl Launcher {
             if !matches!(*room.phase.borrow(), AdapterPhase::Up { .. }) {
                 return Err(anyhow!("the room's network adapter is not up yet"));
             }
-            (room.session.clone(), room.policy.clone())
+            let mut policy = room.policy.clone();
+            for p in room.session.extra_ports().ports() {
+                if !policy.ports.contains(&p) {
+                    policy.ports.push(p);
+                }
+            }
+            (room.session.clone(), policy)
         };
         let report = game_bridge::lan_check::check_room(&session, &policy, ADAPTER_NAME).await?;
         Ok(report.into())
@@ -798,9 +964,13 @@ impl Launcher {
             error,
             refused: view.refused.map(|r| r.to_string()),
             firewall: firewall_view(room, self.portable, inner_flag),
-            pack_gaps: RoomPackGapsView::from_refused(
-                &room.session.refused_log().refused(std::time::Instant::now()),
-            ),
+            pack_gaps: RoomPackGapsView {
+                wide_open: room.session.extra_ports().any_high(),
+                ..RoomPackGapsView::from_refused(
+                    &room.session.refused_log().refused(std::time::Instant::now()),
+                    &room.session.extra_ports().ports(),
+                )
+            },
         }
     }
 
@@ -993,7 +1163,7 @@ mod tests {
         assert_eq!(keys(&f["dropped"][0]), ["from", "port", "transport"]);
         assert_eq!(keys(&f["blocking_programs"][0]), ["path", "program"]);
         let g = serde_json::to_value(RoomPackGapsView::default()).unwrap();
-        assert_eq!(keys(&g), ["ports", "report", "seen"]);
+        assert_eq!(keys(&g), ["allowed", "can_allow", "ports", "report", "seen", "wide_open"]);
     }
 
     fn facts() -> HelperFacts {
@@ -1059,11 +1229,32 @@ mod tests {
         // Two kinds of packet that need the same port.
         log.saw(DropDirection::Inbound, &udp(3660, 3660), now);
         log.saw(DropDirection::Inbound, &udp(3660, 50000), now);
-        let v = RoomPackGapsView::from_refused(&log.refused(now));
-        assert_eq!(v.ports, ["UDP 3660"]);
-        assert_eq!(v.seen.len(), 2);
+        // A probe at a system port is listed but never offered.
+        let mut ssh = udp(40000, 22);
+        ssh[9] = 6;
+        log.saw(DropDirection::Inbound, &ssh, now);
+        let v = RoomPackGapsView::from_refused(&log.refused(now), &[]);
+        assert_eq!(v.ports.iter().filter(|p| *p == "UDP 3660").count(), 1);
+        assert!(v.ports.contains(&"TCP 22".to_string()), "{:?}", v.ports);
+        assert_eq!(v.can_allow, ["UDP 3660"], "never a system port");
+        assert_eq!(v.seen.len(), 3);
         assert!(v.report.unwrap().contains("Please report this"));
-        assert!(RoomPackGapsView::from_refused(&[]).report.is_none());
+        let allowed = [game_bridge::lan_filter::LanPort {
+            proto: game_bridge::lan_filter::LanProto::Udp,
+            port: 3660,
+        }];
+        let after = RoomPackGapsView::from_refused(&[], &allowed);
+        assert!(after.report.is_none() && after.can_allow.is_empty());
+        assert_eq!(after.allowed, ["UDP 3660"]);
+    }
+
+    #[test]
+    fn an_allowed_port_round_trips_through_settings_and_a_system_port_never_does() {
+        let p = parse_port_key("udp/3660").unwrap();
+        assert_eq!(port_key(&p), "udp/3660");
+        assert!(parse_port_key("tcp/22").is_none());
+        assert!(parse_port_key("icmp/3660").is_none());
+        assert!(parse_port_key("udp/notaport").is_none());
     }
 
     /// The player who granted the helper before the launcher opened firewalls

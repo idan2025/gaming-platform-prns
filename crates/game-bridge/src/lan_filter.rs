@@ -148,14 +148,55 @@ type FragmentKey = (Ipv4Addr, u16, u8);
 /// Per-member packet filter, owned by the pump.
 #[derive(Debug)]
 pub struct LanFilter {
+    /// The pack's own policy.
+    base: LanPolicy,
+    /// `base` plus the ports this machine's player allowed on top.
     policy: LanPolicy,
+    /// Which [`ExtraPorts`] generation `policy` was built from.
+    extra_generation: u64,
+    /// The player's "still can't join" switch: every port from
+    /// [`LOWEST_ALLOWABLE_PORT`] up, except operating systems' own chatter.
+    any_high: bool,
     flows: HashMap<FlowKey, Instant>,
     fragments: HashMap<FragmentKey, Instant>,
 }
 
 impl LanFilter {
     pub fn new(policy: LanPolicy) -> Self {
-        Self { policy, flows: HashMap::new(), fragments: HashMap::new() }
+        Self {
+            base: policy.clone(),
+            policy,
+            extra_generation: 0,
+            any_high: false,
+            flows: HashMap::new(),
+            fragments: HashMap::new(),
+        }
+    }
+
+    /// Admit the ports `extra` holds on top of the pack's, if they changed
+    /// since last asked. Cheap when nothing did: one atomic load.
+    pub fn sync_extra(&mut self, extra: &ExtraPorts) {
+        let generation = extra.generation();
+        if generation == self.extra_generation {
+            return;
+        }
+        let mut policy = self.base.clone();
+        for port in extra.ports() {
+            if !policy.ports.contains(&port) {
+                policy.ports.push(port);
+            }
+        }
+        self.policy = policy;
+        self.any_high = extra.any_high();
+        self.extra_generation = generation;
+    }
+
+    /// Whether `port` gets through: the pack's, the player's extras, or —
+    /// with the switch on — any port at or above [`LOWEST_ALLOWABLE_PORT`] that
+    /// is not an operating system's own.
+    fn admits(&self, proto: LanProto, port: u16) -> bool {
+        self.policy.declares(proto, port)
+            || (self.any_high && port >= LOWEST_ALLOWABLE_PORT && !OS_CHATTER.contains(&port))
     }
 
     /// Whether this side may send `packet` into the room. A unicast opens (or
@@ -167,7 +208,7 @@ impl LanFilter {
             // rare enough that sending it is not worth a table.
             return match (lan_proto(p.protocol), p.ports) {
                 (Some(proto), Some((sport, dport))) => {
-                    let allowed = self.policy.declares(proto, dport);
+                    let allowed = self.admits(proto, dport);
                     if allowed {
                         // A search is a broadcast, and its answers are
                         // unicasts from whoever heard it — OpenTTD's LAN
@@ -206,7 +247,7 @@ impl LanFilter {
         }
         let Some(proto) = lan_proto(p.protocol) else { return self.policy.any };
         let Some((sport, dport)) = p.ports else { return false };
-        let allowed = self.policy.declares(proto, dport)
+        let allowed = self.admits(proto, dport)
             || self.refresh_flow((proto, dport, p.src, sport), now)
             || self.refresh_flow((proto, dport, ANY_MEMBER, sport), now);
         if allowed && p.fragment == Fragment::First {
@@ -235,6 +276,62 @@ impl LanFilter {
             }
         }
         self.flows.insert(key, now);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ports a player allowed on top of the pack's.
+
+/// The lowest port a player is offered to allow. Below it live a machine's
+/// own services — SSH, file sharing, mail — which no LAN game uses, and which
+/// a room member sending to them must not get opened by one careless click.
+pub const LOWEST_ALLOWABLE_PORT: u16 = 1024;
+
+/// Ports this machine's player allowed for the room's game on top of its
+/// pack's, after the room named them as missing (`RefusedLog`). Shared by the
+/// session and the pump, which picks a change up on its next packet.
+#[derive(Debug, Default)]
+pub struct ExtraPorts {
+    ports: std::sync::Mutex<Vec<LanPort>>,
+    any_high: std::sync::atomic::AtomicBool,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl ExtraPorts {
+    /// Replace the extra ports. Any port below [`LOWEST_ALLOWABLE_PORT`] is
+    /// refused here, whoever asks.
+    pub fn set(&self, ports: Vec<LanPort>) -> Result<(), u16> {
+        if let Some(p) = ports.iter().find(|p| p.port < LOWEST_ALLOWABLE_PORT) {
+            return Err(p.port);
+        }
+        let mut deduped: Vec<LanPort> = Vec::new();
+        for p in ports {
+            if !deduped.contains(&p) {
+                deduped.push(p);
+            }
+        }
+        *self.ports.lock().expect("extra ports lock") = deduped;
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn ports(&self) -> Vec<LanPort> {
+        self.ports.lock().expect("extra ports lock").clone()
+    }
+
+    /// The last-resort switch: admit every port from [`LOWEST_ALLOWABLE_PORT`]
+    /// up for this game, for when the room cannot tell which one is missing.
+    pub fn set_any_high(&self, on: bool) {
+        self.any_high.store(on, std::sync::atomic::Ordering::Release);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn any_high(&self) -> bool {
+        self.any_high.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -357,6 +454,14 @@ impl RefusedLog {
         let r = Refused { direction, proto, local_port, peer, peer_port, count: 1, last: now };
         log.insert(key, r.clone());
         Some(r)
+    }
+
+    /// Forget what was refused on `ports`: the player just allowed them.
+    pub fn forget(&self, ports: &[LanPort]) {
+        let mut log = self.inner.lock().expect("refused log lock");
+        log.retain(|_, r| {
+            !ports.iter().any(|p| p.proto == r.proto && p.port == r.suggested_port())
+        });
     }
 
     /// Everything refused in the last [`REFUSED_REMEMBER`], most packets first.
@@ -579,5 +684,54 @@ mod tests {
         }
         assert!(log.saw(DropDirection::Inbound, &ip(PEER, ME, PROTO_ICMP, 1, 0, &[8, 0, 0, 0]), now).is_none());
         assert!(log.refused(now).is_empty());
+    }
+
+    /// One click on "Allow" opens exactly the port the room named, and only
+    /// for the game — and Undo shuts it again.
+    #[test]
+    fn a_port_the_player_allowed_is_admitted_and_undo_shuts_it() {
+        let mut f = game();
+        let extra = ExtraPorts::default();
+        let now = Instant::now();
+        assert!(!f.inbound(&udp(PEER, 3660, ME, 3660), now));
+        extra.set(vec![LanPort { proto: LanProto::Udp, port: 3660 }]).unwrap();
+        f.sync_extra(&extra);
+        assert!(f.inbound(&udp(PEER, 3660, ME, 3660), now));
+        assert!(f.inbound(&udp(PEER, 5555, ME, 9999), now), "the pack's own port still is");
+        assert!(!f.inbound(&tcp(PEER, 3660, ME, 3660), now), "the other protocol is not");
+        extra.set(Vec::new()).unwrap();
+        f.sync_extra(&extra);
+        assert!(!f.inbound(&udp(PEER, 3660, ME, 3660), now));
+        assert!(f.inbound(&udp(PEER, 5555, ME, 9999), now), "undo never touches the pack's");
+    }
+
+    #[test]
+    fn a_system_port_can_never_be_allowed() {
+        let extra = ExtraPorts::default();
+        assert_eq!(extra.set(vec![LanPort { proto: LanProto::Tcp, port: 22 }]), Err(22));
+        assert_eq!(extra.set(vec![LanPort { proto: LanProto::Tcp, port: 445 }]), Err(445));
+        assert!(extra.ports().is_empty());
+    }
+
+    /// The switch for when the room cannot name the missing port: every high
+    /// port, but never a system service's and never the OS's own chatter.
+    #[test]
+    fn the_last_resort_switch_opens_high_ports_only() {
+        let mut f = game();
+        let extra = ExtraPorts::default();
+        let now = Instant::now();
+        let s = RoomSubnet::default();
+        extra.set_any_high(true);
+        f.sync_extra(&extra);
+        assert!(f.inbound(&udp(PEER, 51000, ME, 52000), now), "an ephemeral pair");
+        assert!(f.inbound(&tcp(PEER, 40000, ME, 3290), now));
+        assert!(!f.inbound(&tcp(PEER, 40000, ME, 22), now), "ssh stays shut");
+        assert!(!f.inbound(&tcp(PEER, 40000, ME, 445), now), "smb stays shut");
+        assert!(!f.outbound(&udp(ME, 5353, Ipv4Addr::new(224, 0, 0, 251), 5353), &s, now), "mDNS stays home");
+        assert!(!f.outbound(&udp(ME, 1900, s.broadcast(), 1900), &s, now), "SSDP stays home");
+        assert!(f.outbound(&udp(ME, 51000, s.broadcast(), 7777), &s, now), "a game's own broadcast goes");
+        extra.set_any_high(false);
+        f.sync_extra(&extra);
+        assert!(!f.inbound(&udp(PEER, 51000, ME, 52000), now));
     }
 }

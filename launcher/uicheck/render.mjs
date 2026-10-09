@@ -161,6 +161,9 @@ function makeInvoke(scenario) {
         return scenario.roomCheck;
       case 'fix_room_firewall':
       case 'unblock_room_programs':
+      case 'allow_room_ports':
+      case 'reset_room_ports':
+      case 'set_room_wide_open':
         if (scenario.firewallFails) throw new Error(scenario.firewallFails);
         if (!scenario.roomAfterFix) throw new Error(`unknown command ${cmd}`);
         scenario.room = scenario.roomAfterFix;
@@ -556,7 +559,7 @@ const noRoom = {
   active: false, role: null, game_id: null, name: null, room_hash: null, address: null,
   subnet: null, members: [], adapter: 'none', error: null, refused: null,
   firewall: { dropped: [], advice: null, heads_up: null, command: null, can_fix: false, blocking_programs: [], other_firewalls: [] },
-  pack_gaps: { ports: [], seen: [], report: null },
+  pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 
 const lanGame = (lan) => ({
@@ -595,7 +598,7 @@ const memberRoom = {
   members: [{ address: '198.19.1.1', is_self: false }, { address: '198.19.4.2', is_self: true }],
   adapter: 'up', error: null, refused: null,
   firewall: { dropped: [], advice: null, heads_up: null, command: null, can_fix: false, blocking_programs: [], other_firewalls: [] },
-  pack_gaps: { ports: [], seen: [], report: null },
+  pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
 
@@ -868,8 +871,11 @@ await run('ports the pack lacks are named, with a report to send', {
       ports: ['UDP 3660'],
       seen: ['UDP from 198.19.1.1:3660 to this computer\u2019s port 3660 (12 packets)'],
       report: 'The room blocked traffic the game\u2019s pack does not list. The pack probably needs: UDP 3660.',
+      can_allow: ['UDP 3660'],
+      allowed: [],
     },
   },
+  roomAfterFix: { ...memberRoom, pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: ['UDP 3660'], wide_open: false } },
   rows: () => [row()],
 }, async (win, doc) => {
   const t = doc.querySelector('#room-pack-gaps')?.textContent || '';
@@ -878,6 +884,38 @@ await run('ports the pack lacks are named, with a report to send', {
   check('the report is there to copy', doc.querySelector('#room-pack-gaps-report')?.textContent.includes('probably needs'));
   check('the verdict says not ready', doc.querySelector('#room-verdict')?.textContent.includes('ports its pack does not list'));
   check('the banner says so too', doc.querySelector('#room-banner').classList.contains('err'));
+  const allow = doc.querySelector('#room-allow-ports');
+  check('Allow is offered', allow && !allow.disabled);
+  allow?.click();
+  await settle();
+  check('Allow calls the launcher', calls.includes('allow_room_ports'));
+  const after = doc.querySelector('#room-pack-gaps')?.textContent || '';
+  check('the allowed port is shown, with Undo', after.includes('Also allowed on this computer for this game: UDP 3660') && !!doc.querySelector('#room-reset-ports'), after);
+  check('and asks for the report still', after.includes('send the report'), after);
+  check('the warning is gone', !after.includes('ports its pack does not list'), after);
+  doc.querySelector('#room-reset-ports')?.click();
+  await settle();
+  check('Undo calls the launcher', calls.includes('reset_room_ports'));
+});
+
+// Dana's report: her firewall off, and still no lobby. When nothing names the
+// port, one switch opens every high port for the game, and is undone as easily.
+await run('the last-resort switch opens more ports, and says so, and turns off', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: memberRoom,
+  roomAfterFix: { ...memberRoom, pack_gaps: { ...memberRoom.pack_gaps, wide_open: true } },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const btn = doc.querySelector('#room-still-stuck #room-wide-on');
+  check('a still-stuck switch is offered, tucked away', !!btn);
+  btn?.click();
+  await settle();
+  check('it calls the launcher', calls.includes('set_room_wide_open'));
+  const t = doc.querySelector('#room-wide-open')?.textContent || '';
+  check('the pane says every high port is open, plainly', t.includes('Every port above 1024 is open'), t);
+  check('with a way back', !!doc.querySelector('#room-wide-off'));
 });
 
 await run('no firewall to speak of shows nothing', {

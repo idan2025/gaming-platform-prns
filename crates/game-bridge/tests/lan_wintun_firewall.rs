@@ -166,6 +166,36 @@ fn delete_rule(name: &str) {
     let _ = netsh(&["delete", "rule", &format!("name={name}")]);
 }
 
+/// Every Wintun adapter Windows knows, hidden ones included, as
+/// `name|{GUID}`. One room after another must leave exactly one, named `gbl0`:
+/// a random GUID per room made Windows number them "gbl0 2", "gbl0 3"…
+fn wintun_adapters() -> Vec<String> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter -IncludeHidden | Where-Object InterfaceDescription -like '*Wintun*' | \
+             ForEach-Object { $_.Name + '|' + $_.InterfaceGuid }",
+        ])
+        .output()
+        .expect("powershell runs");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn assert_one_gbl0(when: &str) {
+    let (d1, d2, d3, d4) = game_bridge::lan_adapter::adapter_guid("gbl0");
+    let guid = format!(
+        "{{{d1:08X}-{d2:04X}-{d3:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+    );
+    let adapters = wintun_adapters();
+    assert_eq!(adapters, [format!("gbl0|{guid}")], "{when}: the room adapter is one, named gbl0");
+}
+
 fn holds(addr: Ipv4Addr) -> bool {
     UdpSocket::bind((addr, 0)).is_ok()
 }
@@ -229,6 +259,7 @@ async fn a_firewall_that_drops_the_room_is_noticed_opened_and_unblocked() {
     let (stop, runner) = room_on_adapter(host.clone(), AdapterSetup::InProcess);
     wait_until("the adapter holds the host's address", Duration::from_secs(60), || holds(h_addr))
         .await;
+    assert_one_gbl0("the first room");
     let answer = connect_from_member(&member, m_addr, h_addr, 40001).await;
     assert!(
         answer.is_none(),
@@ -293,6 +324,7 @@ async fn a_firewall_that_drops_the_room_is_noticed_opened_and_unblocked() {
         AdapterSetup::Helper { path: helper.clone(), portable: true },
     );
     wait_until("the portable adapter comes up", Duration::from_secs(60), || holds(h_addr)).await;
+    assert_one_gbl0("the second room");
     assert!(rule_exists(PORTABLE_RULE_NAME), "the portable helper opened nothing");
     assert!(!rule_exists(RULE_NAME), "a portable room left an installed launcher's rule");
     let answer = connect_from_member(&member, m_addr, h_addr, 40005).await;
@@ -309,6 +341,7 @@ async fn a_firewall_that_drops_the_room_is_noticed_opened_and_unblocked() {
     let (stop, runner) =
         room_on_adapter(host.clone(), AdapterSetup::Helper { path: helper, portable: false });
     wait_until("the adapter comes up", Duration::from_secs(60), || holds(h_addr)).await;
+    assert_one_gbl0("the third room");
     let answer = connect_from_member(&member, m_addr, h_addr, 40006).await;
     assert!(accepted(answer), "the installed helper's rule did not let the join in: {answer:?}");
     stop.send(()).unwrap();

@@ -197,8 +197,9 @@ the launcher as soon as it starts (v0.2.12). Every binary also answers
 Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
 the last three.
 
-- **v0.2.29** — a LAN room names the ports a game used that its pack does
-  not list, so a missing port is found from one failed join.
+- **v0.2.29** — a LAN game that shows up but will not join: the room names
+  the missing port and lets it through with one click, and the Windows room
+  adapter stays one adapter instead of "gbl0 2", "gbl0 3"….
 - **v0.2.28** — LAN rooms open the firewall themselves, so a game hosted in
   a room can be joined, not just seen; what cannot be opened gets a button or
   is named.

@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use game_bridge::lan_adapter::{self, AdapterConfig, TunDevice};
 use game_bridge::lan_check;
-use game_bridge::lan_filter::LanProto;
+use game_bridge::lan_filter::{LanPort, LanProto};
 use game_bridge::lan_pump;
 use game_bridge::lan_session::{LanHostArgs, LanMemberArgs, LanSession};
 use game_bridge::pack::GamePack;
@@ -398,6 +398,26 @@ async fn one_pack(pack: GamePack) {
         .find(|r| r.local_port == PRIVATE_TCP && r.peer == host_addr)
         .unwrap_or_else(|| panic!("{}: m1 refused TCP {PRIVATE_TCP} and recorded nothing: {refused:?}", pack.id));
     assert_eq!((r.proto, r.suggested_port()), (LanProto::Tcp, PRIVATE_TCP));
+    // One click on Allow, on m1: the port the room named opens, live, with the
+    // pump running — and Undo shuts it again.
+    m1.extra_ports().set(vec![LanPort { proto: LanProto::Tcp, port: PRIVATE_TCP }]).unwrap();
+    let connect = |ns: &Ns| {
+        ns.run(move || {
+            TcpStream::connect_timeout(
+                &SocketAddr::from((m1_addr, PRIVATE_TCP)),
+                Duration::from_secs(2),
+            )
+            .is_ok()
+        })
+    };
+    assert!(connect(&nss[0]), "{}: an allowed port did not open", pack.id);
+    m1.extra_ports().set(Vec::new()).unwrap();
+    assert!(!connect(&nss[0]), "{}: undo did not shut the port again", pack.id);
+    // The last resort, for a port nobody could name: every high port.
+    m1.extra_ports().set_any_high(true);
+    assert!(connect(&nss[0]), "{}: the still-stuck switch did not open a high port", pack.id);
+    m1.extra_ports().set_any_high(false);
+    assert!(!connect(&nss[0]), "{}: turning the switch off did not shut it", pack.id);
 
     // --- The room check passes from every member, with the game's sockets
     // bound to its own ports, and never hands them its probe.

@@ -311,6 +311,21 @@ async fn fix_room_firewall(state: tauri::State<'_, AppState>) -> Result<RoomView
 }
 
 #[tauri::command]
+async fn allow_room_ports(state: tauri::State<'_, AppState>) -> Result<RoomView, String> {
+    state.launcher.allow_room_ports().await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn set_room_wide_open(state: tauri::State<'_, AppState>, on: bool) -> Result<RoomView, String> {
+    state.launcher.set_room_wide_open(on).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn reset_room_ports(state: tauri::State<'_, AppState>) -> Result<RoomView, String> {
+    state.launcher.reset_room_ports().await.map_err(fmt_err)
+}
+
+#[tauri::command]
 async fn unblock_room_programs(state: tauri::State<'_, AppState>) -> Result<RoomView, String> {
     state.launcher.unblock_room_programs().await.map_err(fmt_err)
 }
@@ -417,6 +432,9 @@ pub fn run() {
             check_room,
             fix_room_firewall,
             unblock_room_programs,
+            allow_room_ports,
+            reset_room_ports,
+            set_room_wide_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");

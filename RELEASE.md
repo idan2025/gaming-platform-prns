@@ -76,28 +76,49 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## v0.2.29
 
-### A LAN room says which ports a game is missing
+### When a LAN game shows up but will not let you join
 
 Each game's LAN pack lists the network ports the game uses, and the room lets
 in only those. Some of those lists come from other people's packet captures
 and can be incomplete; Need for Speed: Underground 2's is one of them. When a
-game used a port its pack did not list, the room blocked it without a word.
-The game could still be seen, but joining it hung, exactly like a firewall
-problem.
+game used a port its pack did not list, the room blocked it without a word:
+the game showed up, joining hung, and turning the firewall off did not help.
 
-Now the room keeps track of what it blocks:
+Now the room pane deals with it:
 
-- The room pane says **"This game used ports its pack does not list"**, names
-  the ports it probably needs (for example *UDP 3660*), and lists what was
-  blocked.
-- **Copy report** puts it all on the clipboard. Send it in, and the pack gets
-  fixed for everyone.
-- The room check shows the same finding.
-- Your system's own network chatter (name lookups, network browsing, device
-  discovery) is left out, so what is listed is the game's.
+- **It names the port.** "This game used ports its pack does not list", with
+  the ports it probably needs (for example *UDP 3660*) and what was blocked.
+  The room check shows the same.
+- **Allow on this computer** lets those ports through for that game, from
+  then on, and opens this computer's firewall to the room too if it is not
+  open yet: Windows Firewall, ufw or firewalld, whichever this computer runs.
+  **Undo** takes it back.
+- **Still can't join?** If nothing is named and joining still hangs, one
+  switch lets the game use every port above 1024 on that computer. Do it on
+  both computers. **Turn off** takes it back.
+- **Copy report** puts what was blocked on the clipboard. Please send it in,
+  so the game's pack gets fixed for everyone.
 
-**If a game shows up but you cannot join it**, open the LAN room panel on both
-computers after a failed join, and send what it says.
+Only room members can reach a port opened this way, and system ports (below
+1024: file sharing, remote login and the like) are never offered. Your
+system's own network chatter is left out of the list, so what is listed is
+the game's.
+
+### The room check says when nothing is listening
+
+If a game is hosted but the room check finds nothing listening on its port
+on the host's room address, the check now says so instead of passing quietly.
+Some games, for example under Wine or with a fixed address set, listen only
+on the computer's other addresses.
+
+### One room adapter on Windows, not "gbl0 2", "gbl0 3"…
+
+Every room created a brand-new network adapter as far as Windows was
+concerned, numbered one higher each time, each with a new "Network" profile.
+The room's adapter now has the same identity every time, so Windows sees one
+adapter, room after room. Leftover ones from earlier versions can be removed
+in Device Manager (View → Show hidden devices → Network adapters), but they
+do no harm.
 
 ## v0.2.28
 

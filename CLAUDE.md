@@ -542,7 +542,23 @@ Rules a later change could quietly break:
   LLMNR, WS-Discovery, NTP) is left out, or it would bury the game's. An
   inbound packet to an ephemeral port (≥ 32768) suggests the *sender's* port,
   the fixed end a pack can declare. This is how a pack gets fixed from one
-  failed join; keep it, and keep it quiet about chatter. `tested` stays false until a person has played.
+  failed join; keep it, and keep it quiet about chatter.
+  - **The player can let a named port through (Allow) or, as a last resort,
+    every port from 1024 up ("Still can't join?")**, per game, on that
+    machine, remembered in settings, with Undo (`lan_filter::ExtraPorts`,
+    picked up by the pump on its next packet). **Never below 1024**:
+    `ExtraPorts::set` refuses it whoever asks, and the switch skips OS
+    chatter ports, so a member sending to SSH or SMB can never get it opened
+    by one careless click. Never automatic: opening whatever a packet hit
+    would let any member open any port by sending to it. Both turn the OS
+    firewall's room rule on too if it is not yet (it covers every port).
+- **A Windows room adapter has a fixed GUID** (`lan_adapter::adapter_guid`,
+  2026-10-09). Wintun with no GUID picks a random one, and Windows treated
+  every room's adapter as a new network card: "gbl0 2", "gbl0 3"… each with a
+  new Public network profile. **Never change `ADAPTER_GUID_BASE`** — every
+  installed launcher's adapter would come up new once more;
+  `a_room_adapter_has_the_same_guid_every_time` freezes it, and
+  `lan_wintun_firewall.rs` requires exactly one `gbl0` across three rooms. `tested` stays false until a person has played.
 - **`lan_wintun.rs` proves the metric fix only because CI pins the runner's
   network to metric 2 first.** Left alone the runner's Wintun already wins and
   a branch without the fix passes; at 1 the room ties and loses. Removing that

@@ -199,6 +199,7 @@ pub struct LanSession {
     probes: crate::lan_check::ProbeLog,
     connects: crate::lan_firewall::ConnectWatch,
     refused: crate::lan_filter::RefusedLog,
+    extra_ports: crate::lan_filter::ExtraPorts,
 }
 
 impl LanSession {
@@ -254,6 +255,12 @@ impl LanSession {
     /// used that its pack does not list.
     pub fn refused_log(&self) -> &crate::lan_filter::RefusedLog {
         &self.refused
+    }
+
+    /// Ports this machine's player allowed on top of the pack's; the pump
+    /// picks a change up on its next packet.
+    pub fn extra_ports(&self) -> &crate::lan_filter::ExtraPorts {
+        &self.extra_ports
     }
 
     /// Rooms and servers this node has heard announce.
@@ -401,6 +408,7 @@ impl LanSession {
             probes: Default::default(),
             connects: Default::default(),
             refused: Default::default(),
+            extra_ports: Default::default(),
         })
     }
 
@@ -477,6 +485,7 @@ impl LanSession {
             probes: Default::default(),
             connects: Default::default(),
             refused: Default::default(),
+            extra_ports: Default::default(),
         })
     }
 }

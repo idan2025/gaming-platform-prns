@@ -368,6 +368,27 @@ impl CheckReport {
         let tcp_ports = |ports: &[u16]| {
             ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
         };
+        // Not a fault, but the one thing a refused connection can mean once a
+        // game *is* hosted: it is not listening where the room delivers.
+        let not_listening: Vec<String> = self
+            .members
+            .iter()
+            .filter(|m| m.answered_unicast)
+            .filter_map(|m| {
+                let closed: Vec<u16> =
+                    m.tcp.iter().filter(|t| t.state == TcpState::Closed).map(|t| t.port).collect();
+                (!closed.is_empty()).then(|| {
+                    format!(
+                        "Nothing on {} is listening on TCP {} yet. That is normal before a game is \
+                         hosted there; if one is hosted there now, the game is not listening on the \
+                         room's address — a game run through Wine or with a fixed address set can do \
+                         that.",
+                        m.address,
+                        tcp_ports(&closed)
+                    )
+                })
+            })
+            .collect();
         if self.ok() {
             let slowest = self.members.iter().filter_map(|m| m.round_trip).max();
             let checked: Vec<u16> =
@@ -389,6 +410,7 @@ impl CheckReport {
                     tcp_ports(&checked)
                 ));
             }
+            out.extend(not_listening);
             out.push(
                 "That proves the room, not the game: if the game still lists nothing, allow it \
                  through the firewall on every machine, and check it is set to LAN play."
@@ -426,6 +448,7 @@ impl CheckReport {
         if !self.refused_here.is_empty() {
             out.push(missing_ports_finding(&self.refused_here));
         }
+        out.extend(not_listening.iter().cloned());
         if self.answers_blocked_here {
             out.push(
                 "Answers reached this machine's room adapter but not the program that asked: a \
@@ -847,18 +870,24 @@ mod tests {
         let f = r.findings().join("\n");
         assert!(f.contains("198.19.2.2 did not answer a connection to TCP 3282,"), "{f}");
         assert!(f.contains("firewall on that machine"), "{f}");
-        assert!(!f.contains("9900"), "a refused port reached the member's stack: {f}");
+        assert!(
+            f.contains("connection to TCP 3282, though"),
+            "only the unanswered port is blamed; a refused one reached the member's stack: {f}"
+        );
+        assert!(f.contains("listening on TCP 9900"), "{f}");
     }
 
     /// The rule that keeps a game that is not hosting yet from failing the
     /// check: a refused connection was answered.
     #[test]
-    fn a_refused_tcp_port_passes() {
+    fn a_refused_tcp_port_passes_and_says_nothing_listens_there() {
         let mut m = member(B, true);
         m.tcp = vec![TcpCheck { port: 9900, state: TcpState::Closed }];
         let r = report(vec![m]);
         assert!(r.ok());
-        assert!(r.findings().join("\n").contains("TCP 9900 through"));
+        let f = r.findings().join("\n");
+        assert!(f.contains("TCP 9900 through"), "{f}");
+        assert!(f.contains("Nothing on 198.19.2.2 is listening on TCP 9900 yet"), "{f}");
     }
 
     #[test]

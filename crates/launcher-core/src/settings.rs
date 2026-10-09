@@ -84,6 +84,15 @@ pub struct LauncherSettings {
     /// own watch still says if something is dropped.
     #[serde(default)]
     pub room_firewall_opened: bool,
+    /// Ports the player allowed for a game's LAN room on top of its pack's,
+    /// keyed by pack id, as `"udp/3660"`. Set from the room pane's Allow, after
+    /// the room named them as missing; this machine's only.
+    #[serde(default)]
+    pub lan_extra_ports: BTreeMap<String, Vec<String>>,
+    /// Pack ids whose LAN room this player opened to every port above 1024,
+    /// as a last resort when a join failed and no missing port was named.
+    #[serde(default)]
+    pub lan_wide_open: std::collections::BTreeSet<String>,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.

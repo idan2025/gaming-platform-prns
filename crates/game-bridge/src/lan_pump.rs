@@ -42,8 +42,11 @@ where
             let n = device.recv(&mut buf).await?;
             let packet = &buf[..n];
             let subnet = room.subnet();
-            let allowed =
-                filter.lock().expect("filter lock").outbound(packet, &subnet, Instant::now());
+            let allowed = {
+                let mut f = filter.lock().expect("filter lock");
+                f.sync_extra(room.extra_ports());
+                f.outbound(packet, &subnet, Instant::now())
+            };
             if !allowed {
                 // Only a broadcast is ever refused on the way out.
                 report_refused(room.refused_log().saw(
@@ -65,7 +68,11 @@ where
 
     let down = async {
         while let Some(packet) = room.recv().await {
-            let allowed = filter.lock().expect("filter lock").inbound(&packet, Instant::now());
+            let allowed = {
+                let mut f = filter.lock().expect("filter lock");
+                f.sync_extra(room.extra_ports());
+                f.inbound(&packet, Instant::now())
+            };
             if !allowed {
                 debug!("the room delivered a packet this member does not admit; dropped");
                 report_refused(room.refused_log().saw(DropDirection::Inbound, &packet, Instant::now()));

@@ -191,9 +191,13 @@ impl WintunDevice {
         let api = WintunApi::load(dll)?;
         let name = wide(std::ffi::OsStr::new(&config.name));
         let tunnel_type = wide(std::ffi::OsStr::new("GamingPlatformPrns"));
-        // SAFETY: nul-terminated wide strings; no requested GUID.
+        // The same GUID for the same name every room, so Windows sees one
+        // adapter and not "gbl0 2", "gbl0 3"… (`adapter_guid`).
+        let (data1, data2, data3, data4) = super::adapter_guid(&config.name);
+        let guid = GUID { data1, data2, data3, data4 };
+        // SAFETY: nul-terminated wide strings and a GUID that outlive the call.
         let adapter =
-            unsafe { (api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), std::ptr::null()) };
+            unsafe { (api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), &guid) };
         if adapter.is_null() {
             return Err(last_error(&format!(
                 "creating Wintun adapter {} (needs an administrator)",
