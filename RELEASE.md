@@ -74,6 +74,60 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.28
+
+### LAN rooms open the firewall themselves
+
+The first real Need for Speed: Underground 2 race in a room hung on joining.
+The other player saw the race in the game's LAN list, picked it, and waited
+until it timed out, because the host's firewall dropped the connection.
+CachyOS turns ufw on with "deny incoming" by default, and Windows treats a
+new network adapter as a Public network. Seeing a game needs only your own
+side open; joining it needs the host's. So a room could look fine and still
+not work.
+
+Now the room opens the firewall itself, at the moment it already asks for
+permission:
+
+- **Windows**: the administrator prompt every room already shows also adds
+  one firewall rule, "Mesh Game Servers LAN rooms". It lets in room addresses
+  only, and it covers every room and every game from then on.
+- **Linux**: the password prompt a room asks for also opens ufw or firewalld
+  to the room adapter, `gbl0`. Granting the helper permission once now does
+  the same, under the same single prompt. If you granted the permission with
+  an older version, the room pane offers **Fix it**, which asks for your
+  password once.
+- **Portable** downloads still leave nothing behind: their rule is removed
+  when the room ends. A ufw rule that was already there is never removed,
+  since you may have added it yourself.
+
+Behind the firewall the launcher still lets in only the game's own ports,
+so a room member can reach nothing else on your computer.
+
+### What the room cannot open, it names
+
+- **The room checks itself** a few seconds after someone joins. The pane says
+  *Ready to play*, or what is wrong in plain words.
+- **"Someone tried to join a game on this computer, but this computer's
+  firewall blocked it"**, the moment it happens, with a button to fix it.
+- **Windows blocking the game itself**, which happens after someone once
+  clicked "Cancel" on that game's firewall question. A block beats any allow,
+  so the pane names the program and offers **Unblock**, which turns that
+  block off with one administrator prompt.
+- **Another firewall program** (Norton and the like) ignores Windows' rules.
+  The pane names it and says what to allow in it.
+- The room check also connects to each of the game's TCP ports on every
+  member. A broadcast check could not see this fault.
+
+The by-hand commands are still in the pane, under "Or do it yourself".
+
+Tested in CI on a real Windows network adapter with Windows Firewall on and
+blocking incoming connections: without the rule, a join is dropped and the
+host's launcher notices; the rule lets it in; a block rule for the program
+beats it, is named, and Unblock lifts it; a portable room's rule goes with
+the room and an installed room's rule stays. The Linux ufw and firewalld
+steps are tested against stand-ins, not yet against a real ufw.
+
 ## v0.2.27
 
 ### Linux downloads say x86_64 or aarch64
