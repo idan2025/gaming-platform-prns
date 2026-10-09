@@ -483,7 +483,7 @@ pub async fn check_room(
         check_room_with(session, policy, UdpSocket::from_std(socket)?, TcpSocket::new_v4, DEFAULT_WAIT)
             .await?;
     if !report.dropped_here.is_empty() {
-        report.firewall_advice = Some(crate::lan_firewall::advice_line(firewall, adapter, policy));
+        report.firewall_advice = Some(crate::lan_firewall::advice_line(firewall, adapter));
     }
     Ok(report)
 }

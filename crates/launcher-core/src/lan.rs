@@ -658,7 +658,7 @@ fn firewall_view(room: &RoomState) -> RoomFirewallView {
     RoomFirewallView {
         advice: (!dropped.is_empty()).then(|| advice(room.firewall, ADAPTER_NAME)),
         heads_up: heads_up(room.firewall),
-        command: fix_command(room.firewall, ADAPTER_NAME, &room.policy),
+        command: fix_command(room.firewall, ADAPTER_NAME),
         dropped,
     }
 }

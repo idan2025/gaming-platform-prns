@@ -26,18 +26,17 @@
 //! - **Only an unanswered connection is evidence.** A reset is an answer: it
 //!   means the packet reached the stack. Counting it would blame the firewall
 //!   for a game that is simply not hosting yet.
-//! - **The command opens the room adapter, never the machine.** ufw and
-//!   firewalld are told about `gbl*` only; on Windows the rule is bound to the
-//!   adapter's alias and the game's declared ports. The pump still filters
-//!   what comes in on it.
+//! - **The command opens the room, never the machine, and is run once.** ufw
+//!   and firewalld are told about the `gbl*` name, which every room reuses; on
+//!   Windows the rule matches the room range `198.18.0.0/15`, not the adapter,
+//!   because each room's Wintun adapter is new. The pump still filters what
+//!   comes in.
 //! - **Advice, never action.** Nothing here runs a command.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use crate::lan_filter::{LanPolicy, LanProto};
 
 /// How long the operating system has to answer a connection. A kernel answers
 /// a SYN at once, listener or not; this is margin, not a guess at latency.
@@ -219,38 +218,23 @@ fn ufw_refuses_incoming(ufw_conf: &str, defaults: &str) -> bool {
 /// The command that lets the room's members reach this machine through
 /// `firewall`, for the adapter named `adapter`. `None` when there is no one
 /// command to give.
-pub fn fix_command(firewall: LocalFirewall, adapter: &str, policy: &LanPolicy) -> Option<String> {
+pub fn fix_command(firewall: LocalFirewall, adapter: &str) -> Option<String> {
     match firewall {
         LocalFirewall::Ufw => Some(format!("sudo ufw allow in on {adapter}")),
         LocalFirewall::Firewalld => Some(format!(
             "sudo firewall-cmd --permanent --zone=trusted --add-interface={adapter} && sudo firewall-cmd --reload"
         )),
-        LocalFirewall::Windows => {
-            let ports = |proto: LanProto| {
-                let list: Vec<String> = policy
-                    .ports
-                    .iter()
-                    .filter(|p| p.proto == proto)
-                    .map(|p| p.port.to_string())
-                    .collect();
-                list.join(",")
-            };
-            let rule = |proto: &str, ports: String| {
-                let local = if policy.any { String::new() } else { format!(" -LocalPort {ports}") };
-                format!(
-                    "New-NetFirewallRule -DisplayName 'Mesh Game Servers room {proto}' -Direction Inbound \
-                     -InterfaceAlias {adapter} -Protocol {proto}{local} -Action Allow"
-                )
-            };
-            let mut lines = Vec::new();
-            for (proto, name) in [(LanProto::Tcp, "TCP"), (LanProto::Udp, "UDP")] {
-                let list = ports(proto);
-                if policy.any || !list.is_empty() {
-                    lines.push(rule(name, list));
-                }
-            }
-            (!lines.is_empty()).then(|| lines.join("\n"))
-        }
+        // Matched on the room's addresses, never on the adapter: Wintun gives
+        // every room's adapter a fresh GUID, and a rule bound to one adapter
+        // would quietly stop matching the next room's. Every room is inside
+        // `ALLOWED_RANGE`, checked at decode, so one rule covers every room
+        // and every game, once; the pump still admits only declared ports.
+        LocalFirewall::Windows => Some(format!(
+            "New-NetFirewallRule -DisplayName 'Mesh Game Servers LAN rooms' -Direction Inbound \
+             -RemoteAddress {}/{} -Action Allow",
+            crate::lan::ALLOWED_RANGE,
+            crate::lan::ALLOWED_RANGE_LEN
+        )),
         LocalFirewall::Unknown => None,
     }
 }
@@ -266,8 +250,8 @@ pub fn advice(firewall: LocalFirewall, adapter: &str) -> String {
             "firewalld is refusing incoming connections here. Trust the room's adapter once, in a terminal:"
                 .to_string()
         }
-        LocalFirewall::Windows => "Windows Firewall is refusing them. Allow the game's ports on the room's \
-             adapter once, in PowerShell run as administrator:"
+        LocalFirewall::Windows => "Windows Firewall is refusing them. Allow the rooms once — it covers every \
+             room and game — in PowerShell run as administrator:"
             .to_string(),
         LocalFirewall::Unknown => format!(
             "Allow incoming connections on the room's adapter, {adapter}, in this machine's firewall."
@@ -276,8 +260,8 @@ pub fn advice(firewall: LocalFirewall, adapter: &str) -> String {
 }
 
 /// [`advice`] and [`fix_command`] as one line, for a log or a terminal.
-pub fn advice_line(firewall: LocalFirewall, adapter: &str, policy: &LanPolicy) -> String {
-    match fix_command(firewall, adapter, policy) {
+pub fn advice_line(firewall: LocalFirewall, adapter: &str) -> String {
+    match fix_command(firewall, adapter) {
         Some(cmd) => format!("{} {}", advice(firewall, adapter), cmd.replace('\n', " ; ")),
         None => advice(firewall, adapter),
     }
@@ -306,7 +290,6 @@ pub fn heads_up(firewall: LocalFirewall) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lan_filter::LanPort;
 
     const ME: Ipv4Addr = Ipv4Addr::new(198, 19, 1, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(198, 19, 2, 2);
@@ -404,27 +387,23 @@ mod tests {
         assert!(!ufw_refuses_incoming("", ""), "no ufw at all");
     }
 
-    fn nfsu2() -> LanPolicy {
-        let tcp = |port| LanPort { proto: LanProto::Tcp, port };
-        let udp = |port| LanPort { proto: LanProto::Udp, port };
-        LanPolicy { ports: vec![udp(9999), udp(3658), tcp(9900), tcp(3282)], any: false }
-    }
-
-    /// The commands open the room adapter and nothing else.
+    /// The commands open the room and nothing else.
     #[test]
     fn every_command_names_the_room_adapter() {
-        for fw in [LocalFirewall::Ufw, LocalFirewall::Firewalld, LocalFirewall::Windows] {
-            let cmd = fix_command(fw, "gbl0", &nfsu2()).unwrap();
+        for fw in [LocalFirewall::Ufw, LocalFirewall::Firewalld] {
+            let cmd = fix_command(fw, "gbl0").unwrap();
             assert!(cmd.contains("gbl0"), "{fw:?}: {cmd}");
         }
-        let win = fix_command(LocalFirewall::Windows, "gbl0", &nfsu2()).unwrap();
-        assert!(win.contains("-Protocol TCP -LocalPort 9900,3282"), "{win}");
-        assert!(win.contains("-Protocol UDP -LocalPort 9999,3658"), "{win}");
-        assert_eq!(win.lines().count(), 2);
-        assert!(fix_command(LocalFirewall::Unknown, "gbl0", &nfsu2()).is_none());
-        let unknown = advice_line(LocalFirewall::Unknown, "gbl0", &nfsu2());
+        // Windows: one rule, for every room and game, matched on the room range
+        // because each room's adapter is a new one.
+        let win = fix_command(LocalFirewall::Windows, "gbl0").unwrap();
+        assert!(win.contains("-RemoteAddress 198.18.0.0/15"), "{win}");
+        assert!(!win.contains("InterfaceAlias"), "{win}");
+        assert_eq!(win, fix_command(LocalFirewall::Windows, "gbl0").unwrap());
+        assert!(fix_command(LocalFirewall::Unknown, "gbl0").is_none());
+        let unknown = advice_line(LocalFirewall::Unknown, "gbl0");
         assert!(unknown.contains("gbl0"), "{unknown}");
-        let ufw = advice_line(LocalFirewall::Ufw, "gbl0", &nfsu2());
+        let ufw = advice_line(LocalFirewall::Ufw, "gbl0");
         assert!(ufw.ends_with("sudo ufw allow in on gbl0"), "{ufw}");
     }
 

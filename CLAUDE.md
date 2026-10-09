@@ -499,8 +499,10 @@ Rules a later change could quietly break:
   delivered that the stack never answered (a reset *is* an answer, so a game
   not hosting yet is never blamed); the room check also connects to every
   declared TCP port on every member. The room pane shows the command
-  (`sudo ufw allow in on gbl0`, firewalld's, or a PowerShell rule scoped to
-  the adapter and the declared ports). **Never run it for the player**: a
+  (`sudo ufw allow in on gbl0`, firewalld's, or on Windows one rule for
+  `-RemoteAddress 198.18.0.0/15` — never `-InterfaceAlias`, because every
+  room's Wintun adapter is new). Run once, it covers every room and game.
+  **Never run it for the player**: a
   rule outlives the room, and the helper only moves packets. Pinned by fault 3
   in `tests/lan_pack_ports.rs`, a blackhole route standing in for the firewall.
 - **A `[lan]` pack's port list is proven carried, not proven complete.**
