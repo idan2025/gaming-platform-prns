@@ -100,7 +100,9 @@ Now the room pane deals with it:
   so the game's pack gets fixed for everyone.
 
 Only room members can reach a port opened this way, and system ports (below
-1024: file sharing, remote login and the like) are never offered. Your
+1024: file sharing, remote login and the like) are never offered — nor are
+the remote-access and database services above it (Remote Desktop, VNC,
+PowerShell remoting, MySQL, PostgreSQL and the like). Your
 system's own network chatter is left out of the list, so what is listed is
 the game's.
 

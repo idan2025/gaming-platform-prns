@@ -1793,8 +1793,9 @@ function renderRoomPackGaps(parent, r) {
 }
 
 // The last resort, for a join that hangs with nothing named: every port above
-// 1024 for this game on this computer. Never system ports, never the OS's own
-// chatter — the launcher refuses those whatever is asked.
+// 1024 for this game on this computer. Never system ports, remote desktops or
+// databases, never the OS's own chatter — the filter refuses those whatever is
+// asked (lan_filter::is_allowable).
 function renderRoomWideOpen(parent, r) {
   const g = r.pack_gaps;
   if (!g || r.adapter !== 'up') return;
@@ -1818,7 +1819,7 @@ function renderRoomWideOpen(parent, r) {
   d.appendChild(el('summary', '', 'Still can’t join?'));
   d.appendChild(el('p', 'small',
     'If the game shows up but joining hangs and nothing above names a port, let this game use every '
-    + 'port above 1024 on this computer. Only room members can reach them; system ports stay shut. '
+    + 'port above 1024 on this computer. Only room members can reach them; system ports, remote desktop and databases stay shut. '
     + 'Do it on both computers, then try again.'));
   const on = el('button', 'quiet', act.busy ? 'Working…' : 'Open more ports for this game');
   on.type = 'button';

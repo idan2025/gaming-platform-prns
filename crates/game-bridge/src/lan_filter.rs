@@ -192,11 +192,9 @@ impl LanFilter {
     }
 
     /// Whether `port` gets through: the pack's, the player's extras, or —
-    /// with the switch on — any port at or above [`LOWEST_ALLOWABLE_PORT`] that
-    /// is not an operating system's own.
+    /// with the switch on — any port a player may allow ([`is_allowable`]).
     fn admits(&self, proto: LanProto, port: u16) -> bool {
-        self.policy.declares(proto, port)
-            || (self.any_high && port >= LOWEST_ALLOWABLE_PORT && !OS_CHATTER.contains(&port))
+        self.policy.declares(proto, port) || (self.any_high && is_allowable(port))
     }
 
     /// Whether this side may send `packet` into the room. A unicast opens (or
@@ -287,6 +285,35 @@ impl LanFilter {
 /// a room member sending to them must not get opened by one careless click.
 pub const LOWEST_ALLOWABLE_PORT: u16 = 1024;
 
+/// Services above 1024 that hand whoever reaches them a machine or its data:
+/// remote desktops, remote shells, databases, a container daemon. No LAN game
+/// uses one, and the reason 1024 is the floor applies to them unchanged — a
+/// member who sends to RDP would otherwise see it named as a "missing port"
+/// one Allow click away, and the last-resort switch would open it outright.
+const REMOTE_SERVICES: &[u16] = &[
+    1433, 1434, // SQL Server
+    1521, // Oracle
+    2049, // NFS
+    2375, 2376, // Docker's API
+    3306, // MySQL / MariaDB
+    3389, // Remote Desktop
+    5432, // PostgreSQL
+    5900, 5901, 5902, 5903, // VNC
+    5985, 5986, // WinRM (PowerShell remoting)
+    6379, // Redis
+    9200, // Elasticsearch
+    11211, // memcached
+    27017, // MongoDB
+];
+
+/// Whether a player may let `port` through on top of a pack's, by Allow or by
+/// the last-resort switch: at or above [`LOWEST_ALLOWABLE_PORT`], and neither
+/// an operating system's own chatter nor a remote-access or database service.
+/// A pack may still declare any of them; this gates only what a click opens.
+pub fn is_allowable(port: u16) -> bool {
+    port >= LOWEST_ALLOWABLE_PORT && !OS_CHATTER.contains(&port) && !REMOTE_SERVICES.contains(&port)
+}
+
 /// Ports this machine's player allowed for the room's game on top of its
 /// pack's, after the room named them as missing (`RefusedLog`). Shared by the
 /// session and the pump, which picks a change up on its next packet.
@@ -298,10 +325,10 @@ pub struct ExtraPorts {
 }
 
 impl ExtraPorts {
-    /// Replace the extra ports. Any port below [`LOWEST_ALLOWABLE_PORT`] is
+    /// Replace the extra ports. Any port that is not [`is_allowable`] is
     /// refused here, whoever asks.
     pub fn set(&self, ports: Vec<LanPort>) -> Result<(), u16> {
-        if let Some(p) = ports.iter().find(|p| p.port < LOWEST_ALLOWABLE_PORT) {
+        if let Some(p) = ports.iter().find(|p| !is_allowable(p.port)) {
             return Err(p.port);
         }
         let mut deduped: Vec<LanPort> = Vec::new();
@@ -319,8 +346,8 @@ impl ExtraPorts {
         self.ports.lock().expect("extra ports lock").clone()
     }
 
-    /// The last-resort switch: admit every port from [`LOWEST_ALLOWABLE_PORT`]
-    /// up for this game, for when the room cannot tell which one is missing.
+    /// The last-resort switch: admit every [`is_allowable`] port for this
+    /// game, for when the room cannot tell which one is missing.
     pub fn set_any_high(&self, on: bool) {
         self.any_high.store(on, std::sync::atomic::Ordering::Release);
         self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -710,6 +737,8 @@ mod tests {
         let extra = ExtraPorts::default();
         assert_eq!(extra.set(vec![LanPort { proto: LanProto::Tcp, port: 22 }]), Err(22));
         assert_eq!(extra.set(vec![LanPort { proto: LanProto::Tcp, port: 445 }]), Err(445));
+        assert_eq!(extra.set(vec![LanPort { proto: LanProto::Tcp, port: 3389 }]), Err(3389), "RDP");
+        assert_eq!(extra.set(vec![LanPort { proto: LanProto::Tcp, port: 5900 }]), Err(5900), "VNC");
         assert!(extra.ports().is_empty());
     }
 
@@ -727,6 +756,9 @@ mod tests {
         assert!(f.inbound(&tcp(PEER, 40000, ME, 3290), now));
         assert!(!f.inbound(&tcp(PEER, 40000, ME, 22), now), "ssh stays shut");
         assert!(!f.inbound(&tcp(PEER, 40000, ME, 445), now), "smb stays shut");
+        assert!(!f.inbound(&tcp(PEER, 40000, ME, 3389), now), "RDP is above 1024 and stays shut");
+        assert!(!f.inbound(&tcp(PEER, 40000, ME, 5985), now), "WinRM stays shut");
+        assert!(!f.inbound(&tcp(PEER, 40000, ME, 3306), now), "a database stays shut");
         assert!(!f.outbound(&udp(ME, 5353, Ipv4Addr::new(224, 0, 0, 251), 5353), &s, now), "mDNS stays home");
         assert!(!f.outbound(&udp(ME, 1900, s.broadcast(), 1900), &s, now), "SSDP stays home");
         assert!(f.outbound(&udp(ME, 51000, s.broadcast(), 7777), &s, now), "a game's own broadcast goes");

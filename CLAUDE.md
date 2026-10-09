@@ -546,11 +546,14 @@ Rules a later change could quietly break:
   - **The player can let a named port through (Allow) or, as a last resort,
     every port from 1024 up ("Still can't join?")**, per game, on that
     machine, remembered in settings, with Undo (`lan_filter::ExtraPorts`,
-    picked up by the pump on its next packet). **Never below 1024**:
-    `ExtraPorts::set` refuses it whoever asks, and the switch skips OS
-    chatter ports, so a member sending to SSH or SMB can never get it opened
-    by one careless click. Never automatic: opening whatever a packet hit
-    would let any member open any port by sending to it. Both turn the OS
+    picked up by the pump on its next packet). **Never below 1024, and never
+    a remote-access or database service above it** (RDP, VNC, WinRM, SQL…):
+    `lan_filter::is_allowable` is the one gate, `ExtraPorts::set` and the
+    switch both use it, so a member sending to SSH, SMB or RDP can never get
+    it opened by one careless click — a refused knock on 3389 is *named* in
+    the pane, which is exactly why Allow must not offer it. Never
+    automatic: opening whatever a packet hit would let any member open any
+    port by sending to it. Both turn the OS
     firewall's room rule on too if it is not yet (it covers every port).
 - **A Windows room adapter has a fixed GUID** (`lan_adapter::adapter_guid`,
   2026-10-09). Wintun with no GUID picks a random one, and Windows treated

@@ -139,7 +139,8 @@ pub struct RoomPackGapsView {
     pub seen: Vec<String>,
     /// The whole finding as one paragraph, for a bug report.
     pub report: Option<String>,
-    /// Of `ports`, those the Allow button would open: none below 1024, none
+    /// Of `ports`, those the Allow button would open: none below 1024, no
+    /// remote-access or database service (`lan_filter::is_allowable`), none
     /// already allowed.
     pub can_allow: Vec<String>,
     /// Ports this machine already allows for this game on top of its pack's,
@@ -169,7 +170,7 @@ fn port_label(p: &game_bridge::lan_filter::LanPort) -> String {
 /// A settings key back into a port; anything else is ignored, so a hand-edited
 /// settings file cannot stop a room starting.
 pub(crate) fn parse_port_key(key: &str) -> Option<game_bridge::lan_filter::LanPort> {
-    use game_bridge::lan_filter::{LanPort, LanProto, LOWEST_ALLOWABLE_PORT};
+    use game_bridge::lan_filter::{is_allowable, LanPort, LanProto};
     let (proto, port) = key.split_once('/')?;
     let proto = match proto {
         "udp" => LanProto::Udp,
@@ -177,7 +178,7 @@ pub(crate) fn parse_port_key(key: &str) -> Option<game_bridge::lan_filter::LanPo
         _ => return None,
     };
     let port: u16 = port.parse().ok()?;
-    (port >= LOWEST_ALLOWABLE_PORT).then_some(LanPort { proto, port })
+    is_allowable(port).then_some(LanPort { proto, port })
 }
 
 /// The ports a refused-traffic log says a pack is missing, by its fixed end.
@@ -205,7 +206,7 @@ impl RoomPackGapsView {
                 .then(|| game_bridge::lan_check::missing_ports_finding(refused)),
             can_allow: suggested
                 .iter()
-                .filter(|p| p.port >= game_bridge::lan_filter::LOWEST_ALLOWABLE_PORT)
+                .filter(|p| game_bridge::lan_filter::is_allowable(p.port))
                 .filter(|p| !allowed.contains(p))
                 .map(port_label)
                 .collect(),
@@ -610,7 +611,7 @@ impl Launcher {
             let mut ports = room.session.extra_ports().ports();
             let new: Vec<_> = suggested_ports(&room.session.refused_log().refused(std::time::Instant::now()))
                 .into_iter()
-                .filter(|p| p.port >= game_bridge::lan_filter::LOWEST_ALLOWABLE_PORT)
+                .filter(|p| game_bridge::lan_filter::is_allowable(p.port))
                 .filter(|p| !ports.contains(p))
                 .collect();
             if new.is_empty() {
@@ -621,7 +622,7 @@ impl Launcher {
             room.session
                 .extra_ports()
                 .set(ports.clone())
-                .map_err(|p| anyhow!("port {p} is a system port and is never allowed"))?;
+                .map_err(|p| anyhow!("port {p} is a system or remote-access port and is never allowed"))?;
             (room.game_id.clone(), ports)
         };
         self.save_extra_ports(&game_id, &ports).await?;
@@ -1233,11 +1234,16 @@ mod tests {
         let mut ssh = udp(40000, 22);
         ssh[9] = 6;
         log.saw(DropDirection::Inbound, &ssh, now);
+        // So is a member knocking on Remote Desktop, which is above 1024.
+        let mut rdp = udp(40001, 3389);
+        rdp[9] = 6;
+        log.saw(DropDirection::Inbound, &rdp, now);
         let v = RoomPackGapsView::from_refused(&log.refused(now), &[]);
         assert_eq!(v.ports.iter().filter(|p| *p == "UDP 3660").count(), 1);
         assert!(v.ports.contains(&"TCP 22".to_string()), "{:?}", v.ports);
-        assert_eq!(v.can_allow, ["UDP 3660"], "never a system port");
-        assert_eq!(v.seen.len(), 3);
+        assert!(v.ports.contains(&"TCP 3389".to_string()), "{:?}", v.ports);
+        assert_eq!(v.can_allow, ["UDP 3660"], "never a system or remote-access port");
+        assert_eq!(v.seen.len(), 4);
         assert!(v.report.unwrap().contains("Please report this"));
         let allowed = [game_bridge::lan_filter::LanPort {
             proto: game_bridge::lan_filter::LanProto::Udp,
@@ -1253,6 +1259,7 @@ mod tests {
         let p = parse_port_key("udp/3660").unwrap();
         assert_eq!(port_key(&p), "udp/3660");
         assert!(parse_port_key("tcp/22").is_none());
+        assert!(parse_port_key("tcp/3389").is_none(), "a hand-edited RDP entry is ignored");
         assert!(parse_port_key("icmp/3660").is_none());
         assert!(parse_port_key("udp/notaport").is_none());
     }

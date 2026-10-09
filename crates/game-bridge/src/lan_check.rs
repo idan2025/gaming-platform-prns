@@ -359,12 +359,6 @@ impl CheckReport {
             );
             return out;
         }
-        if self.ok() && !self.refused_here.is_empty() {
-            // The room itself works; the game's pack is what is short.
-            out.push("The room works, but the game used ports its pack does not list:".to_string());
-            out.push(missing_ports_finding(&self.refused_here));
-            return out;
-        }
         let tcp_ports = |ports: &[u16]| {
             ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
         };
@@ -389,6 +383,15 @@ impl CheckReport {
                 })
             })
             .collect();
+        if self.ok() && !self.refused_here.is_empty() {
+            // The room itself works; the game's pack is what is short — or the
+            // game is not listening where the room delivers, which the same
+            // hung join looks like, so both are said.
+            out.push("The room works, but the game used ports its pack does not list:".to_string());
+            out.push(missing_ports_finding(&self.refused_here));
+            out.extend(not_listening);
+            return out;
+        }
         if self.ok() {
             let slowest = self.members.iter().filter_map(|m| m.round_trip).max();
             let checked: Vec<u16> =
@@ -847,13 +850,18 @@ mod tests {
         p[20..22].copy_from_slice(&3660u16.to_be_bytes());
         p[22..24].copy_from_slice(&3660u16.to_be_bytes());
         log.saw(crate::lan_filter::DropDirection::Inbound, &p, Instant::now());
-        let mut r = report(vec![member(B, true)]);
+        let mut m = member(B, true);
+        m.tcp = vec![TcpCheck { port: 9900, state: TcpState::Closed }];
+        let mut r = report(vec![m]);
         r.refused_here = log.refused(Instant::now());
         assert!(r.ok(), "the room itself works");
         let f = r.findings().join("\n");
         assert!(f.contains("ports its pack does not list"), "{f}");
         assert!(f.contains("probably needs: UDP 3660"), "{f}");
         assert!(f.contains("from 198.19.2.2:3660"), "{f}");
+        // The same hung join can be a game under Wine listening elsewhere, so
+        // a missing port never hides that.
+        assert!(f.contains("listening on TCP 9900"), "{f}");
     }
 
     /// What a member's firewall dropping the game's TCP looks like from the
