@@ -74,6 +74,31 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.29
+
+### A LAN room says which ports a game is missing
+
+Each game's LAN pack lists the network ports the game uses, and the room lets
+in only those. Some of those lists come from other people's packet captures
+and can be incomplete; Need for Speed: Underground 2's is one of them. When a
+game used a port its pack did not list, the room blocked it without a word.
+The game could still be seen, but joining it hung, exactly like a firewall
+problem.
+
+Now the room keeps track of what it blocks:
+
+- The room pane says **"This game used ports its pack does not list"**, names
+  the ports it probably needs (for example *UDP 3660*), and lists what was
+  blocked.
+- **Copy report** puts it all on the clipboard. Send it in, and the pack gets
+  fixed for everyone.
+- The room check shows the same finding.
+- Your system's own network chatter (name lookups, network browsing, device
+  discovery) is left out, so what is listed is the game's.
+
+**If a game shows up but you cannot join it**, open the LAN room panel on both
+computers after a failed join, and send what it says.
+
 ## v0.2.28
 
 ### LAN rooms open the firewall themselves
