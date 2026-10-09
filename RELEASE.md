@@ -74,6 +74,23 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.27
+
+### Linux downloads say x86_64 or aarch64
+
+Every Linux download now names its architecture the way `uname -m` prints it:
+`Mesh.Game.Servers_0.2.27_x86_64.AppImage`, `…_x86_64.deb`,
+`…_x86_64-portable.tar.gz`, and the same with `aarch64`. They used to say
+`amd64` and `arm64`, which differ by one letter. A CachyOS player unpacked the
+arm64 portable build on an x86_64 PC and got only *the file could not be run by
+the operating system*. The rpm already used these names and is unchanged.
+
+Only the file names change. The `.deb` still declares `Architecture: amd64`
+inside, as dpkg requires, so installing and upgrading work as before. A link
+straight to an older release's Linux file keeps working; a link that builds the
+name from a version number needs the new spelling from 0.2.27 on. Windows
+downloads keep `x64`.
+
 ## v0.2.26
 
 The engine underneath moved again: Prns `v0.3.7-hotfix.5` to upstream `main`
