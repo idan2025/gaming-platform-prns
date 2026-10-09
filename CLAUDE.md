@@ -491,6 +491,18 @@ Rules a later change could quietly break:
   check tells "sent out another network" from "a firewall here" from "that
   member answered nothing". `tests/lan_pack_ports.rs` breaks both halves on
   purpose and requires the check to name each.
+- **The OS firewall can still drop what the pump admits, and the launcher
+  says so rather than fixing it** (2026-10-09, `lan_firewall.rs`). The first
+  real NFSU2 race: the member saw the race and hung joining it, because the
+  CachyOS host's ufw (on, deny incoming, by default) dropped TCP 9900 — a
+  broadcast check cannot see that. The pump's `ConnectWatch` flags a SYN it
+  delivered that the stack never answered (a reset *is* an answer, so a game
+  not hosting yet is never blamed); the room check also connects to every
+  declared TCP port on every member. The room pane shows the command
+  (`sudo ufw allow in on gbl0`, firewalld's, or a PowerShell rule scoped to
+  the adapter and the declared ports). **Never run it for the player**: a
+  rule outlives the room, and the helper only moves packets. Pinned by fault 3
+  in `tests/lan_pack_ports.rs`, a blackhole route standing in for the firewall.
 - **A `[lan]` pack's port list is proven carried, not proven complete.**
   `lan_pack_ports.rs` crosses every declared port for every shipped `[lan]`
   pack (found by property), so it cannot notice a port the pack left out;

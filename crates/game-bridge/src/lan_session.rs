@@ -197,6 +197,7 @@ pub struct LanSession {
     inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     room_hash: Arc<Mutex<Option<DestinationHash>>>,
     probes: crate::lan_check::ProbeLog,
+    connects: crate::lan_firewall::ConnectWatch,
 }
 
 impl LanSession {
@@ -240,6 +241,12 @@ impl LanSession {
     /// What this member's pump saw of a room check (`lan_check.rs`).
     pub fn probe_log(&self) -> &crate::lan_check::ProbeLog {
         &self.probes
+    }
+
+    /// Connections the room delivered here that this machine never answered
+    /// (`lan_firewall.rs`).
+    pub fn connect_watch(&self) -> &crate::lan_firewall::ConnectWatch {
+        &self.connects
     }
 
     /// Rooms and servers this node has heard announce.
@@ -385,6 +392,7 @@ impl LanSession {
             inbound: tokio::sync::Mutex::new(in_rx),
             room_hash: Arc::new(Mutex::new(Some(room_hash))),
             probes: Default::default(),
+            connects: Default::default(),
         })
     }
 
@@ -459,6 +467,7 @@ impl LanSession {
             inbound: tokio::sync::Mutex::new(in_rx),
             room_hash,
             probes: Default::default(),
+            connects: Default::default(),
         })
     }
 }

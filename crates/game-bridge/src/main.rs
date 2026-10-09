@@ -422,7 +422,7 @@ async fn run_lan_adapter(
     };
     let (phase, phase_rx) = tokio::sync::watch::channel(AdapterPhase::WaitingForSeat);
     if check {
-        tokio::spawn(check_room_on_change(session.clone(), policy.clone(), phase_rx));
+        tokio::spawn(check_room_on_change(session.clone(), policy.clone(), adapter.clone(), phase_rx));
     }
     run_room_on_adapter_reporting(session, policy, adapter, setup, stop, phase).await
 }
@@ -433,6 +433,7 @@ async fn run_lan_adapter(
 async fn check_room_on_change(
     session: std::sync::Arc<game_bridge::lan_session::LanSession>,
     policy: game_bridge::lan_filter::LanPolicy,
+    adapter: String,
     phase: tokio::sync::watch::Receiver<game_bridge::lan_adapter::AdapterPhase>,
 ) {
     use game_bridge::lan_adapter::AdapterPhase;
@@ -447,7 +448,7 @@ async fn check_room_on_change(
         if members.len() < 2 || checked.as_ref() == Some(&members) {
             continue;
         }
-        match game_bridge::lan_check::check_room(&session, &policy).await {
+        match game_bridge::lan_check::check_room(&session, &policy, &adapter).await {
             Ok(report) => {
                 println!("room check from {} on UDP {}:", report.address, report.port);
                 for line in report.findings() {

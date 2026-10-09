@@ -24,7 +24,13 @@
 //! - an answer the pump delivered that the socket never got was stopped on this
 //!   machine, between the adapter and the program — a firewall;
 //! - a member that answered nothing has no working room on its side (or runs a
-//!   launcher from before this check).
+//!   launcher from before this check);
+//! - a member the room reaches that did not answer a TCP connection to one of
+//!   the game's declared TCP ports has a firewall dropping it. That is the
+//!   one that lets a player *see* a game and hang joining it, and a broadcast
+//!   cannot find it — the first real NFSU2 race in a room hit exactly this.
+//!   The member's own launcher saw the connection go unanswered and names its
+//!   firewall (`lan_firewall.rs`); [`CheckReport::dropped_here`] is that, here.
 //!
 //! # Rules a later change could quietly break
 //!
@@ -37,6 +43,9 @@
 //!   the room what any broadcast does — the host's gate applies to it.
 //! - **A probe is swallowed, not delivered.** A game listening on the port it
 //!   arrived on would otherwise read 24 bytes it never asked for.
+//! - **A TCP probe is a real connection, closed at once.** A refused one is a
+//!   pass: the reset came from the member's stack, so nothing dropped it, and
+//!   a game that is not hosting yet must not fail the check.
 //! - **This proves the room, not the game.** A member's firewall rule for the
 //!   game itself, or a game that advertises its real LAN address instead of
 //!   the room's, are beyond it; the report says so rather than overclaim.
@@ -47,7 +56,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpSocket, UdpSocket};
 
 use crate::lan_filter::{LanPolicy, LanProto};
 use crate::lan_session::LanSession;
@@ -69,6 +78,9 @@ const ROUND_GAP: Duration = Duration::from_millis(300);
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(3);
 /// Probes and answers a [`ProbeLog`] remembers; a check needs a few dozen.
 const LOG_CAP: usize = 512;
+/// How long a TCP probe waits to connect. A stack answers a SYN at once; a
+/// firewall that drops it is what makes one wait this long.
+const TCP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -252,6 +264,24 @@ pub fn probe_port(policy: &LanPolicy) -> Option<u16> {
         .or(policy.any.then_some(FALLBACK_PORT))
 }
 
+/// What a TCP connection to one of a member's declared ports did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpState {
+    /// Something there accepted it.
+    Open,
+    /// Refused: the member's stack answered, nothing listens there yet.
+    Closed,
+    /// Nothing answered.
+    NoAnswer,
+}
+
+/// One declared TCP port on one member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpCheck {
+    pub port: u16,
+    pub state: TcpState,
+}
+
 /// How one other member did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberCheck {
@@ -264,11 +294,21 @@ pub struct MemberCheck {
     pub answered_unicast: bool,
     /// Fastest answer to any probe, there and back.
     pub round_trip: Option<Duration>,
+    /// Each of the game's declared TCP ports, connected to on this member.
+    pub tcp: Vec<TcpCheck>,
 }
 
 impl MemberCheck {
     pub fn ok(&self) -> bool {
-        self.heard_limited_broadcast && self.heard_subnet_broadcast && self.answered_unicast
+        self.heard_limited_broadcast
+            && self.heard_subnet_broadcast
+            && self.answered_unicast
+            && self.tcp_unanswered().is_empty()
+    }
+
+    /// Declared TCP ports on this member nothing answered.
+    pub fn tcp_unanswered(&self) -> Vec<u16> {
+        self.tcp.iter().filter(|t| t.state == TcpState::NoAnswer).map(|t| t.port).collect()
     }
 }
 
@@ -288,6 +328,12 @@ pub struct CheckReport {
     /// Some answer reached this machine's adapter but not the socket that
     /// asked: something on this machine stopped it.
     pub answers_blocked_here: bool,
+    /// Connections members made to this machine that nothing here answered,
+    /// as `(port, member)` (`lan_firewall::ConnectWatch`).
+    pub dropped_here: Vec<(u16, Ipv4Addr)>,
+    /// What to run to open this machine's firewall to the room, once it has
+    /// dropped something (`lan_firewall::advice_line`).
+    pub firewall_advice: Option<String>,
 }
 
 impl CheckReport {
@@ -296,6 +342,7 @@ impl CheckReport {
         !self.members.is_empty()
             && self.limited_broadcast_left
             && self.subnet_broadcast_left
+            && self.dropped_here.is_empty()
             && self.members.iter().all(MemberCheck::ok)
     }
 
@@ -309,8 +356,13 @@ impl CheckReport {
             );
             return out;
         }
+        let tcp_ports = |ports: &[u16]| {
+            ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+        };
         if self.ok() {
             let slowest = self.members.iter().filter_map(|m| m.round_trip).max();
+            let checked: Vec<u16> =
+                self.members.first().map(|m| m.tcp.iter().map(|t| t.port).collect()).unwrap_or_default();
             out.push(match slowest {
                 Some(rtt) => format!(
                     "The room works: every member heard this machine's LAN broadcasts and answered \
@@ -322,6 +374,12 @@ impl CheckReport {
                         .to_string()
                 }
             });
+            if !checked.is_empty() {
+                out.push(format!(
+                    "Every member let a connection to TCP {} through.",
+                    tcp_ports(&checked)
+                ));
+            }
             out.push(
                 "That proves the room, not the game: if the game still lists nothing, allow it \
                  through the firewall on every machine, and check it is set to LAN play."
@@ -345,6 +403,16 @@ impl CheckReport {
                  route is missing: leave and rejoin the room."
                     .to_string(),
             );
+        }
+        for (port, from) in &self.dropped_here {
+            out.push(format!(
+                "{from} tried to connect to this machine on TCP {port} and nothing here answered: a firewall \
+                 on this machine is dropping the room's connections, so the others can see a game hosted \
+                 here but not join it. {}",
+                self.firewall_advice.as_deref().unwrap_or(
+                    "Allow incoming connections on the room's adapter in this machine's firewall."
+                )
+            ));
         }
         if self.answers_blocked_here {
             out.push(
@@ -382,33 +450,57 @@ impl CheckReport {
                     ));
                 }
             }
+            let unanswered = m.tcp_unanswered();
+            if m.answered_unicast && !unanswered.is_empty() {
+                out.push(format!(
+                    "{} did not answer a connection to TCP {}, though the room reaches it: a firewall on \
+                     that machine is dropping them, so a game hosted there can be seen but not joined. The \
+                     launcher there names the command that opens it.",
+                    m.address,
+                    tcp_ports(&unanswered)
+                ));
+            }
         }
         out
     }
 }
 
-/// Check `session`'s room from this machine, on `policy`'s UDP port. The room
-/// must already be on this machine's adapter.
-pub async fn check_room(session: &LanSession, policy: &LanPolicy) -> Result<CheckReport> {
-    let port = probe_port(policy).ok_or_else(|| {
-        anyhow!("this game uses no UDP on its LAN, and the room check is a UDP broadcast")
-    })?;
+/// Check `session`'s room from this machine, on `policy`'s UDP port and every
+/// declared TCP port. The room must already be on this machine's adapter,
+/// named `adapter`.
+pub async fn check_room(
+    session: &LanSession,
+    policy: &LanPolicy,
+    adapter: &str,
+) -> Result<CheckReport> {
     // `0.0.0.0`, as a game binds: what is under test is where the operating
     // system sends a broadcast from a socket that did not pick an interface.
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_broadcast(true)?;
     socket.set_nonblocking(true)?;
-    check_room_with(session, port, UdpSocket::from_std(socket)?, DEFAULT_WAIT).await
+    let firewall = crate::lan_firewall::detect();
+    let mut report =
+        check_room_with(session, policy, UdpSocket::from_std(socket)?, TcpSocket::new_v4, DEFAULT_WAIT)
+            .await?;
+    if !report.dropped_here.is_empty() {
+        report.firewall_advice = Some(crate::lan_firewall::advice_line(firewall, adapter, policy));
+    }
+    Ok(report)
 }
 
-/// [`check_room`] on a socket the caller made — a test makes it inside a
-/// network namespace. `socket` must allow broadcast.
+/// [`check_room`] on sockets the caller makes — a test makes them inside a
+/// network namespace. `socket` must allow broadcast; `new_tcp` makes one
+/// socket per TCP probe.
 pub async fn check_room_with(
     session: &LanSession,
-    port: u16,
+    policy: &LanPolicy,
     socket: UdpSocket,
+    new_tcp: impl Fn() -> std::io::Result<TcpSocket>,
     wait: Duration,
 ) -> Result<CheckReport> {
+    let port = probe_port(policy).ok_or_else(|| {
+        anyhow!("this game uses no UDP on its LAN, and the room check is a UDP broadcast")
+    })?;
     let view = session.view();
     let address = view
         .own_address
@@ -435,6 +527,7 @@ pub async fn check_room_with(
                     heard_subnet_broadcast: false,
                     answered_unicast: false,
                     round_trip: None,
+                    tcp: Vec::new(),
                 },
             )
         })
@@ -464,6 +557,36 @@ pub async fn check_room_with(
         m.round_trip = Some(m.round_trip.map_or(rtt, |r| r.min(rtt)));
     };
 
+    // Every declared TCP port on every other member, all at once, alongside
+    // the broadcasts.
+    let tcp_ports: Vec<u16> = policy
+        .ports
+        .iter()
+        .filter(|p| p.proto == LanProto::Tcp)
+        .map(|p| p.port)
+        .collect();
+    let mut tcp_probes = tokio::task::JoinSet::new();
+    for &member in &others {
+        for &tcp_port in &tcp_ports {
+            let sock = new_tcp()?;
+            tcp_probes.spawn(async move {
+                let state =
+                    match tokio::time::timeout(TCP_WAIT, sock.connect((member, tcp_port).into())).await {
+                        Ok(Ok(_stream)) => TcpState::Open,
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            TcpState::Closed
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(%member, tcp_port, error = %e, "a room check TCP probe failed");
+                            TcpState::NoAnswer
+                        }
+                        Err(_) => TcpState::NoAnswer,
+                    };
+                (member, TcpCheck { port: tcp_port, state })
+            });
+        }
+    }
+
     for round in 0..ROUNDS {
         let mut targets = vec![Target::Limited, Target::Subnet];
         targets.extend(
@@ -492,7 +615,7 @@ pub async fn check_room_with(
         let until =
             tokio::time::Instant::now() + if round + 1 == ROUNDS { wait } else { ROUND_GAP };
         loop {
-            if results.values().all(MemberCheck::ok) && !results.is_empty() && round > 0 {
+            if results.values().all(udp_done) && !results.is_empty() && round > 0 {
                 break;
             }
             match tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await {
@@ -501,8 +624,14 @@ pub async fn check_room_with(
                 Err(_) => break,
             }
         }
-        if results.values().all(MemberCheck::ok) && !results.is_empty() {
+        if results.values().all(udp_done) && !results.is_empty() {
             break;
+        }
+    }
+    while let Some(done) = tcp_probes.join_next().await {
+        let (member, check) = done.map_err(|e| anyhow!("a room check TCP probe: {e}"))?;
+        if let Some(m) = results.get_mut(&member) {
+            m.tcp.push(check);
         }
     }
 
@@ -514,6 +643,15 @@ pub async fn check_room_with(
         sent.keys().any(|n| !received.contains(n) && !log.delivered(*n).is_empty());
     let mut members: Vec<MemberCheck> = results.into_values().collect();
     members.sort_by_key(|m| m.address);
+    for m in &mut members {
+        m.tcp.sort_by_key(|t| t.port);
+    }
+    let dropped_here = session
+        .connect_watch()
+        .dropped(Instant::now())
+        .into_iter()
+        .map(|d| (d.port, d.from))
+        .collect();
     Ok(CheckReport {
         address,
         port,
@@ -521,7 +659,15 @@ pub async fn check_room_with(
         limited_broadcast_left,
         subnet_broadcast_left,
         answers_blocked_here,
+        dropped_here,
+        firewall_advice: None,
     })
+}
+
+/// Every broadcast and unicast probe to `m` was answered; its TCP probes are
+/// waited for separately.
+fn udp_done(m: &MemberCheck) -> bool {
+    m.heard_limited_broadcast && m.heard_subnet_broadcast && m.answered_unicast
 }
 
 fn random_nonce() -> Result<u64> {
@@ -612,6 +758,7 @@ mod tests {
             heard_subnet_broadcast: ok,
             answered_unicast: ok,
             round_trip: ok.then_some(Duration::from_millis(40)),
+            tcp: Vec::new(),
         }
     }
 
@@ -623,7 +770,48 @@ mod tests {
             limited_broadcast_left: true,
             subnet_broadcast_left: true,
             answers_blocked_here: false,
+            dropped_here: Vec::new(),
+            firewall_advice: None,
         }
+    }
+
+    /// What a member's firewall dropping the game's TCP looks like from the
+    /// other side: the broadcasts all work, and a join would hang.
+    #[test]
+    fn a_member_whose_firewall_drops_the_games_tcp_is_named() {
+        let mut m = member(B, true);
+        m.tcp = vec![
+            TcpCheck { port: 3282, state: TcpState::NoAnswer },
+            TcpCheck { port: 9900, state: TcpState::Closed },
+        ];
+        let r = report(vec![m]);
+        assert!(!r.ok());
+        let f = r.findings().join("\n");
+        assert!(f.contains("198.19.2.2 did not answer a connection to TCP 3282,"), "{f}");
+        assert!(f.contains("firewall on that machine"), "{f}");
+        assert!(!f.contains("9900"), "a refused port reached the member's stack: {f}");
+    }
+
+    /// The rule that keeps a game that is not hosting yet from failing the
+    /// check: a refused connection was answered.
+    #[test]
+    fn a_refused_tcp_port_passes() {
+        let mut m = member(B, true);
+        m.tcp = vec![TcpCheck { port: 9900, state: TcpState::Closed }];
+        let r = report(vec![m]);
+        assert!(r.ok());
+        assert!(r.findings().join("\n").contains("TCP 9900 through"));
+    }
+
+    #[test]
+    fn a_connection_this_machine_dropped_is_named_with_the_fix() {
+        let mut r = report(vec![member(B, true)]);
+        r.dropped_here = vec![(9900, B)];
+        r.firewall_advice = Some("Run: sudo ufw allow in on gbl0".into());
+        assert!(!r.ok());
+        let f = r.findings().join("\n");
+        assert!(f.contains("198.19.2.2 tried to connect to this machine on TCP 9900"), "{f}");
+        assert!(f.contains("sudo ufw allow in on gbl0"), "{f}");
     }
 
     #[test]

@@ -15,6 +15,13 @@
 //!   client on 3282–3285;
 //! - an undeclared TCP port still shut.
 //!
+//! And a third fault, the one the first real NFSU2 race hit: a member whose
+//! machine drops the game's TCP (there, the host's ufw). The broadcasts all
+//! work, so the game lists the race and hangs joining it; the check must name
+//! that member from outside, and that member's own pump must notice the
+//! connection it never answered (`lan_firewall.rs`). A blackhole route to the
+//! checker stands in for the firewall — `ip` is all this test needs.
+//!
 //! Then the room check (`lan_check.rs`) runs from every member and must pass
 //! with the game's own sockets bound to its ports — and must not hand those
 //! sockets its probe — and it must name two faults it exists to find: a
@@ -133,13 +140,34 @@ impl Ns {
         UdpSocket::from_std(s).unwrap()
     }
 
+    /// Makes TCP sockets for the room check, each inside this namespace.
+    fn tcp_sockets(&self) -> impl Fn() -> std::io::Result<tokio::net::TcpSocket> {
+        let netns = self.netns.try_clone().unwrap();
+        move || {
+            let fd = netns.try_clone()?;
+            std::thread::spawn(move || {
+                // SAFETY: moves only this fresh thread into the namespace.
+                assert_eq!(unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWNET) }, 0);
+                tokio::net::TcpSocket::new_v4()
+            })
+            .join()
+            .unwrap()
+        }
+    }
+
     fn tcp_listener(&self, port: u16) -> TcpListener {
         self.run(move || TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap())
     }
 
     fn ip(&self, args: &'static [&'static str]) {
+        self.ip_owned(args.iter().map(|a| a.to_string()).collect());
+    }
+
+    fn ip_owned(&self, args: Vec<String>) {
+        let shown = args.clone();
         let out = self
             .run(move || std::process::Command::new("ip").args(args).output().expect("ip runs"));
+        let args = shown;
         assert!(out.status.success(), "ip {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 }
@@ -369,7 +397,7 @@ async fn one_pack(pack: GamePack) {
     for (i, ns) in nss.iter().enumerate() {
         let checker = ns.udp(0);
         let report =
-            lan_check::check_room_with(&sessions[i], port, checker, Duration::from_secs(3))
+            lan_check::check_room_with(&sessions[i], &policy, checker, ns.tcp_sockets(), Duration::from_secs(3))
                 .await
                 .unwrap();
         assert!(
@@ -389,6 +417,53 @@ async fn one_pack(pack: GamePack) {
             );
         }
         drain(&games[i]).await; // its own limited broadcast, looped back
+        if !tcp_ports.is_empty() {
+            assert!(
+                report.members.iter().all(|m| m.tcp.len() == tcp_ports.len()),
+                "{}: every declared TCP port was tried on every member: {report:?}",
+                pack.id
+            );
+        }
+    }
+
+    // --- Fault 3: m1's machine drops the game's TCP. Its answers to the
+    // host cannot be routed, which is what a firewall dropping the host's
+    // connections looks like from both ends.
+    if !tcp_ports.is_empty() {
+        let host_addr = nss[0].address;
+        nss[1].ip_owned(vec!["route".into(), "add".into(), "blackhole".into(), format!("{host_addr}/32")]);
+        let report = lan_check::check_room_with(
+            &host,
+            &policy,
+            nss[0].udp(0),
+            nss[0].tcp_sockets(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!report.ok(), "{}: {report:?}", pack.id);
+        let m1_addr = nss[1].address;
+        let m1_check = report.members.iter().find(|m| m.address == m1_addr).unwrap();
+        assert!(m1_check.answered_unicast, "the room still reaches m1: {report:?}");
+        let mut want = tcp_ports.clone();
+        want.sort();
+        assert_eq!(m1_check.tcp_unanswered(), want, "{}: {report:?}", pack.id);
+        let other = report.members.iter().find(|m| m.address != m1_addr).unwrap();
+        assert!(other.ok(), "{}: m2 is not at fault: {report:?}", pack.id);
+        let findings = report.findings().join("\n");
+        assert!(findings.contains(&format!("{m1_addr} did not answer a connection to TCP")), "{findings}");
+        assert!(findings.contains("firewall on that machine"), "{findings}");
+        // And m1 knows it is the one, without running a check of its own.
+        wait_until("m1's pump notices the connections it never answered", || {
+            m1.connect_watch().dropped(std::time::Instant::now()).iter().any(|d| d.from == host_addr)
+        })
+        .await;
+        let seen: Vec<u16> =
+            m1.connect_watch().dropped(std::time::Instant::now()).iter().map(|d| d.port).collect();
+        let mut want = tcp_ports.clone();
+        want.sort();
+        assert_eq!(seen, want, "{}: every port the host tried", pack.id);
+        nss[1].ip_owned(vec!["route".into(), "del".into(), "blackhole".into(), format!("{host_addr}/32")]);
     }
 
     // --- Fault 1: this machine sends 255.255.255.255 out of another network —
@@ -397,7 +472,7 @@ async fn one_pack(pack: GamePack) {
     nss[2].ip(&["link", "set", "lo", "up"]);
     nss[2].ip(&["route", "add", "255.255.255.255", "dev", "lo"]);
     let report =
-        lan_check::check_room_with(&m2, port, nss[2].udp(0), Duration::from_secs(2)).await.unwrap();
+        lan_check::check_room_with(&m2, &policy, nss[2].udp(0), nss[2].tcp_sockets(), Duration::from_secs(2)).await.unwrap();
     assert!(!report.ok());
     assert!(!report.limited_broadcast_left, "{report:?}");
     assert!(report.subnet_broadcast_left, "the subnet broadcast still takes the room: {report:?}");
@@ -414,7 +489,7 @@ async fn one_pack(pack: GamePack) {
     wait_until("m1 sees the fourth member", || m1.view().members.len() == 4).await;
     let m3_addr = m3.own_address().unwrap();
     let report =
-        lan_check::check_room_with(&m1, port, nss[1].udp(0), Duration::from_secs(2)).await.unwrap();
+        lan_check::check_room_with(&m1, &policy, nss[1].udp(0), nss[1].tcp_sockets(), Duration::from_secs(2)).await.unwrap();
     assert!(!report.ok());
     let silent: Vec<_> = report.members.iter().filter(|m| !m.ok()).map(|m| m.address).collect();
     assert_eq!(silent, vec![m3_addr], "only the member without an adapter fails: {report:?}");

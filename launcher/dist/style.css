@@ -660,6 +660,8 @@ input:focus-visible, select:focus-visible {
 .helper-status { display: flex; gap: 10px; align-items: center; padding: 4px 8px; margin: 6px 0; border-radius: var(--radius); font-size: 12px; }
 .helper-status.ok { color: var(--ok); }
 .helper-status.warn { color: var(--warn); background: var(--warn-bg); }
+.room-firewall { margin: 6px 0; }
+.room-command { font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; user-select: all; background: var(--warn-bg); padding: 4px 8px; border-radius: var(--radius); margin: 4px 0; }
 .room-hash { display: block; font-size: 11px; color: var(--fg-muted); margin: 4px 0; word-break: break-all; }
 .room-check { margin: 6px 0; }
 .room-check p { margin: 4px 0; }

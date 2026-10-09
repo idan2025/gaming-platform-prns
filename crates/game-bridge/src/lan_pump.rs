@@ -11,7 +11,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::lan_filter::{LanFilter, LanPolicy};
 use crate::lan_session::{LanSendError, LanSession};
@@ -48,6 +48,7 @@ where
                 continue;
             }
             room.probe_log().saw_outbound(packet);
+            report_dropped(room.connect_watch().saw_outbound(packet, Instant::now()));
             match room.send(packet.to_vec()) {
                 Ok(()) => {}
                 Err(LanSendError::Stopped) => return Ok::<(), io::Error>(()),
@@ -74,6 +75,7 @@ where
             }
             device.send(&packet).await?;
             room.probe_log().saw_delivered(&packet);
+            report_dropped(room.connect_watch().saw_delivered(&packet, Instant::now()));
         }
         Ok::<(), io::Error>(())
     };
@@ -81,5 +83,18 @@ where
     tokio::select! {
         r = up => r,
         r = down => r,
+    }
+}
+
+/// Say once, in the log, that this machine left a member's connection
+/// unanswered (`lan_firewall.rs`). The launcher shows it from the watch.
+fn report_dropped(found: Vec<crate::lan_firewall::Dropped>) {
+    for d in found {
+        warn!(
+            port = d.port,
+            from = %d.from,
+            "a room member's TCP connection reached this machine and nothing answered it: \
+             a firewall here is dropping the room's connections"
+        );
     }
 }

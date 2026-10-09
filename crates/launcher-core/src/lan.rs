@@ -121,6 +121,36 @@ pub struct RoomView {
     pub error: Option<String>,
     /// Why the room refused this member, when it did.
     pub refused: Option<String>,
+    /// Whether this machine's firewall is keeping the room out.
+    pub firewall: RoomFirewallView,
+}
+
+/// This machine's firewall, as far as the room can tell (`game_bridge::lan_firewall`).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RoomFirewallView {
+    /// Members' connections that reached this machine and that nothing here
+    /// answered, in the last ten minutes. Not empty means a firewall here is
+    /// dropping the room's connections — the "can see it, cannot join" fault.
+    pub dropped: Vec<RoomDroppedView>,
+    /// What to do about it, once something was dropped; `command` is the
+    /// thing to run.
+    pub advice: Option<String>,
+    /// A warning before anything was dropped, for a firewall whose default is
+    /// known to refuse incoming connections (ufw, firewalld); `command` again.
+    pub heads_up: Option<String>,
+    /// The command that opens this machine's firewall to the room adapter, when
+    /// the firewall is one it knows. Lines are separate commands.
+    pub command: Option<String>,
+}
+
+/// One connection nothing here answered.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomDroppedView {
+    pub port: u16,
+    /// Always `"tcp"`: only a connection has an answer to miss.
+    pub transport: &'static str,
+    /// The member that tried.
+    pub from: String,
 }
 
 impl RoomView {
@@ -137,6 +167,7 @@ impl RoomView {
             adapter: "none".to_string(),
             error: None,
             refused: None,
+            firewall: RoomFirewallView::default(),
         }
     }
 }
@@ -173,6 +204,8 @@ pub struct RoomCheckMemberView {
     pub ok: bool,
     /// Fastest answer there and back, when it answered at all.
     pub round_trip_ms: Option<u64>,
+    /// The game's declared TCP ports on that member that nothing answered.
+    pub tcp_unanswered: Vec<u16>,
 }
 
 impl From<game_bridge::lan_check::CheckReport> for RoomCheckView {
@@ -189,6 +222,7 @@ impl From<game_bridge::lan_check::CheckReport> for RoomCheckView {
                     address: m.address.to_string(),
                     ok: m.ok(),
                     round_trip_ms: m.round_trip.map(|d| d.as_millis() as u64),
+                    tcp_unanswered: m.tcp_unanswered(),
                 })
                 .collect(),
         }
@@ -205,6 +239,8 @@ pub(crate) struct RoomState {
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
     phase: watch::Receiver<AdapterPhase>,
+    /// Which firewall this machine runs, read once when the room opens.
+    firewall: game_bridge::lan_firewall::LocalFirewall,
 }
 
 /// Where `lan-helper` ships: beside this executable, on every platform the
@@ -510,6 +546,9 @@ impl Launcher {
             stop_rx,
             phase_tx,
         );
+        let firewall = tokio::task::spawn_blocking(game_bridge::lan_firewall::detect)
+            .await
+            .unwrap_or(game_bridge::lan_firewall::LocalFirewall::Unknown);
         inner.room = Some(RoomState {
             role,
             game_id,
@@ -519,6 +558,7 @@ impl Launcher {
             stop: Some(stop_tx),
             task,
             phase: phase_rx,
+            firewall,
         });
         drop(inner);
         Ok(self.room_status().await)
@@ -566,7 +606,7 @@ impl Launcher {
             }
             (room.session.clone(), room.policy.clone())
         };
-        let report = game_bridge::lan_check::check_room(&session, &policy).await?;
+        let report = game_bridge::lan_check::check_room(&session, &policy, ADAPTER_NAME).await?;
         Ok(report.into())
     }
 
@@ -595,12 +635,31 @@ impl Launcher {
             adapter: adapter.to_string(),
             error,
             refused: view.refused.map(|r| r.to_string()),
+            firewall: firewall_view(room),
         }
     }
 
     /// The room identity: its own file beside the settings, like the client's.
     fn lan_identity_path(&self) -> PathBuf {
         self.client_identity_path().with_file_name("lan.identity")
+    }
+}
+
+/// What the room's firewall watch has seen, and what to tell the player.
+fn firewall_view(room: &RoomState) -> RoomFirewallView {
+    use game_bridge::lan_firewall::{advice, fix_command, heads_up};
+    let dropped: Vec<RoomDroppedView> = room
+        .session
+        .connect_watch()
+        .dropped(std::time::Instant::now())
+        .into_iter()
+        .map(|d| RoomDroppedView { port: d.port, transport: "tcp", from: d.from.to_string() })
+        .collect();
+    RoomFirewallView {
+        advice: (!dropped.is_empty()).then(|| advice(room.firewall, ADAPTER_NAME)),
+        heads_up: heads_up(room.firewall),
+        command: fix_command(room.firewall, ADAPTER_NAME, &room.policy),
+        dropped,
     }
 }
 
@@ -664,6 +723,7 @@ mod tests {
                 "adapter",
                 "address",
                 "error",
+                "firewall",
                 "game_id",
                 "members",
                 "name",
@@ -678,6 +738,15 @@ mod tests {
             serde_json::to_value(RoomMemberView { address: "198.19.0.1".into(), is_self: true })
                 .unwrap();
         assert_eq!(keys(&m), ["address", "is_self"]);
+        let f = serde_json::to_value(RoomFirewallView {
+            dropped: vec![RoomDroppedView { port: 9900, transport: "tcp", from: "198.19.0.2".into() }],
+            advice: Some("ufw is refusing incoming connections here.".into()),
+            heads_up: None,
+            command: Some("sudo ufw allow in on gbl0".into()),
+        })
+        .unwrap();
+        assert_eq!(keys(&f), ["advice", "command", "dropped", "heads_up"]);
+        assert_eq!(keys(&f["dropped"][0]), ["from", "port", "transport"]);
     }
 
     fn facts() -> HelperFacts {
@@ -705,15 +774,22 @@ mod tests {
                 heard_subnet_broadcast: true,
                 answered_unicast: true,
                 round_trip: Some(std::time::Duration::from_millis(12)),
+                tcp: vec![game_bridge::lan_check::TcpCheck {
+                    port: 9900,
+                    state: game_bridge::lan_check::TcpState::NoAnswer,
+                }],
             }],
             limited_broadcast_left: true,
             subnet_broadcast_left: true,
             answers_blocked_here: false,
+            dropped_here: Vec::new(),
+            firewall_advice: None,
         };
         let v = serde_json::to_value(RoomCheckView::from(report)).unwrap();
         assert_eq!(keys(&v), ["address", "findings", "members", "ok", "port"]);
-        assert_eq!(keys(&v["members"][0]), ["address", "ok", "round_trip_ms"]);
-        assert_eq!(v["ok"], true);
+        assert_eq!(keys(&v["members"][0]), ["address", "ok", "round_trip_ms", "tcp_unanswered"]);
+        assert_eq!(v["ok"], false, "an unanswered TCP port fails the member");
+        assert_eq!(v["members"][0]["tcp_unanswered"][0], 9900);
         assert_eq!(v["members"][0]["round_trip_ms"], 12);
     }
 

@@ -548,6 +548,7 @@ const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r =>
 const noRoom = {
   active: false, role: null, game_id: null, name: null, room_hash: null, address: null,
   subnet: null, members: [], adapter: 'none', error: null, refused: null,
+  firewall: { dropped: [], advice: null, heads_up: null, command: null },
 };
 
 const lanGame = (lan) => ({
@@ -585,6 +586,7 @@ const memberRoom = {
   address: '198.19.4.2', subnet: '198.19.0.0/16',
   members: [{ address: '198.19.1.1', is_self: false }, { address: '198.19.4.2', is_self: true }],
   adapter: 'up', error: null, refused: null,
+  firewall: { dropped: [], advice: null, heads_up: null, command: null },
 };
 
 await run('a LAN room is a room, not a server', {
@@ -750,6 +752,58 @@ await run('checking a room shows what failed and who answered', {
   check('and each member, with its round trip', t.includes('198.19.1.1') && t.includes('did not answer everything'), t);
   win.eval('renderRoomPanel()');
   check('the result survives a poll', !!doc.querySelector('#room-check-result')?.textContent.includes('another network'));
+});
+
+// The first real NFSU2 race: the host's ufw dropped the member's join, and the
+// member saw the race in the game and hung joining it. The host's pane must
+// say so, and give the command, without being asked.
+await run('a firewall here dropping the room is shown, with the command', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: {
+    ...memberRoom, role: 'host',
+    firewall: {
+      dropped: [{ port: 9900, transport: 'tcp', from: '198.19.4.2' }],
+      advice: 'ufw is refusing incoming connections here. Allow the room\u2019s adapter once, in a terminal:',
+      heads_up: 'ufw is on here and refuses incoming connections by default',
+      command: 'sudo ufw allow in on gbl0',
+    },
+  },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const box = doc.querySelector('#room-body #room-firewall');
+  const t = box ? box.textContent : '';
+  check('the dropped connection is named', t.includes('198.19.4.2') && t.includes('TCP 9900'), t);
+  check('with the advice, not the heads-up', t.includes('refusing incoming') && !t.includes('by default'), t);
+  check('and the command, on its own', doc.querySelector('#room-firewall-command')?.textContent === 'sudo ufw allow in on gbl0');
+  const banner = doc.querySelector('#room-banner');
+  check('the banner says the room is blocked', banner.classList.contains('err') && banner.textContent.includes('firewall'), banner.textContent);
+});
+
+await run('a firewall that bites by default is warned about before anything is dropped', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: {
+    ...memberRoom,
+    firewall: { dropped: [], advice: null, heads_up: 'ufw is on here and refuses incoming connections by default.', command: 'sudo ufw allow in on gbl0' },
+  },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const t = doc.querySelector('#room-firewall')?.textContent || '';
+  check('the heads-up is shown', t.includes('by default'), t);
+  check('the banner is not an error yet', !doc.querySelector('#room-banner').classList.contains('err'));
+});
+
+await run('no firewall to speak of shows nothing', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: memberRoom,
+  rows: () => [row()],
+}, async (win, doc) => {
+  check('no firewall box', !doc.querySelector('#room-firewall'));
 });
 
 await run('a room check needs somebody to answer', {

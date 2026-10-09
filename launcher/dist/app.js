@@ -1584,11 +1584,13 @@ function renderRoomBanner() {
   const r = state.room;
   if (!r || !r.active) { b.classList.add('hidden'); b.textContent = ''; return; }
   b.classList.remove('hidden');
-  b.classList.toggle('err', r.adapter === 'failed' || !!r.refused);
+  const blocked = roomFirewallDropped(r).length > 0;
+  b.classList.toggle('err', r.adapter === 'failed' || !!r.refused || blocked);
   b.textContent = '';
   const text = el('span', '', roomLine(r));
   if (r.error) text.appendChild(el('span', 'room-err', ' — ' + r.error));
   if (r.refused) text.appendChild(el('span', 'room-err', ' — refused: ' + r.refused));
+  if (blocked) text.appendChild(el('span', 'room-err', ' — this machine’s firewall is blocking the room; see LAN room'));
   b.appendChild(text);
   const leave = el('button', 'quiet', 'Leave room');
   leave.type = 'button';
@@ -1709,6 +1711,37 @@ async function hostRoom() {
   }
 }
 
+function roomFirewallDropped(r) {
+  return (r && r.firewall && r.firewall.dropped) || [];
+}
+
+// This machine's firewall (`game_bridge::lan_firewall`). A member's connection
+// that reached the room adapter and that nothing here answered was dropped by
+// a firewall on this machine: the others see a game hosted here and hang
+// joining it. The launcher never changes the firewall itself — a rule would
+// outlive the room — so it says what to run, where it can be copied.
+function renderRoomFirewall(parent, r) {
+  const f = r.firewall;
+  if (!f) return; // an older shell
+  const dropped = roomFirewallDropped(r);
+  const text = dropped.length ? f.advice : f.heads_up;
+  if (!dropped.length && !text) return;
+  const box = el('div', 'room-firewall');
+  box.id = 'room-firewall';
+  dropped.forEach(d => box.appendChild(el('p', 'room-err',
+    d.from + ' tried to connect to this machine on ' + d.transport.toUpperCase() + ' ' + d.port
+    + ' and nothing here answered: a firewall on this machine is dropping the room’s connections, '
+    + 'so the others can see a game hosted here but not join it.')));
+  if (text) box.appendChild(el('p', dropped.length ? 'small' : 'warn-line', text));
+  if (f.command) {
+    const pre = el('pre', 'room-command', f.command);
+    pre.id = 'room-firewall-command';
+    pre.title = 'Copy this and run it yourself. The launcher does not change your firewall.';
+    box.appendChild(pre);
+  }
+  parent.appendChild(box);
+}
+
 // The room check sends a real broadcast on the game's own port from this
 // machine and every member's launcher answers it, so it finds what a game's
 // empty LAN list cannot say: a broadcast sent out of another network, a
@@ -1736,7 +1769,7 @@ function renderRoomCheck(parent, r) {
   btn.disabled = c.busy || r.adapter !== 'up' || others === 0;
   btn.title = others === 0
     ? 'Needs another member in the room to answer.'
-    : 'Send a LAN broadcast on this game’s port and see who answers. Run it before starting the game.';
+    : 'Send a LAN broadcast on this game’s port and connect to its TCP ports, and see who answers. Run it before starting the game.';
   btn.onclick = checkRoom;
   parent.appendChild(btn);
   if (c.hash !== r.room_hash) return;
@@ -1749,7 +1782,8 @@ function renderRoomCheck(parent, r) {
     res.findings.forEach((line, i) => out.appendChild(el('p', i === 0 ? (res.ok ? 'check-ok' : 'room-err') : 'small', line)));
     const ul = el('ul', 'player-list');
     res.members.forEach(m => ul.appendChild(el('li', '',
-      m.address + ' — ' + (m.ok ? 'answered' + (m.round_trip_ms != null ? ' in ' + m.round_trip_ms + ' ms' : '') : 'did not answer everything'))));
+      m.address + ' — ' + (m.ok ? 'answered' + (m.round_trip_ms != null ? ' in ' + m.round_trip_ms + ' ms' : '')
+        : ((m.tcp_unanswered || []).length ? 'did not answer TCP ' + m.tcp_unanswered.join(', ') : 'did not answer everything')))));
     out.appendChild(ul);
   }
   parent.appendChild(out);
@@ -1815,6 +1849,7 @@ function renderRoomPanel(force) {
     const ul = el('ul', 'player-list');
     r.members.forEach(m => ul.appendChild(el('li', '', m.address + (m.is_self ? ' (you)' : ''))));
     body.appendChild(ul);
+    renderRoomFirewall(body, r);
     renderRoomCheck(body, r);
     const leave = el('button', 'quiet', 'Leave room');
     leave.type = 'button';
