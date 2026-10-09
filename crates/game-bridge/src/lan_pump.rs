@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use crate::lan_filter::{LanFilter, LanPolicy};
+use crate::lan_filter::{DropDirection, LanFilter, LanPolicy};
 use crate::lan_session::{LanSendError, LanSession};
 
 /// Anything that reads and writes whole IPv4 packets.
@@ -45,6 +45,12 @@ where
             let allowed =
                 filter.lock().expect("filter lock").outbound(packet, &subnet, Instant::now());
             if !allowed {
+                // Only a broadcast is ever refused on the way out.
+                report_refused(room.refused_log().saw(
+                    DropDirection::OutboundBroadcast,
+                    packet,
+                    Instant::now(),
+                ));
                 continue;
             }
             room.probe_log().saw_outbound(packet);
@@ -62,6 +68,7 @@ where
             let allowed = filter.lock().expect("filter lock").inbound(&packet, Instant::now());
             if !allowed {
                 debug!("the room delivered a packet this member does not admit; dropped");
+                report_refused(room.refused_log().saw(DropDirection::Inbound, &packet, Instant::now()));
                 continue;
             }
             // A room check's probe is answered here, never handed to the
@@ -95,6 +102,18 @@ fn report_dropped(found: Vec<crate::lan_firewall::Dropped>) {
             from = %d.from,
             "a room member's TCP connection reached this machine and nothing answered it: \
              a firewall here is dropping the room's connections"
+        );
+    }
+}
+
+/// Say once, in the log, that the filter refused a kind of packet the game's
+/// pack does not list (`lan_filter::RefusedLog`).
+fn report_refused(new: Option<crate::lan_filter::Refused>) {
+    if let Some(r) = new {
+        warn!(
+            port = r.suggested_port(),
+            "the room refused {}: the game's pack does not list that port",
+            r.describe()
         );
     }
 }

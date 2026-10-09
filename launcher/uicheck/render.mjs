@@ -556,6 +556,7 @@ const noRoom = {
   active: false, role: null, game_id: null, name: null, room_hash: null, address: null,
   subnet: null, members: [], adapter: 'none', error: null, refused: null,
   firewall: { dropped: [], advice: null, heads_up: null, command: null, can_fix: false, blocking_programs: [], other_firewalls: [] },
+  pack_gaps: { ports: [], seen: [], report: null },
 };
 
 const lanGame = (lan) => ({
@@ -594,6 +595,7 @@ const memberRoom = {
   members: [{ address: '198.19.1.1', is_self: false }, { address: '198.19.4.2', is_self: true }],
   adapter: 'up', error: null, refused: null,
   firewall: { dropped: [], advice: null, heads_up: null, command: null, can_fix: false, blocking_programs: [], other_firewalls: [] },
+  pack_gaps: { ports: [], seen: [], report: null },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
 
@@ -854,6 +856,30 @@ await run('a firewall that bites by default is warned about before anything is d
   check('the banner is not an error yet', !doc.querySelector('#room-banner').classList.contains('err'));
 });
 
+// The second real NFSU2 try: the firewall open, and still no lobby. The
+// room's filter is the only witness to a port the pack lacks, so it says so.
+await run('ports the pack lacks are named, with a report to send', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: {
+    ...memberRoom,
+    pack_gaps: {
+      ports: ['UDP 3660'],
+      seen: ['UDP from 198.19.1.1:3660 to this computer\u2019s port 3660 (12 packets)'],
+      report: 'The room blocked traffic the game\u2019s pack does not list. The pack probably needs: UDP 3660.',
+    },
+  },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const t = doc.querySelector('#room-pack-gaps')?.textContent || '';
+  check('the missing port is named in plain words', t.includes('ports its pack does not list') && t.includes('UDP 3660'), t);
+  check('what was blocked is listed', t.includes('12 packets'), t);
+  check('the report is there to copy', doc.querySelector('#room-pack-gaps-report')?.textContent.includes('probably needs'));
+  check('the verdict says not ready', doc.querySelector('#room-verdict')?.textContent.includes('ports its pack does not list'));
+  check('the banner says so too', doc.querySelector('#room-banner').classList.contains('err'));
+});
+
 await run('no firewall to speak of shows nothing', {
   status: running,
   games: [lanGame()],
@@ -862,6 +888,7 @@ await run('no firewall to speak of shows nothing', {
   rows: () => [row()],
 }, async (win, doc) => {
   check('no firewall box', !doc.querySelector('#room-firewall'));
+  check('and no pack-gap box', !doc.querySelector('#room-pack-gaps'));
 });
 
 // Nobody should have to know there is a check: it runs when someone joins.

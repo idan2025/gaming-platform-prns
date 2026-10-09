@@ -123,6 +123,46 @@ pub struct RoomView {
     pub refused: Option<String>,
     /// Whether this machine's firewall is keeping the room out.
     pub firewall: RoomFirewallView,
+    /// What the room's own filter refused because the game's pack does not
+    /// list it — a missing port, named.
+    pub pack_gaps: RoomPackGapsView,
+}
+
+/// Traffic the room filter refused because the game's pack does not list its
+/// port (`game_bridge::lan_filter::RefusedLog`). Not empty is the likely
+/// reason a game can be seen and not joined, and the fix is the pack's.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RoomPackGapsView {
+    /// The ports the pack most likely needs, as `"UDP 3660"`.
+    pub ports: Vec<String>,
+    /// What was refused, one line each, as a player would paste it.
+    pub seen: Vec<String>,
+    /// The whole finding as one paragraph, for a bug report.
+    pub report: Option<String>,
+}
+
+impl RoomPackGapsView {
+    fn from_refused(refused: &[game_bridge::lan_filter::Refused]) -> Self {
+        if refused.is_empty() {
+            return Self::default();
+        }
+        let mut ports = Vec::new();
+        for r in refused {
+            let proto = match r.proto {
+                game_bridge::lan_filter::LanProto::Udp => "UDP",
+                game_bridge::lan_filter::LanProto::Tcp => "TCP",
+            };
+            let p = format!("{proto} {}", r.suggested_port());
+            if !ports.contains(&p) {
+                ports.push(p);
+            }
+        }
+        Self {
+            ports,
+            seen: refused.iter().map(|r| r.describe()).collect(),
+            report: Some(game_bridge::lan_check::missing_ports_finding(refused)),
+        }
+    }
 }
 
 /// This machine's firewall, as far as the room can tell (`game_bridge::lan_firewall`).
@@ -194,6 +234,7 @@ impl RoomView {
             error: None,
             refused: None,
             firewall: RoomFirewallView::default(),
+            pack_gaps: RoomPackGapsView::default(),
         }
     }
 }
@@ -757,6 +798,9 @@ impl Launcher {
             error,
             refused: view.refused.map(|r| r.to_string()),
             firewall: firewall_view(room, self.portable, inner_flag),
+            pack_gaps: RoomPackGapsView::from_refused(
+                &room.session.refused_log().refused(std::time::Instant::now()),
+            ),
         }
     }
 
@@ -909,6 +953,7 @@ mod tests {
                 "game_id",
                 "members",
                 "name",
+                "pack_gaps",
                 "refused",
                 "role",
                 "room_hash",
@@ -947,6 +992,8 @@ mod tests {
         );
         assert_eq!(keys(&f["dropped"][0]), ["from", "port", "transport"]);
         assert_eq!(keys(&f["blocking_programs"][0]), ["path", "program"]);
+        let g = serde_json::to_value(RoomPackGapsView::default()).unwrap();
+        assert_eq!(keys(&g), ["ports", "report", "seen"]);
     }
 
     fn facts() -> HelperFacts {
@@ -984,6 +1031,7 @@ mod tests {
             answers_blocked_here: false,
             dropped_here: Vec::new(),
             firewall_advice: None,
+            refused_here: Vec::new(),
         };
         let v = serde_json::to_value(RoomCheckView::from(report)).unwrap();
         assert_eq!(keys(&v), ["address", "findings", "members", "ok", "port"]);
@@ -991,6 +1039,31 @@ mod tests {
         assert_eq!(v["ok"], false, "an unanswered TCP port fails the member");
         assert_eq!(v["members"][0]["tcp_unanswered"][0], 9900);
         assert_eq!(v["members"][0]["round_trip_ms"], 12);
+    }
+
+    #[test]
+    fn a_pack_gap_names_the_port_once_and_keeps_the_report() {
+        use game_bridge::lan_filter::{DropDirection, RefusedLog};
+        let log = RefusedLog::default();
+        let now = std::time::Instant::now();
+        let udp = |sport: u16, dport: u16| {
+            let mut p = vec![0u8; 28];
+            p[0] = 0x45;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&[198, 19, 1, 1]);
+            p[16..20].copy_from_slice(&[198, 19, 4, 2]);
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p[22..24].copy_from_slice(&dport.to_be_bytes());
+            p
+        };
+        // Two kinds of packet that need the same port.
+        log.saw(DropDirection::Inbound, &udp(3660, 3660), now);
+        log.saw(DropDirection::Inbound, &udp(3660, 50000), now);
+        let v = RoomPackGapsView::from_refused(&log.refused(now));
+        assert_eq!(v.ports, ["UDP 3660"]);
+        assert_eq!(v.seen.len(), 2);
+        assert!(v.report.unwrap().contains("Please report this"));
+        assert!(RoomPackGapsView::from_refused(&[]).report.is_none());
     }
 
     /// The player who granted the helper before the launcher opened firewalls

@@ -25,6 +25,11 @@
 //! - **A non-first fragment carries no ports**, so it is admitted only if the
 //!   first fragment of the same datagram was. Otherwise fragments would be a
 //!   way past every other rule.
+//! - **A refused packet is recorded, not just dropped** ([`RefusedLog`]). The
+//!   first real NFSU2 race hung on joining with nothing to show why; a pack's
+//!   ports come from somebody's captures and can be incomplete, and the only
+//!   witness to a missing one is this filter. Operating systems' own chatter
+//!   is left out, so what is listed is the game's.
 //! - **`any` is the pack's to declare, loudly.** A game with unpredictable
 //!   ports needs it; the launcher must say so before joining (`PLAN.md` §14.2).
 
@@ -233,6 +238,137 @@ impl LanFilter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// What the filter refused, so a missing port names itself.
+
+/// Ports operating systems chatter on by themselves — name lookup, network
+/// browsing, discovery, time, DHCP. None is a game's, and listing them would
+/// bury the one that is.
+const OS_CHATTER: &[u16] = &[53, 67, 68, 123, 137, 138, 139, 445, 1900, 3702, 5353, 5355];
+
+/// Ports at or above this are a stack's own ephemeral choice (Linux starts at
+/// 32768, Windows at 49152), so the fixed side of such a packet is the
+/// other end.
+const EPHEMERAL_FROM: u16 = 32768;
+
+/// Which way a refused packet was going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DropDirection {
+    /// Another member sent it to this machine.
+    Inbound,
+    /// This machine broadcast it.
+    OutboundBroadcast,
+}
+
+/// One kind of packet the filter refused, and how often.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub direction: DropDirection,
+    pub proto: LanProto,
+    /// This machine's port: the destination inbound, the source outbound.
+    pub local_port: u16,
+    /// The other end's address and port: the sender inbound, the broadcast
+    /// address and destination port outbound.
+    pub peer: Ipv4Addr,
+    pub peer_port: u16,
+    pub count: u64,
+    pub last: Instant,
+}
+
+impl Refused {
+    /// The port a pack would have to declare to let this through: the fixed
+    /// end of it. Outbound, the broadcast's destination; inbound, this side's
+    /// port unless that is an ephemeral one, when it is the sender's — a
+    /// reply from a game's fixed port to a random one.
+    pub fn suggested_port(&self) -> u16 {
+        match self.direction {
+            DropDirection::OutboundBroadcast => self.peer_port,
+            DropDirection::Inbound if self.local_port >= EPHEMERAL_FROM => self.peer_port,
+            DropDirection::Inbound => self.local_port,
+        }
+    }
+
+    /// One line a player can paste into a bug report.
+    pub fn describe(&self) -> String {
+        let proto = match self.proto {
+            LanProto::Udp => "UDP",
+            LanProto::Tcp => "TCP",
+        };
+        match self.direction {
+            DropDirection::Inbound => format!(
+                "{proto} from {}:{} to this computer's port {} ({} packet{})",
+                self.peer,
+                self.peer_port,
+                self.local_port,
+                self.count,
+                if self.count == 1 { "" } else { "s" }
+            ),
+            DropDirection::OutboundBroadcast => format!(
+                "{proto} broadcast from this computer's port {} to port {} ({} packet{})",
+                self.local_port,
+                self.peer_port,
+                self.count,
+                if self.count == 1 { "" } else { "s" }
+            ),
+        }
+    }
+}
+
+/// How many kinds of refused packet are remembered; a game has a handful,
+/// and a flood of distinct ones is not worth more memory.
+const REFUSED_CAP: usize = 64;
+/// How long one is shown after its last packet.
+pub const REFUSED_REMEMBER: Duration = Duration::from_secs(600);
+
+type RefusedKey = (DropDirection, LanProto, u16, Ipv4Addr, u16);
+
+/// What this member's filter refused, kept on the session for the room pane
+/// and the room check. Written by the pump, read by anyone.
+#[derive(Debug, Default)]
+pub struct RefusedLog {
+    inner: std::sync::Mutex<HashMap<RefusedKey, Refused>>,
+}
+
+impl RefusedLog {
+    /// The filter refused `packet` going `direction`. Returns the record when
+    /// this kind is new, so the caller can say so once.
+    pub fn saw(&self, direction: DropDirection, packet: &[u8], now: Instant) -> Option<Refused> {
+        let p = parse(packet)?;
+        let proto = lan_proto(p.protocol)?;
+        let (sport, dport) = p.ports?;
+        let (local_port, peer, peer_port) = match direction {
+            DropDirection::Inbound => (dport, p.src, sport),
+            DropDirection::OutboundBroadcast => (sport, p.dst, dport),
+        };
+        if OS_CHATTER.contains(&dport) || OS_CHATTER.contains(&sport) {
+            return None;
+        }
+        let key = (direction, proto, local_port, peer, peer_port);
+        let mut log = self.inner.lock().expect("refused log lock");
+        log.retain(|_, r| now.duration_since(r.last) < REFUSED_REMEMBER);
+        if let Some(r) = log.get_mut(&key) {
+            r.count += 1;
+            r.last = now;
+            return None;
+        }
+        if log.len() >= REFUSED_CAP {
+            return None;
+        }
+        let r = Refused { direction, proto, local_port, peer, peer_port, count: 1, last: now };
+        log.insert(key, r.clone());
+        Some(r)
+    }
+
+    /// Everything refused in the last [`REFUSED_REMEMBER`], most packets first.
+    pub fn refused(&self, now: Instant) -> Vec<Refused> {
+        let mut log = self.inner.lock().expect("refused log lock");
+        log.retain(|_, r| now.duration_since(r.last) < REFUSED_REMEMBER);
+        let mut out: Vec<Refused> = log.values().cloned().collect();
+        out.sort_by(|a, b| b.count.cmp(&a.count).then(a.local_port.cmp(&b.local_port)));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +535,49 @@ mod tests {
         assert!(f.inbound(&ip(PEER, ME, PROTO_ICMP, 1, 0, &[8, 0, 0, 0]), now));
         assert!(!f.inbound(b"not a packet", now));
         assert!(!f.inbound(&ip(PEER, ME, PROTO_UDP, 1, 0, &[0, 1]), now), "a UDP header cut short");
+    }
+
+    /// The NFSU2 case this exists for: after discovery the game answers from
+    /// ports it never declared, the filter drops it, and nothing said so.
+    #[test]
+    fn a_refused_packet_is_recorded_and_says_which_port_the_pack_lacks() {
+        let log = RefusedLog::default();
+        let now = Instant::now();
+        let first = log.saw(DropDirection::Inbound, &udp(PEER, 3660, ME, 3660), now).unwrap();
+        assert_eq!(first.suggested_port(), 3660);
+        assert!(log.saw(DropDirection::Inbound, &udp(PEER, 3660, ME, 3660), now).is_none(), "said once");
+        let r = log.refused(now);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].count, 2);
+        assert_eq!(r[0].describe(), "UDP from 198.19.2.2:3660 to this computer's port 3660 (2 packets)");
+        assert!(log.refused(now + REFUSED_REMEMBER).is_empty(), "and forgotten later");
+    }
+
+    /// A reply from a game's fixed port to a random one: the fixed one is what
+    /// a pack can declare.
+    #[test]
+    fn a_reply_to_an_ephemeral_port_suggests_the_senders_port() {
+        let log = RefusedLog::default();
+        let r = log.saw(DropDirection::Inbound, &tcp(PEER, 3290, ME, 51000), Instant::now()).unwrap();
+        assert_eq!((r.proto, r.suggested_port()), (LanProto::Tcp, 3290));
+        let s = RoomSubnet::default();
+        let b = log
+            .saw(DropDirection::OutboundBroadcast, &udp(ME, 51001, s.broadcast(), 7777), Instant::now())
+            .unwrap();
+        assert_eq!(b.suggested_port(), 7777);
+        assert!(b.describe().contains("broadcast"), "{}", b.describe());
+    }
+
+    #[test]
+    fn an_operating_systems_own_chatter_is_not_blamed_on_the_pack() {
+        let log = RefusedLog::default();
+        let now = Instant::now();
+        let s = RoomSubnet::default();
+        for port in [137, 138, 1900, 5353, 5355, 445] {
+            assert!(log.saw(DropDirection::OutboundBroadcast, &udp(ME, port, s.broadcast(), port), now).is_none());
+            assert!(log.saw(DropDirection::Inbound, &tcp(PEER, 50000, ME, port), now).is_none());
+        }
+        assert!(log.saw(DropDirection::Inbound, &ip(PEER, ME, PROTO_ICMP, 1, 0, &[8, 0, 0, 0]), now).is_none());
+        assert!(log.refused(now).is_empty());
     }
 }

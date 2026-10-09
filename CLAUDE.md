@@ -535,7 +535,14 @@ Rules a later change could quietly break:
 - **A `[lan]` pack's port list is proven carried, not proven complete.**
   `lan_pack_ports.rs` crosses every declared port for every shipped `[lan]`
   pack (found by property), so it cannot notice a port the pack left out;
-  only the game can. `tested` stays false until a person has played.
+  only the game can. **So the filter records what it refuses**
+  (`lan_filter::RefusedLog`, 2026-10-09): the room pane and the room check
+  name the ports a game used that its pack does not list, with a report to
+  paste. Operating systems' own chatter (DNS, DHCP, NetBIOS, SMB, SSDP, mDNS,
+  LLMNR, WS-Discovery, NTP) is left out, or it would bury the game's. An
+  inbound packet to an ephemeral port (≥ 32768) suggests the *sender's* port,
+  the fixed end a pack can declare. This is how a pack gets fixed from one
+  failed join; keep it, and keep it quiet about chatter. `tested` stays false until a person has played.
 - **`lan_wintun.rs` proves the metric fix only because CI pins the runner's
   network to metric 2 first.** Left alone the runner's Wintun already wins and
   a branch without the fix passes; at 1 the room ties and loses. Removing that

@@ -1594,12 +1594,13 @@ function renderRoomBanner() {
   if (!r || !r.active) { b.classList.add('hidden'); b.textContent = ''; return; }
   b.classList.remove('hidden');
   const blocked = roomFirewallDropped(r).length > 0;
-  b.classList.toggle('err', r.adapter === 'failed' || !!r.refused || blocked);
+  b.classList.toggle('err', r.adapter === 'failed' || !!r.refused || blocked || roomPackGaps(r).length > 0);
   b.textContent = '';
   const text = el('span', '', roomLine(r));
   if (r.error) text.appendChild(el('span', 'room-err', ' — ' + r.error));
   if (r.refused) text.appendChild(el('span', 'room-err', ' — refused: ' + r.refused));
   if (blocked) text.appendChild(el('span', 'room-err', ' — this machine’s firewall is blocking the room; see LAN room'));
+  else if (roomPackGaps(r).length) text.appendChild(el('span', 'room-err', ' — the game uses ports its pack does not list; see LAN room'));
   b.appendChild(text);
   const leave = el('button', 'quiet', 'Leave room');
   leave.type = 'button';
@@ -1720,6 +1721,45 @@ async function hostRoom() {
   }
 }
 
+function roomPackGaps(r) {
+  return (r && r.pack_gaps && r.pack_gaps.ports) || [];
+}
+
+// Traffic the room's own filter refused because the game's pack does not list
+// its port (`game_bridge::lan_filter::RefusedLog`). A pack's ports come from
+// somebody's captures and can be short; this is the only witness to a missing
+// one, so it is said plainly, with a report the player can send.
+function renderRoomPackGaps(parent, r) {
+  const g = r.pack_gaps;
+  if (!g || !(g.ports || []).length) return;
+  const box = el('div', 'room-firewall');
+  box.id = 'room-pack-gaps';
+  box.appendChild(el('p', 'room-err',
+    'This game used ports its pack does not list, so the room blocked them. That is probably why '
+    + 'joining fails. Ports it needs: ' + g.ports.join(', ') + '.'));
+  const ul = el('ul', 'player-list');
+  (g.seen || []).forEach(line => ul.appendChild(el('li', 'small', line)));
+  box.appendChild(ul);
+  if (g.report) {
+    const pre = el('pre', 'room-command', g.report);
+    pre.id = 'room-pack-gaps-report';
+    box.appendChild(pre);
+    const copy = el('button', 'quiet', 'Copy report');
+    copy.type = 'button';
+    copy.id = 'room-pack-gaps-copy';
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(g.report);
+        copy.textContent = 'Copied';
+      } catch (_) {
+        copy.textContent = 'Select the text above and copy it';
+      }
+    };
+    box.appendChild(copy);
+  }
+  parent.appendChild(box);
+}
+
 function roomFirewallDropped(r) {
   return (r && r.firewall && r.firewall.dropped) || [];
 }
@@ -1814,6 +1854,9 @@ function renderRoomVerdict(parent, r) {
   let text = null, cls = 'small';
   if (roomFirewallDropped(r).length) {
     text = 'Not ready: the others cannot join games on this computer yet.';
+    cls = 'room-err';
+  } else if (roomPackGaps(r).length) {
+    text = 'Not ready: this game needs ports its pack does not list yet — see below.';
     cls = 'room-err';
   } else if (r.adapter !== 'up') {
     return;
@@ -1959,6 +2002,7 @@ function renderRoomPanel(force) {
     r.members.forEach(m => ul.appendChild(el('li', '', m.address + (m.is_self ? ' (you)' : ''))));
     body.appendChild(ul);
     renderRoomFirewall(body, r);
+    renderRoomPackGaps(body, r);
     renderRoomCheck(body, r);
     const leave = el('button', 'quiet', 'Leave room');
     leave.type = 'button';

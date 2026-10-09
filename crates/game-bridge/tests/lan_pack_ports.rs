@@ -389,6 +389,15 @@ async fn one_pack(pack: GamePack) {
         .is_ok()
     });
     assert!(!reached, "{}: the host reached an undeclared TCP port on a member", pack.id);
+    // And the member that refused it can say so: the only witness to a port a
+    // pack forgot is this filter (`lan_filter::RefusedLog`).
+    let host_addr = nss[0].address;
+    let refused = m1.refused_log().refused(std::time::Instant::now());
+    let r = refused
+        .iter()
+        .find(|r| r.local_port == PRIVATE_TCP && r.peer == host_addr)
+        .unwrap_or_else(|| panic!("{}: m1 refused TCP {PRIVATE_TCP} and recorded nothing: {refused:?}", pack.id));
+    assert_eq!((r.proto, r.suggested_port()), (LanProto::Tcp, PRIVATE_TCP));
 
     // --- The room check passes from every member, with the game's sockets
     // bound to its own ports, and never hands them its probe.

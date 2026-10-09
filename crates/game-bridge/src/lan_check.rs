@@ -334,6 +334,9 @@ pub struct CheckReport {
     /// What to run to open this machine's firewall to the room, once it has
     /// dropped something (`lan_firewall::advice_line`).
     pub firewall_advice: Option<String>,
+    /// What this machine's room filter refused because the game's pack does
+    /// not list it (`lan_filter::RefusedLog`).
+    pub refused_here: Vec<crate::lan_filter::Refused>,
 }
 
 impl CheckReport {
@@ -354,6 +357,12 @@ impl CheckReport {
             out.push(
                 "Nobody else is in the room yet, so there is nobody to check against.".to_string(),
             );
+            return out;
+        }
+        if self.ok() && !self.refused_here.is_empty() {
+            // The room itself works; the game's pack is what is short.
+            out.push("The room works, but the game used ports its pack does not list:".to_string());
+            out.push(missing_ports_finding(&self.refused_here));
             return out;
         }
         let tcp_ports = |ports: &[u16]| {
@@ -414,6 +423,9 @@ impl CheckReport {
                 )
             ));
         }
+        if !self.refused_here.is_empty() {
+            out.push(missing_ports_finding(&self.refused_here));
+        }
         if self.answers_blocked_here {
             out.push(
                 "Answers reached this machine's room adapter but not the program that asked: a \
@@ -463,6 +475,30 @@ impl CheckReport {
         }
         out
     }
+}
+
+/// The finding for what the room filter refused: what it was, and which ports
+/// the pack most likely needs, in a form a player can paste into a report.
+pub fn missing_ports_finding(refused: &[crate::lan_filter::Refused]) -> String {
+    let mut wanted: Vec<String> = Vec::new();
+    for r in refused {
+        let proto = match r.proto {
+            LanProto::Udp => "UDP",
+            LanProto::Tcp => "TCP",
+        };
+        let w = format!("{proto} {}", r.suggested_port());
+        if !wanted.contains(&w) {
+            wanted.push(w);
+        }
+    }
+    let seen: Vec<String> = refused.iter().map(|r| r.describe()).collect();
+    format!(
+        "The room blocked traffic the game's pack does not list, which is the likely reason a game \
+         can be seen but not joined. The pack probably needs: {}. Please report this. What was \
+         blocked: {}.",
+        wanted.join(", "),
+        seen.join("; ")
+    )
 }
 
 /// Check `session`'s room from this machine, on `policy`'s UDP port and every
@@ -661,6 +697,7 @@ pub async fn check_room_with(
         answers_blocked_here,
         dropped_here,
         firewall_advice: None,
+        refused_here: session.refused_log().refused(Instant::now()),
     })
 }
 
@@ -772,7 +809,28 @@ mod tests {
             answers_blocked_here: false,
             dropped_here: Vec::new(),
             firewall_advice: None,
+            refused_here: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ports_the_pack_lacks_are_named_even_when_the_room_works() {
+        let log = crate::lan_filter::RefusedLog::default();
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&B.octets());
+        p[16..20].copy_from_slice(&A.octets());
+        p[20..22].copy_from_slice(&3660u16.to_be_bytes());
+        p[22..24].copy_from_slice(&3660u16.to_be_bytes());
+        log.saw(crate::lan_filter::DropDirection::Inbound, &p, Instant::now());
+        let mut r = report(vec![member(B, true)]);
+        r.refused_here = log.refused(Instant::now());
+        assert!(r.ok(), "the room itself works");
+        let f = r.findings().join("\n");
+        assert!(f.contains("ports its pack does not list"), "{f}");
+        assert!(f.contains("probably needs: UDP 3660"), "{f}");
+        assert!(f.contains("from 198.19.2.2:3660"), "{f}");
     }
 
     /// What a member's firewall dropping the game's TCP looks like from the

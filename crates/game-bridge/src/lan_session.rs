@@ -198,6 +198,7 @@ pub struct LanSession {
     room_hash: Arc<Mutex<Option<DestinationHash>>>,
     probes: crate::lan_check::ProbeLog,
     connects: crate::lan_firewall::ConnectWatch,
+    refused: crate::lan_filter::RefusedLog,
 }
 
 impl LanSession {
@@ -247,6 +248,12 @@ impl LanSession {
     /// (`lan_firewall.rs`).
     pub fn connect_watch(&self) -> &crate::lan_firewall::ConnectWatch {
         &self.connects
+    }
+
+    /// What this member's filter refused (`lan_filter.rs`): the ports a game
+    /// used that its pack does not list.
+    pub fn refused_log(&self) -> &crate::lan_filter::RefusedLog {
+        &self.refused
     }
 
     /// Rooms and servers this node has heard announce.
@@ -393,6 +400,7 @@ impl LanSession {
             room_hash: Arc::new(Mutex::new(Some(room_hash))),
             probes: Default::default(),
             connects: Default::default(),
+            refused: Default::default(),
         })
     }
 
@@ -468,6 +476,7 @@ impl LanSession {
             room_hash,
             probes: Default::default(),
             connects: Default::default(),
+            refused: Default::default(),
         })
     }
 }
