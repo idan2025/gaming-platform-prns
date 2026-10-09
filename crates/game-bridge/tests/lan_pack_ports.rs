@@ -453,16 +453,21 @@ async fn one_pack(pack: GamePack) {
         let findings = report.findings().join("\n");
         assert!(findings.contains(&format!("{m1_addr} did not answer a connection to TCP")), "{findings}");
         assert!(findings.contains("firewall on that machine"), "{findings}");
-        // And m1 knows it is the one, without running a check of its own.
-        wait_until("m1's pump notices the connections it never answered", || {
-            m1.connect_watch().dropped(std::time::Instant::now()).iter().any(|d| d.from == host_addr)
-        })
-        .await;
-        let seen: Vec<u16> =
-            m1.connect_watch().dropped(std::time::Instant::now()).iter().map(|d| d.port).collect();
+        // And m1 knows it is the one, without running a check of its own —
+        // for every port the host tried. Each crosses its grace on its own
+        // clock, a few milliseconds apart, so wait for the whole set rather
+        // than the first one (which raced on ARM CI).
         let mut want = tcp_ports.clone();
         want.sort();
-        assert_eq!(seen, want, "{}: every port the host tried", pack.id);
+        let seen = || -> Vec<u16> {
+            m1.connect_watch()
+                .dropped(std::time::Instant::now())
+                .iter()
+                .filter(|d| d.from == host_addr)
+                .map(|d| d.port)
+                .collect()
+        };
+        wait_until("m1's pump notices every connection it never answered", || seen() == want).await;
         nss[1].ip_owned(vec!["route".into(), "del".into(), "blackhole".into(), format!("{host_addr}/32")]);
     }
 
