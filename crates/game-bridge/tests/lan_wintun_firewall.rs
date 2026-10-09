@@ -170,13 +170,25 @@ fn delete_rule(name: &str) {
 /// `name|{GUID}`. One room after another must leave exactly one, named `gbl0`:
 /// a random GUID per room made Windows number them "gbl0 2", "gbl0 3"…
 fn wintun_adapters() -> Vec<String> {
+    // Wintun names an adapter's description after its tunnel type, not after
+    // itself, so match the room's name, this project's tunnel type, or Wintun.
+    adapters(
+        "Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -like 'gbl*' -or \
+         $_.InterfaceDescription -like '*GamingPlatformPrns*' -or $_.InterfaceDescription -like '*Wintun*' } | \
+         ForEach-Object { $_.Name + '|' + $_.InterfaceGuid }",
+    )
+}
+
+/// Every adapter, for a failure message.
+fn all_adapters() -> Vec<String> {
+    adapters(
+        "Get-NetAdapter -IncludeHidden | ForEach-Object { $_.Name + '|' + $_.InterfaceGuid + '|' + $_.InterfaceDescription }",
+    )
+}
+
+fn adapters(script: &str) -> Vec<String> {
     let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-NetAdapter -IncludeHidden | Where-Object InterfaceDescription -like '*Wintun*' | \
-             ForEach-Object { $_.Name + '|' + $_.InterfaceGuid }",
-        ])
+        .args(["-NoProfile", "-Command", script])
         .output()
         .expect("powershell runs");
     String::from_utf8_lossy(&out.stdout)
@@ -193,7 +205,12 @@ fn assert_one_gbl0(when: &str) {
         d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
     );
     let adapters = wintun_adapters();
-    assert_eq!(adapters, [format!("gbl0|{guid}")], "{when}: the room adapter is one, named gbl0");
+    assert_eq!(
+        adapters,
+        [format!("gbl0|{guid}")],
+        "{when}: the room adapter is one, named gbl0. Every adapter: {:#?}",
+        all_adapters()
+    );
 }
 
 fn holds(addr: Ipv4Addr) -> bool {
