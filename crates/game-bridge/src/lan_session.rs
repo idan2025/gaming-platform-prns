@@ -201,6 +201,9 @@ pub struct LanSession {
     refused: crate::lan_filter::RefusedLog,
     extra_ports: crate::lan_filter::ExtraPorts,
     rebound: Mutex<Vec<crate::lan_rebind::Rebound>>,
+    /// Wakes a host's announcer early (`announce_now`). `None` on a member,
+    /// which announces nothing anyone browses.
+    announce: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl LanSession {
@@ -276,6 +279,21 @@ impl LanSession {
         *self.rebound.lock().expect("rebound lock") = rebound;
     }
 
+    /// Announce the room now rather than at the announcer's next tick, so a
+    /// player who just connected a new interface does not wait out the
+    /// interval. The announcer keeps its own floor between announces, so
+    /// pressing this repeatedly cannot become a storm on a slow link. Returns
+    /// false on a member: only a host has a room to announce.
+    pub fn announce_now(&self) -> bool {
+        match &self.announce {
+            Some(n) => {
+                n.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Rooms and servers this node has heard announce.
     pub async fn discovered(&self) -> Vec<DiscoveredServer> {
         self.bridge.discovered().await
@@ -293,6 +311,8 @@ impl LanSession {
         let own_identity = InMemoryNodeIdentity::from_secret_key_bytes(&secret).identity_hash();
         let room_hash = room_destination(&args.profile, secret.clone(), &[])?;
 
+        let announce = Arc::new(tokio::sync::Notify::new());
+        let announce_wake = announce.clone();
         let mut table = MemberTable::new(args.subnet, args.max_members);
         let own_address = table.admit(own_identity).expect("an empty room seats its host");
         let view = Arc::new(Mutex::new(RoomView::new(own_identity, args.subnet)));
@@ -367,9 +387,21 @@ impl LanSession {
                 let interval = args.announce_interval.max(1);
                 tokio::spawn(async move {
                     let mut early = EARLY_ANNOUNCE_DELAYS_SECS.iter().copied();
+                    let mut last: Option<tokio::time::Instant> = None;
                     loop {
                         let wait = early.next().unwrap_or(interval);
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                            _ = announce_wake.notified() => {
+                                // Asked for early: still never closer together
+                                // than the floor.
+                                if let Some(at) = last {
+                                    let due = at + crate::relay::MIN_ANNOUNCE_GAP;
+                                    tokio::time::sleep_until(due).await;
+                                }
+                            }
+                        }
+                        last = Some(tokio::time::Instant::now());
                         let mut record = base.clone();
                         record.players =
                             announce_view.lock().expect("room view lock").members.len() as u8;
@@ -423,6 +455,7 @@ impl LanSession {
             refused: Default::default(),
             extra_ports: Default::default(),
             rebound: Default::default(),
+            announce: Some(announce),
         })
     }
 
@@ -501,6 +534,7 @@ impl LanSession {
             refused: Default::default(),
             extra_ports: Default::default(),
             rebound: Default::default(),
+            announce: None,
         })
     }
 }

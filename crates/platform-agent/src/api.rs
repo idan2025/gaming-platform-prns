@@ -44,7 +44,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::agent::Agent;
@@ -121,6 +121,7 @@ pub fn router_full(
         // rides behind the same token gate as every container-creating route
         // (`interfaces.rs` "Authorization is the API's").
         .route("/mesh", get(mesh_status))
+        .route("/mesh/announce", post(mesh_announce))
         .route("/mesh/interfaces", get(mesh_interfaces).post(mesh_interface_add))
         .route("/mesh/interfaces/:id", delete(mesh_interface_remove))
         .route("/interfaces", get(interfaces_status).post(interfaces_add))
@@ -237,6 +238,9 @@ struct GameOption {
     /// `console`: the UI hides the control rather than offering one that
     /// answers 400.
     bots: bool,
+    /// The Steam app players own, from the pack's `[launch]`. The UI shows the
+    /// game's artwork from it and uses it for nothing else.
+    steam_app_id: Option<u32>,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -257,6 +261,36 @@ async fn mesh_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
              announce them on Reticulum."
         },
     }))
+}
+
+/// Announce every server this node runs now, or one when `instance` is given,
+/// rather than at each announcer's next tick. A request, not a broadcast
+/// decision: each announcer keeps its own floor, so pressing it repeatedly
+/// cannot become a storm on somebody's slow link.
+#[derive(Debug, Default, Deserialize)]
+struct AnnounceReq {
+    #[serde(default)]
+    instance: Option<String>,
+}
+
+async fn mesh_announce(
+    State(state): State<ApiState>,
+    body: Option<Json<AnnounceReq>>,
+) -> ApiResult<serde_json::Value> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let mesh = state.agent.mesh();
+    if !mesh.enabled() {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "this node runs its games LAN-only, so there is nothing to announce. Add a [mesh] \
+             section to its config and restart",
+        ));
+    }
+    let asked = mesh.announce_now(req.instance.as_deref()).await;
+    if req.instance.is_some() && asked == 0 {
+        return Err(fail(StatusCode::NOT_FOUND, "that server is not announced on the mesh"));
+    }
+    Ok(Json(json!({ "announced": asked })))
 }
 
 /// The interfaces every game bridge on this node attaches.
@@ -380,6 +414,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 extra_ports: pack.extra_ports.len(),
                 console: pack.console.is_some(),
                 bots: bots && pack.console.is_some(),
+                steam_app_id: pack.launch.as_ref().and_then(|l| l.steam_app_id),
             }
         })
         .collect();

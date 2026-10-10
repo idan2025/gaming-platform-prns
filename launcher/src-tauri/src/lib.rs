@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use launcher_core::lan::{LanHelperView, RoomCheckView, RoomView};
 use launcher_core::{
     error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
-    GameSummary, JoinResult, Launcher, PlayResult, ServerDetailsView, ServerRow,
+    GameSummary, JoinResult, Launcher, PathTraceView, PlayResult, ServerDetailsView, ServerRow,
 };
 use tauri::Manager;
 
@@ -134,6 +134,21 @@ async fn forget_server(
     destination_hash: Option<String>,
 ) -> Result<(), String> {
     state.launcher.forget_server(destination_hash.as_deref()).await.map_err(fmt_err)
+}
+
+/// Ask the mesh for a path to one destination now, and say what came back.
+#[tauri::command]
+async fn trace_path(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+) -> Result<PathTraceView, String> {
+    state.launcher.trace_path(&destination_hash).await.map_err(fmt_err)
+}
+
+/// Announce the room this launcher hosts now. `false` when it hosts none.
+#[tauri::command]
+async fn announce_room(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.launcher.announce_room().await)
 }
 
 /// Indexes this launcher is willing to ask.
@@ -408,6 +423,8 @@ pub fn run() {
             known_servers,
             refresh_known_servers,
             forget_server,
+            trace_path,
+            announce_room,
             indexes,
             add_index,
             remove_index,

@@ -74,6 +74,41 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### A new look for the launcher and the node's web page
+
+Both were redesigned. The launcher has a sidebar (Servers, LAN rooms,
+Connections, Indexes), game artwork on every row, and a detail panel with the
+game's picture, a big Join button and the technical details folded away under
+Advanced. The node's web page has the same look, game cards with artwork, and
+a dialog for starting a server.
+
+Game pictures come from Steam's image server when the game's pack names its
+Steam app. Offline, or for a game that is not on Steam, a lettered tile shows
+instead. Nothing else about you or your servers is sent there.
+
+### The list shows only what is online
+
+A server is listed while it is announcing or answers the mesh, and drops off
+three minutes after it goes quiet. Servers you heard before are no longer
+listed from memory: the launcher asks the mesh about them once a minute, and
+any that answer come back by themselves. The server or room you are in stays
+listed while you are in it.
+
+### Right-click menus, Remove that works, and Announce
+
+Right-click a server for Join, View details, Trace path, Copy address and
+Remove from list. The browser's own menu, whose Reload broke the launcher until
+it was restarted, is gone, and F5 and Ctrl+R do nothing. Remove now takes the
+server off the list at once and keeps it off until it announces again; before,
+it could wait for a slow server check and then come straight back.
+
+The new Announce button announces your LAN room if you host one and asks the
+mesh where your saved servers are. Its menu also traces the path to the
+selected server. On the node's web page, Announce sends every server's
+announce at once, and each server's menu can announce just that one.
+
 ## v0.2.30
 
 ### A game that listens on the wrong address can be joined

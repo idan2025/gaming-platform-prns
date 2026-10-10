@@ -92,6 +92,38 @@ pub struct KnownServerView {
     pub last_seen_secs: u64,
 }
 
+/// What one manual path request found (`Launcher::trace_path`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PathTraceView {
+    pub destination_hash: String,
+    /// Whether the mesh answered with a path.
+    pub found: bool,
+    /// How far away the path says the destination is, when one was found.
+    pub hops: Option<u8>,
+    /// How long the request took to settle, found or not.
+    pub millis: u64,
+    /// Why nothing was found, in words.
+    pub error: Option<String>,
+}
+
+/// How long a server stays listed after it was last heard — by its announce,
+/// or by the mesh answering a path request for it.
+///
+/// **The list is what is live, never history** (the user's call, 2026-10-10).
+/// A transport node passes an announce on once and then suppresses repeats,
+/// so behind a hub a running server is not heard again on its own;
+/// [`KEEPALIVE_EVERY`] asks for it instead, comfortably inside this window.
+pub const STALE_AFTER: Duration = Duration::from_secs(180);
+
+/// How often a running browse node asks the mesh again about remembered
+/// servers it has not heard lately. One small path request per server, and
+/// only for servers seen within [`KEEPALIVE_HORIZON_SECS`].
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(60);
+
+/// A remembered server not heard for this long is no longer asked about by
+/// itself; "Find remembered" still asks about every one.
+const KEEPALIVE_HORIZON_SECS: u64 = 7 * 24 * 3600;
+
 /// How stale a remembered `last_seen` has to get before a write is worth it.
 ///
 /// The list is polled every couple of seconds; persisting a new timestamp each
@@ -103,33 +135,6 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// A row built from memory rather than from an announce.
-///
-/// Every live field is `None` on purpose. The launcher knows what this server
-/// was called and what it ran; it does not know whether it is up, and must not
-/// imply it.
-fn remembered_row(hash: &str, k: &KnownServer) -> ServerRow {
-    ServerRow {
-        destination_hash: hash.to_string(),
-        name: k.name.clone(),
-        game_id: k.game_id.clone(),
-        map: None,
-        players: None,
-        max_players: None,
-        hops: 0,
-        interface_label: String::new(),
-        min_link_class: None,
-        passworded: None,
-        allowlisted: None,
-        dedicated: None,
-        transport_mode: None,
-        last_seen_secs: unix_now().saturating_sub(k.last_seen_unix),
-        legacy: false,
-        remembered: true,
-        from_index: false,
-    }
 }
 
 /// A row an index reported, rather than one this launcher heard.
@@ -215,7 +220,9 @@ impl BrowseQueryInput {
                 _ => SortBy::Hops,
             },
             descending: self.descending,
-            max_age: self.max_age_secs.map(Duration::from_secs),
+            // Only what is live: a row nobody has heard for `STALE_AFTER`
+            // leaves the list rather than lingering as history.
+            max_age: Some(self.max_age_secs.map(Duration::from_secs).unwrap_or(STALE_AFTER)),
         }
     }
 }
@@ -245,6 +252,9 @@ pub struct GameSummary {
     /// Whether this game can be played in a Mode 3 LAN room, and what that
     /// exposes (`lan.rs`). `None` means no room is offered for it.
     pub lan: Option<lan::LanSupport>,
+    /// The Steam app players own, from the pack's `[launch]`, when it has one.
+    /// The UI uses it for the game's artwork and nothing else.
+    pub steam_app_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -426,12 +436,21 @@ struct Inner {
     last_join: Option<JoinState>,
     /// The LAN room this launcher is in, if any (`lan.rs`). One at a time.
     room: Option<lan::RoomState>,
+    /// Index rows the player removed from the list, for this run. A heard row
+    /// is dropped from the browse node itself and a remembered one from
+    /// settings; an index would hand the same row straight back on the next
+    /// poll, so it is filtered here instead.
+    hidden: std::collections::HashSet<String>,
+    /// The browse node's keep-alive (`start_browse`), aborted when it stops.
+    keepalive: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// The address a live join is pointed at, kept so Play can start a game against
 /// it without the frontend round-tripping the details back.
 #[derive(Debug, Clone)]
 struct JoinState {
+    /// The server joined, so the list keeps it while it is in use.
+    destination: DestinationHash,
     listen_addr: String,
     port: u16,
     game_id: String,
@@ -552,6 +571,8 @@ impl Launcher {
                 client: None,
                 last_join: None,
                 room: None,
+                hidden: Default::default(),
+                keepalive: None,
             })),
             packs,
             settings: Arc::new(Mutex::new(settings)),
@@ -639,6 +660,7 @@ impl Launcher {
                 signer: p.trust.signer().map(|s| hex::encode(s.as_bytes())),
                 signature_expires_at: p.expires_at,
                 lan: lan::lan_support(&p.pack),
+                steam_app_id: p.pack.launch.as_ref().and_then(|l| l.steam_app_id),
             })
             .collect()
     }
@@ -675,18 +697,35 @@ impl Launcher {
         // server that could not be routed to held the command open for its
         // full path timeout, and the session lock with it, so `browse_status`
         // could not answer either.
+        //
+        // Then again every `KEEPALIVE_EVERY`, for remembered servers not heard
+        // lately: behind a hub a running server is not heard again on its own,
+        // and the list drops what has not been heard for `STALE_AFTER`.
         let settings = Arc::clone(&self.settings);
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
+        let keepalive = tokio::spawn(async move {
             if let Err(e) = Self::refresh_known(&settings, &inner).await {
                 tracing::debug!(error = %e, "could not ask about remembered servers");
             }
+            loop {
+                tokio::time::sleep(KEEPALIVE_EVERY).await;
+                if let Err(e) = Self::keep_alive(&settings, &inner).await {
+                    tracing::debug!(error = %e, "keep-alive stopped");
+                    return;
+                }
+            }
         });
+        if let Some(old) = self.inner.lock().await.keepalive.replace(keepalive) {
+            old.abort();
+        }
         Ok(())
     }
 
     pub async fn stop_browse(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
+        if let Some(task) = inner.keepalive.take() {
+            task.abort();
+        }
         if let Some(mut session) = inner.browse.take() {
             session.stop().await;
         }
@@ -727,8 +766,29 @@ impl Launcher {
             // failure it should show in red.
             return Ok(Vec::new());
         };
-        let rows = session.browse(&input.to_query()).await;
+        let query = input.to_query();
+        let rows = session.browse(&query).await;
         let mut out: Vec<ServerRow> = rows.iter().map(row_view).collect();
+
+        // The one exception to "only what is live": the server or room this
+        // launcher is in stays listed while it is in it, however quiet it has
+        // gone — it is in use, and its row is where Leave and Play are.
+        let in_use: Vec<DestinationHash> = inner
+            .last_join
+            .as_ref()
+            .map(|j| j.destination)
+            .into_iter()
+            .chain(inner.room.as_ref().and_then(|r| r.room_hash()))
+            .filter(|h| !rows.iter().any(|r| r.destination_hash == *h))
+            .collect();
+        if !in_use.is_empty() {
+            let unaged = game_bridge::browse::BrowseQuery { max_age: None, ..query.clone() };
+            for row in session.browse(&unaged).await {
+                if in_use.contains(&row.destination_hash) {
+                    out.push(row_view(&row));
+                }
+            }
+        }
         drop(inner);
 
         // Everything heard is worth remembering: the mesh will not repeat it.
@@ -741,25 +801,16 @@ impl Launcher {
             let heard: std::collections::HashSet<String> =
                 out.iter().map(|r| r.destination_hash.clone()).collect();
             let from_indexes = self.query_indexes(&input).await;
-            out.extend(from_indexes.into_iter().filter(|r| !heard.contains(&r.destination_hash)));
+            let hidden = self.inner.lock().await.hidden.clone();
+            out.extend(from_indexes.into_iter().filter(|r| {
+                !heard.contains(&r.destination_hash) && !hidden.contains(&r.destination_hash)
+            }));
         }
 
-        // Then add back the ones we know about but have not heard this run,
-        // flagged so nothing about them reads as live. They are joinable —
-        // a destination hash is all a join needs — and that is the whole
-        // point of keeping them.
-        let heard: std::collections::HashSet<&str> =
-            out.iter().map(|r| r.destination_hash.as_str()).collect();
-        let remembered: Vec<ServerRow> = self
-            .settings
-            .lock()
-            .await
-            .known_servers
-            .iter()
-            .filter(|(hash, _)| !heard.contains(hash.as_str()))
-            .map(|(hash, k)| remembered_row(hash, k))
-            .collect();
-        out.extend(remembered);
+        // Remembered servers are *not* listed. Memory is what the launcher
+        // asks the mesh about (`refresh_known`, and the keep-alive in
+        // `start_browse`); a server that answers comes back as a heard row
+        // with live numbers, and one that does not stays off the list.
         Ok(out)
     }
 
@@ -838,9 +889,8 @@ impl Launcher {
     /// node to ask through.
     async fn probe_reachable(&self, destination_hash: &str) -> Option<bool> {
         let hash = parse_hash(destination_hash).ok()?;
-        let inner = self.inner.lock().await;
-        let session = inner.browse.as_ref()?;
-        Some(session.probe_details(hash).await.is_ok())
+        let handle = self.inner.lock().await.browse.as_ref()?.handle().clone();
+        Some(game_bridge::relay::probe_details_via(&handle, hash).await.is_ok())
     }
 
     /// Record every server heard, so it can be found again after the mesh has
@@ -898,16 +948,60 @@ impl Launcher {
         out
     }
 
-    /// Forget one remembered server, or all of them when `hash` is `None`.
+    /// Remove one server from the list, or forget every remembered one when
+    /// `hash` is `None`.
+    ///
+    /// **One server goes from every place a row can come from**, or it is back
+    /// on the next poll: settings (remembered), the browse node's list (heard
+    /// this run — `list_servers` would also re-remember it), and the index
+    /// rows (hidden for this run). A server that is really up returns with its
+    /// next announce, which is the truth about it.
+    ///
+    /// Never holds the session lock across anything slow: a detail probe used
+    /// to hold it for a whole link timeout, and Remove sat behind it.
     pub async fn forget_server(&self, hash: Option<&str>) -> Result<()> {
-        let mut settings = self.settings.lock().await;
-        match hash {
-            Some(h) => {
-                settings.known_servers.remove(h);
+        {
+            let mut settings = self.settings.lock().await;
+            match hash {
+                Some(h) => {
+                    settings.known_servers.remove(h);
+                }
+                None => settings.known_servers.clear(),
             }
-            None => settings.known_servers.clear(),
+            self.persist(&settings)?;
         }
-        self.persist(&settings)
+        if let Some(h) = hash {
+            let mut inner = self.inner.lock().await;
+            inner.hidden.insert(h.to_string());
+            if let (Some(session), Ok(parsed)) = (inner.browse.as_ref(), parse_hash(h)) {
+                session.forget(parsed).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask the mesh for a path to one destination, now, and say what came
+    /// back. The same request "Find remembered" sends for every remembered
+    /// server, for the one a player picked.
+    pub async fn trace_path(&self, destination_hash: &str) -> Result<PathTraceView> {
+        let parsed = parse_hash(destination_hash).map_err(|e| anyhow!("not a destination: {e}"))?;
+        let handle = {
+            let inner = self.inner.lock().await;
+            let Some(session) = inner.browse.as_ref() else {
+                return Err(anyhow!("start browsing before tracing a path"));
+            };
+            session.handle().clone()
+        };
+        let started = std::time::Instant::now();
+        let asked =
+            tokio::time::timeout(Self::KNOWN_SERVER_PATH_TIMEOUT, handle.request_path(parsed)).await;
+        let millis = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let (found, hops, error) = match asked {
+            Ok(Ok(path)) => (true, Some(path.hops.0), None),
+            Ok(Err(e)) => (false, None, Some(format!("the mesh found no path ({e:?})"))),
+            Err(_) => (false, None, Some("nobody answered with a path in time".to_string())),
+        };
+        Ok(PathTraceView { destination_hash: destination_hash.to_string(), found, hops, millis, error })
     }
 
     /// Ask the mesh where every remembered server is.
@@ -942,7 +1036,46 @@ impl Launcher {
         inner: &Arc<Mutex<Inner>>,
     ) -> Result<usize> {
         let hashes: Vec<String> = settings.lock().await.known_servers.keys().cloned().collect();
+        Self::ask_paths(inner, hashes).await
+    }
 
+    /// One keep-alive pass: ask about remembered servers seen within the
+    /// horizon that the browse node has not heard for half the stale window.
+    /// Errors only when browsing has stopped, which ends the loop.
+    async fn keep_alive(
+        settings: &Arc<Mutex<LauncherSettings>>,
+        inner: &Arc<Mutex<Inner>>,
+    ) -> Result<usize> {
+        let fresh: std::collections::HashSet<String> = {
+            let guard = inner.lock().await;
+            let Some(session) = guard.browse.as_ref() else {
+                return Err(anyhow!("browsing stopped"));
+            };
+            session
+                .discovered()
+                .await
+                .into_iter()
+                .filter(|d| d.last_seen.elapsed() < STALE_AFTER / 2)
+                .map(|d| hex::encode(d.destination_hash.as_bytes()))
+                .collect()
+        };
+        let now = unix_now();
+        let hashes: Vec<String> = settings
+            .lock()
+            .await
+            .known_servers
+            .iter()
+            .filter(|(hash, k)| {
+                !fresh.contains(*hash) && now.saturating_sub(k.last_seen_unix) < KEEPALIVE_HORIZON_SECS
+            })
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        Self::ask_paths(inner, hashes).await
+    }
+
+    /// Request a path to each destination, concurrently, each bounded by
+    /// [`Self::KNOWN_SERVER_PATH_TIMEOUT`]. Returns how many answered.
+    async fn ask_paths(inner: &Arc<Mutex<Inner>>, hashes: Vec<String>) -> Result<usize> {
         // Take a handle and let the session lock go *before* asking the mesh
         // anything. A path request is a network round trip, and holding
         // `inner` across it queues `browse_status`, `list_servers` and
@@ -985,11 +1118,17 @@ impl Launcher {
             Ok(h) => h,
             Err(e) => return unreachable_view(destination_hash, e.to_string()),
         };
-        let inner = self.inner.lock().await;
-        let Some(session) = inner.browse.as_ref() else {
-            return unreachable_view(destination_hash, "the browse node is not running".into());
+        // A handle, not the session: a probe can take a whole link timeout,
+        // and holding the lock across it froze the list, the status chip and
+        // Remove until it gave up.
+        let handle = {
+            let inner = self.inner.lock().await;
+            let Some(session) = inner.browse.as_ref() else {
+                return unreachable_view(destination_hash, "the browse node is not running".into());
+            };
+            session.handle().clone()
         };
-        match session.probe_details(hash).await {
+        match game_bridge::relay::probe_details_via(&handle, hash).await {
             Ok((d, rtt_ms)) => ServerDetailsView {
                 destination_hash: destination_hash.to_string(),
                 reachable: true,
@@ -1167,6 +1306,7 @@ impl Launcher {
         }
         inner.client = Some(BridgeSession::start_client(args).await?);
         inner.last_join = Some(JoinState {
+            destination: hash,
             listen_addr: listen_addr.clone(),
             port: listen_port,
             game_id: game_id.clone(),
@@ -1757,7 +1897,16 @@ mod tests {
     fn game_summary_json_keys_are_the_frontend_contract() {
         let games = Launcher::new(Vec::new()).list_games();
         let v = serde_json::to_value(&games[0]).unwrap();
-        for key in ["id", "display_name", "trust", "trust_detail", "signer", "signature_expires_at", "lan"]
+        for key in [
+            "id",
+            "display_name",
+            "trust",
+            "trust_detail",
+            "signer",
+            "signature_expires_at",
+            "lan",
+            "steam_app_id",
+        ]
         {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");
         }
@@ -2035,16 +2184,16 @@ query = "a2s"
         );
     }
 
-    /// A server heard once is remembered, and comes back as a row that is
-    /// honestly marked as memory rather than as a live sighting.
+    /// Every server heard is remembered, so the mesh can be asked about it
+    /// again: a transport node floods an announce when a destination is new and
+    /// suppresses the repeats once it holds a path, so a launcher started later
+    /// hears nothing on its own.
     ///
-    /// This exists because the mesh will not repeat itself: a transport node
-    /// floods an announce when a destination is new and suppresses the repeats
-    /// once it holds a path, so a launcher started later hears nothing. A
-    /// destination hash is all a join needs, so remembering one keeps the
-    /// server joinable with no index and no infrastructure.
+    /// **Memory is never listed.** The list is what is live; a remembered
+    /// server appears only once the mesh answers for it again, as a heard row
+    /// with live numbers.
     #[tokio::test]
-    async fn a_server_heard_once_is_remembered_and_returns_marked_as_memory() {
+    async fn a_server_heard_once_is_remembered_but_never_listed_from_memory() {
         let dir = tempfile::tempdir().unwrap();
         let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("launcher.json"));
 
@@ -2057,12 +2206,11 @@ query = "a2s"
         assert_eq!(known.len(), 1);
         assert_eq!(known[0].name.as_deref(), Some("Idan's"));
 
-        let back = remembered_row("aa", &l.settings.lock().await.known_servers["aa"]);
-        assert!(back.remembered, "a row from memory must say so");
-        assert_eq!(back.name.as_deref(), Some("Idan's"));
-        // Nothing live may be invented. A stale player count rendered as a
-        // current one is the single thing a server browser must not do.
-        assert!(back.players.is_none() && back.map.is_none() && back.max_players.is_none());
+        let input: BrowseQueryInput = serde_json::from_str("{}").unwrap();
+        let listed = l.list_servers(input.clone()).await.unwrap();
+        assert!(listed.is_empty(), "history must not be listed as a server: {listed:?}");
+        // And a heard row goes stale off the list by default, not never.
+        assert_eq!(input.to_query().max_age, Some(STALE_AFTER));
     }
 
     /// Remembering survives a restart, which is the entire point of writing it
@@ -2088,6 +2236,16 @@ query = "a2s"
         ghost.remembered = true;
         l.remember_heard(&[ghost]).await;
         assert!(l.known_servers().await.is_empty(), "memory must not feed itself");
+    }
+
+    #[tokio::test]
+    async fn a_removed_index_row_is_hidden_and_tracing_needs_a_node() {
+        let l = Launcher::new(Vec::new());
+        l.forget_server(Some("aa")).await.unwrap();
+        assert!(l.inner.lock().await.hidden.contains("aa"), "an index would hand the row back");
+        let err = l.trace_path(&"ab".repeat(16)).await.unwrap_err();
+        assert!(err.to_string().contains("start browsing"), "{err}");
+        assert!(!l.announce_room().await, "no room, nothing to announce");
     }
 
     #[tokio::test]

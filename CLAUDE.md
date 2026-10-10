@@ -402,6 +402,30 @@ form and a button on a running server. Rules a later change could quietly break:
   argument in `app_set_config`, so `content::validate_mod_name` is an allowlist
   and a failing name is refused, never repaired — the same rule as a map name.
 
+**The server list is what is live, never history** (2026-10-10, the user's
+call). `list_servers` does not list remembered servers; a heard row drops off
+after `STALE_AFTER` (180 s) unless the query sets `max_age_secs`. Because a
+transport node passes an announce on once and then suppresses repeats, a
+running server behind a hub is not heard again on its own, so `start_browse`
+runs a keep-alive that path-requests remembered servers not heard lately every
+`KEEPALIVE_EVERY` (60 s); an answer arrives as an ordinary announce. The one
+exception is the server or room this launcher is in, listed however quiet it
+has gone. Rules a later change could quietly break:
+- **Remove takes a row out of every source, or it is back next poll**:
+  settings, the browse node's own list (`BridgeSession::forget`, else
+  `list_servers` re-remembers it), and index rows (hidden for the run).
+  Pinned by `a_forgotten_server_stays_gone_until_it_announces_again`.
+- **Never hold the session lock across a network round trip.** A detail probe
+  did, for a whole link timeout, and froze the list, the status and Remove
+  behind it. Probes and traces clone the handle (`probe_details_via`).
+- **The launcher's right-click is its own.** The webview's menu is a
+  browser's, and its Reload throws the page away under a running core; F5 and
+  Ctrl+R are blocked too. Text fields keep the native menu for cut and paste.
+  Pinned in `launcher/uicheck/render.mjs`.
+- **Game artwork is the pack's `[launch] steam_app_id`, fetched from Steam's
+  CDN, over a lettered tile.** The tile is what an offline launcher shows, so
+  the UI must look finished without the network; never bundle game art.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

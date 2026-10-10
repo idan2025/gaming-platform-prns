@@ -12,213 +12,192 @@
   <span id="error-text"></span>
   <button id="error-dismiss" type="button" aria-label="Dismiss error">×</button>
 </div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
 <!-- Token screen -->
-<section id="token-screen" class="screen centered" aria-labelledby="token-heading">
-  <h1 id="token-heading">Mesh Host</h1>
-  <p class="help">This agent is password-protected. The token is in the file named by
-    <code>api_token_file</code> in the agent config.</p>
-  <form id="token-form" autocomplete="off">
-    <label for="token-input">Agent token</label>
-    <input id="token-input" type="password" name="token" required>
-    <button type="submit" class="primary">Connect</button>
-  </form>
-  <p id="token-error" class="inline-error" aria-live="polite"></p>
+<section id="token-screen" class="screen login hidden" aria-labelledby="token-heading">
+  <div class="login-card">
+    <svg class="brand-mark" viewBox="0 0 32 32" width="40" height="40" aria-hidden="true">
+      <rect x="1" y="1" width="30" height="30" rx="8" class="brand-bg"/>
+      <circle cx="10" cy="11" r="2.6" class="brand-dot"/><circle cx="22" cy="11" r="2.6" class="brand-dot"/><circle cx="16" cy="22" r="2.6" class="brand-dot"/>
+      <path d="M10 11 L22 11 M10 11 L16 22 M22 11 L16 22" class="brand-line"/>
+    </svg>
+    <h1 id="token-heading">Mesh Host</h1>
+    <p class="help">This node is protected by a token. You will find it in the file named by
+      <code>api_token_file</code> in the agent's config.</p>
+    <form id="token-form" autocomplete="off">
+      <label for="token-input">Access token</label>
+      <input id="token-input" type="password" name="token" required>
+      <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+    </form>
+    <p id="token-error" class="inline-error" aria-live="polite"></p>
+  </div>
 </section>
 
-<!-- Main UI -->
-<!-- Which build is serving this page, so "did my redeploy land" is a glance
-     rather than a `docker inspect`. Filled in from /health after the token is
-     accepted: every API route is token-gated, and a version string handed to
-     anyone who can reach the port would be the one thing here that is not. -->
-<div id="build-version" class="build-version" title="The agent build serving this page">—</div>
+<!-- Which build is serving this page, so "did my redeploy land" is a glance.
+     Filled in from /health after the token is accepted. -->
+<div id="build-version" class="build-version" title="The agent build serving this page"></div>
 
-<section id="main-ui" class="screen hidden">
-  <header class="app-header">
-    <div class="brand">Mesh Host</div>
-    <div id="status-pill" class="status-pill" title="Running instances vs. host capacity">— of — running</div>
-    <button id="disconnect-btn" type="button" class="quiet danger">Disconnect</button>
-  </header>
-
-  <nav class="tabs" role="tablist">
-    <button id="tab-servers" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="tab-panel-servers">Servers</button>
-    <button id="tab-games" type="button" class="tab" role="tab" aria-selected="false" aria-controls="tab-panel-games">Games</button>
-    <button id="tab-interfaces" type="button" class="tab" role="tab" aria-selected="false" aria-controls="tab-panel-interfaces">Mesh</button>
-  </nav>
-
-  <main>
-    <section id="tab-panel-servers" class="tab-panel" role="tabpanel" aria-labelledby="tab-servers">
-      <div class="panel-head">
-        <h2>Running servers</h2>
-        <p class="muted">Containers created from game definitions. Stop a server to halt the process; remove it to delete the container.</p>
+<section id="main-ui" class="screen shell hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+        <rect x="1" y="1" width="30" height="30" rx="8" class="brand-bg"/>
+        <circle cx="10" cy="11" r="2.6" class="brand-dot"/><circle cx="22" cy="11" r="2.6" class="brand-dot"/><circle cx="16" cy="22" r="2.6" class="brand-dot"/>
+        <path d="M10 11 L22 11 M10 11 L16 22 M22 11 L16 22" class="brand-line"/>
+      </svg>
+      <div>
+        <div class="brand-name">Mesh Host</div>
+        <div class="brand-sub">Game server node</div>
       </div>
-      <table class="instances-table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Game</th>
-            <th>State</th>
-            <th>Map</th>
-            <th>Port</th>
-            <th>Mesh</th>
-            <th>Players</th>
-            <th>Uptime</th>
-            <th class="actions-col">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="instances-tbody"></tbody>
-      </table>
-      <p id="instances-empty" class="empty-state hidden">No servers are running. Go to the <button type="button" class="link-btn" id="empty-goto-games">Games</button> tab to start one.</p>
-    </section>
-
-    <section id="tab-panel-games" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-games">
-      <div class="panel-head">
-        <h2>Games</h2>
-        <p class="muted">Pick a game to launch a container. Unrunnable games are shown greyed out with the reason.</p>
+    </div>
+    <nav class="nav" role="tablist">
+      <button id="tab-servers" type="button" class="nav-item active" role="tab" aria-selected="true" aria-controls="tab-panel-servers">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        <span>Servers</span><span class="nav-count" id="nav-servers-count"></span>
+      </button>
+      <button id="tab-games" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-games">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="18" height="11" rx="4"/><path d="M8 11v3M6.5 12.5h3M15 12h.01M17.5 13.5h.01"/></svg>
+        <span>Games</span><span class="nav-count" id="nav-games-count"></span>
+      </button>
+      <button id="tab-interfaces" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-interfaces">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
+        <span>Mesh</span>
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="node-card">
+        <div class="node-line"><span class="dot on"></span><span id="status-pill" title="Running servers vs. this node's capacity">—</span></div>
+        <div class="capacity"><i id="capacity-bar"></i></div>
+        <button id="disconnect-btn" type="button" class="btn btn-block">Sign out</button>
       </div>
-      <div id="games-grid" class="games-grid"></div>
-    </section>
+    </div>
+  </aside>
 
-    <section id="tab-panel-interfaces" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-interfaces">
-      <div class="panel-head">
-        <h2>Mesh interfaces</h2>
-        <p class="muted">Link this node to the Reticulum mesh. Add a TCP client to dial a relay, a TCP server to <em>be</em> a relay, or LAN auto-discovery to find neighbours on the local network. Each may be IFAC-protected so only peers sharing the network name and passphrase can talk on it. Interfaces added here are saved and re-attached on restart.</p>
-      </div>
+  <div class="workspace">
+    <header class="toolbar">
+      <h1 id="page-title">Servers</h1>
+      <div class="toolbar-spacer"></div>
+      <button id="announce-btn" type="button" class="btn"
+              title="Announce every server on the mesh now, instead of waiting for the next announce">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h3l5 4V6L7 10H4z"/><path d="M16 9a4 4 0 010 6M18.5 6.5a7.5 7.5 0 010 11"/></svg>
+        Announce
+      </button>
+      <button id="new-server-btn" type="button" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        New server
+      </button>
+    </header>
 
-      <div id="mesh-offline" class="empty-state hidden">
-        This node has no <code>[uplink]</code>, so there are no uplink interfaces to configure here.
-        That is a <em>different</em> thing from hosting games on the mesh: <code>[uplink]</code> is the
-        control destination an index drives this node through, while <code>[mesh]</code> is what announces
-        the games this node runs. Games can be on the mesh with no uplink at all — the panel below says
-        whether yours are.
-      </div>
-
-      <!-- Games on the mesh. Deliberately outside the online/offline split
-           above: an operator kept being told they had "no mesh" while their
-           servers were announced on it, because the two Reticulum jobs on this
-           node were being reported as one. -->
-      <div id="mesh-games" class="mesh-games">
-        <h3>Games on the mesh</h3>
-        <p id="mesh-games-note" class="muted">—</p>
-        <div id="mesh-games-list"></div>
-
-        <h3>Interfaces for hosted games</h3>
-        <p class="muted">How the servers this node runs reach the mesh. A TCP address
-          like <code>0.0.0.0:4789</code> binds a relay others dial; anything else dials
-          one. LAN auto-discovery finds neighbours with no address — but not from
-          inside a container, where the local network is Docker's own.
-          Added here, these apply to every server and are remembered across restarts.</p>
-        <form id="mesh-iface-form" class="start-form">
-          <label for="mesh-iface-kind">Kind</label>
-          <select id="mesh-iface-kind">
-            <option value="tcp">TCP</option>
-            <option value="backbone">Backbone (fast link to a hub)</option>
-            <option value="udp">UDP (point-to-point)</option>
-            <option value="auto">LAN auto-discovery</option>
-          </select>
-          <label for="mesh-iface-addr">Address (host:port)</label>
-          <input id="mesh-iface-addr" type="text" placeholder="hub.example.org:4789">
-          <div id="mesh-iface-udp" class="hidden">
-            <label for="mesh-iface-local">Local address to bind (host:port)</label>
-            <input id="mesh-iface-local" type="text" placeholder="0.0.0.0:4790">
-            <label for="mesh-iface-peer">Peer address to send to (host:port)</label>
-            <input id="mesh-iface-peer" type="text" placeholder="192.168.1.20:4790">
-            <p class="muted small">UDP here is point-to-point and is not discovered:
-              <strong>the far side needs the mirror of this</strong>, its local and peer
-              swapped, or datagrams go into nothing. Worth it on a local network, where a
-              TCP interface makes Reticulum ride a reliable ordered stream underneath a
-              protocol that already does its own retransmission and ordering.</p>
-          </div>
-          <label for="mesh-iface-ifac">IFAC network name (optional)</label>
-          <input id="mesh-iface-ifac" type="text" placeholder="leave empty for an open network">
-          <label for="mesh-iface-pass">IFAC passphrase (optional)</label>
-          <input id="mesh-iface-pass" type="password" placeholder="shared secret">
-          <div class="form-actions">
-            <button type="submit" class="primary">Add interface</button>
-          </div>
-        </form>
-        <div id="mesh-iface-list"></div>
-      </div>
-
-      <div id="mesh-online" class="hidden">
-        <div class="mesh-identity">
-          <span class="muted">This node's mesh address:</span>
-          <code id="mesh-destination">—</code>
+    <main class="content">
+      <section id="tab-panel-servers" class="tab-panel" role="tabpanel" aria-labelledby="tab-servers">
+        <div class="list-head">
+          <div></div><div>Server</div><div>Status</div><div>Map</div><div>Players</div><div>Port</div><div>Mesh address</div><div>Uptime</div><div></div>
         </div>
-
-        <table class="instances-table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Kind</th>
-              <th>State</th>
-              <th>RX</th>
-              <th>TX</th>
-              <th>Links</th>
-              <th class="actions-col">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="interfaces-tbody"></tbody>
-        </table>
-        <p id="interfaces-empty" class="empty-state hidden">No interfaces yet. Add one below to link this node to the mesh.</p>
-
-        <div class="panel-head">
-          <h3>Add an interface</h3>
+        <div id="instances-tbody" class="list"></div>
+        <div id="instances-empty" class="empty hidden">
+          <div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/></svg></div>
+          <h2>No servers yet</h2>
+          <p>Pick a game and start one. It is announced on the mesh as soon as it is up.</p>
+          <button type="button" class="btn btn-primary" id="empty-goto-games">Browse games</button>
         </div>
-        <form id="iface-form" class="start-form" autocomplete="off">
-          <label for="iface-kind">Kind</label>
-          <select id="iface-kind" name="kind">
-            <option value="tcp">TCP (dial a relay, or be one)</option>
-            <option value="auto">Wi-Fi / LAN auto-discovery</option>
-          </select>
+      </section>
 
-          <div id="iface-addr-wrap">
-            <label for="iface-addr">Address (host:port)</label>
-            <input id="iface-addr" type="text" placeholder="relay.example.com:4242 — or 0.0.0.0:4242 to be a relay">
-            <p class="muted small">A host and port dials that relay as a client. <code>0.0.0.0:PORT</code> binds a TCP server on this box so others can dial you.</p>
+      <section id="tab-panel-games" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-games">
+        <p class="page-lead">Games this node has a pack for. A game this node cannot run says why.</p>
+        <div id="games-grid" class="games-grid"></div>
+      </section>
+
+      <section id="tab-panel-interfaces" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-interfaces">
+        <div class="page">
+          <div id="mesh-games" class="card">
+            <div class="card-head"><h2>Announced on the mesh</h2></div>
+            <p id="mesh-games-note" class="card-text">—</p>
+            <div id="mesh-games-list" class="item-list"></div>
           </div>
 
-          <label class="checkbox-row">
-            <input id="iface-ifac-toggle" type="checkbox">
-            IFAC-protect this interface
-          </label>
-          <div id="iface-ifac-wrap" class="advanced-wrap hidden">
-            <label for="iface-ifac-name">Network name</label>
-            <input id="iface-ifac-name" type="text" placeholder="optional">
-            <label for="iface-ifac-pass">Passphrase</label>
-            <input id="iface-ifac-pass" type="password" placeholder="optional">
-            <p class="muted small">Only peers configured with the same name and passphrase can talk on this interface.</p>
+          <div class="card">
+            <div class="card-head"><h2>Connections for hosted games</h2></div>
+            <p class="card-text">How the servers this node runs reach the mesh. A TCP address
+              like <code>0.0.0.0:4789</code> makes this node a relay others dial; anything else dials
+              one. LAN auto-discovery does not work from inside a container, where the local network
+              is Docker's own. These apply to every server and are kept across restarts.</p>
+            <form id="mesh-iface-form" class="form-grid">
+              <label for="mesh-iface-kind">Kind</label>
+              <select id="mesh-iface-kind" class="field">
+                <option value="tcp">TCP</option>
+                <option value="backbone">Backbone (fast link to a hub)</option>
+                <option value="udp">UDP (point-to-point)</option>
+                <option value="auto">LAN auto-discovery</option>
+              </select>
+              <label for="mesh-iface-addr">Address</label>
+              <input id="mesh-iface-addr" class="field" type="text" placeholder="hub.example.org:4789">
+              <div id="mesh-iface-udp" class="form-span hidden">
+                <div class="form-grid">
+                  <label for="mesh-iface-local">Bind locally</label>
+                  <input id="mesh-iface-local" class="field" type="text" placeholder="0.0.0.0:4790">
+                  <label for="mesh-iface-peer">Send to peer</label>
+                  <input id="mesh-iface-peer" class="field" type="text" placeholder="192.168.1.20:4790">
+                </div>
+                <p class="hint">UDP here is point-to-point and is not discovered: <strong>the far side needs
+                  the mirror of this</strong>, its local and peer swapped.</p>
+              </div>
+              <label for="mesh-iface-ifac">Network name</label>
+              <input id="mesh-iface-ifac" class="field" type="text" placeholder="optional — leave empty for an open network">
+              <label for="mesh-iface-pass">Passphrase</label>
+              <input id="mesh-iface-pass" class="field" type="password" placeholder="optional">
+              <div class="form-span form-actions">
+                <button type="submit" class="btn btn-primary">Add connection</button>
+              </div>
+            </form>
+            <div id="mesh-iface-list" class="item-list"></div>
           </div>
 
-          <div class="form-actions">
-            <button type="submit" class="primary">Add interface</button>
+          <div id="mesh-offline" class="card hidden">
+            <div class="card-head"><h2>Index uplink</h2></div>
+            <p class="card-text">This node has no <code>[uplink]</code>, so no index drives it. That is
+              separate from hosting on the mesh: <code>[uplink]</code> is how an index manages this
+              node, <code>[mesh]</code> is what announces its games.</p>
           </div>
-        </form>
-      </div>
-    </section>
-  </main>
+
+          <div id="mesh-online" class="card hidden">
+            <div class="card-head"><h2>Index uplink</h2></div>
+            <p class="card-text">This node's address: <code id="mesh-destination" class="selectable">—</code></p>
+            <div id="interfaces-tbody" class="item-list"></div>
+            <p id="interfaces-empty" class="card-text hidden">No uplink connections yet.</p>
+            <form id="iface-form" class="form-grid" autocomplete="off" style="margin-top:14px">
+              <label for="iface-kind">Kind</label>
+              <select id="iface-kind" name="kind" class="field">
+                <option value="tcp">TCP (dial a relay, or be one)</option>
+                <option value="auto">Wi-Fi / LAN auto-discovery</option>
+              </select>
+              <label for="iface-addr" id="iface-addr-label">Address</label>
+              <div id="iface-addr-wrap">
+                <input id="iface-addr" class="field" type="text" placeholder="relay.example.com:4242 — or 0.0.0.0:4242 to be a relay">
+              </div>
+              <div class="form-span">
+                <label class="check"><input id="iface-ifac-toggle" type="checkbox"> Protect with a network name and passphrase</label>
+              </div>
+              <div id="iface-ifac-wrap" class="form-span hidden">
+                <div class="form-grid">
+                  <label for="iface-ifac-name">Network name</label>
+                  <input id="iface-ifac-name" class="field" type="text">
+                  <label for="iface-ifac-pass">Passphrase</label>
+                  <input id="iface-ifac-pass" class="field" type="password">
+                </div>
+              </div>
+              <div class="form-span form-actions">
+                <button type="submit" class="btn btn-primary">Add connection</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
 </section>
 
-<template id="instance-row-template">
-  <tr>
-    <td class="cell-name"></td>
-    <td class="cell-game"></td>
-    <td class="cell-state"><span class="state-pill"></span></td>
-    <td class="cell-map"></td>
-    <td class="cell-port"></td>
-    <td class="cell-mesh"></td>
-    <td class="cell-players"></td>
-    <td class="cell-uptime"></td>
-    <td class="actions-col cell-actions">
-      <button type="button" class="quiet map-btn">Change map</button>
-      <button type="button" class="quiet bots-btn">Bots</button>
-      <button type="button" class="quiet restart-btn">Restart</button>
-      <button type="button" class="quiet stop-btn">Stop</button>
-      <button type="button" class="quiet danger remove-btn">Remove</button>
-    </td>
-  </tr>
-</template>
-
+<div id="ctx-menu" class="menu" role="menu" hidden></div>
 <script src="app.js"></script>
 </body>
 </html>

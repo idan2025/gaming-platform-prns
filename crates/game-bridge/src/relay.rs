@@ -331,7 +331,7 @@ pub(crate) const EARLY_ANNOUNCE_DELAYS_SECS: [u64; 3] = [2, 6, 14];
 
 /// Floor between announces asked for by [`BridgeSession::announce_now`], so a
 /// flapping interface cannot turn into an announce storm.
-const MIN_ANNOUNCE_GAP: Duration = Duration::from_secs(10);
+pub(crate) const MIN_ANNOUNCE_GAP: Duration = Duration::from_secs(10);
 
 /// A discovered `<app_name>.server` destination heard via announce.
 #[derive(Debug, Clone)]
@@ -490,6 +490,17 @@ impl BridgeSession {
     /// Snapshot of discovered server destinations (the browser list).
     pub async fn discovered(&self) -> Vec<DiscoveredServer> {
         self.discovered.read().await.clone()
+    }
+
+    /// Drop one destination from the browser list. Returns whether it was
+    /// there. A server that is still up comes back with its next announce,
+    /// which is the honest outcome: this forgets what was heard, it does not
+    /// pretend a live server is gone.
+    pub async fn forget(&self, destination: DestinationHash) -> bool {
+        let mut l = self.discovered.write().await;
+        let before = l.len();
+        l.retain(|s| s.destination_hash != destination);
+        l.len() != before
     }
 
     /// Snapshot of clients that have `identify()`d themselves over an
@@ -1371,38 +1382,7 @@ impl BridgeSession {
         &self,
         destination: DestinationHash,
     ) -> Result<(ServerDetails, u32)> {
-        let link_id = match self.handle.establish_link(destination).await {
-            Ok(id) => id,
-            Err(e) => {
-                // A server may need a path resolved before a link will open —
-                // announces are not always enough between same-interface peers.
-                debug!(error = ?e, "no route for probe; requesting a path first");
-                self.handle
-                    .request_path(destination)
-                    .await
-                    .map_err(|pe| anyhow!("no path to server: {pe:?}"))?;
-                self.handle
-                    .establish_link(destination)
-                    .await
-                    .map_err(|e2| anyhow!("link to server failed: {e2:?}"))?
-            }
-        };
-
-        let outcome = self
-            .handle
-            .request(
-                link_id,
-                RequestPathHash::of(DETAILS_ENDPOINT_ID),
-                &crate::details::request_body(),
-            )
-            .await;
-        // Close the link either way: a probe is a question, not a session.
-        let _ = self.handle.close_link(link_id);
-
-        let (response, rtt) = outcome.map_err(|e| anyhow!("detail probe failed: {e:?}"))?;
-        let details = ServerDetails::decode(&response)
-            .map_err(|e| anyhow!("server sent a details response we cannot read: {e}"))?;
-        Ok((details, rtt.millis().min(u32::MAX as u64) as u32))
+        probe_details_via(&self.handle, destination).await
     }
 
     /// What this node is carrying, per interface.
@@ -1433,6 +1413,42 @@ impl BridgeSession {
     pub fn relays_transit(&self) -> bool {
         self.role == BridgeRole::Relay || self.relay_transit
     }
+}
+
+/// [`BridgeSession::probe_details`] over a bare handle, so a caller holding
+/// the session behind a lock can clone the handle and let the lock go before a
+/// round trip that can take as long as a link timeout.
+pub async fn probe_details_via(
+    handle: &PrnsNodeHandle,
+    destination: DestinationHash,
+) -> Result<(ServerDetails, u32)> {
+    let link_id = match handle.establish_link(destination).await {
+        Ok(id) => id,
+        Err(e) => {
+            // A server may need a path resolved before a link will open —
+            // announces are not always enough between same-interface peers.
+            debug!(error = ?e, "no route for probe; requesting a path first");
+            handle
+                .request_path(destination)
+                .await
+                .map_err(|pe| anyhow!("no path to server: {pe:?}"))?;
+            handle
+                .establish_link(destination)
+                .await
+                .map_err(|e2| anyhow!("link to server failed: {e2:?}"))?
+        }
+    };
+
+    let outcome = handle
+        .request(link_id, RequestPathHash::of(DETAILS_ENDPOINT_ID), &crate::details::request_body())
+        .await;
+    // Close the link either way: a probe is a question, not a session.
+    let _ = handle.close_link(link_id);
+
+    let (response, rtt) = outcome.map_err(|e| anyhow!("detail probe failed: {e:?}"))?;
+    let details = ServerDetails::decode(&response)
+        .map_err(|e| anyhow!("server sent a details response we cannot read: {e}"))?;
+    Ok((details, rtt.millis().min(u32::MAX as u64) as u32))
 }
 
 /// Per-interface transit visibility. See `BridgeSession::transit_stats` for
