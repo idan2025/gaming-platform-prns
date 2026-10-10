@@ -167,7 +167,9 @@ fn diagnose(control_answered: bool) {
             "Get-NetIPInterface -AddressFamily IPv4 | Format-Table InterfaceAlias, \
              InterfaceMetric, WeakHostSend, WeakHostReceive, Forwarding, ConnectionState -AutoSize; \
              Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction -AutoSize; \
-             Get-NetIPAddress -AddressFamily IPv4 | Format-Table InterfaceAlias, IPAddress -AutoSize",
+             Get-NetIPAddress -AddressFamily IPv4 | Format-Table InterfaceAlias, IPAddress -AutoSize; \
+             netstat -ano -p tcp | Select-String ':990'; \
+             Get-NetRoute -AddressFamily IPv4 | Format-Table DestinationPrefix, InterfaceAlias, NextHop, RouteMetric -AutoSize",
         ])
         .output();
     if let Ok(out) = out {
@@ -258,6 +260,29 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
     let control_answer = join(&member, m_addr, MEMBER_PORT + 1, h_addr, CONTROL_TCP).await;
     let answer = join(&member, m_addr, MEMBER_PORT, h_addr, GAME_TCP).await;
     if answer.is_none() {
+        // Which half failed: did the translated packet reach the game (a
+        // SYN_RECEIVED socket, a datagram read) and its answer go missing,
+        // or did Windows drop it on the way in?
+        let ping = udp((m_addr, MEMBER_PORT).into(), (h_addr, GAME_UDP).into(), b"ping");
+        let mut buf = [0u8; 64];
+        let mut got = None;
+        for _ in 0..10 {
+            member.send(ping.clone()).unwrap();
+            if let Ok((n, f)) = game_udp.recv_from(&mut buf) {
+                got = Some((buf[..n].to_vec(), f));
+                break;
+            }
+        }
+        println!("translated UDP reached the game: {got:?}");
+        if let Some((_, f)) = got {
+            game_udp.send_to(b"pong", f).unwrap();
+            let back = tokio::time::timeout(Duration::from_secs(3), member.recv()).await;
+            println!(
+                "its answer through the room: {:?}",
+                back.ok().flatten().as_deref().and_then(parse)
+            );
+        }
+        println!("rebound: {:?}", host.rebound());
         diagnose(control_answer.is_some());
     }
     assert!(
