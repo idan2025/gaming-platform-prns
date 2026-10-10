@@ -283,6 +283,50 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
             );
         }
         println!("rebound: {:?}", host.rebound());
+        // Experiment: weak-host send on the adapter that owns the address too,
+        // until reboot only, taken back after.
+        let ps = |cmd: String| {
+            let out = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &cmd])
+                .output()
+                .unwrap();
+            println!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        ps(format!(
+            "Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4 | \
+             Set-NetIPInterface -WeakHostSend Enabled -PolicyStore ActiveStore"
+        ));
+        let mut got = None;
+        for _ in 0..10 {
+            member.send(ping.clone()).unwrap();
+            if let Ok((_, f)) = game_udp.recv_from(&mut buf) {
+                game_udp.send_to(b"pong", f).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < deadline {
+                    if let Ok(Some(p)) =
+                        tokio::time::timeout(Duration::from_millis(300), member.recv()).await
+                    {
+                        if let Some((17, src, _, _, b"pong")) = parse(&p) {
+                            got = Some(src);
+                        }
+                    }
+                }
+                if got.is_some() {
+                    break;
+                }
+            }
+        }
+        println!("EXPERIMENT weak host send on the owning adapter too: answer from {got:?}");
+        let tcp = join(&member, m_addr, MEMBER_PORT + 7, h_addr, GAME_TCP).await;
+        println!("EXPERIMENT tcp join: {tcp:?}");
+        ps(format!(
+            "Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4 | \
+             Set-NetIPInterface -WeakHostSend Disabled -PolicyStore ActiveStore"
+        ));
         diagnose(control_answer.is_some());
     }
     assert!(
