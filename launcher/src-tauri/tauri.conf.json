@@ -27,6 +27,22 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJFRTM5NUQ0NjNBOTE3NDIKUldSQ0Y2bGoxSlhqTHNDUVJaeDduYi91SWdTc1p6RlFHV3BmQ056U2pDbWp4SkZSUnZZeXNSYjQK",
+      "endpoints": [
+        "https://github.com/idan2025/gaming-platform-prns/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["lanthorn"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

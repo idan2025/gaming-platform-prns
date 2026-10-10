@@ -93,6 +93,11 @@ pub struct LauncherSettings {
     /// as a last resort when a join failed and no missing port was named.
     #[serde(default)]
     pub lan_wide_open: std::collections::BTreeSet<String>,
+    /// The player turned off looking for launcher updates at start
+    /// (`update.rs`). Stored as "off" so a missing field — every settings
+    /// file written before it existed — means the check is on.
+    #[serde(default)]
+    pub update_check_off: bool,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.

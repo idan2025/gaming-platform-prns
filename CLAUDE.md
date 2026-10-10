@@ -412,6 +412,24 @@ form and a button on a running server. Rules a later change could quietly break:
   argument in `app_set_config`, so `content::validate_mod_name` is an allowlist
   and a failing name is refused, never repaired — the same rule as a map name.
 
+**The launcher updates itself and opens invite links** (2026-10-10,
+`launcher-core/src/update.rs`, `invite.rs`). Rules a later change could
+quietly break:
+- **The update check must never block or fail loudly offline.** It runs after
+  start, off the UI's path; a failed check at start is silence.
+- **Only a copy that owns its files replaces them** (`update::install_mode`):
+  installed Windows and macOS, and an AppImage. Portable, `.deb`, `.rpm` and
+  Arch get a link to the release page.
+- **The signing key is the update channel.** `plugins.updater.pubkey` in
+  `tauri.conf.json` must match the `TAURI_SIGNING_PRIVATE_KEY` secret; changing
+  either strands every installed launcher (`RELEASE.md`). The AppImage is
+  re-signed after its libwayland repack, or the updater rejects it.
+- **An invite link selects a server and never joins one**, and every field is
+  validated as data in `invite::parse`; refused, never repaired.
+- **A portable launcher registers no link scheme** — it writes nothing
+  outside its folder. Single-instance is what hands a clicked link to the
+  running launcher instead of starting a second mesh node.
+
 **The server list is what is live, never history** (2026-10-10, the user's
 call). `list_servers` does not list remembered servers; a heard row drops off
 after `STALE_AFTER` (180 s) unless the query sets `max_age_secs`. Because a

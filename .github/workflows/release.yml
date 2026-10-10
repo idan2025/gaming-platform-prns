@@ -254,9 +254,17 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-wintun.ps1 launcher/src-tauri/binaries
 
+      # The release build also produces the updater's files: each installer's
+      # `.sig`, made with the key in the repository's secrets, which the
+      # launcher checks against the public key in tauri.conf.json before it
+      # installs anything (launcher-core/src/update.rs). Only here: a build
+      # without the key — CI, a contributor's machine — makes no .sig.
       - name: Bundle
         working-directory: launcher/src-tauri
-        run: cargo tauri build ${{ matrix.args || '' }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build ${{ matrix.args || '' }} --config tauri.release.conf.json
 
       # linuxdeploy bundles the build host's libwayland-client.so.0 into the
       # AppImage, and on any machine with the NVIDIA driver that library *is*
@@ -289,6 +297,9 @@ jobs:
       - name: Un-bundle libwayland-client from the AppImage
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           export APPIMAGE_EXTRACT_AND_RUN=1
@@ -324,6 +335,10 @@ jobs:
             rm -f "$lib" "$img"
             "$tool" --no-appstream "$work/squashfs-root" "$img"
             rm -rf "$work"
+            # The repack changed the bytes, so the bundle step's signature no
+            # longer matches them: sign the image that actually ships.
+            rm -f "$img.sig"
+            cargo tauri signer sign "$img"
             echo "$(basename "$img"): dropped the bundled libwayland-client"
           done
 
@@ -375,8 +390,16 @@ jobs:
           # covers both without branching, and without a nested find whose
           # own `{}` would fight this one's.
           find launcher/src-tauri/target -type f -path '*/bundle/*' \
-            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \
+               -o -name '*.sig' -o -name '*.app.tar.gz' \) \
             -exec cp {} dist/ \;
+          # The macOS update archive is named after the app alone; give it the
+          # version and architecture every other asset carries.
+          version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' launcher/src-tauri/tauri.conf.json)"
+          for f in dist/*.app.tar.gz dist/*.app.tar.gz.sig; do
+            [ -e "$f" ] || continue
+            mv "$f" "dist/Lanthorn_${version}_universal${f#dist/Lanthorn}"
+          done
           # Tauri names the .deb and the AppImage with Debian's amd64/arm64 (the
           # rpm already says x86_64/aarch64). Rename them so every Linux asset
           # spells its architecture one way. Only the file name changes; the
@@ -412,3 +435,54 @@ jobs:
             exit 1
           fi
           gh release upload "$tag" "${files[@]}" --clobber
+
+  # The updater's manifest (launcher-core/src/update.rs): which file each
+  # platform downloads and its signature, read off the release this run just
+  # filled. A launcher asks for releases/latest/download/latest.json, so the
+  # newest published release is the one offered.
+  updater-manifest:
+    name: update manifest
+    needs: launcher
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write and upload latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          mkdir work && cd work
+          gh release download "$tag" -R "$REPO" -p '*.sig'
+          ls -la
+          TAG="$tag" python3 - <<'PY'
+          import datetime, json, os, pathlib
+          tag = os.environ["TAG"]; repo = os.environ["REPO"]; v = tag.lstrip("v")
+          base = f"https://github.com/{repo}/releases/download/{tag}/"
+          want = {
+              "linux-x86_64": f"Lanthorn_{v}_x86_64.AppImage",
+              "linux-aarch64": f"Lanthorn_{v}_aarch64.AppImage",
+              "windows-x86_64": f"Lanthorn_{v}_x64-setup.exe",
+              "darwin-x86_64": f"Lanthorn_{v}_universal.app.tar.gz",
+              "darwin-aarch64": f"Lanthorn_{v}_universal.app.tar.gz",
+          }
+          platforms = {}
+          for key, name in want.items():
+              sig = pathlib.Path(name + ".sig")
+              if sig.exists():
+                  platforms[key] = {"signature": sig.read_text().strip(), "url": base + name}
+              else:
+                  print(f"no signature for {name}; {key} is not offered this release")
+          if not platforms:
+              raise SystemExit("no signed installers were found")
+          manifest = {
+              "version": v,
+              "notes": f"Lanthorn {v}. What changed: https://github.com/{repo}/releases/tag/{tag}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          pathlib.Path("latest.json").write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
+          PY
+          gh release upload "$tag" latest.json -R "$REPO" --clobber

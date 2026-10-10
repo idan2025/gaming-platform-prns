@@ -566,3 +566,9 @@ details.small > summary { cursor: pointer; color: var(--text-2); }
 .art img.art-bg { object-fit: cover; filter: blur(14px) saturate(1.3) brightness(0.7); transform: scale(1.25); }
 .art img.art-fg { object-fit: contain; }
 .detail-hero .art-room::after { display: none; }
+
+.update-banner { background: var(--accent-soft); }
+.update-banner .rb-icon { color: var(--accent); }
+.invite-form { display: flex; gap: 8px; padding: 6px 6px 4px; width: 360px; }
+.invite-form input { flex: 1; height: 32px; padding: 0 10px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); outline: none; font-family: var(--mono); font-size: 12px; }
+.invite-form input:focus { border-color: var(--accent); }

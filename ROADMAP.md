@@ -10,8 +10,8 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 
 | # | Feature | Who it is for | Size | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Auto-update | every player | M | proposed |
-| 2 | Invite links | players with friends | S–M | proposed |
+| 1 | Auto-update | every player | M | **done** (v0.2.31) |
+| 2 | Invite links | players with friends | S–M | **done** (v0.2.31) |
 | 3 | Favorites and "it's up" alerts | regulars | S | needs a decision |
 | 4 | Installed-game detection | every player | M | proposed |
 | 5 | Tray icon and notifications | hosts, regulars | M | proposed |
@@ -29,6 +29,11 @@ a server.
 ---
 
 ## 1. Auto-update
+
+**Done in v0.2.31** (`launcher-core/src/update.rs`, `check_update` /
+`install_update` in the shell, `updater-manifest` in `release.yml`; key
+handling in `RELEASE.md`). Decided: ask, with the notes shown, and a setting to
+turn the check off.
 
 **What.** The launcher checks for a newer release, downloads it, verifies its
 signature, and restarts into it — on a click, or on its own at the next start.
@@ -57,8 +62,11 @@ the release notes shown, and a "do this automatically" checkbox.
 
 ## 2. Invite links
 
+**Done in v0.2.31** (`launcher-core/src/invite.rs`; the scheme is
+`lanthorn`, with `room=1` for rooms; the https fallback page is not built yet).
+
 **What.** "Copy invite" on a server or room gives a link such as
-`meshgames://join/<destination>?game=<id>`. Clicking it in Discord, WhatsApp or
+`lanthorn://join/<destination>?game=<id>`. Clicking it in Discord, WhatsApp or
 a browser opens the launcher on that server and offers Join.
 
 **Why.** "Find Idan's room in the list" fails exactly when it matters: before a
