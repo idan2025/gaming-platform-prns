@@ -74,18 +74,26 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
-## Unreleased
+## v0.2.30
 
-### A game run through Wine or Proton can be joined
+### A game that listens on the wrong address can be joined
 
 Some games listen on the computer's Wi-Fi or Ethernet address instead of the
-room's — under Wine or Proton especially, but a native game with a fixed
-address set does the same, on Linux or Windows. Need for Speed: Underground 2 did: the race
-showed up in the other player's list, and every join was refused. The room
-now finds where the game is listening and passes its traffic through. There
-is nothing to click and nothing to set up. Only the game's own ports are
-passed, and only to programs on this computer; nothing else on your network
-becomes reachable from the room. The room check says when it is doing this.
+room's. Under Wine or Proton this is common, and a native game with a fixed
+address set does the same, on Linux or Windows. Need for Speed: Underground 2
+under Proton did it: the race showed up in the other player's list, and every
+join was refused, firewalls on or off. The room now finds where the game is
+listening and passes its traffic through. There is nothing to click and
+nothing to set up, on either computer, whichever one hosts. Only the game's
+own ports are passed, and only to programs on this computer; nothing else on
+your network becomes reachable from the room. The room check says when it is
+doing this.
+
+On Windows this needs one network setting ("weak host send") on the adapters
+that reach the internet while a room is open, so the game's answers can leave
+through the room. The room turns it on when it starts and off when it ends,
+and only where it was off. It is never saved: if the launcher is killed
+instead of closed, it stays on until the next restart.
 
 Steam's own LAN discovery (UDP 27036), which Proton runs beside every game,
 is no longer listed as a port the game needs. If you allowed it for a game
