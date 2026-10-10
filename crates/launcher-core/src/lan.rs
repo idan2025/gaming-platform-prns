@@ -529,6 +529,13 @@ fn run_check(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
+impl RoomState {
+    /// The room's destination, once known.
+    pub(crate) fn room_hash(&self) -> Option<personal_rns::prelude::DestinationHash> {
+        self.session.room_hash()
+    }
+}
+
 impl Launcher {
     /// Whether this machine can put a room on an adapter, and if not, why.
     pub async fn lan_helper(&self) -> LanHelperView {
@@ -936,6 +943,16 @@ impl Launcher {
         };
         let report = game_bridge::lan_check::check_room(&session, &policy, ADAPTER_NAME).await?;
         Ok(report.into())
+    }
+
+    /// Announce the room this launcher hosts now, rather than at its next
+    /// tick. Returns false when there is nothing to announce — no room, or a
+    /// room this launcher only joined. The announcer keeps its own floor
+    /// between announces, so a button pressed repeatedly cannot flood a slow
+    /// link.
+    pub async fn announce_room(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.room.as_ref().is_some_and(|room| room.session.announce_now())
     }
 
     /// The room this launcher is in, as the UI shows it.

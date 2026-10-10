@@ -443,6 +443,21 @@ impl MeshBridges {
         self.extra.lock().await.iter().map(|i| i.public()).collect()
     }
 
+    /// Ask every running bridge — or the one serving `instance` — to announce
+    /// now. Returns how many were asked.
+    pub async fn announce_now(&self, instance: Option<&str>) -> usize {
+        let bridges = self.bridges.lock().await;
+        let mut asked = 0;
+        for (id, bridge) in bridges.iter() {
+            if instance.is_some_and(|want| want != id) {
+                continue;
+            }
+            bridge.session.request_announce();
+            asked += 1;
+        }
+        asked
+    }
+
     /// Attach an interface to every bridge now and to every bridge later.
     ///
     /// Re-adding the same id replaces the saved entry rather than stacking a

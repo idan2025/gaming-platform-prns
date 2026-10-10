@@ -6,98 +6,187 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div id="app">
-  <header class="topbar">
+<div id="app" class="shell">
+  <aside class="sidebar" aria-label="Navigation">
     <div class="brand">
-      <svg class="brand-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-        <circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/>
-        <path d="M7 7 L11 16 M17 7 L13 16 M7 6 L17 6"/>
+      <svg class="brand-mark" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+        <rect x="1" y="1" width="30" height="30" rx="8" class="brand-bg"/>
+        <circle cx="10" cy="11" r="2.6" class="brand-dot"/>
+        <circle cx="22" cy="11" r="2.6" class="brand-dot"/>
+        <circle cx="16" cy="22" r="2.6" class="brand-dot"/>
+        <path d="M10 11 L22 11 M10 11 L16 22 M22 11 L16 22" class="brand-line"/>
       </svg>
-      <h1>Mesh Game Servers</h1>
-    </div>
-    <div id="status" class="status" aria-live="polite"></div>
-  </header>
-
-  <!-- Which build this is, so a player reporting a problem, and whoever asks
-       them "which version?", both have the answer on screen. Filled in from
-       the core; an older shell without the command leaves it blank rather than
-       printing "undefined". -->
-  <div id="build-version" class="build-version" title="The launcher build you are running"></div>
-
-  <section class="filters" id="filters" aria-label="Filters">
-    <div class="field field-text">
-      <input id="f-text" type="search" placeholder="Search server name…" aria-label="Search by name">
-    </div>
-    <div class="field">
-      <select id="f-game" aria-label="Filter by game"></select>
-    </div>
-    <label class="toggle"><input type="checkbox" id="f-players"><span>Has players</span></label>
-    <label class="toggle"><input type="checkbox" id="f-notfull"><span>Not full</span></label>
-    <label class="toggle"><input type="checkbox" id="f-pw"><span>Hide passworded</span></label>
-    <label class="toggle"><input type="checkbox" id="f-dedicated"><span>Dedicated only</span></label>
-    <label class="toggle"><input type="checkbox" id="f-legacy" checked><span>Include legacy</span></label>
-    <label class="field field-num">Max hops
-      <input id="f-maxhops" type="number" min="0" step="1" placeholder="any" aria-label="Maximum hops">
-    </label>
-    <!-- The mesh announces a server once and then stops repeating it, so a
-         launcher started later hears nothing. This asks the mesh where the
-         servers it already knows about are. -->
-    <button id="f-refresh" type="button" class="quiet"
-            title="Ask the mesh where remembered servers are. The mesh announces a server once and then stops repeating it, so this is how one that was already running is found again.">Find remembered</button>
-  </section>
-
-  <div id="legacy-notice" class="legacy-notice hidden" role="status"></div>
-
-  <!-- An index is a cache of the mesh, never the source of truth (DESIGN.md
-       §0). None is configured by default and browsing works with none; adding
-       one is a player choosing to trust somebody's list. -->
-  <details id="index-panel" class="index-panel">
-    <summary>Indexes <span id="index-count" class="muted"></span></summary>
-    <p class="index-help">An index is somebody else's list of servers, and it is
-      optional. Browsing works without one — the launcher hears servers directly
-      and remembers the ones it has seen. An index adds the ones it has heard
-      that you have not, which is the only way to find a server that was already
-      running before you ever started.</p>
-    <div class="index-add">
-      <input id="index-hash" type="text" placeholder="index address (32 hex characters)"
-             aria-label="Index destination address">
-      <button id="index-add-btn" type="button" class="quiet">Add index</button>
-    </div>
-    <div id="index-list"></div>
-  </details>
-
-  <!-- Mode 3 (PLAN.md §14): a virtual LAN for games that only find each other
-       by LAN broadcast. Hidden by the script when the shell has no room
-       commands. -->
-  <details id="room-panel" class="index-panel" hidden>
-    <summary>LAN rooms <span id="room-summary" class="muted"></span></summary>
-    <p class="index-help">A LAN room makes everyone in it look like one local
-      network, for older games that only find each other by LAN broadcast. It
-      runs over the mesh like everything else; a small helper puts it on a
-      virtual network adapter on this machine, and only the game's own ports are
-      reachable through it.</p>
-    <div id="room-body"></div>
-  </details>
-  <div id="room-banner" class="room-banner hidden" role="status"></div>
-
-  <main class="main">
-    <section class="list-wrap" aria-label="Server list">
-      <div class="list-head" role="row">
-        <button class="col col-name" data-sort="name" type="button">Name<span class="arrow"></span></button>
-        <div class="col col-game">Game</div>
-        <div class="col col-map">Map</div>
-        <button class="col col-players" data-sort="players" type="button">Players<span class="arrow"></span></button>
-        <button class="col col-hops" data-sort="hops" type="button">Hops<span class="arrow"></span></button>
-        <button class="col col-seen" data-sort="last_seen" type="button">Last seen<span class="arrow"></span></button>
+      <div class="brand-text">
+        <div class="brand-name">Mesh Game Servers</div>
+        <div class="brand-sub">Server browser</div>
       </div>
-      <div class="list-body" id="list" tabindex="0" role="listbox" aria-label="Servers"></div>
-    </section>
+    </div>
 
-    <aside class="detail" id="detail" hidden aria-label="Server details"></aside>
-  </main>
+    <nav class="nav" role="tablist" aria-label="Sections">
+      <button class="nav-item active" id="nav-servers" data-view="servers" role="tab" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        <span>Servers</span><span class="nav-count" id="nav-servers-count"></span>
+      </button>
+      <button class="nav-item" id="nav-rooms" data-view="rooms" role="tab" type="button" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="13" rx="2"/><path d="M8 21h8M12 18v3"/><path d="M7 12h3M14 12h3"/></svg>
+        <span>LAN rooms</span><span class="nav-dot" id="nav-rooms-dot" hidden></span>
+      </button>
+      <button class="nav-item" id="nav-connections" data-view="connections" role="tab" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
+        <span>Connections</span>
+      </button>
+      <button class="nav-item" id="nav-indexes" data-view="indexes" role="tab" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 10h16M4 15h10M4 20h7"/></svg>
+        <span>Indexes</span><span class="nav-count" id="index-count"></span>
+      </button>
+    </nav>
 
-  <div id="error" class="error hidden" role="alert"></div>
+    <div class="sidebar-foot">
+      <div id="status" class="node-card" aria-live="polite"></div>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="toolbar" id="filters" aria-label="Filters">
+      <div class="search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>
+        <input id="f-text" type="search" placeholder="Search servers" aria-label="Search by name" spellcheck="false">
+      </div>
+      <div class="select-wrap">
+        <select id="f-game" aria-label="Filter by game"></select>
+      </div>
+      <div class="pop-anchor">
+        <button id="filters-btn" type="button" class="tool" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+          <span>Filters</span><span class="tool-badge" id="filters-count" hidden></span>
+        </button>
+        <div id="filters-pop" class="popover" hidden>
+          <div class="pop-title">Show only</div>
+          <label class="check"><input type="checkbox" id="f-players"><span>Servers with players</span></label>
+          <label class="check"><input type="checkbox" id="f-notfull"><span>Servers that are not full</span></label>
+          <label class="check"><input type="checkbox" id="f-dedicated"><span>Dedicated servers</span></label>
+          <div class="pop-sep"></div>
+          <label class="check"><input type="checkbox" id="f-pw"><span>Hide password-protected</span></label>
+          <label class="check"><input type="checkbox" id="f-legacy" checked><span>Include older servers</span></label>
+          <label class="pop-field">Within
+            <input id="f-maxhops" type="number" min="0" step="1" placeholder="any" aria-label="Maximum hops">
+            hops
+          </label>
+          <div class="pop-actions"><button type="button" class="link" id="filters-clear">Reset filters</button></div>
+        </div>
+      </div>
+
+      <div class="toolbar-spacer"></div>
+
+      <div class="split pop-anchor">
+        <button id="announce-btn" type="button" class="tool tool-primary"
+                title="Announce your room if you host one, and ask the mesh where your saved servers are">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h3l5 4V6L7 10H4z"/><path d="M16 9a4 4 0 010 6M18.5 6.5a7.5 7.5 0 010 11"/></svg>
+          <span>Announce</span>
+        </button>
+        <button id="announce-more" type="button" class="tool tool-primary split-caret" aria-label="More announce options" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5"/></svg>
+        </button>
+        <div id="announce-pop" class="popover popover-right menu-pop" hidden role="menu">
+          <button type="button" class="menu-item" id="announce-room" role="menuitem">
+            <span class="mi-label">Announce my room now</span><span class="mi-hint" id="announce-room-hint"></span>
+          </button>
+          <button type="button" class="menu-item" id="f-refresh" role="menuitem">
+            <span class="mi-label">Look for saved servers</span><span class="mi-hint">path request to each</span>
+          </button>
+          <button type="button" class="menu-item" id="announce-trace" role="menuitem">
+            <span class="mi-label">Trace path to selected server</span><span class="mi-hint" id="announce-trace-hint"></span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div id="room-banner" class="room-banner hidden" role="status"></div>
+    <div id="legacy-notice" class="notice hidden" role="status"></div>
+
+    <main class="views">
+      <section class="view view-servers" id="view-servers" aria-label="Server list">
+        <div class="list-wrap">
+          <div class="list-head" role="row">
+            <div class="col col-art" aria-hidden="true"></div>
+            <button class="col col-name" data-sort="name" type="button">Server<span class="arrow"></span></button>
+            <div class="col col-game">Game</div>
+            <div class="col col-map">Map</div>
+            <button class="col col-players" data-sort="players" type="button">Players<span class="arrow"></span></button>
+            <button class="col col-hops" data-sort="hops" type="button">Distance<span class="arrow"></span></button>
+            <button class="col col-seen" data-sort="last_seen" type="button">Heard<span class="arrow"></span></button>
+          </div>
+          <div class="list-body" id="list" tabindex="0" role="listbox" aria-label="Servers"></div>
+        </div>
+        <aside class="detail" id="detail" hidden aria-label="Server details"></aside>
+      </section>
+
+      <!-- Mode 3 (PLAN.md §14): a virtual LAN for games that only find each
+           other by LAN broadcast. Hidden by the script when the shell has no
+           room commands. -->
+      <section class="view view-page" id="view-rooms" hidden>
+        <div class="page">
+          <header class="page-head">
+            <h1>LAN rooms</h1>
+            <p>A LAN room makes everyone in it look like one local network, for
+              older games that only find each other by LAN broadcast. A small
+              helper puts the room on a virtual network adapter on this
+              computer, and only the game's own ports are reachable through it.</p>
+          </header>
+          <div id="room-panel" class="room-panel" hidden>
+            <div id="room-body"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view view-page" id="view-connections" hidden>
+        <div class="page">
+          <header class="page-head">
+            <h1>Connections</h1>
+            <p>How this launcher reaches the mesh. Nothing here is a server you
+              depend on: any relay or neighbour that carries Reticulum will do.</p>
+          </header>
+          <div id="connections-body"></div>
+        </div>
+      </section>
+
+      <!-- An index is a cache of the mesh, never the source of truth (DESIGN.md
+           §0). None is configured by default and browsing works with none;
+           adding one is a player choosing to trust somebody's list. -->
+      <section class="view view-page" id="view-indexes" hidden>
+        <div class="page">
+          <header class="page-head">
+            <h1>Indexes</h1>
+          </header>
+          <div id="index-panel" class="card">
+            <p class="card-text">An index is somebody else's list of servers, and it is
+              optional. Browsing works without one — the launcher hears servers directly.
+              An index adds the ones it has heard that you have not, which is how you find
+              a server too far away to have reached you yet.</p>
+            <div class="inline-form">
+              <input id="index-hash" type="text" placeholder="Index address (32 hex characters)"
+                     aria-label="Index destination address" spellcheck="false">
+              <button id="index-add-btn" type="button" class="btn">Add index</button>
+            </div>
+            <div id="index-list" class="item-list"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="statusbar">
+      <span id="statusbar-text"></span>
+    </footer>
+  </div>
 </div>
+
+<!-- Which build this is, so a player reporting a problem, and whoever asks
+     them "which version?", both have the answer on screen. -->
+<div id="build-version" class="build-version" title="The launcher build you are running"></div>
+
+<div id="ctx-menu" class="menu ctx-menu" role="menu" hidden></div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<div id="error" class="error hidden" role="alert"></div>
 <script src="app.js"></script>
 </body>
 </html>

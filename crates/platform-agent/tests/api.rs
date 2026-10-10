@@ -333,6 +333,42 @@ async fn games_say_whether_they_have_bots() {
     }
 }
 
+/// The artwork id is a field the UI reads by name; Sven Co-op's pack names
+/// the Steam app players own.
+#[tokio::test(flavor = "multi_thread")]
+async fn games_carry_the_steam_app_players_own() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/games"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sven = body.as_array().unwrap().iter().find(|g| g["id"] == "sven-coop").expect("sven");
+    assert_eq!(sven["steam_app_id"], 225840, "{sven}");
+}
+
+/// Announce now on a LAN-only node is a clear refusal, not a silent success
+/// that announced nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn announcing_on_a_lan_only_node_says_why_it_cannot() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/mesh/announce"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap_or("").contains("LAN-only"), "{body}");
+}
+
 /// A node with no `[uplink]` block has no mesh node to configure, so the
 /// interfaces routes answer 501 with the reason rather than 404 or a panic. The
 /// route is wired and reachable; it just has nothing to act on. (The interface

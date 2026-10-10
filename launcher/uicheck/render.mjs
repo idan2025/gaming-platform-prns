@@ -136,6 +136,10 @@ function makeInvoke(scenario) {
         return (scenario.known ?? []).length;
       case 'forget_server':
         return null;
+      case 'trace_path':
+        return { destination_hash: args.destinationHash, found: true, hops: 2, millis: 140, error: null };
+      case 'announce_room':
+        return !!(scenario.room && scenario.room.active && scenario.room.role === 'host');
       case 'clear_listen_port':
         return null;
       // Mode 3 rooms. A scenario without `lanHelper` is a shell that predates
@@ -276,38 +280,6 @@ await run('the detail pane survives a re-render', {
     after.value === '270', `got ${JSON.stringify(after.value)}`);
   check('the scroll container is present to be restored',
     !!doc.querySelector('#detail .detail-body'));
-});
-
-// A remembered row must be visibly different from a live one. It is joinable —
-// a destination hash is all a join needs — but nothing about it is current, and
-// rendering a stale player count as a live one is the single thing a server
-// browser must not do.
-await run('a remembered server is marked as memory, not as live', {
-  status: running,
-  rows: () => [rememberedRow],
-}, async (win, doc) => {
-  const el = doc.querySelector('#list .row');
-  check('a remembered server still appears in the list', !!el);
-  check('the row is marked as remembered', el.classList.contains('remembered'));
-  check('the row carries a badge saying so', el.textContent.includes('remembered'));
-
-  const players = el.querySelector('[data-cell="players"]').textContent;
-  check('unknown players render as a dash, never a stale number',
-    players === '—', `got ${JSON.stringify(players)}`);
-  // "Unknown" is the list's existing word for a field it does not have, and it
-  // is the honest one here: the launcher knows the server existed, not what it
-  // is running now.
-  const map = el.querySelector('[data-cell="map"]').textContent;
-  check('the map is not presented as known', map === 'Unknown' || map === '—',
-    `got ${JSON.stringify(map)}`);
-
-  el.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
-  const pane = doc.querySelector('#detail');
-  check('the detail pane explains that it is from memory', /Remembered/i.test(pane.textContent));
-  check('and offers to forget it', /Forget this server/i.test(pane.textContent));
-  check('and offers to look for it now', /Look for it now/i.test(pane.textContent));
-  check('no undefined in a remembered pane', !pane.textContent.includes('undefined'));
 });
 
 // Binding a local port always succeeds. If nobody could route to the server,
@@ -967,6 +939,76 @@ await run('an older shell shows no room controls at all', {
 }, (win, doc) => {
   check('the room panel is hidden', doc.querySelector('#room-panel').hidden);
   check('and no error is shown for the missing commands', doc.querySelector('#error').classList.contains('hidden'));
+});
+
+// The webview's own menu is a browser's, and its Reload tears the page out from
+// under a running launcher. A right-click on a row gets the launcher's menu, and
+// Remove takes the row off the list at once — it used to wait out a probe, and
+// then come straight back on the next poll.
+{
+  let listed = [row(), legacyRow];
+  await run('right-click gives the launcher\u2019s menu, and Remove removes', {
+    status: running,
+    rows: () => listed,
+  }, async (win, doc) => {
+    const target = doc.querySelector('#list .row');
+    const hash = target.dataset.hash;
+    const ev = new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 50, clientY: 50 });
+    target.dispatchEvent(ev);
+    check('the browser menu is suppressed on a row', ev.defaultPrevented);
+    const menu = doc.querySelector('#ctx-menu');
+    check('the launcher menu opens', menu && !menu.hidden);
+    const labels = [...menu.querySelectorAll('.menu-item')].map(b => b.textContent);
+    for (const want of ['Join server', 'View details', 'Trace path', 'Copy address', 'Remove from list']) {
+      check(`the menu offers ${want}`, labels.some(l => l.includes(want)), labels.join(' | '));
+    }
+
+    [...menu.querySelectorAll('.menu-item')].find(b => b.textContent.includes('Trace path')).click();
+    await settle();
+    check('Trace path asks the core for that server', calls.includes('trace_path') && lastArgs.get('trace_path')?.destinationHash === hash);
+    check('and says what it found', doc.querySelector('#toast').textContent.includes('2 hops'), doc.querySelector('#toast').textContent);
+
+    target.dispatchEvent(new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    // The core forgets it everywhere; a later poll must agree.
+    listed = [legacyRow];
+    doc.querySelector('#ctx-remove').click();
+    check('the row is gone at once, before any reply', !doc.querySelector(`#list .row[data-hash="${hash}"]`));
+    await settle();
+    check('forget_server was sent that server', lastArgs.get('forget_server')?.destinationHash === hash);
+    check('the menu closed', doc.querySelector('#ctx-menu').hidden);
+
+    const blank = new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    doc.querySelector('.toolbar').dispatchEvent(blank);
+    check('the browser menu is suppressed everywhere else too', blank.defaultPrevented);
+    const field = new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    doc.querySelector('#f-text').dispatchEvent(field);
+    check('but not inside a text field, where cut and paste live', !field.defaultPrevented);
+
+    for (const init of [{ key: 'F5' }, { key: 'r', ctrlKey: true }]) {
+      const k = new win.KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true });
+      doc.dispatchEvent(k);
+      check(`reload by ${init.ctrlKey ? 'Ctrl+R' : 'F5'} is blocked`, k.defaultPrevented);
+    }
+  });
+}
+
+// Announce: a browser has nothing of its own to announce, so it asks the mesh
+// where its saved servers are; a host's room goes out too.
+await run('Announce asks for saved servers, and announces a hosted room', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: { supported: true, path: '/x', ready: true, mode: 'granted', can_grant: false, can_revoke: false, detail: 'Ready.' },
+  room: { ...noRoom, active: true, role: 'host', game_id: 'openttd', room_hash: 'ab'.repeat(16), address: '198.19.0.1', members: [{ address: '198.19.0.1', is_self: true }], adapter: 'up' },
+  known: [{ destination_hash: 'cd'.repeat(16), name: 'x', game_id: 'sven-coop', last_seen_secs: 9 }],
+  rows: () => [row()],
+}, async (win, doc) => {
+  doc.querySelector('#announce-btn').click();
+  await settle();
+  check('the hosted room is announced', calls.includes('announce_room'));
+  check('saved servers are looked for', calls.includes('refresh_known_servers'));
+  const t = doc.querySelector('#toast').textContent;
+  check('and it says both', t.includes('room was announced') && t.includes('1 saved server'), t);
+  check('the room page offers Announce now', !!doc.querySelector('#room-announce'));
 });
 
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);

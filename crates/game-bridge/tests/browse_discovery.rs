@@ -139,6 +139,48 @@ async fn a_legacy_announce_is_still_listed_by_name() {
     server.stop().await;
 }
 
+/// Removing a server from the list removes it, and keeps it removed until it
+/// announces again. The launcher's Remove used to clear only the remembered
+/// copy, and the browse node's own row put it straight back on the next poll.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forgotten_server_stays_gone_until_it_announces_again() {
+    let tcp_port = common::free_tcp_port();
+    let dir = common::scratch_dir("browse-forget");
+
+    let mut server_args = ServerArgs::new(GameProfile::sven_coop());
+    server_args.identity = dir.join("server.identity");
+    server_args.tcp = Some(format!("0.0.0.0:{tcp_port}"));
+    server_args.announce_interval = 1;
+    server_args.game_port = 1;
+    let mut server = BridgeSession::start_server(server_args).await.expect("server starts");
+    let hash = server.own_hash().expect("the server has a destination");
+
+    let mut browser_args = BrowserArgs::new();
+    browser_args.tcp = Some(format!("127.0.0.1:{tcp_port}"));
+    let mut browser = BridgeSession::start_browser(browser_args).await.expect("browser starts");
+
+    let query = BrowseQuery::default();
+    let listed = |rows: &[game_bridge::DiscoveredServer]| rows.iter().any(|r| r.destination_hash == hash);
+    assert!(wait_for(&browser, &query, Duration::from_secs(30), listed).await, "never heard the server");
+
+    // While it is up, forgetting is honest: its next announce brings it back.
+    assert!(browser.forget(hash).await, "the row was there to forget");
+    assert!(
+        wait_for(&browser, &query, Duration::from_secs(30), listed).await,
+        "a live server must come back with its next announce"
+    );
+
+    // Once it is gone, forgetting is final.
+    server.stop().await;
+    assert!(browser.forget(hash).await);
+    assert!(!listed(&browser.browse(&query).await), "a forgotten row is still listed");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!listed(&browser.browse(&query).await), "a stopped server came back after being forgotten");
+    assert!(!browser.forget(hash).await, "forgetting twice finds nothing the second time");
+
+    browser.stop().await;
+}
+
 /// A filter that asks about a field only a record carries must not smuggle in
 /// legacy rows — and must still find the record ones.
 #[tokio::test(flavor = "multi_thread")]
