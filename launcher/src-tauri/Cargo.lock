@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "game-bridge"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "anyhow",
  "getrandom 0.2.17",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "index-client"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "anyhow",
  "game-bridge",
@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "launcher"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "launcher-core",
  "serde",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "launcher-core"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "anyhow",
  "game-bridge",
