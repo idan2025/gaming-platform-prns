@@ -337,6 +337,9 @@ pub struct CheckReport {
     /// What this machine's room filter refused because the game's pack does
     /// not list it (`lan_filter::RefusedLog`).
     pub refused_here: Vec<crate::lan_filter::Refused>,
+    /// The game's ports this machine's pump translates because the game
+    /// listens on another of its addresses (`lan_rebind.rs`).
+    pub rebound_here: Vec<crate::lan_rebind::Rebound>,
 }
 
 impl CheckReport {
@@ -383,6 +386,24 @@ impl CheckReport {
                 })
             })
             .collect();
+        // Not a fault: said so a player comparing notes with the other
+        // machine knows the room is doing it.
+        let rebound: Vec<String> = self
+            .rebound_here
+            .iter()
+            .map(|r| {
+                let proto = match r.port.proto {
+                    LanProto::Udp => "UDP",
+                    LanProto::Tcp => "TCP",
+                };
+                format!(
+                    "On this computer the game listens on {} for {proto} {}, not on the room's \
+                     address (games run through Wine do this). The room passes that traffic \
+                     through.",
+                    r.address, r.port.port
+                )
+            })
+            .collect();
         if self.ok() && !self.refused_here.is_empty() {
             // The room itself works; the game's pack is what is short — or the
             // game is not listening where the room delivers, which the same
@@ -390,6 +411,7 @@ impl CheckReport {
             out.push("The room works, but the game used ports its pack does not list:".to_string());
             out.push(missing_ports_finding(&self.refused_here));
             out.extend(not_listening);
+            out.extend(rebound);
             return out;
         }
         if self.ok() {
@@ -414,6 +436,7 @@ impl CheckReport {
                 ));
             }
             out.extend(not_listening);
+            out.extend(rebound.iter().cloned());
             out.push(
                 "That proves the room, not the game: if the game still lists nothing, allow it \
                  through the firewall on every machine, and check it is set to LAN play."
@@ -452,6 +475,7 @@ impl CheckReport {
             out.push(missing_ports_finding(&self.refused_here));
         }
         out.extend(not_listening.iter().cloned());
+        out.extend(rebound);
         if self.answers_blocked_here {
             out.push(
                 "Answers reached this machine's room adapter but not the program that asked: a \
@@ -724,6 +748,7 @@ pub async fn check_room_with(
         dropped_here,
         firewall_advice: None,
         refused_here: session.refused_log().refused(Instant::now()),
+        rebound_here: session.rebound(),
     })
 }
 
@@ -836,7 +861,23 @@ mod tests {
             dropped_here: Vec::new(),
             firewall_advice: None,
             refused_here: Vec::new(),
+            rebound_here: Vec::new(),
         }
+    }
+
+    /// A game under Wine on this machine: the check says the room is
+    /// translating for it, so nobody goes looking for a fault.
+    #[test]
+    fn a_game_on_another_address_is_named_and_not_blamed() {
+        let mut r = report(vec![member(B, true)]);
+        r.rebound_here = vec![crate::lan_rebind::Rebound {
+            port: crate::lan_filter::LanPort { proto: LanProto::Tcp, port: 9900 },
+            address: Ipv4Addr::new(192, 168, 32, 203),
+        }];
+        assert!(r.ok());
+        let f = r.findings().join("\n");
+        assert!(f.contains("listens on 192.168.32.203 for TCP 9900"), "{f}");
+        assert!(f.contains("passes that traffic through"), "{f}");
     }
 
     #[test]

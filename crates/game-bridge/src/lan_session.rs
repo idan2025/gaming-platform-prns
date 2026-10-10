@@ -200,6 +200,7 @@ pub struct LanSession {
     connects: crate::lan_firewall::ConnectWatch,
     refused: crate::lan_filter::RefusedLog,
     extra_ports: crate::lan_filter::ExtraPorts,
+    rebound: Mutex<Vec<crate::lan_rebind::Rebound>>,
 }
 
 impl LanSession {
@@ -231,7 +232,8 @@ impl LanSession {
     }
 
     pub fn own_address(&self) -> Option<Ipv4Addr> {
-        self.view().own_address
+        // Read on every packet: the field, not a copy of the member table.
+        self.view.lock().expect("room view lock").own_address
     }
 
     /// The room's destination: this node's own on a host, the one it joined
@@ -261,6 +263,17 @@ impl LanSession {
     /// picks a change up on its next packet.
     pub fn extra_ports(&self) -> &crate::lan_filter::ExtraPorts {
         &self.extra_ports
+    }
+
+    /// The game's ports this machine's pump is translating to another of its
+    /// addresses, because the game listens there and not on the room's
+    /// (`lan_rebind.rs`). Written by the pump.
+    pub fn rebound(&self) -> Vec<crate::lan_rebind::Rebound> {
+        self.rebound.lock().expect("rebound lock").clone()
+    }
+
+    pub fn set_rebound(&self, rebound: Vec<crate::lan_rebind::Rebound>) {
+        *self.rebound.lock().expect("rebound lock") = rebound;
     }
 
     /// Rooms and servers this node has heard announce.
@@ -409,6 +422,7 @@ impl LanSession {
             connects: Default::default(),
             refused: Default::default(),
             extra_ports: Default::default(),
+            rebound: Default::default(),
         })
     }
 
@@ -486,6 +500,7 @@ impl LanSession {
             connects: Default::default(),
             refused: Default::default(),
             extra_ports: Default::default(),
+            rebound: Default::default(),
         })
     }
 }

@@ -9,11 +9,12 @@
 use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::lan_filter::{DropDirection, LanFilter, LanPolicy};
+use crate::lan_rebind::Rebinder;
 use crate::lan_session::{LanSendError, LanSession};
 
 /// Anything that reads and writes whole IPv4 packets.
@@ -22,13 +23,35 @@ pub trait PacketDevice {
     fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 }
 
+/// How often the pump looks for the game on this machine's other addresses
+/// (`lan_rebind::survey`): soon enough that a join seconds after hosting finds
+/// it, rarely enough to cost nothing.
+const SURVEY_EVERY: Duration = Duration::from_secs(2);
+
 /// Pump until the adapter fails or the room stops. Returns the adapter's error,
 /// if that is what ended it.
 pub async fn pump<D>(device: Arc<D>, room: Arc<LanSession>, policy: LanPolicy) -> io::Result<()>
 where
     D: PacketDevice + Send + Sync + 'static,
 {
-    let filter = Mutex::new(LanFilter::new(policy));
+    pump_surveying(device, room, policy, crate::lan_rebind::survey).await
+}
+
+/// [`pump`], looking for the game with `survey`: the machine's own, except
+/// where the adapter lives in another network namespace than the pump, as in
+/// tests.
+pub async fn pump_surveying<D, S>(
+    device: Arc<D>,
+    room: Arc<LanSession>,
+    policy: LanPolicy,
+    survey: S,
+) -> io::Result<()>
+where
+    D: PacketDevice + Send + Sync + 'static,
+    S: Fn(std::net::Ipv4Addr, &[crate::lan_filter::LanPort]) -> crate::lan_rebind::Survey,
+{
+    let filter = Mutex::new(LanFilter::new(policy.clone()));
+    let rebinder = Mutex::new(Rebinder::default());
 
     // Both halves are futures of this one task, not a spawned one: dropping
     // the pump must close the device at once. A spawned half outlives an
@@ -40,6 +63,12 @@ where
         let mut buf = vec![0u8; 65536];
         loop {
             let n = device.recv(&mut buf).await?;
+            // A game that listens on another of this machine's addresses
+            // also answers from it; the room only ever sees the room address
+            // (`lan_rebind.rs`), so the filter and the watches do too.
+            if let Some(own) = room.own_address() {
+                rebinder.lock().expect("rebinder lock").outbound(&mut buf[..n], own, Instant::now());
+            }
             let packet = &buf[..n];
             let subnet = room.subnet();
             let allowed = {
@@ -87,16 +116,56 @@ where
                 }
                 continue;
             }
-            device.send(&packet).await?;
+            let translated = room
+                .own_address()
+                .and_then(|own| rebinder.lock().expect("rebinder lock").inbound(&packet, own, Instant::now()));
+            device.send(translated.as_deref().unwrap_or(&packet)).await?;
             room.probe_log().saw_delivered(&packet);
             report_dropped(room.connect_watch().saw_delivered(&packet, Instant::now()));
         }
         Ok::<(), io::Error>(())
     };
 
+    // Where the game is: on the room address, on every address, or — under
+    // Wine — on the Wi-Fi's or the Ethernet's alone.
+    let watch = async {
+        let mut tick = tokio::time::interval(SURVEY_EVERY);
+        loop {
+            tick.tick().await;
+            let Some(own) = room.own_address() else { continue };
+            if policy.any {
+                // Every port is the game's; there is no list to look for.
+                continue;
+            }
+            let mut ports = policy.ports.clone();
+            for p in room.extra_ports().ports() {
+                if !ports.contains(&p) {
+                    ports.push(p);
+                }
+            }
+            let survey = survey(own, &ports);
+            let mut r = rebinder.lock().expect("rebinder lock");
+            if r.update(survey) {
+                for b in r.rebound() {
+                    info!(
+                        port = b.port.port,
+                        address = %b.address,
+                        "the game listens on {} and not on the room's address {own}; the room \
+                         passes its traffic through",
+                        b.address
+                    );
+                }
+                room.set_rebound(r.rebound().to_vec());
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
     tokio::select! {
         r = up => r,
         r = down => r,
+        r = watch => r,
     }
 }
 
