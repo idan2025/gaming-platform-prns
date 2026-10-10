@@ -102,6 +102,19 @@ where
                 f.sync_extra(room.extra_ports());
                 f.inbound(&packet, Instant::now())
             };
+            // Only what is addressed to this member — its room address or a
+            // broadcast to the room. The adapter accepts more than its own
+            // address (Linux always; Windows once weak-host, for a game on
+            // another address), so a packet aimed at the Wi-Fi's address must
+            // not get through by naming it.
+            let own = room.own_address();
+            let for_us = crate::lan::ipv4_endpoints(&packet).is_some_and(|(_, dst)| {
+                Some(dst) == own || room.subnet().is_broadcast(dst) || dst.is_multicast()
+            });
+            if !for_us {
+                debug!("the room delivered a packet addressed to someone else; dropped");
+                continue;
+            }
             if !allowed {
                 debug!("the room delivered a packet this member does not admit; dropped");
                 report_refused(room.refused_log().saw(DropDirection::Inbound, &packet, Instant::now()));

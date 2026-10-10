@@ -163,6 +163,11 @@ jobs:
       - name: Test
         run: cargo test -p game-bridge --test lan_wintun -- --nocapture
 
+      # A game bound to the runner's Ethernet address, joined at the room
+      # address: the translation plus the room adapter's weak host model.
+      - name: Test a game on another address
+        run: cargo test -p game-bridge --test lan_rebind_windows -- --nocapture
+
       # Then the firewall a player actually has: on, and blocking every
       # inbound connection nothing allows. The first real NFSU2 race in a room
       # hung on exactly this, and the "off" above had hidden it — so this proves
