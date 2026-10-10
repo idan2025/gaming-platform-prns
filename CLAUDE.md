@@ -2,6 +2,16 @@
 
 ## What this is
 
+**The product is called Lanthorn** (renamed from "Mesh Game Servers" on
+2026-10-10; the node's web UI is Lanthorn Host). The repository, crate names,
+the Tauri `identifier` (`org.idan2025.gamingplatformprns.launcher`), the
+settings directory (`gaming-platform-prns/`) and every pack `app_name` kept
+their old names **on purpose**: the identifier and settings directory decide
+where players' data lives, and an `app_name` is a wire contract. Do not
+"finish the rename" there. The Windows firewall rule was renamed, and `open`
+deletes the old one (`lan_firewall::LEGACY_RULE_NAMES`).
+
+
 A **decentralized server browser** for game servers over Reticulum, built on
 [Prns](https://github.com/KenAKAFrosty/Prns).
 

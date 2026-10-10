@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Mesh Game Servers",
+  "productName": "Lanthorn",
   "version": "0.2.30",
   "identifier": "org.idan2025.gamingplatformprns.launcher",
-  "mainBinaryName": "mesh-game-servers",
+  "mainBinaryName": "lanthorn",
   "build": {
     "frontendDist": "../dist",
     "beforeDevCommand": "",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Mesh Game Servers",
+        "title": "Lanthorn",
         "width": 1100,
         "height": 720,
         "minWidth": 900,

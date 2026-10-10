@@ -9,6 +9,12 @@
 #
 # Build and install from this directory:  makepkg -si
 # Bump:  set pkgver, reset pkgrel=1, then `updpkgsums`.
+#
+# From v0.2.31 the product is Lanthorn and the binary `lanthorn`. At the first
+# bump past 0.2.30: pkgname=lanthorn, every mesh-game-servers path and icon
+# below becomes lanthorn, the .desktop Name=Lanthorn, the packs directory
+# /usr/lib/Lanthorn/packs, and add conflicts=('mesh-game-servers') and
+# replaces=('mesh-game-servers') so pacman swaps the old package out.
 
 pkgname=mesh-game-servers
 pkgver=0.2.19

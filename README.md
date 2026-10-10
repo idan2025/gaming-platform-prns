@@ -1,4 +1,7 @@
-# gaming-platform-prns
+# Lanthorn
+
+<img src="launcher/src-tauri/icons/lanthorn.svg" width="96" alt="">
+
 
 A **decentralized server browser** for game servers over
 [Reticulum](https://reticulum.network/), built on
@@ -33,7 +36,7 @@ The launcher is the only one a player needs; the rest are for hosting.
 
 | You want to | Take |
 | --- | --- |
-| Browse and join servers | `Mesh Game Servers` — `.deb`, `.rpm`, `.AppImage` (`x86_64`, `aarch64` — pick the one `uname -m` prints), `.dmg` (universal), `.exe` (Windows) |
+| Browse and join servers | `Lanthorn` — `.deb`, `.rpm`, `.AppImage` (`x86_64`, `aarch64` — pick the one `uname -m` prints), `.dmg` (universal), `.exe` (Windows) |
 | The same, installing nothing | the portable `-portable.zip` (Windows) or `-portable.tar.gz` (Linux; needs the system's WebKitGTK 4.1): unpack and run. Everything it keeps stays in its `portable-data` folder, LAN rooms included, and deleting the folder leaves nothing behind |
 | Run a node with a web UI | the Docker image, `ghcr.io/idan2025/gaming-platform-prns` |
 | Host or relay without a desktop | the CLI tarball for your target: `game-bridge`, `platform-agent`, `platform-index` |

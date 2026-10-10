@@ -20,7 +20,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | proposed |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
-| — | Rebrand | the project | S–M | open |
+| — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 Recommended first: **1 and 2.** They remove the most friction for a new player:
 nobody stays stuck on an old build, and nobody has to be talked through finding
@@ -194,6 +194,20 @@ always visible. The AppImage already runs on SteamOS.
 ---
 
 ## Rebrand
+
+**Decided 2026-10-10: Lanthorn.** The icon (`launcher/src-tauri/icons/lanthorn.svg`)
+is a green-lit lantern inside a double ring, its light reaching out as links
+between mesh nodes, one breaking out of the ring — a nod to Reticulum's mark,
+without its lettering. Kept original on purpose: the user asked for a "Green
+Lantern" feel, and DC's emblem and lantern shapes are trademarks, so the
+resemblance is the colour and the glow only. Done as listed below: product
+name, binary `lanthorn`, asset names, both UIs, the Windows firewall rule
+(old one deleted once, `LEGACY_RULE_NAMES`); kept: the Tauri identifier, the
+settings directory and every `app_name`. The Arch `PKGBUILD` switches at its
+next hand bump (see its header).
+
+The original analysis follows.
+
 
 "Mesh Game Servers" says what it does, which is why it is hard to remember and
 impossible to search for. A name should be short, searchable, say something

@@ -27,7 +27,7 @@ There is no screenshot tooling on this machine, but Xvfb and ffmpeg are enough:
 
 ```sh
 Xvfb :99 -screen 0 1280x800x24 &
-DISPLAY=:99 ./src-tauri/target/release/mesh-game-servers &
+DISPLAY=:99 ./src-tauri/target/release/lanthorn &
 # WebKit takes ~30s to map a window on a cold start here
 DISPLAY=:99 ffmpeg -f x11grab -video_size 1280x800 -i :99 -frames:v 1 -y shot.png
 ```

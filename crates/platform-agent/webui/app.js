@@ -1,6 +1,6 @@
 "use strict";
 
-// Mesh Host agent UI. Vanilla ES2020. No frameworks, no imports.
+// Lanthorn Host: the node agent UI. Vanilla ES2020. No frameworks, no imports.
 // Talks to the same-origin API. Polls every 5s, pausing while a mutating request is in flight.
 
 const TOKEN_KEY = "agent_token";

@@ -2246,7 +2246,7 @@ function renderRoomFirewall(parent, r) {
   if (others.length) {
     box.appendChild(el('p', 'room-err',
       others.join(' and ') + (others.length === 1 ? ' is' : ' are')
-      + ' on, and blocks the room no matter what Windows allows. Open it and allow Mesh Game Servers '
+      + ' on, and blocks the room no matter what Windows allows. Open it and allow Lanthorn '
       + 'and your game, or switch it off while you play.'));
   }
   if (blocks.length) {

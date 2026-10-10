@@ -1336,7 +1336,7 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
      and CI's launcher job runs them — the shell's build script refuses to
      start without them, so a bundle config naming a missing file fails CI.
      A local `cargo tauri build --bundles deb` put `/usr/bin/lan-helper` beside
-     `/usr/bin/mesh-game-servers`. The release's Windows CLI zip carries the
+     `/usr/bin/lanthorn`. The release's Windows CLI zip carries the
      helper and `wintun.dll` too.
 
    `uicheck` drives it: a room row joins as a room and sends no probe, the

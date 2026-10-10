@@ -1,4 +1,4 @@
-/* Mesh Host — the node's web UI. Same palette and components as the launcher,
+/* Lanthorn Host — the node's web UI. Same palette and components as the launcher,
  * so the two read as one product. Dark first, light behind
  * prefers-color-scheme; every colour is a token. */
 :root {
@@ -15,10 +15,10 @@
   --text: #e7eaee;
   --text-2: #a3abb6;
   --text-3: #6d7682;
-  --accent: #4f8cff;
-  --accent-hover: #6a9dff;
-  --accent-soft: rgba(79, 140, 255, 0.14);
-  --accent-text: #ffffff;
+  --accent: #22d37a;
+  --accent-hover: #43e392;
+  --accent-soft: rgba(34, 211, 122, 0.13);
+  --accent-text: #04140b;
   --ok: #3ccf8e;
   --ok-soft: rgba(60, 207, 142, 0.13);
   --warn: #f2b14c;
@@ -46,9 +46,9 @@
     --text: #161a21;
     --text-2: #4e5764;
     --text-3: #8a93a0;
-    --accent: #2f6bec;
-    --accent-hover: #2459cc;
-    --accent-soft: rgba(47, 107, 236, 0.1);
+    --accent: #0f9d58;
+    --accent-hover: #0b8148;
+    --accent-soft: rgba(15, 157, 88, 0.1);
     --ok: #13915a;
     --ok-soft: rgba(19, 145, 90, 0.1);
     --warn: #b7791f;
@@ -72,9 +72,7 @@ code { font-family: var(--mono); font-size: 0.92em; background: var(--surface-2)
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 10px; border: 2px solid transparent; background-clip: padding-box; }
 
-.brand-bg { fill: var(--accent); stroke: none; }
-.brand-dot { fill: #fff; stroke: none; }
-.brand-line { stroke: rgba(255, 255, 255, 0.75); stroke-width: 1.6; }
+.brand-mark { stroke: none; flex: none; border-radius: 22%; }
 
 /* ---------- sign in ---------- */
 .login { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
