@@ -21,6 +21,11 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros",
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tauri-plugin-updater = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+serde_json = "1"
+tauri-plugin-opener = "2"
 
 [features]
 # Used for production builds or when no dev server is specified. Do not remove.

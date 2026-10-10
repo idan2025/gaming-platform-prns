@@ -13,15 +13,23 @@
 
 use std::path::PathBuf;
 
+use launcher_core::invite::Invite;
 use launcher_core::lan::{LanHelperView, RoomCheckView, RoomView};
+use launcher_core::update::{install_mode, InstallFacts, InstallMode, UpdateView};
 use launcher_core::{
     error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
     GameSummary, JoinResult, Launcher, PathTraceView, PlayResult, ServerDetailsView, ServerRow,
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+use tauri_plugin_updater::UpdaterExt;
 
 struct AppState {
     launcher: Launcher,
+    /// An invite this launcher was opened with, or was handed while running,
+    /// until the page takes it (`take_invite`).
+    pending_invite: std::sync::Mutex<Option<Invite>>,
+    /// The update the last check found, kept for `install_update`.
+    update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
 }
 
 #[tauri::command]
@@ -149,6 +157,113 @@ async fn trace_path(
 #[tauri::command]
 async fn announce_room(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.launcher.announce_room().await)
+}
+
+/// Look for a newer launcher (`launcher-core/src/update.rs`). A failed check
+/// is an error here, for the "Check now" button; the page's own check at
+/// start swallows it, because offline is a supported way to run.
+#[tauri::command]
+async fn check_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UpdateView, String> {
+    let current = app.package_info().version.to_string();
+    let mode = install_mode(InstallFacts::here(state.launcher.is_portable()));
+    let auto = state.launcher.auto_check_updates().await;
+    let found = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| format!("could not check for updates: {e}"))?;
+    let mut view = UpdateView::none(&current, mode, auto);
+    if let Some(update) = &found {
+        view.available = Some(update.version.clone());
+        view.notes = update.body.clone();
+    }
+    *state.update.lock().await = found;
+    Ok(view)
+}
+
+/// Download the update the last check found, verify its signature, install
+/// it and restart. Only where this copy can replace itself.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if install_mode(InstallFacts::here(state.launcher.is_portable())) != InstallMode::InPlace {
+        return Err("this copy of Lanthorn updates from the release page, not by itself".into());
+    }
+    let Some(update) = state.update.lock().await.take() else {
+        return Err("no update to install; check again".into());
+    };
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| format!("the update did not install: {e}"))?;
+    app.restart();
+}
+
+#[tauri::command]
+async fn set_auto_update(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.launcher.set_auto_check_updates(on).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn auto_update(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.launcher.auto_check_updates().await)
+}
+
+/// The invite this launcher was opened with, once.
+#[tauri::command]
+fn take_invite(state: tauri::State<'_, AppState>) -> Option<Invite> {
+    state.pending_invite.lock().ok().and_then(|mut p| p.take())
+}
+
+/// Read an invite a player pasted: a link, or a bare address.
+#[tauri::command]
+fn parse_invite(text: String) -> Result<Invite, String> {
+    launcher_core::invite::parse(&text)
+}
+
+/// The invite link for a server or room.
+#[tauri::command]
+fn invite_link(
+    destination_hash: String,
+    game_id: Option<String>,
+    name: Option<String>,
+    room: bool,
+) -> String {
+    launcher_core::invite::link(&destination_hash, game_id.as_deref(), name.as_deref(), room)
+}
+
+/// Open the release page in the player's browser. The one URL this opens:
+/// the page never hands the shell a URL to visit.
+#[tauri::command]
+fn open_release_page(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(launcher_core::update::RELEASES_PAGE, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// An invite link reached this launcher — at start, from a second launch, or
+/// from the OS while running. Parsed here, kept for the page, and announced
+/// to it; never acted on. A link only says which server to show.
+fn receive_invite(app: &tauri::AppHandle, url: &str) {
+    match launcher_core::invite::parse(url) {
+        Ok(invite) => {
+            if let Some(state) = app.try_state::<AppState>() {
+                if let Ok(mut p) = state.pending_invite.lock() {
+                    *p = Some(invite.clone());
+                }
+            }
+            let _ = app.emit("invite", invite);
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }
+        Err(e) => tracing::info!(error = %e, "ignored a link that is not an invite"),
+    }
 }
 
 /// Indexes this launcher is willing to ask.
@@ -381,7 +496,23 @@ pub fn run() {
         )
         .try_init();
 
+    let is_portable = portable.is_some();
     tauri::Builder::default()
+        // First, so a second launch — which is how Windows and Linux hand a
+        // clicked invite link to an app — passes its link here and exits
+        // instead of starting a second launcher with a second mesh node.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            for arg in argv.iter().filter(|a| a.starts_with("lanthorn://")) {
+                receive_invite(app, arg);
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let packs = pack_dir(app.handle());
             let launcher = Launcher::from_pack_dir(&packs).with_portable(portable.is_some());
@@ -391,7 +522,35 @@ pub fn run() {
                 portable = ?portable.as_ref().map(|p| p.data_dir.display().to_string()),
                 "launcher starting"
             );
-            app.manage(AppState { launcher });
+            app.manage(AppState {
+                launcher,
+                pending_invite: std::sync::Mutex::new(None),
+                update: tokio::sync::Mutex::new(None),
+            });
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                // The OS learns the scheme from the installer (Windows), the
+                // app bundle (macOS) or the package's .desktop file (Linux).
+                // An AppImage has no installer, so it registers itself; a
+                // portable launcher registers nothing, because it writes
+                // nothing outside its folder.
+                #[cfg(target_os = "linux")]
+                if !is_portable && std::env::var_os("APPIMAGE").is_some() {
+                    let _ = app.deep_link().register_all();
+                }
+                let _ = is_portable;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        receive_invite(&handle, url.as_str());
+                    }
+                });
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    for url in urls {
+                        receive_invite(app.handle(), url.as_str());
+                    }
+                }
+            }
             // The window is made here rather than from the config alone
             // (`"create": false`), so a portable run can give the web view a
             // storage folder inside the portable one.
@@ -425,6 +584,14 @@ pub fn run() {
             forget_server,
             trace_path,
             announce_room,
+            check_update,
+            install_update,
+            set_auto_update,
+            auto_update,
+            take_invite,
+            parse_invite,
+            invite_link,
+            open_release_page,
             indexes,
             add_index,
             remove_index,

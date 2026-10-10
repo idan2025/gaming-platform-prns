@@ -136,6 +136,25 @@ function makeInvoke(scenario) {
         return (scenario.known ?? []).length;
       case 'forget_server':
         return null;
+      case 'take_invite': {
+        const inv = scenario.invite ?? null;
+        scenario.invite = null;
+        return inv;
+      }
+      case 'parse_invite':
+        if (!/^lanthorn:\/\/join\//.test(args.text)) throw new Error('not an invite');
+        return { destination_hash: args.text.slice(16, 48), game_id: null, name: null, room: false };
+      case 'invite_link':
+        return `lanthorn://join/${args.destinationHash}${args.room ? '?room=1' : ''}`;
+      case 'auto_update':
+        return scenario.autoUpdate ?? false;
+      case 'set_auto_update':
+        return null;
+      case 'check_update':
+        return scenario.update ?? { current: '1.0.0', available: null, notes: null, install: 'in-place', page: 'x', auto_check: true };
+      case 'install_update':
+      case 'open_release_page':
+        return null;
       case 'trace_path':
         return { destination_hash: args.destinationHash, found: true, hops: 2, millis: 140, error: null };
       case 'announce_room':
@@ -186,6 +205,7 @@ async function run(label, scenario, assertions) {
   const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole });
   const { window } = dom;
   window.__TAURI__ = { core: { invoke: makeInvoke(scenario) } };
+  window.GPP_UPDATE_CHECK_DELAY_MS = 0;
   scenario.beforeApp?.(window);
   window.eval(appJs);
   // init() runs a few awaits deep; let the microtask queue drain.
@@ -1010,6 +1030,76 @@ await run('Announce asks for saved servers, and announces a hosted room', {
   check('and it says both', t.includes('room was announced') && t.includes('1 saved server'), t);
   check('the room page offers Announce now', !!doc.querySelector('#room-announce'));
 });
+
+
+// An invite link opens the server it names — listed or not — and never joins.
+await run('an invite opens its server and waits for a click', {
+  status: running,
+  rows: () => [],
+  invite: { destination_hash: 'ab'.repeat(16), game_id: 'sven-coop', name: 'Idan\u2019s invite', room: false },
+}, async (win, doc) => {
+  await settle();
+  const pane = doc.querySelector('#detail');
+  check('the invite opens a detail pane', pane && !pane.hidden);
+  check('it shows the invite\u2019s name', pane.textContent.includes('Idan\u2019s invite'), pane.textContent.slice(0, 200));
+  check('Join is offered', !!doc.querySelector('#detail-join') && !doc.querySelector('#detail-join').disabled);
+  check('nothing was joined by the link', !calls.includes('join_server') || lastArgs.get('join_server')?.destinationHash !== 'ab'.repeat(16));
+  check('the mesh is asked where an unheard server is', lastArgs.get('trace_path')?.destinationHash === 'ab'.repeat(16));
+});
+
+await run('a room row copies a room invite', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  rows: () => [roomRow],
+}, async (win, doc) => {
+  const r = doc.querySelector('#list .row');
+  r.dispatchEvent(new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  doc.querySelector('#ctx-invite').click();
+  await settle();
+  check('invite_link is asked for a room link', lastArgs.get('invite_link')?.room === true && lastArgs.get('invite_link')?.destinationHash === roomRow.destination_hash);
+});
+
+await run('an update that installs itself is offered once found', {
+  status: running,
+  rows: () => [row()],
+  autoUpdate: true,
+  update: { current: '1.0.0', available: '1.1.0', notes: 'Better things.', install: 'in-place', page: 'x', auto_check: true },
+}, async (win, doc) => {
+  await settle();
+  const banner = doc.querySelector('#update-banner');
+  check('the banner says a version is available', banner && !banner.classList.contains('hidden') && banner.textContent.includes('1.1.0'), banner?.textContent);
+  check('it offers Update now', doc.querySelector('#update-now')?.textContent === 'Update now');
+  doc.querySelector('#update-now').click();
+  await settle();
+  check('install_update is called', calls.includes('install_update'));
+});
+
+await run('a copy that cannot replace itself links to the download page', {
+  status: running,
+  rows: () => [row()],
+  autoUpdate: true,
+  update: { current: '1.0.0', available: '1.1.0', notes: null, install: 'link-only', page: 'x', auto_check: true },
+}, async (win, doc) => {
+  await settle();
+  const before = calls.filter(c => c === 'install_update').length;
+  doc.querySelector('#update-now').click();
+  await settle();
+  check('it says Download', doc.querySelector('#update-now')?.textContent === 'Download');
+  check('it opens the release page', calls.includes('open_release_page'));
+  check('and never installs', calls.filter(c => c === 'install_update').length === before);
+});
+
+{
+  const before = () => calls.filter(c => c === 'check_update').length;
+  const n0 = before();
+  await run('with the check off, nothing is asked at start', {
+    status: running,
+    rows: () => [row()],
+    autoUpdate: false,
+  }, async () => { await settle(); });
+  check('check_update is not called when turned off', before() === n0);
+}
 
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
 

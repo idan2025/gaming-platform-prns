@@ -61,10 +61,18 @@ const state = {
   autoCheckTimer: null,
   hostDraft: { game_id: null, name: '' },
   roomPanelSig: null,
+  // Updates (`launcher-core/src/update.rs`): the last check's answer, and
+  // whether a check or an install is running.
+  update: null,
+  updateBusy: null,
+  updateError: null,
+  updateDismissed: null,
+  autoUpdate: true,
 };
 
 // The headless render check shortens it before this script loads.
 const AUTO_CHECK_DELAY_MS = window.GPP_AUTO_CHECK_DELAY_MS ?? 3000;
+const UPDATE_CHECK_DELAY_MS = window.GPP_UPDATE_CHECK_DELAY_MS ?? 4000;
 
 const LINK_CLASS = { 1: 'Low-rate', 2: 'TCP / bursty', 3: 'High-bitrate' };
 
@@ -84,6 +92,8 @@ const ICON = {
   x: '<path d="M6 6l12 12M18 6L6 18"/>',
   server: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
   lan: '<rect x="2" y="5" width="20" height="13" rx="2"/><path d="M8 21h8M12 18v3"/>',
+  link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
   wifiOff: '<path d="M3 3l18 18M8.5 16.5a5 5 0 017 0M5 12.5a10 10 0 015-2.6M14 10a10 10 0 015 2.5M12 20h.01"/>',
   check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
 };
@@ -122,7 +132,7 @@ function fmtDuration(secs) {
   if (m > 0) return m + 'm ' + (secs % 60) + 's';
   return secs + 's';
 }
-function hopsText(h) { return h + (h === 1 ? ' hop' : ' hops'); }
+function hopsText(h) { return h == null ? 'Unknown' : h + (h === 1 ? ' hop' : ' hops'); }
 // The game a join would use: what the announce said, else what the player
 // chose for this destination. `null` means neither, and nothing may join.
 function effectiveGameId(d) {
@@ -626,6 +636,7 @@ function openRowMenu(hash, x, y) {
   items.push({ label: 'View details', icon: 'info', action: () => openDetail(hash) });
   items.push('sep');
   items.push({ label: 'Trace path', icon: 'route', hint: 'ask the mesh', action: () => tracePath(hash) });
+  items.push({ label: 'Copy invite link', icon: 'link', id: 'ctx-invite', action: () => copyInvite(row) });
   items.push({ label: 'Copy address', icon: 'copy', action: () => copyText(hash) });
   items.push('sep');
   items.push({ label: 'Remove from list', icon: 'trash', danger: true, id: 'ctx-remove',
@@ -719,7 +730,7 @@ function updateFilterBadge() {
 }
 
 // ---------- views ----------
-const VIEWS = ['servers', 'rooms', 'connections', 'indexes'];
+const VIEWS = ['servers', 'rooms', 'connections', 'indexes', 'settings'];
 function setView(name) {
   if (!VIEWS.includes(name)) name = 'servers';
   state.view = name;
@@ -733,11 +744,12 @@ function setView(name) {
   $('filters').classList.toggle('toolbar-dim', name !== 'servers');
   if (name === 'rooms') { loadLanHelper().then(() => renderRoomPanel(true)); }
   if (name === 'connections') renderConnections();
+  if (name === 'settings') renderSettings();
 }
 
 // ---------- detail pane ----------
-function openDetail(hash) {
-  const row = rowByHash(hash);
+function openDetail(hash, fallback) {
+  const row = rowByHash(hash) || fallback;
   if (!row) return;
   if (state.detail && state.detail.hash === hash) { renderDetail(); return; }
   state.detail = {
@@ -837,6 +849,15 @@ function renderDetail() {
   const actions = el('div', 'detail-actions');
   if (room) renderRoomFoot(actions, d, gameId);
   else renderJoinActions(actions, d, gameId);
+  const inv = el('button', 'btn', 'Invite');
+  inv.id = 'detail-invite';
+  inv.type = 'button';
+  inv.title = 'Copy a link that opens this ' + (room ? 'room' : 'server') + ' in a friend\u2019s Lanthorn';
+  inv.prepend(icon('link'));
+  inv.onclick = () => copyInvite(a);
+  // Ahead of the join message, which spans the whole row.
+  const msg = actions.querySelector('.join-msg');
+  actions.insertBefore(inv, msg);
   pane.appendChild(actions);
 
   // body
@@ -1898,8 +1919,11 @@ async function init() {
   renderConnections();
   loadInterfaces();
   await loadLanHelper();
+  wireInvites();
   await pollAll();
   state.pollTimer = setInterval(pollAll, 2000);
+  await takeInvite();
+  startupUpdateCheck();
 }
 init().catch(err => showError('The launcher could not start: ' + errText(err)));
 
@@ -2563,4 +2587,274 @@ function renderRoomPanel(force) {
   renderLanWarnings(warn, state.hostDraft.game_id);
   card.appendChild(warn);
   body.appendChild(card);
+}
+
+
+// ---------- invites (ROADMAP.md §2) ----------
+//
+// `lanthorn://join/<address>?game=…&name=…&room=1`. Everything about reading
+// one is in launcher-core (`invite.rs`); a link only says which server to
+// show, and a person presses Join.
+
+async function copyInvite(row) {
+  if (!row) return;
+  try {
+    const link = await invoke('invite_link', {
+      destinationHash: row.destination_hash,
+      gameId: row.game_id || null,
+      name: row.name || null,
+      room: isRoom(row),
+    });
+    const what = isRoom(row) ? 'room' : 'server';
+    await navigator.clipboard.writeText(link);
+    toast('Invite link copied. Anyone with Lanthorn who opens it sees this ' + what + '.');
+  } catch (err) {
+    showError('Could not copy the invite: ' + errText(err));
+  }
+}
+
+// Show the server an invite names: its row if it is listed, else a pane built
+// from the invite until its announce arrives — which can be never, for a
+// server too far away to have reached this launcher yet. Joining works
+// either way: an address is all a join needs.
+function showInvite(inv) {
+  if (!inv || !inv.destination_hash) return;
+  setView('servers');
+  const hash = inv.destination_hash;
+  if (inv.game_id && !rowByHash(hash)) state.chosenGame.set(hash, inv.game_id);
+  const placeholder = {
+    destination_hash: hash,
+    name: inv.name || (inv.room ? 'Invited room' : 'Invited server'),
+    game_id: inv.game_id || null,
+    map: null, players: null, max_players: null, hops: null,
+    interface_label: '', min_link_class: null, passworded: null, allowlisted: null,
+    dedicated: null, transport_mode: inv.room ? 3 : null, last_seen_secs: null,
+    legacy: false, remembered: false, from_index: false,
+  };
+  state.detail = null;
+  openDetail(hash, placeholder);
+  if (!rowByHash(hash)) {
+    toast('Opened an invite. This ' + (inv.room ? 'room' : 'server') + ' has not been heard here yet; you can still join it.');
+    // The mesh may know where it is even though its announce never came by.
+    if (state.browse && state.browse.running) invoke('trace_path', { destinationHash: hash }).catch(() => {});
+  }
+}
+
+async function takeInvite() {
+  try {
+    const inv = await invoke('take_invite');
+    if (inv) showInvite(inv);
+  } catch (_) { /* an older shell */ }
+}
+
+async function openInviteText(text) {
+  try {
+    const inv = await invoke('parse_invite', { text });
+    hideError();
+    showInvite(inv);
+    return true;
+  } catch (err) {
+    showError(errText(err));
+    return false;
+  }
+}
+
+function openInviteDialog() {
+  closePopovers();
+  const items = [{ head: 'Paste an invite link or a server address' }];
+  showMenu(window.innerWidth / 2 - 180, 70, items);
+  const m = $('ctx-menu');
+  const row = el('div', 'invite-form');
+  const input = el('input');
+  input.id = 'invite-input';
+  input.type = 'text';
+  input.spellcheck = false;
+  input.placeholder = 'lanthorn://join/…';
+  const go = el('button', 'btn btn-primary', 'Open');
+  go.type = 'button';
+  const open = async () => { if (await openInviteText(input.value)) closeMenu(); };
+  go.onclick = open;
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); open(); } });
+  row.append(input, go);
+  m.appendChild(row);
+  input.focus();
+}
+
+function wireInvites() {
+  $('invite-btn')?.addEventListener('click', openInviteDialog);
+  // A clicked link while the launcher runs (the shell emits it).
+  const ev = window.__TAURI__ && window.__TAURI__.event;
+  if (ev && ev.listen) ev.listen('invite', e => { invoke('take_invite').catch(() => {}); showInvite(e.payload); });
+  // Pasting a link anywhere that is not a text field opens it.
+  document.addEventListener('paste', e => {
+    if (e.target.closest && e.target.closest('input, textarea')) return;
+    const text = (e.clipboardData && e.clipboardData.getData('text')) || '';
+    if (/^\s*(lanthorn:\/\/join\/|[0-9a-fA-F]{32}\s*$)/.test(text)) {
+      e.preventDefault();
+      openInviteText(text);
+    }
+  });
+}
+
+// ---------- updates (ROADMAP.md §1) ----------
+//
+// The download, the signature check and the install are the shell's
+// (`check_update`, `install_update`); what can install itself is decided in
+// launcher-core (`update.rs`). Offline is a supported way to run, so the
+// check at start fails silently and never delays anything.
+
+async function startupUpdateCheck() {
+  try {
+    state.autoUpdate = await invoke('auto_update');
+  } catch (_) { return; } // an older shell
+  if (!state.autoUpdate) return;
+  setTimeout(() => checkUpdate(true), UPDATE_CHECK_DELAY_MS);
+}
+
+async function checkUpdate(quiet) {
+  if (state.updateBusy) return;
+  state.updateBusy = 'checking';
+  state.updateError = null;
+  renderSettings();
+  try {
+    state.update = await invoke('check_update');
+  } catch (err) {
+    if (!quiet) state.updateError = errText(err);
+  }
+  state.updateBusy = null;
+  renderUpdateBanner();
+  renderSettings();
+  if (!quiet && state.update && !state.update.available) toast('Lanthorn is up to date.');
+}
+
+async function installUpdate() {
+  const u = state.update;
+  if (!u || !u.available || state.updateBusy) return;
+  if (u.install !== 'in-place') { openReleasePage(); return; }
+  state.updateBusy = 'installing';
+  renderUpdateBanner();
+  renderSettings();
+  try {
+    await invoke('install_update'); // restarts on success
+  } catch (err) {
+    state.updateBusy = null;
+    state.updateError = errText(err);
+    showError(state.updateError);
+    renderUpdateBanner();
+    renderSettings();
+  }
+}
+
+async function openReleasePage() {
+  try { await invoke('open_release_page'); }
+  catch (err) { showError('Could not open the browser: ' + errText(err)); }
+}
+
+function renderUpdateBanner() {
+  const b = $('update-banner');
+  const dot = $('nav-settings-dot');
+  const u = state.update;
+  const show = !!(u && u.available && state.updateDismissed !== u.available);
+  if (dot) dot.hidden = !(u && u.available);
+  if (!b) return;
+  if (!show) { b.classList.add('hidden'); b.textContent = ''; return; }
+  b.classList.remove('hidden');
+  b.textContent = '';
+  b.appendChild(icon('download', 'rb-icon'));
+  const text = el('div', 'rb-text');
+  text.appendChild(el('div', 'rb-title', 'Lanthorn ' + u.available + ' is available'));
+  text.appendChild(el('div', 'rb-sub', u.install === 'in-place'
+    ? 'You have ' + u.current + '. Updating restarts Lanthorn and leaves any room you are in.'
+    : 'You have ' + u.current + '. This copy updates from the download page.'));
+  b.appendChild(text);
+  const notes = el('button', 'btn', 'What\u2019s new');
+  notes.type = 'button';
+  notes.onclick = () => setView('settings');
+  const go = el('button', 'btn btn-primary', state.updateBusy === 'installing' ? 'Updating…'
+    : (u.install === 'in-place' ? 'Update now' : 'Download'));
+  go.type = 'button';
+  go.id = 'update-now';
+  go.disabled = state.updateBusy === 'installing';
+  go.onclick = installUpdate;
+  const later = el('button', 'btn', 'Later');
+  later.type = 'button';
+  later.onclick = () => { state.updateDismissed = u.available; renderUpdateBanner(); };
+  b.append(notes, go, later);
+}
+
+function renderSettings() {
+  const body = $('settings-body');
+  if (!body) return;
+  const keep = document.activeElement && document.activeElement.id;
+  body.textContent = '';
+  const u = state.update;
+
+  const card = el('div', 'card');
+  const head = el('div', 'card-head');
+  head.appendChild(el('h2', '', 'Updates'));
+  card.appendChild(head);
+  const version = $('build-version')?.textContent || '';
+  let line;
+  if (state.updateBusy === 'checking') line = 'Checking for a newer version…';
+  else if (state.updateBusy === 'installing') line = 'Downloading and installing… Lanthorn restarts when it is done.';
+  else if (u && u.available) line = 'Lanthorn ' + u.available + ' is available. You have ' + u.current + '.';
+  else if (u) line = 'Lanthorn ' + u.current + ' is the newest version.';
+  else line = 'You have Lanthorn ' + (version || 'of an unknown version') + '.';
+  card.appendChild(el('p', 'card-text', line));
+  if (state.updateError) card.appendChild(el('p', 'room-err small', state.updateError));
+  if (u && u.available && u.notes) {
+    const notes = el('pre', 'room-command', u.notes);
+    notes.id = 'update-notes';
+    card.appendChild(notes);
+  }
+  if (u && u.available && u.install !== 'in-place') {
+    card.appendChild(el('p', 'note', 'This copy is portable, or was installed by your system\u2019s package '
+      + 'manager, so it does not replace itself. Download the new version from the release page.'));
+  }
+  const actions = el('div', 'room-actions');
+  const check = el('button', 'btn', state.updateBusy === 'checking' ? 'Checking…' : 'Check now');
+  check.type = 'button';
+  check.id = 'update-check';
+  check.disabled = !!state.updateBusy;
+  check.onclick = () => checkUpdate(false);
+  actions.appendChild(check);
+  if (u && u.available) {
+    const go = el('button', 'btn btn-primary', u.install === 'in-place'
+      ? (state.updateBusy === 'installing' ? 'Updating…' : 'Update and restart') : 'Open the download page');
+    go.type = 'button';
+    go.id = 'update-install';
+    go.disabled = !!state.updateBusy;
+    go.onclick = installUpdate;
+    actions.appendChild(go);
+  }
+  card.appendChild(actions);
+  const auto = el('label', 'toggle-row');
+  const box = el('input');
+  box.type = 'checkbox';
+  box.id = 'update-auto';
+  box.checked = state.autoUpdate;
+  box.onchange = async () => {
+    state.autoUpdate = box.checked;
+    try { await invoke('set_auto_update', { on: box.checked }); }
+    catch (err) { showError('Could not save that: ' + errText(err)); }
+  };
+  auto.append(box, el('span', '', 'Look for updates when Lanthorn starts'));
+  card.appendChild(auto);
+  card.appendChild(el('p', 'note', 'Updates are checked against GitHub and every download is verified '
+    + 'against Lanthorn\u2019s signing key before it is installed. Without internet, nothing is checked '
+    + 'and nothing changes.'));
+  body.appendChild(card);
+
+  const about = el('div', 'card');
+  const ah = el('div', 'card-head');
+  ah.appendChild(el('h2', '', 'About'));
+  about.appendChild(ah);
+  about.appendChild(el('p', 'card-text', 'Lanthorn ' + (version || '') + ' — a decentralized game-server '
+    + 'browser over Reticulum. No account, no central server, no internet required.'));
+  const page = el('button', 'btn', 'Release notes');
+  page.type = 'button';
+  page.onclick = openReleasePage;
+  about.appendChild(page);
+  body.appendChild(about);
+  if (keep) document.getElementById(keep)?.focus({ preventScroll: true });
 }

@@ -93,6 +93,29 @@ installing it does not replace the old app:
   AppImage and portable: delete the old file or folder.
 
 
+### Lanthorn updates itself
+
+Lanthorn now looks for a newer version when it starts, and Settings has a
+"Check now" button. When one is out a banner says so: Update now downloads it,
+checks it is really from us (every update is signed), installs it and
+restarts. The Windows installer, the macOS app and the AppImage update this
+way; the portable builds, `.deb`, `.rpm` and the Arch package say a new version
+is out and open the download page instead. Without internet nothing is checked
+and nothing changes. You can turn the check off in Settings.
+
+This is the first version that can update itself, so getting here is one last
+manual download.
+
+### Invite links
+
+Right-click a server or room, or press Invite in its panel, to copy a link such
+as `lanthorn://join/…`. Anyone with Lanthorn who clicks it in Discord,
+WhatsApp or anywhere else gets that server or room opened in their launcher,
+ready to join — even before it has shown up in their list. A link never joins
+anything by itself. You can also paste a link into Join by invite, or anywhere
+in the window. (Portable copies do not register the link type with the system;
+paste the link instead.)
+
 ### A new look for the launcher and the node's web page
 
 Both were redesigned. The launcher has a sidebar (Servers, LAN rooms,
@@ -1326,6 +1349,27 @@ Windows and macOS bundles have not been produced or tested from this repo.
 `webviewInstallMode: offlineInstaller` is set for the Windows case
 (`PLAN.md` §9): a genuinely offline machine that lacks WebView2 could otherwise
 neither start the launcher nor download the runtime.
+
+## Launcher updates and their signing key
+
+From v0.2.31 the launcher updates itself (`launcher-core/src/update.rs`).
+The release workflow signs every installer the updater can take — Windows
+`-setup.exe` (and `.msi`), the AppImages after their libwayland repack, and the
+macOS `.app.tar.gz` — and a last job, `updater-manifest`, writes `latest.json`
+from those signatures. A launcher reads
+`releases/latest/download/latest.json`, so **the newest published release is
+what every launcher is offered**: never publish a broken one as latest; mark a
+test build as a pre-release.
+
+- The private key is the repository secret `TAURI_SIGNING_PRIVATE_KEY`, with
+  its password in `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The maintainer's copy is
+  `~/.tauri/lanthorn-updater.key` (+ `.password`) on the build machine; **keep a
+  backup offline.** Lose it and no installed launcher will accept another
+  update — they would all have to be reinstalled by hand with a new key.
+- The public key is in `tauri.conf.json` (`plugins.updater.pubkey`). Changing
+  it strands every launcher that has the old one.
+- `tauri.release.conf.json` turns the updater artifacts on for the release
+  only; a build without the key (CI, a contributor) makes no `.sig` and works.
 
 ## Building without the internet
 

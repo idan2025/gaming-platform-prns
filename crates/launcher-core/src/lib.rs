@@ -18,10 +18,12 @@
 //! JavaScript reads a missing property as `undefined` rather than failing. The
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
+pub mod invite;
 pub mod lan;
 pub mod portable;
 pub mod settings;
 pub mod steam;
+pub mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1483,6 +1485,17 @@ impl Launcher {
     }
 
     /// Set (or, with an empty string, clear) the player's display name.
+    /// Whether this launcher looks for updates by itself at start.
+    pub async fn auto_check_updates(&self) -> bool {
+        !self.settings.lock().await.update_check_off
+    }
+
+    pub async fn set_auto_check_updates(&self, on: bool) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        settings.update_check_off = !on;
+        self.persist(&settings)
+    }
+
     pub async fn set_player_name(&self, name: &str) -> Result<()> {
         let trimmed = name.trim();
         let mut settings = self.settings.lock().await;
@@ -2241,6 +2254,17 @@ query = "a2s"
         ghost.remembered = true;
         l.remember_heard(&[ghost]).await;
         assert!(l.known_servers().await.is_empty(), "memory must not feed itself");
+    }
+
+    #[tokio::test]
+    async fn the_update_check_is_on_unless_turned_off_and_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launcher.json");
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        assert!(l.auto_check_updates().await, "a settings file without the field means on");
+        l.set_auto_check_updates(false).await.unwrap();
+        let again = Launcher::new(Vec::new()).with_settings_file(file);
+        assert!(!again.auto_check_updates().await);
     }
 
     #[tokio::test]
