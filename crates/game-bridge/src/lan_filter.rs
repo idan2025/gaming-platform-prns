@@ -366,9 +366,14 @@ impl ExtraPorts {
 // What the filter refused, so a missing port names itself.
 
 /// Ports operating systems chatter on by themselves — name lookup, network
-/// browsing, discovery, time, DHCP. None is a game's, and listing them would
-/// bury the one that is.
-const OS_CHATTER: &[u16] = &[53, 67, 68, 123, 137, 138, 139, 445, 1900, 3702, 5353, 5355];
+/// browsing, discovery, time, DHCP — and Steam's LAN discovery and In-Home
+/// Streaming (27031–27036), which Proton runs beside every game it starts.
+/// None is a game's, and listing them would bury the one that is: Steam's
+/// 27036 was offered as NFSU2's "missing port", allowed, and did nothing.
+const OS_CHATTER: &[u16] = &[
+    53, 67, 68, 123, 137, 138, 139, 445, 1900, 3702, 5353, 5355, 27031, 27032, 27033, 27034, 27035,
+    27036,
+];
 
 /// Ports at or above this are a stack's own ephemeral choice (Linux starts at
 /// 32768, Windows at 49152), so the fixed side of such a packet is the
@@ -705,7 +710,7 @@ mod tests {
         let log = RefusedLog::default();
         let now = Instant::now();
         let s = RoomSubnet::default();
-        for port in [137, 138, 1900, 5353, 5355, 445] {
+        for port in [137, 138, 1900, 5353, 5355, 445, 27036] {
             assert!(log.saw(DropDirection::OutboundBroadcast, &udp(ME, port, s.broadcast(), port), now).is_none());
             assert!(log.saw(DropDirection::Inbound, &tcp(PEER, 50000, ME, port), now).is_none());
         }

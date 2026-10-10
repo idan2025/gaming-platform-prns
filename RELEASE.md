@@ -74,6 +74,22 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### A game run through Wine or Proton can be joined
+
+Under Wine or Proton, some games listen on the computer's Wi-Fi or Ethernet
+address instead of the room's. Need for Speed: Underground 2 did: the race
+showed up in the other player's list, and every join was refused. The room
+now finds where the game is listening and passes its traffic through. There
+is nothing to click and nothing to set up. Only the game's own ports are
+passed, and only to programs on this computer; nothing else on your network
+becomes reachable from the room. The room check says when it is doing this.
+
+Steam's own LAN discovery (UDP 27036), which Proton runs beside every game,
+is no longer listed as a port the game needs. If you allowed it for a game
+before, it is dropped.
+
 ## v0.2.29
 
 ### When a LAN game shows up but will not let you join

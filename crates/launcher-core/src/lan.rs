@@ -1203,6 +1203,7 @@ mod tests {
             dropped_here: Vec::new(),
             firewall_advice: None,
             refused_here: Vec::new(),
+            rebound_here: Vec::new(),
         };
         let v = serde_json::to_value(RoomCheckView::from(report)).unwrap();
         assert_eq!(keys(&v), ["address", "findings", "members", "ok", "port"]);

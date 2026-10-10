@@ -532,6 +532,32 @@ Rules a later change could quietly break:
     in for the firewall) and, with Windows Firewall **on**, by
     `tests/lan_wintun_firewall.rs` in CI's `lan-windows` job. The Linux ufw and
     firewalld paths are unit-tested against a stand-in only.
+- **A game bound to the Wi-Fi's address is reached by translation in the
+  pump** (2026-10-10, `lan_rebind.rs`). Under Proton, NFSU2 listened on
+  `192.168.32.203:9900`, not the room address: the race was listed (discovery
+  was on `0.0.0.0`) and every join refused. The pump rewrites the room address
+  to the one the game holds on the way in and back on the way out, with
+  incremental checksums (ICMP errors' quotes too). Rules:
+  - **Translate only what the game holds.** Inbound is rewritten only for a
+    declared port held on another local address *and not* on the room's
+    (`survey`), or for a flow this machine opened from another address. A
+    socket on the room address or `0.0.0.0` is never touched.
+  - **This machine's addresses only.** A source is translated only if
+    `getifaddrs` lists it. A forwarding machine (any Docker host) routes other
+    hosts' packets into the adapter; translating those would put the home
+    network in the room. `another_hosts_address_is_never_translated`.
+  - **Behind the filter inbound, before it outbound**, so the filter and both
+    watches see room addresses only and nothing new becomes reachable.
+  - **The survey binds, never listens**, and binds the room address only
+    after another address is found taken.
+  - **Linux only.** Windows is strong-host and drops a packet for an address
+    not on the receiving adapter; no Windows game has been seen doing this.
+  - Pinned by `tests/lan_rebind.rs` (real adapters, namespaces, a game on a
+    stand-in Wi-Fi address); without the translation the join fails with
+    `Connection refused`, as in the field.
+- **Steam's 27031–27036 are chatter** (`OS_CHATTER`): Proton runs Steam's LAN
+  discovery beside every game, and 27036 was offered and allowed as NFSU2's
+  missing port.
 - **A `[lan]` pack's port list is proven carried, not proven complete.**
   `lan_pack_ports.rs` crosses every declared port for every shipped `[lan]`
   pack (found by property), so it cannot notice a port the pack left out;
