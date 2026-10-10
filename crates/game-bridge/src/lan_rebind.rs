@@ -32,6 +32,15 @@
 //!   adapter is weak-host, which `lan_adapter/windows.rs` sets on that
 //!   adapter alone. The pump drops any room packet not addressed to this
 //!   member, so neither lets the room reach another address directly.
+//! - **On Windows the sending adapter matters too.** A packet from the
+//!   Ethernet's address goes out the Ethernet adapter, whatever route the
+//!   room has, unless *that* adapter is weak-host for sending as well —
+//!   measured on CI: the translated datagram reached the game and its answer
+//!   left by Ethernet until it was. So while a room is up the elevated side
+//!   turns weak-host send on for the adapters with a default route (the ones
+//!   a game binds) and off again when it ends — only where it was off, and
+//!   in the active store only, so a killed helper leaves it until reboot and
+//!   never longer ([`WeakHostSend`]).
 //! - **The survey never listens.** It *binds* a socket, without listening, to
 //!   learn whether an address and port are taken, and binds the room address
 //!   only once another address is known to be taken — so it cannot steal a
@@ -461,6 +470,99 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
     Vec::new()
 }
 
+// ---------------------------------------------------------------------------
+// Windows: letting the game's answer out through the room adapter.
+
+/// Weak-host send on this machine's default-route adapters for as long as
+/// this lives (see the module's rules). Windows only; elsewhere it does
+/// nothing.
+#[derive(Debug, Default)]
+pub struct WeakHostSend {
+    /// Interface indexes this turned on, and so turns off again.
+    changed: Vec<u32>,
+}
+
+const WEAK_HOST_ON: &str = r#"
+$changed = @()
+$ix = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+  Select-Object -ExpandProperty InterfaceIndex -Unique)
+foreach ($i in $ix) {
+  $n = Get-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue
+  if ($n -and $n.WeakHostSend -ne 'Enabled') {
+    Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -WeakHostSend Enabled -PolicyStore ActiveStore -ErrorAction Stop
+    $changed += $i
+  }
+}
+'changed=' + ($changed -join ',')
+"#;
+
+impl WeakHostSend {
+    /// Turn it on where it is off, on Windows.
+    pub fn on() -> Self {
+        if cfg!(windows) {
+            Self::on_with(&crate::lan_firewall::System)
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn on_with(r: &impl crate::lan_firewall::Run) -> Self {
+        let changed = match r.run("powershell", &powershell(WEAK_HOST_ON)) {
+            Ok((_, out)) => parse_changed(&out),
+            Err(e) => {
+                eprintln!("weak-host send was not turned on: {e}");
+                Vec::new()
+            }
+        };
+        Self { changed }
+    }
+
+    pub fn changed(&self) -> &[u32] {
+        &self.changed
+    }
+
+    /// Turn it back off where this turned it on.
+    pub fn off_with(&mut self, r: &impl crate::lan_firewall::Run) {
+        if self.changed.is_empty() {
+            return;
+        }
+        // The indexes are numbers this parsed, never text from elsewhere.
+        let list: Vec<String> = self.changed.iter().map(u32::to_string).collect();
+        let script = format!(
+            "foreach ($i in @({})) {{ Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 \
+             -WeakHostSend Disabled -PolicyStore ActiveStore -ErrorAction SilentlyContinue }}",
+            list.join(",")
+        );
+        if let Err(e) = r.run("powershell", &powershell(&script)) {
+            eprintln!("weak-host send was left on until reboot: {e}");
+        }
+        self.changed.clear();
+    }
+}
+
+impl Drop for WeakHostSend {
+    fn drop(&mut self) {
+        if cfg!(windows) {
+            self.off_with(&crate::lan_firewall::System);
+        }
+    }
+}
+
+fn powershell(script: &str) -> Vec<String> {
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The `changed=3,7` line [`WEAK_HOST_ON`] prints.
+fn parse_changed(out: &str) -> Vec<u32> {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("changed="))
+        .map(|l| l.split(',').filter_map(|i| i.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +804,40 @@ mod tests {
         let rest = r.inbound(&rest, ROOM, now).expect("the same address as the first");
         assert_eq!(crate::lan::ipv4_endpoints(&rest), Some((PEER, WIFI)));
         assert_eq!(sum(&rest[..20]), 0);
+    }
+
+    struct Fake {
+        out: &'static str,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl crate::lan_firewall::Run for Fake {
+        fn run(&self, program: &str, args: &[String]) -> std::io::Result<(bool, String)> {
+            self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
+            Ok((true, self.out.to_string()))
+        }
+    }
+
+    /// Off again only where this turned it on: an adapter the player had
+    /// set weak-host already is theirs.
+    #[test]
+    fn weak_host_send_is_turned_off_only_where_it_was_turned_on() {
+        let f = Fake { out: "changed=12,7\r\n", calls: Default::default() };
+        let mut w = WeakHostSend::on_with(&f);
+        assert_eq!(w.changed(), [12, 7]);
+        assert!(
+            f.calls.borrow()[0].contains("-PolicyStore ActiveStore"),
+            "until reboot, never saved"
+        );
+        w.off_with(&f);
+        let off = f.calls.borrow()[1].clone();
+        assert!(off.contains("@(12,7)") && off.contains("-WeakHostSend Disabled"), "{off}");
+        assert!(w.changed().is_empty());
+
+        let f = Fake { out: "changed=\r\n", calls: Default::default() };
+        let mut w = WeakHostSend::on_with(&f);
+        w.off_with(&f);
+        assert_eq!(f.calls.borrow().len(), 1, "nothing turned on, nothing turned off");
     }
 
     #[test]

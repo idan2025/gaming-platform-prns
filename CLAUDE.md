@@ -552,9 +552,15 @@ Rules a later change could quietly break:
     after another address is found taken.
   - **Wine or native, Linux or Windows: nothing knows what a game is.** It
     reads where a socket is bound. Windows is strong-host, so the room
-    adapter alone is set weak-host (receive and send) in `configure`;
-    without it the translated SYN is dropped or the answer leaves by
-    Ethernet. `tests/lan_rebind_windows.rs` (CI's `lan-windows`) pins it.
+    adapter is weak-host (receive and send, `configure`) **and** the helper
+    turns weak-host *send* on for the default-route adapters while a room is
+    up (`lan_rebind::WeakHostSend`): measured on CI, with only the room
+    adapter set the translated datagram reached the game and its answer left
+    by Ethernet. Active store only, off again at room end only where the
+    helper turned it on; a killed helper leaves it **until reboot** — the
+    one thing a room may leave behind besides the installed firewall rule.
+    `tests/lan_rebind_windows.rs` (CI's `lan-windows`) pins both halves and
+    the cleanup.
   - **The pump delivers only what is addressed to this member** (its room
     address or a room broadcast). The adapter accepts more than that —
     Linux always, Windows once weak-host — so without this a room packet
