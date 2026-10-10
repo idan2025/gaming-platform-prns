@@ -164,6 +164,57 @@ pub struct GamePack {
     /// these, and broadcasts only to these (`lan_filter.rs`).
     #[serde(default)]
     pub lan: Option<PackLan>,
+    /// A picture of the game for a launcher to show, as an `https` URL on one
+    /// of [`ART_HOSTS`]. Absent means the launcher uses the Steam header of
+    /// `[launch] steam_app_id`, if any, else a lettered tile.
+    ///
+    /// **A host allowlist, not any URL.** Every launcher that loads this pack
+    /// fetches the picture, so a free URL in an unreviewed community pack
+    /// would be a beacon reporting who browses to whoever runs its server.
+    /// Never a local path either: the art is fetched, not shipped, because it
+    /// is the publisher's.
+    #[serde(default)]
+    pub art: Option<String>,
+}
+
+impl GamePack {
+    /// The picture a launcher shows for this game: the pack's `art`, else the
+    /// Steam header of the app players own, else none.
+    pub fn art_url(&self) -> Option<String> {
+        self.art.clone().or_else(|| {
+            self.launch.as_ref().and_then(|l| l.steam_app_id).map(|id| {
+                format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/header.jpg")
+            })
+        })
+    }
+}
+
+/// Where a pack's `art` may point: Steam's image CDN and Wikimedia's file
+/// server, which hosts the official covers of games that are not on Steam.
+pub const ART_HOSTS: [&str; 4] = [
+    "upload.wikimedia.org",
+    "cdn.cloudflare.steamstatic.com",
+    "shared.cloudflare.steamstatic.com",
+    "cdn.akamai.steamstatic.com",
+];
+
+/// Refuse an `art` URL that is not plain `https` on [`ART_HOSTS`]. The path is
+/// an allowlist of URL-safe characters with no query or fragment, so the value
+/// can go straight into an `<img src>`.
+pub fn validate_art_url(url: &str) -> Result<(), String> {
+    let rest = url.strip_prefix("https://").ok_or("art must be an https:// URL")?;
+    let (host, path) = rest.split_once('/').ok_or("art has no path")?;
+    if !ART_HOSTS.contains(&host) {
+        return Err(format!("art may only point at {}; {host} is not one", ART_HOSTS.join(", ")));
+    }
+    if url.len() > 300 {
+        return Err("art URL is longer than 300 characters".to_string());
+    }
+    let ok = |c: char| c.is_ascii_alphanumeric() || "-._~/%()".contains(c);
+    if path.is_empty() || !path.chars().all(ok) || path.contains("..") {
+        return Err("art path may only use letters, digits and - . _ ~ / % ( )".to_string());
+    }
+    Ok(())
 }
 
 /// A pack's `[lan]` block.
@@ -352,6 +403,7 @@ pub enum PackError {
     InvalidLaunch(LaunchError),
     /// The pack's `[lan]` block is not usable.
     InvalidLan(String),
+    InvalidArt(String),
 }
 
 impl core::fmt::Display for PackError {
@@ -368,6 +420,7 @@ impl core::fmt::Display for PackError {
             Self::Signature(e) => write!(f, "pack signature: {e}"),
             Self::InvalidLaunch(e) => write!(f, "pack describes an unusable launch: {e}"),
             Self::InvalidLan(e) => write!(f, "pack describes an unusable LAN: {e}"),
+            Self::InvalidArt(e) => write!(f, "pack names unusable art: {e}"),
         }
     }
 }
@@ -430,6 +483,8 @@ impl GamePack {
             }),
             // Sven Co-op joins by address, so it is Mode 1, not a LAN room.
             lan: None,
+            // Its Steam header, from `launch.steam_app_id`.
+            art: None,
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -457,6 +512,9 @@ impl GamePack {
         }
         if let Some(lan) = &pack.lan {
             lan.validate().map_err(PackError::InvalidLan)?;
+        }
+        if let Some(art) = &pack.art {
+            validate_art_url(art).map_err(PackError::InvalidArt)?;
         }
         Ok(pack)
     }
@@ -917,5 +975,47 @@ query = "a2s"
         let pack = GamePack::parse(&src).expect("a TCP pack is usable now");
         assert_eq!(pack.transport, PackTransport::Tcp);
         assert_eq!(pack.to_profile().unwrap().transport, GameTransport::Tcp);
+    }
+
+    #[test]
+    fn art_is_https_on_an_allowed_host_or_nothing() {
+        assert!(validate_art_url("https://upload.wikimedia.org/wikipedia/en/1/10/Nfsu2-win-cover.jpg").is_ok());
+        for bad in [
+            "http://upload.wikimedia.org/x.jpg",
+            "https://tracker.example.com/pixel.gif",
+            "https://upload.wikimedia.org.evil.example/x.jpg",
+            "https://upload.wikimedia.org/x.jpg?who=me",
+            "https://upload.wikimedia.org/x.jpg\" onerror=\"x",
+            "https://upload.wikimedia.org/../x.jpg",
+            "file:///etc/passwd",
+        ] {
+            assert!(validate_art_url(bad).is_err(), "{bad} was accepted");
+        }
+        let pack = format!("{}\nart = \"https://tracker.example.com/p.gif\"\n", NO_CONTENT_TOML);
+        assert!(matches!(GamePack::parse(&pack), Err(PackError::InvalidArt(_))));
+    }
+
+    #[test]
+    fn art_falls_back_to_the_steam_header() {
+        let sven = GamePack::sven_coop();
+        assert_eq!(
+            sven.art_url().as_deref(),
+            Some("https://cdn.cloudflare.steamstatic.com/steam/apps/225840/header.jpg")
+        );
+    }
+
+    /// Every shipped pack's art is one this build accepts, and every shipped
+    /// pack has some: a lettered tile is for offline, not for a game we ship.
+    #[test]
+    fn every_shipped_pack_has_art() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let pack = GamePack::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(pack.art_url().is_some(), "{} has no art", path.display());
+        }
     }
 }

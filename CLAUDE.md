@@ -422,9 +422,13 @@ has gone. Rules a later change could quietly break:
   browser's, and its Reload throws the page away under a running core; F5 and
   Ctrl+R are blocked too. Text fields keep the native menu for cut and paste.
   Pinned in `launcher/uicheck/render.mjs`.
-- **Game artwork is the pack's `[launch] steam_app_id`, fetched from Steam's
-  CDN, over a lettered tile.** The tile is what an offline launcher shows, so
-  the UI must look finished without the network; never bundle game art.
+- **Game artwork is fetched, never bundled** (it is the publisher's): a
+  pack's `art` URL, else the Steam header of `[launch] steam_app_id`
+  (`GamePack::art_url`), over a lettered tile that is what an offline
+  launcher shows. **`art` is a host allowlist** (`ART_HOSTS`: Steam's CDN and
+  `upload.wikimedia.org`, https, no query): every launcher fetches it, so a
+  free URL in an unreviewed pack would be a beacon reporting who browses.
+  `every_shipped_pack_has_art` holds every shipped pack to having one.
 
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right

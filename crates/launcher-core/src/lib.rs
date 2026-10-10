@@ -255,6 +255,9 @@ pub struct GameSummary {
     /// The Steam app players own, from the pack's `[launch]`, when it has one.
     /// The UI uses it for the game's artwork and nothing else.
     pub steam_app_id: Option<u32>,
+    /// The picture to show for this game (`GamePack::art_url`): the pack's
+    /// `art`, else the Steam header. `None` means a lettered tile.
+    pub art_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -661,6 +664,7 @@ impl Launcher {
                 signature_expires_at: p.expires_at,
                 lan: lan::lan_support(&p.pack),
                 steam_app_id: p.pack.launch.as_ref().and_then(|l| l.steam_app_id),
+                art_url: p.pack.art_url(),
             })
             .collect()
     }
@@ -1906,6 +1910,7 @@ mod tests {
             "signature_expires_at",
             "lan",
             "steam_app_id",
+            "art_url",
         ]
         {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");

@@ -349,6 +349,7 @@ async fn games_carry_the_steam_app_players_own() {
         .unwrap();
     let sven = body.as_array().unwrap().iter().find(|g| g["id"] == "sven-coop").expect("sven");
     assert_eq!(sven["steam_app_id"], 225840, "{sven}");
+    assert!(sven["art_url"].as_str().unwrap_or("").contains("/225840/"), "{sven}");
 }
 
 /// Announce now on a LAN-only node is a clear refusal, not a silent success

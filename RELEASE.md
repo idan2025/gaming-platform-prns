@@ -84,9 +84,11 @@ game's picture, a big Join button and the technical details folded away under
 Advanced. The node's web page has the same look, game cards with artwork, and
 a dialog for starting a server.
 
-Game pictures come from Steam's image server when the game's pack names its
-Steam app. Offline, or for a game that is not on Steam, a lettered tile shows
-instead. Nothing else about you or your servers is sent there.
+Game pictures come from Steam's image server, or for games that are not on
+Steam (both Need for Speed games) their box art from Wikipedia's image server.
+Offline, a lettered tile shows instead. Nothing else about you or your servers
+is sent there. A pack can name its own picture with `art = "https://…"`, but
+only on those two image servers.
 
 ### The list shows only what is online
 

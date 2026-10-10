@@ -241,6 +241,8 @@ struct GameOption {
     /// The Steam app players own, from the pack's `[launch]`. The UI shows the
     /// game's artwork from it and uses it for nothing else.
     steam_app_id: Option<u32>,
+    /// The picture to show (`GamePack::art_url`), or none for a lettered tile.
+    art_url: Option<String>,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -415,6 +417,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 console: pack.console.is_some(),
                 bots: bots && pack.console.is_some(),
                 steam_app_id: pack.launch.as_ref().and_then(|l| l.steam_app_id),
+                art_url: pack.art_url(),
             }
         })
         .collect();

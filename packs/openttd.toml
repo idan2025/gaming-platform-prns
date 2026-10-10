@@ -17,6 +17,10 @@ transport = "tcp"
 min_link_class = 2
 notes = "Open source (GPL). Dedicated server: `openttd -D`, needs a base graphics set such as OpenGFX even headless. Discovery is UDP 3979 broadcast, play is TCP 3979."
 
+# OpenTTD's Steam header (app 1536610). This pack starts no game, so it has
+# no [launch] steam_app_id to take it from.
+art = "https://cdn.cloudflare.steamstatic.com/steam/apps/1536610/header.jpg"
+
 # OpenTTD's LAN, read out of its 15.3 source:
 # - A client finds servers by broadcasting PACKET_UDP_CLIENT_FIND_SERVER to UDP
 #   3979 on each interface's *subnet* broadcast address
@@ -26,6 +30,7 @@ notes = "Open source (GPL). Dedicated server: `openttd -D`, needs a base graphic
 #   (`src/network/core/tcp_game.h`, PACKET_CLIENT_GAME_INFO).
 # So both are declared: other members reach this machine only on these, and
 # this machine broadcasts only to these (`lan_filter.rs`).
+
 [lan]
 ports = [
     { port = 3979, transport = "udp" },
