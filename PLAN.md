@@ -1460,3 +1460,10 @@ prerequisite for anything but LAN rooms. A game that can join by `host:port`
 uses Mode 1 or 2 even if it also has a LAN mode. Mode 4 — traffic addressed to a
 publisher's relay (Steam networking, EOS P2P) — stays impossible, and a game
 that is only reachable that way is listed as such rather than attempted.
+
+## 15. Roadmap
+
+What comes after the 2026-10-10 redesign — auto-update, invite links,
+favorites, installed-game detection, a tray, room chat, node tooling, the pack
+browser, a playability check, a controller mode, and a possible rebrand — is in
+`ROADMAP.md`, with the rules from this plan that each item has to respect.
