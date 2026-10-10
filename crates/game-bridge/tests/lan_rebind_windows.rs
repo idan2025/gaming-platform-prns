@@ -27,6 +27,9 @@ use game_bridge::profile::GameProfile;
 mod common;
 
 const GAME_TCP: u16 = 9900;
+/// A control: a listener on the room address itself, no translation. If it
+/// goes unanswered too, the fault is not the translation's.
+const CONTROL_TCP: u16 = 9901;
 const GAME_UDP: u16 = 3658;
 const MEMBER_PORT: u16 = 51000;
 
@@ -124,6 +127,54 @@ async fn wait_until(what: &str, within: Duration, mut cond: impl FnMut() -> bool
     }
 }
 
+/// Send a SYN from the member to `to:port` until something answers it;
+/// `(source, TCP flags)` of the answer.
+async fn join(
+    member: &LanSession,
+    m_addr: Ipv4Addr,
+    from_port: u16,
+    to: Ipv4Addr,
+    port: u16,
+) -> Option<(SocketAddr, u8)> {
+    let syn = tcp_syn((m_addr, from_port).into(), (to, port).into());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        member.send(syn.clone()).unwrap();
+        let window = Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(p)) =
+            tokio::time::timeout(window.saturating_duration_since(Instant::now()), member.recv())
+                .await
+        {
+            match parse(&p) {
+                Some((6, src, dst, flags, _)) if dst == SocketAddr::from((m_addr, from_port)) => {
+                    return Some((src, flags));
+                }
+                Some((proto, src, dst, _, _)) => println!("member saw {proto} {src} -> {dst}"),
+                None => println!("member saw {} bytes", p.len()),
+            }
+        }
+    }
+    None
+}
+
+/// What decides whether a translated packet is delivered and answered.
+fn diagnose(control_answered: bool) {
+    println!("control (room address, no translation) answered: {control_answered}");
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetIPInterface -AddressFamily IPv4 | Format-Table InterfaceAlias, \
+             InterfaceMetric, WeakHostSend, WeakHostReceive, Forwarding, ConnectionState -AutoSize; \
+             Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction -AutoSize; \
+             Get-NetIPAddress -AddressFamily IPv4 | Format-Table InterfaceAlias, IPAddress -AutoSize",
+        ])
+        .output();
+    if let Ok(out) = out {
+        println!("{}", String::from_utf8_lossy(&out.stdout));
+    }
+}
+
 fn holds(addr: Ipv4Addr) -> bool {
     UdpSocket::bind((addr, 0)).is_ok()
 }
@@ -157,6 +208,7 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
     let policy = LanPolicy {
         ports: vec![
             LanPort { proto: LanProto::Tcp, port: GAME_TCP },
+            LanPort { proto: LanProto::Tcp, port: CONTROL_TCP },
             LanPort { proto: LanProto::Udp, port: GAME_UDP },
         ],
         any: false,
@@ -178,10 +230,16 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
 
     // The game, bound the way Wine binds one — or a native game with a fixed
     // address set: the runner's own Ethernet address, not the room's.
-    let ethernet = game_bridge::lan_rebind::local_addresses()
-        .into_iter()
-        .find(|a| !a.is_loopback() && !a.is_link_local() && *a != h_addr && a.octets()[0] != 198)
-        .expect("the runner has an Ethernet address");
+    // The address with the default route, which is the one Wine picks.
+    let ethernet = {
+        let s = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        s.connect(("1.1.1.1", 53)).unwrap();
+        match s.local_addr().unwrap() {
+            SocketAddr::V4(a) => *a.ip(),
+            _ => unreachable!(),
+        }
+    };
+    assert_ne!(ethernet, h_addr, "the default route is not the room's");
     let game_tcp = TcpListener::bind((ethernet, GAME_TCP)).unwrap();
     let game_udp = UdpSocket::bind((ethernet, GAME_UDP)).unwrap();
     game_udp.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
@@ -196,25 +254,18 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
     // A member's join to the room address: a SYN in, a SYN-ACK back from the
     // room address. Without weak host on the room adapter Windows drops the
     // translated SYN, or sends the answer out of the Ethernet adapter.
-    let syn = tcp_syn((m_addr, MEMBER_PORT).into(), (h_addr, GAME_TCP).into());
-    let mut syn_ack = None;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    'join: while Instant::now() < deadline {
-        member.send(syn.clone()).unwrap();
-        let window = Instant::now() + Duration::from_millis(500);
-        while let Ok(Some(p)) =
-            tokio::time::timeout(window.saturating_duration_since(Instant::now()), member.recv())
-                .await
-        {
-            if let Some((6, src, dst, flags, _)) = parse(&p) {
-                if dst == SocketAddr::from((m_addr, MEMBER_PORT)) {
-                    syn_ack = Some((src, flags));
-                    break 'join;
-                }
-            }
-        }
+    let control = TcpListener::bind((h_addr, CONTROL_TCP)).unwrap();
+    let control_answer = join(&member, m_addr, MEMBER_PORT + 1, h_addr, CONTROL_TCP).await;
+    let answer = join(&member, m_addr, MEMBER_PORT, h_addr, GAME_TCP).await;
+    if answer.is_none() {
+        diagnose(control_answer.is_some());
     }
-    let (src, flags) = syn_ack.expect("the join to the room address was never answered");
+    assert!(
+        control_answer.is_some(),
+        "even a listener on the room address went unanswered: not the translation's fault"
+    );
+    drop(control);
+    let (src, flags) = answer.expect("the join to the room address was never answered");
     assert_eq!(src, SocketAddr::from((h_addr, GAME_TCP)), "answered from the room address");
     assert_eq!(flags & 0x12, 0x12, "a SYN-ACK, not a reset (flags {flags:#04x})");
 
