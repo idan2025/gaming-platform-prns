@@ -80,14 +80,20 @@ function art(gameId, cls) {
   box.style.setProperty("--h", String(hueOf(gameId)));
   const g = gameOf(gameId);
   box.appendChild(el("span", "art-letters", initials(g ? g.display_name : gameId)));
-  if (g && g.steam_app_id) {
-    const img = el("img");
-    img.alt = "";
-    img.loading = "lazy";
-    img.onload = () => img.classList.add("loaded");
-    img.onerror = () => img.remove();
-    img.src = "https://cdn.cloudflare.steamstatic.com/steam/apps/" + g.steam_app_id + "/header.jpg";
-    box.appendChild(img);
+  // A Steam header, or a portrait box cover shown whole over a blurred copy.
+  const url = g && (g.art_url || (g.steam_app_id
+    ? "https://cdn.cloudflare.steamstatic.com/steam/apps/" + g.steam_app_id + "/header.jpg" : null));
+  if (url) {
+    const bg = el("img", "art-bg");
+    const fg = el("img", "art-fg");
+    for (const img of [bg, fg]) {
+      img.alt = "";
+      img.loading = "lazy";
+      img.onload = () => img.classList.add("loaded");
+      img.onerror = () => { bg.remove(); fg.remove(); };
+      img.src = url;
+      box.appendChild(img);
+    }
   }
   return box;
 }

@@ -25,6 +25,9 @@ transport = "tcp"
 min_link_class = 1
 notes = "Windows, EA 2005 (not the 2012 game). No dedicated server: host a LAN race in the game and the others pick it from the game's LAN list. Same LAN protocol as Underground 2: UDP 9999 broadcast discovery, TCP 9900 to the host, UDP 3658/3659 both ways, TCP 3282/3284/3285 back to each client. Allow speed.exe through the firewall, and run the launcher's room check before starting the game."
 
+# The box art, as English Wikipedia shows it. The 2005 game is not on Steam.
+art = "https://upload.wikimedia.org/wikipedia/en/8/8e/Need_for_Speed_Most_Wanted_Box_Art.jpg"
+
 # Most Wanted's LAN, and how much of it was seen for this game rather than
 # inherited from Underground 2 — the game has no source:
 # - Discovery, seen for MW: client and host broadcast 384 bytes from UDP 9999
@@ -43,6 +46,7 @@ notes = "Windows, EA 2005 (not the 2012 game). No dedicated server: host a LAN r
 # Not declared: UDP 9901 (a local-challenge port only NFSLAN/NFSMW_LanIP's
 # online patch opens — the unmodified game never does), and TCP 13505 and
 # 30900–30999 (EA's online lobby servers, shut down).
+
 [lan]
 ports = [
     { port = 9999, transport = "udp" },

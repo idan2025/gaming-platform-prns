@@ -190,15 +190,24 @@ function art(gameId, cls, opts = {}) {
   box.style.setProperty('--h', String(hueOf(gameId || opts.fallbackName)));
   const g = gameId ? gameById(gameId) : null;
   box.appendChild(el('span', 'art-letters', initials(g ? g.display_name : (opts.fallbackName || gameId || '?'))));
-  if (g && g.steam_app_id) {
-    const img = el('img');
-    img.alt = '';
-    img.decoding = 'async';
-    img.loading = 'lazy';
-    img.onload = () => img.classList.add('loaded');
-    img.onerror = () => img.remove();
-    img.src = 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + g.steam_app_id + '/header.jpg';
-    box.appendChild(img);
+  // The pack's picture: a Steam header, or a box cover from Wikimedia. A
+  // cover is portrait, so it sits whole over a blurred copy of itself rather
+  // than being cropped to a sliver. An older core without `art_url` still
+  // gets the Steam header.
+  const url = g && (g.art_url || (g.steam_app_id
+    ? 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + g.steam_app_id + '/header.jpg' : null));
+  if (url) {
+    const bg = el('img', 'art-bg');
+    const fg = el('img', 'art-fg');
+    for (const img of [bg, fg]) {
+      img.alt = '';
+      img.decoding = 'async';
+      img.loading = 'lazy';
+      img.onload = () => img.classList.add('loaded');
+      img.onerror = () => { bg.remove(); fg.remove(); };
+      img.src = url;
+      box.appendChild(img);
+    }
   }
   if (opts.room) box.classList.add('art-room');
   return box;

@@ -24,6 +24,9 @@ transport = "tcp"
 min_link_class = 1
 notes = "Windows, EA 2004. No dedicated server: host a LAN race in the game and the others pick it from the game's LAN list. Discovery is a UDP 9999 broadcast; play is TCP 9900 to the host, TCP 3282/3284/3285 back to each client, and UDP 3658/3659 both ways. Run the launcher's room check before starting the game."
 
+# The PC box art, as English Wikipedia shows it. Not on Steam, so no header there.
+art = "https://upload.wikimedia.org/wikipedia/en/1/10/Nfsu2-win-cover.jpg"
+
 # NFSU2's LAN, from people who carried it across subnets before rooms existed
 # (nfsu2relay, abatis.org.uk/nfsu2relay.html, 2004–2005 — captures, since the
 # game has no source):
@@ -44,6 +47,7 @@ notes = "Windows, EA 2004. No dedicated server: host a LAN race in the game and 
 # not test connection quality, and guessed "more ports would seem to be
 # necessary". If a race in a room warns the same way, that is the first thing
 # to capture; switching to `inbound = "any"` is the diagnostic, not the fix.
+
 [lan]
 ports = [
     { port = 9999, transport = "udp" },
