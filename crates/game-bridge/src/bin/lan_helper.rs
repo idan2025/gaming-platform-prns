@@ -230,7 +230,12 @@ fn serve(name: &str, cidr: &str, rest: &[String]) -> Result<(), String> {
         game_bridge::lan_firewall::Lifetime::Kept
     };
     let opened = open_firewall(name, lifetime);
+    // A game bound to the Wi-Fi's or the Ethernet's address answers through
+    // the room only with this on (`lan_rebind.rs`); off again when the room
+    // ends. Nothing on Linux.
+    let weak_host = game_bridge::lan_rebind::WeakHostSend::on();
     let result = serve_room(&config, args);
+    drop(weak_host);
     if let Err(e) = game_bridge::lan_firewall::close(
         &game_bridge::lan_firewall::System,
         opened,

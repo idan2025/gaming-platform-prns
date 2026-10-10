@@ -430,21 +430,22 @@ pub fn delete_driver(dll: &Path) -> io::Result<()> {
 /// The adapter as the launcher holds it: directly (already an administrator)
 /// or through the helper's relay.
 pub enum WindowsAdapter {
-    Direct(WintunDevice),
+    /// With weak-host send on for the room's lifetime (`lan_rebind.rs`).
+    Direct(WintunDevice, crate::lan_rebind::WeakHostSend),
     Relayed(RemoteDevice),
 }
 
 impl PacketDevice for WindowsAdapter {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Direct(d) => d.recv(buf).await,
+            Self::Direct(d, _) => d.recv(buf).await,
             Self::Relayed(d) => d.recv(buf).await,
         }
     }
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
         match self {
-            Self::Direct(d) => d.send(packet).await,
+            Self::Direct(d, _) => d.send(packet).await,
             Self::Relayed(d) => d.send(packet).await,
         }
     }
@@ -575,7 +576,9 @@ pub(super) async fn open(
             let config = config.clone();
             let device =
                 tokio::task::spawn_blocking(move || WintunDevice::create(&dll, &config)).await??;
-            Ok(WindowsAdapter::Direct(device))
+            let weak_host =
+                tokio::task::spawn_blocking(crate::lan_rebind::WeakHostSend::on).await?;
+            Ok(WindowsAdapter::Direct(device, weak_host))
         }
         AdapterSetup::Helper { path, portable } => {
             let mut extra = Vec::new();

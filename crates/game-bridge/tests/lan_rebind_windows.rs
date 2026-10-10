@@ -4,7 +4,9 @@
 //! The same claim as `lan_rebind.rs`, on the system that needs more for it:
 //! Windows is strong-host, so the pump's translation reaches the game only
 //! because the room adapter is weak-host (`lan_adapter/windows.rs`), and the
-//! game's answer leaves through the room adapter only for the same reason.
+//! game's answer leaves through the room adapter only because the Ethernet
+//! adapter is weak-host for sending while the room is up (`WeakHostSend`,
+//! turned on by the helper and checked off again at the end).
 //! A plain Windows TCP listener and UDP socket bound to the runner's own
 //! Ethernet address stand in for the game; the room's other member speaks raw
 //! IPv4, as in `lan_wintun.rs`, and must get the answers from the host's room
@@ -283,50 +285,7 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
             );
         }
         println!("rebound: {:?}", host.rebound());
-        // Experiment: weak-host send on the adapter that owns the address too,
-        // until reboot only, taken back after.
-        let ps = |cmd: String| {
-            let out = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &cmd])
-                .output()
-                .unwrap();
-            println!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        ps(format!(
-            "Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4 | \
-             Set-NetIPInterface -WeakHostSend Enabled -PolicyStore ActiveStore"
-        ));
-        let mut got = None;
-        for _ in 0..10 {
-            member.send(ping.clone()).unwrap();
-            if let Ok((_, f)) = game_udp.recv_from(&mut buf) {
-                game_udp.send_to(b"pong", f).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while Instant::now() < deadline {
-                    if let Ok(Some(p)) =
-                        tokio::time::timeout(Duration::from_millis(300), member.recv()).await
-                    {
-                        if let Some((17, src, _, _, b"pong")) = parse(&p) {
-                            got = Some(src);
-                        }
-                    }
-                }
-                if got.is_some() {
-                    break;
-                }
-            }
-        }
-        println!("EXPERIMENT weak host send on the owning adapter too: answer from {got:?}");
-        let tcp = join(&member, m_addr, MEMBER_PORT + 7, h_addr, GAME_TCP).await;
-        println!("EXPERIMENT tcp join: {tcp:?}");
-        ps(format!(
-            "Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4 | \
-             Set-NetIPInterface -WeakHostSend Disabled -PolicyStore ActiveStore"
-        ));
+
         diagnose(control_answer.is_some());
     }
     assert!(
@@ -380,4 +339,22 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
     drop(game_tcp);
     stop_tx.send(()).unwrap();
     runner.await.unwrap().unwrap();
+
+    // The room is gone, and so is what it turned on: the runner's adapter is
+    // strong-host again.
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "(Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4).WeakHostSend"
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "Disabled",
+        "the room left weak-host send on behind it"
+    );
 }
