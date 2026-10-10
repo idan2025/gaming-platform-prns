@@ -342,28 +342,28 @@ jobs:
           # letter, and a CachyOS user ran the arm64 build and got only "the
           # file could not be run by the operating system".
           arch="$(uname -m)"
-          stage="$RUNNER_TEMP/portable/Mesh Game Servers"
+          stage="$RUNNER_TEMP/portable/Lanthorn"
           mkdir -p "$stage/packs" "$stage/portable-data" dist
-          cp launcher/src-tauri/target/release/mesh-game-servers "$stage/"
+          cp launcher/src-tauri/target/release/lanthorn "$stage/"
           cp launcher/src-tauri/target/release/lan-helper "$stage/"
           cp packs/*.toml "$stage/packs/"
           cp scripts/portable-readme.txt "$stage/portable-data/README.txt"
-          tar -czf "dist/Mesh.Game.Servers_${version}_${arch}-portable.tar.gz" \
-            -C "$RUNNER_TEMP/portable" "Mesh Game Servers"
+          tar -czf "dist/Lanthorn_${version}_${arch}-portable.tar.gz" \
+            -C "$RUNNER_TEMP/portable" "Lanthorn"
 
       - name: Portable archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $version = (Get-Content launcher/src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          $stage = Join-Path $env:RUNNER_TEMP 'portable\Mesh Game Servers'
+          $stage = Join-Path $env:RUNNER_TEMP 'portable\Lanthorn'
           New-Item -ItemType Directory -Force -Path "$stage\packs", "$stage\portable-data", dist | Out-Null
-          Copy-Item launcher/src-tauri/target/release/mesh-game-servers.exe $stage
+          Copy-Item launcher/src-tauri/target/release/lanthorn.exe $stage
           Copy-Item launcher/src-tauri/target/release/lan-helper.exe $stage
           Copy-Item launcher/src-tauri/binaries/wintun.dll, launcher/src-tauri/binaries/wintun-LICENSE.txt $stage
           Copy-Item packs/*.toml "$stage\packs"
           Copy-Item scripts/portable-readme.txt "$stage\portable-data\README.txt"
-          Compress-Archive -Path $stage -DestinationPath "dist/Mesh.Game.Servers_${version}_x64-portable.zip"
+          Compress-Archive -Path $stage -DestinationPath "dist/Lanthorn_${version}_x64-portable.zip"
 
       - name: Collect bundles
         shell: bash

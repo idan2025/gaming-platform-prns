@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn a_portable_data_folder_beside_the_executable_makes_it_portable() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("mesh-game-servers");
+        let exe = dir.path().join("lanthorn");
         assert_eq!(detect_from(Some(&exe), None), None, "no folder, not portable");
         std::fs::create_dir(dir.path().join(PORTABLE_DIR)).unwrap();
         assert_eq!(
@@ -111,12 +111,12 @@ mod tests {
     #[test]
     fn an_appimage_is_portable_only_with_its_home_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("Mesh.Game.Servers_0.2.21_amd64.AppImage");
+        let image = dir.path().join("Lanthorn_0.2.21_amd64.AppImage");
         // The executable is inside the mounted image; a portable-data folder
         // beside *it* is not what an AppImage user can create.
-        let inner = Path::new("/tmp/.mount_MeshXYZ/usr/bin/mesh-game-servers");
+        let inner = Path::new("/tmp/.mount_MeshXYZ/usr/bin/lanthorn");
         assert_eq!(detect_from(Some(inner), Some(&image)), None);
-        let home = dir.path().join("Mesh.Game.Servers_0.2.21_amd64.AppImage.home");
+        let home = dir.path().join("Lanthorn_0.2.21_amd64.AppImage.home");
         std::fs::create_dir(&home).unwrap();
         assert_eq!(detect_from(Some(inner), Some(&image)), Some(Portable { data_dir: home }));
     }

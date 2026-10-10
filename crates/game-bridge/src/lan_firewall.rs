@@ -254,7 +254,7 @@ pub fn fix_command(firewall: LocalFirewall, adapter: &str) -> Option<String> {
         // `ALLOWED_RANGE`, checked at decode, so one rule covers every room
         // and every game, once; the pump still admits only declared ports.
         LocalFirewall::Windows => Some(format!(
-            "New-NetFirewallRule -DisplayName 'Mesh Game Servers LAN rooms' -Direction Inbound \
+            "New-NetFirewallRule -DisplayName 'Lanthorn LAN rooms' -Direction Inbound \
              -RemoteAddress {}/{} -Action Allow",
             crate::lan::ALLOWED_RANGE,
             crate::lan::ALLOWED_RANGE_LEN
@@ -315,9 +315,15 @@ pub fn heads_up(firewall: LocalFirewall) -> Option<String> {
 // Opening the firewall: `lan-helper`'s half, run with privilege.
 
 /// The rule an installed launcher's helper adds, and keeps.
-pub const RULE_NAME: &str = "Mesh Game Servers LAN rooms";
+pub const RULE_NAME: &str = "Lanthorn LAN rooms";
 /// The rule a portable launcher's helper adds for one room, and removes.
-pub const PORTABLE_RULE_NAME: &str = "Mesh Game Servers LAN rooms (portable)";
+pub const PORTABLE_RULE_NAME: &str = "Lanthorn LAN rooms (portable)";
+/// The same two rules under the product's name before the rename to Lanthorn
+/// (v0.2.31). An installed launcher keeps its rule on purpose, so without
+/// this the old one would stay in every player's firewall forever: [`open`]
+/// deletes the old rule of the same lifetime once the new one is in.
+pub const LEGACY_RULE_NAMES: [&str; 2] =
+    ["Mesh Game Servers LAN rooms", "Mesh Game Servers LAN rooms (portable)"];
 
 /// How long what [`open`] adds should last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +472,14 @@ pub fn open(
             if !ok {
                 return Err(failed("netsh add rule", &out));
             }
+            // The same rule under the old product name, now redundant.
+            let legacy = match lifetime {
+                Lifetime::Kept => LEGACY_RULE_NAMES[0],
+                Lifetime::ThisRoom => LEGACY_RULE_NAMES[1],
+            };
+            let legacy_arg = format!("name={legacy}");
+            let _ =
+                r.run("netsh", &argv(&["advfirewall", "firewall", "delete", "rule", &legacy_arg]))?;
             Ok(Opened::Added(firewall))
         }
         LocalFirewall::Unknown => Ok(Opened::Nothing),
@@ -530,7 +544,7 @@ pub struct WindowsFacts {
 
 /// One PowerShell run; read-only, needs no administrator.
 const FACTS_SCRIPT: &str = r#"$ErrorActionPreference = 'SilentlyContinue'
-$rule = [bool](Get-NetFirewallRule -DisplayName 'Mesh Game Servers LAN rooms*')
+$rule = [bool](Get-NetFirewallRule -DisplayName 'Lanthorn LAN rooms*') -or [bool](Get-NetFirewallRule -DisplayName 'Mesh Game Servers LAN rooms*')
 $blocks = @(Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True | ForEach-Object {
   $p = ($_ | Get-NetFirewallApplicationFilter).Program
   if ($p -and $p -ne 'Any') { [pscustomobject]@{ name = $_.Name; display = $_.DisplayName; program = $p } }
@@ -845,21 +859,22 @@ mod tests {
         let o = open(&f, LocalFirewall::Windows, "gbl0", Lifetime::Kept).unwrap();
         close(&f, o, "gbl0", Lifetime::Kept).unwrap();
         let calls = f.calls();
-        assert_eq!(calls.len(), 2, "{calls:?}");
-        assert_eq!(
-            calls[0],
-            "netsh advfirewall firewall delete rule name=Mesh Game Servers LAN rooms"
-        );
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[0], "netsh advfirewall firewall delete rule name=Lanthorn LAN rooms");
         assert_eq!(
             calls[1],
-            "netsh advfirewall firewall add rule name=Mesh Game Servers LAN rooms dir=in action=allow \
+            "netsh advfirewall firewall add rule name=Lanthorn LAN rooms dir=in action=allow \
              remoteip=198.18.0.0/15 profile=any enable=yes"
         );
+        // The pre-rename rule goes, or an installed launcher's would stay forever.
+        assert_eq!(calls[2], "netsh advfirewall firewall delete rule name=Mesh Game Servers LAN rooms");
 
         let f = Fake::default();
         let o = open(&f, LocalFirewall::Windows, "gbl0", Lifetime::ThisRoom).unwrap();
         close(&f, o, "gbl0", Lifetime::ThisRoom).unwrap();
-        assert!(f.calls().iter().all(|c| c.contains(PORTABLE_RULE_NAME)), "{:?}", f.calls());
+        // Its own rule, and the old name's portable rule, never an installed one.
+        assert!(f.calls().iter().all(|c| c.contains("(portable)")), "{:?}", f.calls());
+        assert!(f.calls().iter().any(|c| c.contains(PORTABLE_RULE_NAME)), "{:?}", f.calls());
         assert!(f.calls().last().unwrap().contains("delete rule"));
     }
 

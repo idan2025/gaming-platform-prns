@@ -812,7 +812,7 @@ await run('Windows blocking the game, and a third-party firewall, are named', {
 }, async (win, doc) => {
   const t = doc.querySelector('#room-firewall')?.textContent || '';
   check('the blocked program is named', t.includes('Windows is blocking speed2.exe'), t);
-  check('the third-party firewall is named, with what to do', t.includes('Norton Firewall is on') && t.includes('allow Mesh Game Servers'), t);
+  check('the third-party firewall is named, with what to do', t.includes('Norton Firewall is on') && t.includes('allow Lanthorn'), t);
   doc.querySelector('#room-unblock')?.click();
   await settle();
   check('Unblock calls the launcher', calls.includes('unblock_room_programs'));

@@ -7,7 +7,7 @@ still the design authority; this file is only the mechanics.
 
 | Artifact | From | Who runs it |
 | --- | --- | --- |
-| `Mesh Game Servers` (launcher) | `launcher/src-tauri` | a player, or anyone hosting from a desktop |
+| `Lanthorn` (launcher) | `launcher/src-tauri` | a player, or anyone hosting from a desktop |
 | `platform-agent` | `crates/platform-agent` | a node operator, alongside Docker |
 | `platform-index` | `crates/platform-index` | anyone who wants to run an index; **nobody has to** |
 | `game-bridge` | `crates/game-bridge` | anyone hosting a game server, or donating transit, without a desktop |
@@ -75,6 +75,23 @@ release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
+
+### Mesh Game Servers is now Lanthorn
+
+New name, new icon: a lantern whose light reaches out across a mesh, inside
+the ring of Reticulum, the network everything here runs on. The node's web page
+is now Lanthorn Host. Nothing about how it works changes: your servers, rooms,
+saved connections and settings carry over, and servers running older versions
+are found exactly as before.
+
+Because the app's name changed, its downloads are now named `Lanthorn_…`, and
+installing it does not replace the old app:
+- **Windows:** after installing Lanthorn, uninstall "Mesh Game Servers" from
+  Settings → Apps. Your settings are kept. The old firewall rule for LAN rooms
+  is replaced by Lanthorn's the first time you open or join a room.
+- **Linux `.deb` / `.rpm`:** remove the `mesh-game-servers` package.
+  AppImage and portable: delete the old file or folder.
+
 
 ### A new look for the launcher and the node's web page
 
