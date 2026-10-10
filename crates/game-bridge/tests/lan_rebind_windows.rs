@@ -340,21 +340,23 @@ async fn a_game_on_the_ethernet_address_is_joined_at_the_room_address_on_windows
     stop_tx.send(()).unwrap();
     runner.await.unwrap().unwrap();
 
-    // The room is gone, and so is what it turned on: the runner's adapter is
-    // strong-host again.
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "(Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4).WeakHostSend"
-            ),
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "Disabled",
-        "the room left weak-host send on behind it"
-    );
+    // The room is gone, and so is what it turned on: once the helper has
+    // exited, the runner's adapter is strong-host again.
+    let weak_host_send = || {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-NetIPAddress -IPAddress {ethernet} | Get-NetIPInterface -AddressFamily IPv4).WeakHostSend"
+                ),
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    wait_until("the room's helper turns weak-host send off again", Duration::from_secs(30), || {
+        weak_host_send() == "Disabled"
+    })
+    .await;
 }
