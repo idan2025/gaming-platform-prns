@@ -357,10 +357,19 @@ fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
         iface.UseAutomaticMetric = false;
         iface.Metric = 1;
         iface.NlMtu = LAN_MTU as u32;
+        // A game bound to the Wi-Fi's or the Ethernet's address is reached
+        // by the pump translating the room address to it (`lan_rebind.rs`).
+        // Windows is strong-host by default: it drops a packet for an address
+        // the receiving adapter does not hold, and will not send one from such
+        // an address. Weak host on this adapter alone lets both through; the
+        // pump drops any room packet not addressed to this member, so the
+        // room cannot use it to reach another address.
+        iface.WeakHostReceive = true;
+        iface.WeakHostSend = true;
         // SetIpInterfaceEntry refuses an IPv4 row whose SitePrefixLength is
         // not 0 (ERROR_INVALID_PARAMETER), and Get fills it in.
         iface.SitePrefixLength = 0;
-        check(SetIpInterfaceEntry(&mut iface), "setting the adapter's metric and MTU")?;
+        check(SetIpInterfaceEntry(&mut iface), "setting the adapter's metric, MTU and host model")?;
 
         let mut route: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
         InitializeIpForwardEntry(&mut route);

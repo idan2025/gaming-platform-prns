@@ -78,8 +78,9 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ### A game run through Wine or Proton can be joined
 
-Under Wine or Proton, some games listen on the computer's Wi-Fi or Ethernet
-address instead of the room's. Need for Speed: Underground 2 did: the race
+Some games listen on the computer's Wi-Fi or Ethernet address instead of the
+room's — under Wine or Proton especially, but a native game with a fixed
+address set does the same, on Linux or Windows. Need for Speed: Underground 2 did: the race
 showed up in the other player's list, and every join was refused. The room
 now finds where the game is listening and passes its traffic through. There
 is nothing to click and nothing to set up. Only the game's own ports are

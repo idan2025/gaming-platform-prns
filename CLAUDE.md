@@ -550,11 +550,19 @@ Rules a later change could quietly break:
     watches see room addresses only and nothing new becomes reachable.
   - **The survey binds, never listens**, and binds the room address only
     after another address is found taken.
-  - **Linux only.** Windows is strong-host and drops a packet for an address
-    not on the receiving adapter; no Windows game has been seen doing this.
-  - Pinned by `tests/lan_rebind.rs` (real adapters, namespaces, a game on a
-    stand-in Wi-Fi address); without the translation the join fails with
-    `Connection refused`, as in the field.
+  - **Wine or native, Linux or Windows: nothing knows what a game is.** It
+    reads where a socket is bound. Windows is strong-host, so the room
+    adapter alone is set weak-host (receive and send) in `configure`;
+    without it the translated SYN is dropped or the answer leaves by
+    Ethernet. `tests/lan_rebind_windows.rs` (CI's `lan-windows`) pins it.
+  - **The pump delivers only what is addressed to this member** (its room
+    address or a room broadcast). The adapter accepts more than that —
+    Linux always, Windows once weak-host — so without this a room packet
+    naming the Wi-Fi's address would reach it directly.
+  - Pinned by `tests/lan_rebind.rs` (real adapters, namespaces, a native
+    stand-in game on a second address, both directions: host's game on its
+    Wi-Fi, and a member calling out from its own); without the translation
+    the join fails with `Connection refused`, as in the field.
 - **Steam's 27031–27036 are chatter** (`OS_CHATTER`): Proton runs Steam's LAN
   discovery beside every game, and 27036 was offered and allowed as NFSU2's
   missing port.

@@ -26,9 +26,12 @@
 //!   the probe log and the connection watch see room addresses only, and the
 //!   translation never widens what a member may reach: only ports the room
 //!   already admits ever arrive here.
-//! - **Linux only.** Linux delivers a packet for any of its addresses on any
-//!   interface; Windows does not, and no Windows game has been seen binding
-//!   the wrong address — Windows puts the room adapter first by metric.
+//! - **Wine or native, Linux or Windows.** Nothing here knows what a game
+//!   is: it looks at where a socket is bound. Linux delivers a packet for any
+//!   of its addresses on any interface; Windows only does once the room
+//!   adapter is weak-host, which `lan_adapter/windows.rs` sets on that
+//!   adapter alone. The pump drops any room packet not addressed to this
+//!   member, so neither lets the room reach another address directly.
 //! - **The survey never listens.** It *binds* a socket, without listening, to
 //!   learn whether an address and port are taken, and binds the room address
 //!   only once another address is known to be taken — so it cannot steal a
@@ -343,8 +346,7 @@ fn checksum_adjust(sum: u16, old: &[u8], new: &[u8]) -> u16 {
 // Finding where the game is.
 
 /// Which of `ports` some program on this machine holds on one of its other
-/// addresses while nothing holds it on `room`. Empty off Linux (see the
-/// module's rules).
+/// addresses while nothing holds it on `room`.
 pub fn survey(room: Ipv4Addr, ports: &[LanPort]) -> Survey {
     let locals: Vec<Ipv4Addr> =
         local_addresses().into_iter().filter(|a| *a != room && is_translatable(*a)).collect();
@@ -387,11 +389,19 @@ fn taken(port: LanPort, address: Ipv4Addr) -> bool {
         LanProto::Udp => std::net::UdpSocket::bind(at).map(drop),
         LanProto::Tcp => tokio::net::TcpSocket::new_v4().and_then(|s| s.bind(at)),
     };
-    matches!(result, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse)
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => true,
+        // Windows answers a port held with SO_EXCLUSIVEADDRUSE (or reserved
+        // by the system) with WSAEACCES. Read alike on both addresses, it
+        // never starts a translation by itself.
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => true,
+        _ => false,
+    }
 }
 
+/// This machine's IPv4 addresses, every interface's.
 #[cfg(target_os = "linux")]
-fn local_addresses() -> Vec<Ipv4Addr> {
+pub fn local_addresses() -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills `head` with a list freed below by freeifaddrs;
@@ -417,8 +427,37 @@ fn local_addresses() -> Vec<Ipv4Addr> {
     out
 }
 
-#[cfg(not(target_os = "linux"))]
-fn local_addresses() -> Vec<Ipv4Addr> {
+/// This machine's IPv4 addresses, every interface's.
+#[cfg(windows)]
+pub fn local_addresses() -> Vec<Ipv4Addr> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    let mut out = Vec::new();
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    // SAFETY: the table is allocated by GetUnicastIpAddressTable, read only
+    // within its NumEntries while alive, and freed by FreeMibTable.
+    unsafe {
+        if GetUnicastIpAddressTable(AF_INET, &mut table) != 0 || table.is_null() {
+            return out;
+        }
+        let rows =
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        for row in rows {
+            let a = Ipv4Addr::from(u32::from_be(row.Address.Ipv4.sin_addr.S_un.S_addr));
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        FreeMibTable(table.cast());
+    }
+    out
+}
+
+/// No room adapter on any other system.
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn local_addresses() -> Vec<Ipv4Addr> {
     Vec::new()
 }
 

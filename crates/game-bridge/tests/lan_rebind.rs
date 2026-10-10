@@ -37,6 +37,9 @@ const GAME_UDP: u16 = 3658;
 const PRIVATE_TCP: u16 = 6001;
 /// The host's stand-in Wi-Fi address.
 const WIFI: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
+/// The member's, for the other direction: a Linux member under Wine whose
+/// game calls out from its Wi-Fi address to a host that listens properly.
+const MEMBER_WIFI: Ipv4Addr = Ipv4Addr::new(10, 78, 0, 1);
 
 #[test]
 fn a_game_listening_on_the_wifi_address_is_joined_at_the_room_address() {
@@ -113,17 +116,17 @@ fn in_ns<T: Send + 'static>(ns: &OwnedFd, f: impl FnOnce() -> T + Send + 'static
 
 /// Give the namespace's loopback a second, ordinary address, as a machine's
 /// Wi-Fi has: `lo:7`, so `127.0.0.1` stays.
-fn add_wifi_address() {
+fn add_wifi_address(alias: &'static [u8], wifi: Ipv4Addr) {
     // SAFETY: plain ioctls on a socket this function owns, with an ifreq
     // naming an alias of `lo`.
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         assert!(sock >= 0);
         for (request, addr) in
-            [(libc::SIOCSIFADDR, WIFI), (libc::SIOCSIFNETMASK, Ipv4Addr::BROADCAST)]
+            [(libc::SIOCSIFADDR, wifi), (libc::SIOCSIFNETMASK, Ipv4Addr::BROADCAST)]
         {
             let mut req: libc::ifreq = std::mem::zeroed();
-            for (d, s) in req.ifr_name.iter_mut().zip(b"lo:7\0") {
+            for (d, s) in req.ifr_name.iter_mut().zip(alias) {
                 *d = *s as libc::c_char;
             }
             let sin = libc::sockaddr_in {
@@ -194,7 +197,7 @@ fn inside_a_user_namespace() {
         // The host's game, the way Wine binds it: the Wi-Fi address only.
         let (game_tcp, game_udp, private) = in_ns(&host_ns, || {
             lan_adapter::bring_up("lo").unwrap();
-            add_wifi_address();
+            add_wifi_address(b"lo:7\0", WIFI);
             let tcp = TcpListener::bind((WIFI, GAME_TCP)).unwrap();
             let udp = UdpSocket::bind((WIFI, GAME_UDP)).unwrap();
             let private = TcpListener::bind((WIFI, PRIVATE_TCP)).unwrap();
@@ -231,7 +234,11 @@ fn inside_a_user_namespace() {
             let (n, from_udp) = game_udp.recv_from(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"ping");
             game_udp.send_to(b"pong", from_udp).unwrap();
-            (from_tcp, from_udp)
+            // The other direction: a member's game calling from its own
+            // Wi-Fi address.
+            let (mut conn, from_member_wifi) = game_tcp.accept().unwrap();
+            conn.write_all(b"hello").unwrap();
+            (from_tcp, from_udp, from_member_wifi)
         });
 
         // The member joins the room address, as every game client does.
@@ -268,9 +275,48 @@ fn inside_a_user_namespace() {
             SocketAddr::from((h_addr, GAME_UDP)),
             "the answer came from the host's room address, never its Wi-Fi's"
         );
-        let (from_tcp, from_udp) = game.join().unwrap();
+
+        // Vice versa: the member is the Linux machine under Wine, and its
+        // game connects out from the Wi-Fi address. The kernel routes it into
+        // the room adapter with the Wi-Fi source; the member's pump gives it
+        // the room address, and the reply finds its way back.
+        in_ns(&member_ns, || {
+            lan_adapter::bring_up("lo").unwrap();
+            add_wifi_address(b"lo:8\0", MEMBER_WIFI);
+        });
+        // One survey later, the member's pump knows the address is its own.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let hello = in_ns(&member_ns, move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                use tokio::io::AsyncReadExt;
+                let sock = tokio::net::TcpSocket::new_v4().unwrap();
+                sock.bind(SocketAddr::from((MEMBER_WIFI, 0))).unwrap();
+                let mut conn = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    sock.connect(SocketAddr::from((h_addr, GAME_TCP))),
+                )
+                .await
+                .expect("the call from the member's Wi-Fi address is answered")
+                .expect("and not refused");
+                let mut buf = [0u8; 16];
+                let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                buf[..n].to_vec()
+            })
+        });
+        assert_eq!(hello, b"hello");
+
+        let (from_tcp, from_udp, from_member_wifi) = game.join().unwrap();
         assert_eq!(from_tcp.ip(), m_addr, "the game sees the member's room address");
         assert_eq!(from_udp.ip(), m_addr);
+        assert_eq!(
+            from_member_wifi.ip(),
+            m_addr,
+            "a call from the member's Wi-Fi address arrives as its room address"
+        );
 
         // The translation is for the game's ports only: a listener on the
         // same Wi-Fi address, on a port the game did not declare, stays out of
