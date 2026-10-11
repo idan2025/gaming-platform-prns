@@ -374,6 +374,21 @@ for (const [rtt, want] of [[84, /should play smoothly/], [180, /little delay/], 
     check(rtt + ' ms gets a playability hint', !!hint && want.test(hint.textContent), hint && hint.textContent);
   });
 }
+// The link check: a game needing a fast link, heard over radio, is warned
+// about; a low-rate one is told joins will be slow; a TCP relay says nothing.
+for (const [iface, tier, want] of [['LoRa', 2, /needs a fast link/], ['LoRa', 1, /low-rate game/], ['TcpClient', 2, null]]) {
+  await run(`a tier ${tier} game heard over ${iface}`, {
+    status: running,
+    rows: () => [row({ interface_label: iface, min_link_class: tier })],
+  }, async (win, doc) => {
+    doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+    const fit = doc.querySelector('#detail-linkfit');
+    if (want) check(`tier ${tier} over ${iface} is named`, !!fit && want.test(fit.textContent), fit && fit.textContent);
+    else check(`tier ${tier} over ${iface} needs no warning`, !fit, fit && fit.textContent);
+  });
+}
+
 await run('no round trip, no playability hint', {
   status: running,
   rows: () => [row()],
