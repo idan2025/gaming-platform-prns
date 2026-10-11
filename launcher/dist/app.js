@@ -826,6 +826,7 @@ function renderDetail() {
   const keepId = active && active.id && pane.contains(active) ? active.id : null;
   const selStart = keepId && active.selectionStart != null ? active.selectionStart : null;
   const selEnd = keepId && active.selectionEnd != null ? active.selectionEnd : null;
+  const prevArt = pane.querySelector('.detail-hero > .art');
 
   pane.textContent = '';
   const a = d.announce;
@@ -833,9 +834,17 @@ function renderDetail() {
   const room = isRoom(a);
   const gameId = effectiveGameId(d);
 
-  // hero
+  // hero. The artwork is carried across, like a list row's: a new <img> on
+  // every poll starts transparent and fades in again, so the picture blinked
+  // every two seconds.
   const hero = el('div', 'detail-hero');
-  hero.appendChild(art(legacy ? null : gameId, '', { room, fallbackName: a.name }));
+  const artKey = (legacy ? '' : gameId || '') + '|' + room + '|' + (a.name || '');
+  let heroArt = prevArt && prevArt.dataset.key === artKey ? prevArt : null;
+  if (!heroArt) {
+    heroArt = art(legacy ? null : gameId, '', { room, fallbackName: a.name });
+    heroArt.dataset.key = artKey;
+  }
+  hero.appendChild(heroArt);
   const heroText = el('div', 'hero-text');
   heroText.appendChild(el('h2', '', a.name || 'Unnamed server'));
   heroText.appendChild(el('div', 'hero-game',
