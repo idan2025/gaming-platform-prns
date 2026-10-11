@@ -15,6 +15,9 @@ const LOW_DISK_BYTES = 10 * 1024 ** 3;
 // The log view: how often it re-reads while open, and how much it may ask for.
 const LOG_REFRESH_MS = 2000;
 const LOG_LINE_CHOICES = [200, 1000, 2000];
+// Kept in step with MAX_CRASH_RESTARTS_PER_HOUR in agent.rs.
+const MAX_CRASH_RESTARTS = 5;
+const PLAYERS_REFRESH_MS = 5000;
 
 // The map-name alphabet, kept in step with `validate_map_name` in
 // crates/game-bridge/src/console.rs. The node is the authority — this only
@@ -46,6 +49,9 @@ const state = {
   },
   storage: null,         // {path, free_bytes, total_bytes}, or null on an older agent
   logTimer: null,
+  playersTimer: null,
+  orphans: null,         // {count, bytes, skipped_recent} from /orphans/summary
+  orphansCheckedAt: 0,
 };
 
 const ICON = {
@@ -62,6 +68,7 @@ const ICON = {
   edit: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/>',
   link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
   log: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+  users: '<circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M16 4.5a3.2 3.2 0 010 6.2M18 14.5c1.8.8 3 2.7 3 5"/>',
 };
 function icon(name) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -299,6 +306,7 @@ async function poll() {
     recordPlayers();
     renderStatusPill();
     renderStorage();
+    refreshOrphans(false);
     renderInstances();
   } catch (e) {
     if (e && e.__auth) return;
@@ -599,6 +607,34 @@ function playersTitle(inst) {
   return "Read from the game just now" + (inst.bots ? ", including the " + inst.bots + " bots this node asked for" : "") + ".";
 }
 
+// How a stopped server ended, in words. The same rule as LastExit::is_crash in
+// instance.rs: 0 and the signals a stop sends are a stop; anything else, an
+// out-of-memory kill, or Docker failing to start it is a crash.
+const SIGNALS = { 134: "aborted", 136: "arithmetic error", 139: "segmentation fault" };
+function exitWords(exit) {
+  if (!exit) return null;
+  const when = exit.finished_at ? " at " + new Date(exit.finished_at).toLocaleString() : "";
+  if (exit.oom_killed) {
+    return { crash: true, short: "out of memory",
+      long: "Killed for going over its memory limit" + when + ". Raise memory_limit_bytes for this game in agent.toml." };
+  }
+  if (exit.error) return { crash: true, short: "could not start", long: "Docker could not start it" + when + ": " + exit.error };
+  if ([0, 130, 137, 143].includes(exit.code)) {
+    return { crash: false, short: "stopped", long: "Stopped" + when + " (exit " + exit.code + ")." };
+  }
+  const what = SIGNALS[exit.code] || "exit code " + exit.code;
+  const brief = { 134: "aborted", 136: "math error", 139: "segfault" }[exit.code] || "exit";
+  return { crash: true, short: brief + " (" + exit.code + ")", long: "Crashed" + when + " with " + what + " (exit " + exit.code + "). Show log has its last lines." };
+}
+function stateTitle(inst, ending) {
+  const parts = [];
+  if (ending) parts.push(ending.long);
+  if (inst.restart_on_crash) {
+    parts.push("Started again if it crashes" + (inst.crash_restarts ? " (" + inst.crash_restarts + " this hour, of " + MAX_CRASH_RESTARTS + ")" : "") + ".");
+  }
+  return parts.join(" ");
+}
+
 function instById(id) { return state.instances.find(i => i.instance_id === id) || null; }
 
 // What a server can be asked to do right now, and why not when it cannot. One
@@ -653,6 +689,9 @@ function buildRow(inst) {
   row.append(artCell, nameCell, stateCell,
     el("div", "cell cell-map"), el("div", "cell cell-players"), el("div", "cell cell-port"),
     el("div", "cell cell-mesh"), el("div", "cell cell-uptime"), actions, buildUsageStrip());
+  const playersCell = row.querySelector(".cell-players");
+  playersCell.classList.add("clickable");
+  playersCell.addEventListener("click", () => { if (instById(id)?.state === "running") onShowPlayers(id); });
   row.addEventListener("contextmenu", (e) => {
     if (e.target.closest("input, textarea")) return;
     e.preventDefault();
@@ -681,18 +720,29 @@ function renderInstances() {
     row.querySelector(".cell-name").textContent = inst.name || inst.instance_id;
     row.querySelector(".cell-game").textContent = gameName(inst.game_id);
     const pill = row.querySelector(".state-pill");
-    pill.textContent = inst.state;
-    pill.className = "state-pill state-" + String(inst.state || "unknown");
+    const ending = exitWords(inst.last_exit);
+    const crashed = inst.state === "stopped" && ending && ending.crash;
+    pill.textContent = crashed ? "crashed" : inst.state;
+    pill.className = "state-pill state-" + (crashed ? "crashed" : String(inst.state || "unknown"));
+    pill.title = stateTitle(inst, ending);
 
     // null is "the game could not be asked", not "no map" — and not zero
     // players either. A blank would make an unreachable server look like one
     // on an empty map.
     const mapCell = row.querySelector(".cell-map");
-    if (inst.map_now) {
+    if (inst.state === "stopped" && ending) {
+      // A stopped server has no map to show; how it ended is the useful fact.
+      mapCell.textContent = ending.short;
+      mapCell.title = ending.long;
+      mapCell.classList.toggle("muted-em", !ending.crash);
+      mapCell.classList.toggle("bad-text", ending.crash);
+    } else if (inst.map_now) {
+      mapCell.classList.remove("bad-text");
       mapCell.textContent = inst.map_now;
       mapCell.title = "Read from the game just now";
       mapCell.classList.remove("muted-em");
     } else {
+      mapCell.classList.remove("bad-text");
       mapCell.textContent = "—";
       mapCell.title = inst.state === "running"
         ? "This game answers no query, or did not answer — not the same as having no map."
@@ -801,6 +851,14 @@ function openInstanceMenu(id, x, y) {
     action: () => copyValue(inviteLink(inst)) });
   items.push({ label: "Copy mesh address", icon: "copy", disabled: !inst.mesh_destination, action: () => copyValue(inst.mesh_destination) });
   items.push({ label: "Show log", icon: "log", action: () => onShowLog(id) });
+  items.push({ label: "Players…", icon: "users", disabled: !cap.running,
+    title: cap.running ? "Who is on this server, as the game reports it." : "The server has to be running.",
+    action: () => onShowPlayers(id) });
+  if (inst.restart_on_crash != null) {
+    items.push({ label: (inst.restart_on_crash ? "✓ " : "") + "Restart if it crashes", icon: "restart",
+      title: "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone.",
+      action: () => onToggleRestartOnCrash(id, !inst.restart_on_crash) });
+  }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
   showMenu(x, y, items);
@@ -970,6 +1028,13 @@ function openStartDialog(gameId) {
       bots = field(form, "sf-bots", "Bots", { type: "number", min: "0", max: "32", step: "1", placeholder: "none" });
       form.appendChild(el("p", "muted small", "Bots join immediately, and the number can be changed while the server runs."));
     }
+    const crashWrap = el("label", "check");
+    const crash = el("input");
+    crash.type = "checkbox";
+    crash.id = "sf-crash";
+    crashWrap.append(crash, el("span", null, "Start it again if it crashes"));
+    form.append(crashWrap, el("p", "muted small",
+      "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone. Can be changed later from the server's menu."));
     const adv = el("details");
     adv.appendChild(el("summary", "muted", "Advanced"));
     const advWrap = el("div", "advanced-wrap");
@@ -992,7 +1057,7 @@ function openStartDialog(gameId) {
       e.preventDefault();
       onStartSubmit(gameId, {
         name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value,
-        bots: bots ? bots.value : "", fixedPort: port.value,
+        bots: bots ? bots.value : "", fixedPort: port.value, restartOnCrash: crash.checked,
       }, go, close);
     });
     body.appendChild(form);
@@ -1048,6 +1113,7 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
   const body = {
     instance_id, game_id: gameId, name, max_players: f.maxPlayers, port,
     extra_ports: {}, map: map === "" ? null : map, bots, owner: null,
+    restart_on_crash: !!f.restartOnCrash,
   };
   submitBtn.disabled = true;
   submitBtn.textContent = "Starting…";
@@ -1216,6 +1282,120 @@ function onShowLog(instanceId) {
     refresh(true);
   });
   back.querySelector(".modal").classList.add("modal-wide");
+}
+
+// ---------- players ----------
+
+function formatDuration(secs) {
+  if (secs == null) return "—";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  return h ? h + "h " + m + "m" : m ? m + "m" : Math.floor(secs) + "s";
+}
+
+// Who is on a server, from the game itself. Bots are in the list: A2S does not
+// tell them apart. `null` from the node is "could not ask", never "nobody".
+function onShowPlayers(instanceId) {
+  const inst = instById(instanceId);
+  const back = openModal("players-dialog", null, (body, close) => {
+    const head = el("div", "log-head");
+    head.appendChild(el("h3", null, "Players · " + ((inst && inst.name) || instanceId)));
+    head.appendChild(el("div", "toolbar-spacer"));
+    const shut = el("button", "btn", "Close");
+    shut.type = "button";
+    shut.addEventListener("click", close);
+    head.appendChild(shut);
+    const table = el("div", "players-table");
+    table.textContent = "Asking the game…";
+    const foot = el("div", "muted small log-foot", "Updates every 5 s while open.");
+    body.append(head, table, foot);
+
+    async function refresh() {
+      if (state.playersTimer) { clearTimeout(state.playersTimer); state.playersTimer = null; }
+      if (!$("players-dialog")) return;
+      try {
+        const list = await api("GET", "/instances/" + encodeURIComponent(instanceId) + "/players");
+        if (!$("players-dialog")) return;
+        table.textContent = "";
+        if (list == null) {
+          table.appendChild(el("p", "muted", "The game did not answer, or answers no player query. That is not the same as nobody being on."));
+        } else if (!list.length) {
+          table.appendChild(el("p", "muted", "Nobody is on this server."));
+        } else {
+          const headRow = el("div", "players-row players-headrow");
+          headRow.append(el("div", null, "Name"), el("div", null, "Score"), el("div", null, "Connected"));
+          table.appendChild(headRow);
+          for (const p of [...list].sort((a, b) => b.score - a.score)) {
+            const r = el("div", "players-row");
+            r.append(el("div", "players-name", p.name || "(connecting)"), el("div", null, String(p.score)),
+              el("div", null, formatDuration(p.connected_secs)));
+            table.appendChild(r);
+          }
+        }
+        foot.textContent = (list ? list.length + " listed" : "Not answered") + " · updates every 5 s while open.";
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        foot.textContent = (e && e.error) || "Could not ask the node.";
+      }
+      if ($("players-dialog")) state.playersTimer = setTimeout(refresh, PLAYERS_REFRESH_MS);
+    }
+    refresh();
+  });
+  back.querySelector(".modal").classList.add("modal-mid");
+}
+
+async function onToggleRestartOnCrash(instanceId, on) {
+  try {
+    await withInFlight(api("POST", "/instances/" + encodeURIComponent(instanceId) + "/restart-on-crash", { on }));
+    clearError();
+    toast(on ? "It will be started again if it crashes." : "It will stay stopped if it crashes.");
+    poll();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Could not change that.");
+  }
+}
+
+// ---------- leftovers ----------
+
+// Folders of servers deleted earlier. Read once a minute, not every poll: it
+// walks the disk. Deleting them is the operator's call (agent.rs,
+// clean_orphans), and asked for every time.
+const ORPHANS_EVERY_MS = 60000;
+async function refreshOrphans(force) {
+  if (!force && Date.now() - state.orphansCheckedAt < ORPHANS_EVERY_MS) return;
+  state.orphansCheckedAt = Date.now();
+  try {
+    state.orphans = await api("GET", "/orphans/summary");
+  } catch (e) {
+    state.orphans = null; // an older agent: no notice
+  }
+  renderOrphans();
+}
+function renderOrphans() {
+  const bar = $("orphans-bar");
+  if (!bar) return;
+  const o = state.orphans;
+  bar.classList.toggle("hidden", !o || !o.count);
+  if (!o || !o.count) return;
+  $("orphans-text").textContent = o.count + " leftover folder" + (o.count === 1 ? "" : "s") +
+    " from deleted servers, " + formatBytes(o.bytes) + ".";
+}
+async function onCleanOrphans() {
+  const o = state.orphans;
+  if (!o || !o.count) return;
+  if (!confirm("Delete " + o.count + " leftover folder" + (o.count === 1 ? "" : "s") + " (" + formatBytes(o.bytes) + ")?\n\n" +
+    "They belong to servers that no longer exist: their saves, logs and mesh identities. " +
+    "A server started again under one of those names would get a new mesh address.\n\nThis cannot be undone.")) return;
+  try {
+    const r = await withInFlight(api("POST", "/orphans/clean"));
+    clearError();
+    toast("Removed " + r.count + " folder" + (r.count === 1 ? "" : "s") + ", " + formatBytes(r.bytes) + "." +
+      (r.failed ? " " + r.failed + " could not be removed: " + r.error : ""));
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Could not clean up.");
+  }
+  refreshOrphans(true);
 }
 
 // ---------- server actions ----------
@@ -1687,6 +1867,9 @@ document.addEventListener("DOMContentLoaded", () => {
     state.usage.players.clear();
     state.storage = null;
     renderStorage();
+    state.orphans = null;
+    state.orphansCheckedAt = 0;
+    renderOrphans();
     state.installing.clear();
     state.installingMsg.clear();
     state.installDone.clear();
@@ -1699,6 +1882,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));
   $("announce-btn").addEventListener("click", () => onAnnounce(null));
+  $("orphans-clean").addEventListener("click", onCleanOrphans);
 
   $("iface-kind").addEventListener("change", () => {
     const tcp = $("iface-kind").value === "tcp";
@@ -1717,7 +1901,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeMenu();
-      for (const id of ["start-dialog", "map-dialog", "bots-dialog", "log-dialog"]) closeModal(id);
+      for (const id of ["start-dialog", "map-dialog", "bots-dialog", "log-dialog", "players-dialog"]) closeModal(id);
     }
   });
 

@@ -74,6 +74,28 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host: who is playing, why a server stopped, and restarts after a crash
+
+- **Players…** in a server's menu (or a click on its player count) lists who
+  is on it, with score and time connected, as the game reports it. Bots are
+  listed too.
+- A server that crashed says so: its status reads **Crashed**, and the map
+  column says how, such as `segfault (139)` or `out of memory`. A server you
+  stopped still reads Stopped.
+- **Restart if it crashes**, on the start form or in a server's menu: the node
+  starts it again after a crash, up to 5 times an hour, and never after a Stop.
+- Leftover folders from servers deleted earlier are counted above the list,
+  with a **Clean up…** button that asks first. Folders touched in the last ten
+  minutes are left alone.
+
+### The launcher warns about slow links
+
+A server heard over LoRa or another radio link says so in its details: a game
+that needs a fast link is warned about, and a low-rate one is told joining will
+be slow. It is a warning, never a block.
+
 ## v0.2.34
 
 ### Lanthorn Host shows a server's player cap

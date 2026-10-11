@@ -110,6 +110,18 @@ async fn main() -> Result<()> {
     // that nothing is announcing. Put them back on the mesh before serving.
     agent.restore_mesh_bridges().await;
 
+    // Restart-on-crash (`Agent::check_crashes`). The first pass only marks
+    // the exits already on this node as seen.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                agent.check_crashes().await;
+                tokio::time::sleep(platform_agent::agent::CRASH_CHECK_EVERY).await;
+            }
+        });
+    }
+
     // The Reticulum control uplink is opt-in via `[uplink]` in the config. When
     // present, the agent also announces a `platform-agent.control` destination
     // and answers authenticated create/stop/remove/list requests over a Link, so
