@@ -315,6 +315,77 @@ needs a test against a real daemon: delete refused while a stopped container
 mounts the copy, cancel leaves nothing in `content/`, and a progress total that
 is never invented.
 
+**Build plan** (for whoever builds it; line numbers as of v0.2.35, `3a8abdd`).
+Build the base first, then each addition as its own commit:
+
+1. **List installed copies.** `crates/platform-agent/src/agent.rs`: an
+   `Agent::installed()` walking `data_root/content/<game>/<version>` (sizes
+   with the `dir_size` helper already there for orphans), marking each copy
+   `configured` when `self.config().games[game].content_version` names it,
+   and listing the containers that mount it. `list_managed` has no mounts, so
+   inspect each managed container's `Mounts` once per call, or carry the
+   content version in a label at create (`docker.rs` `create_and_start`, near
+   `PORTS_LABEL`) and fall back to inspect for older containers. Route
+   `GET /content` in `api.rs` (routes start near `api.rs:107`; today there is
+   only `/content/:game`, `api.rs:123`).
+2. **Delete a copy.** `DELETE /content/:game/:version` →
+   `Agent::delete_content`. Build the path with `StoreLayout::content_dir`
+   (`store.rs:193`) from validated ids. Refuse when any managed container
+   mounts it (running **or** stopped) and when `Installs::is_running(game)`
+   (`install.rs:86`). Return 409 with the server ids, so the page can list
+   them.
+3. **Progress.** The staging directory is created per run with a random name
+   (`content.rs:386`, `staging_root`), so the install task does not know it
+   today. Have `Provisioner::ensure` (`content.rs:199`) report its staging path
+   to `Installs` when it creates one (a callback or a shared slot), and have
+   `install_status` (`api.rs:746`) add `bytes` = `dir_size(staging)` to
+   `InstallState::Running` (`install.rs:46`). Keep `since_secs`; the page
+   works out the rate from two readings, as it does for `/usage`. A
+   `total_bytes` only when known (rules above).
+4. **Cancel.** `DELETE /content/:game/install`. The task's container is named
+   `gpp-content-{app_id}-{task}-{attempt}` (`content.rs:333`) and carries
+   `TASK_LABEL` (`docker.rs:49`). Record the name in `Installs` when the run
+   starts, stop and remove it, discard staging, and finish the task as
+   `Failed { error: "cancelled" }`. `ensure` must then not rename a
+   half-finished tree: check it returns the error rather than the rename
+   (`content.rs:250` is the archive path's rename).
+5. **The page.** `crates/platform-agent/webui`: a fourth tab, `installed`
+   (`app.js:1817` `TABS`, `TITLES`; `index.html:71` for the nav button,
+   `index.html:129` for a panel). Rows from `GET /content`, plus one row per
+   game whose `/content/:game` state is `running`. Poll every 2 s while the
+   tab is open, as `/usage` does. Delete asks first, with the size and,
+   on 409, the servers that use the copy. Downloads show bytes, rate and
+   elapsed time, a percentage only with a total, and Cancel.
+6. **Unused copies.** `configured == false` and no container mounts it: mark
+   it *unused* and put those rows first.
+7. Then, each separately: update into a new version directory, verify,
+   room-before-download, remove a pack, a queue.
+
+**Tests to write** (Docker-gated ones skip without a daemon, like
+`tests/docker_guard.rs`; build tiny images from busybox, never pull):
+- delete refused while a **stopped** managed container mounts the copy, and
+  allowed once it is removed;
+- delete refused while that game's install is running;
+- a hostile game or version id is refused (`../`, empty, too long), never
+  turned into a path;
+- cancel leaves nothing under `content/<game>/` and removes the task
+  container; a later install still works;
+- progress `bytes` grows during a fake install (a stand-in steamcmd image that
+  writes a file slowly, like `gpp-test-steamcmd-ok` in `tests/content_provision.rs`),
+  and `total_bytes` is absent when nothing declares one;
+- every new route answers 401 without the token (add them to the list in
+  `tests/api.rs`, `without_the_token_every_route_is_refused`);
+- the page: `launcher/uicheck` is the launcher's harness, not the node's; the
+  node page has none, so check it in headless Chromium against a mock API (the
+  way PR #6 and #8 did) and say so in the PR.
+
+**Done when:** `cargo test --workspace` and `cargo clippy --workspace
+--all-targets` are clean, the Windows CI job passes (the agent builds there;
+gate anything Unix-only with `#[cfg(unix)]`, as `disk_space` does), CLAUDE.md
+records the rules a later change could break, `RELEASE.md` has an Unreleased
+entry, and on the node the 928 MB `counter-strike-16/app90` copy shows as
+unused and can be deleted from the page.
+
 ---
 
 ## Rebrand
