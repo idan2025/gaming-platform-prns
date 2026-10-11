@@ -132,6 +132,16 @@ function fmtDuration(secs) {
   if (m > 0) return m + 'm ' + (secs % 60) + 's';
   return secs + 's';
 }
+// What a round trip means for playing, in words. The detail probe's round trip
+// is one request and its answer over an open link, which is close to what a
+// game's own packets see. The bands are rough on purpose: a hint before Join.
+function playability(rttMs) {
+  if (rttMs == null) return null;
+  if (rttMs < 120) return { cls: 'feel-good', text: 'Close by: should play smoothly.' };
+  if (rttMs < 250) return { cls: 'feel-ok', text: 'Playable, with a little delay.' };
+  if (rttMs < 500) return { cls: 'feel-far', text: 'Far away: expect lag in fast games.' };
+  return { cls: 'feel-bad', text: 'Very far: fast games will struggle; slower ones may be fine.' };
+}
 function hopsText(h) { return h == null ? 'Unknown' : h + (h === 1 ? ' hop' : ' hops'); }
 // The game a join would use: what the announce said, else what the player
 // chose for this destination. `null` means neither, and nothing may join.
@@ -885,6 +895,14 @@ function renderDetail() {
   if (!room && d.data && d.data.rtt_ms != null) stat(stats, 'Round trip', d.data.rtt_ms + ' ms');
   else stat(stats, 'Heard', fmtSeen(a.last_seen_secs));
   overview.appendChild(stats);
+  const feel = !room && d.data ? playability(d.data.rtt_ms) : null;
+  if (feel) {
+    const n = el('p', 'note playability ' + feel.cls, feel.text);
+    n.id = 'detail-playability';
+    n.title = 'From the round trip of asking this server for its details just now. '
+      + 'A hint, not a promise: the mesh path can change.';
+    overview.appendChild(n);
+  }
   if (legacy) {
     overview.appendChild(el('p', 'note',
       'An older server that announces only its name, so its game, map and player count are '

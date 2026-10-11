@@ -360,6 +360,30 @@ await run('an index row is marked as second-hand', {
   check('and says an index is optional', /works without one/i.test(panel.textContent));
 });
 
+// The round trip in words before Join. A server that did not answer gets no
+// hint: no number is not a good number.
+for (const [rtt, want] of [[84, /should play smoothly/], [180, /little delay/], [400, /expect lag/], [900, /Very far/]]) {
+  await run('a ' + rtt + ' ms round trip is put in words', {
+    status: running,
+    rows: () => [row()],
+    details: { ...details, rtt_ms: rtt },
+  }, async (win, doc) => {
+    doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+    const hint = doc.querySelector('#detail-playability');
+    check(rtt + ' ms gets a playability hint', !!hint && want.test(hint.textContent), hint && hint.textContent);
+  });
+}
+await run('no round trip, no playability hint', {
+  status: running,
+  rows: () => [row()],
+  details: { ...details, reachable: false, rtt_ms: null },
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  check('a server that did not answer gets no hint', !doc.querySelector('#detail-playability'));
+});
+
 await run('unreachable server', {
   status: running,
   rows: () => [row()],
@@ -1255,6 +1279,20 @@ await run('a copy that cannot replace itself links to the download page', {
     autoUpdate: false,
   }, async () => { await settle(); });
   check('check_update is not called when turned off', before() === n0);
+}
+
+// Lanthorn Host makes invite links too, in its own JavaScript. They must be the
+// launcher's links byte for byte; launcher-core's
+// `a_link_from_lanthorn_host_is_the_link_this_side_makes` holds the same string.
+{
+  const nodeJs = fs.readFileSync(new URL('../../crates/platform-agent/webui/app.js', import.meta.url), 'utf8');
+  const start = nodeJs.indexOf('function inviteLink(');
+  const end = nodeJs.indexOf('\n}\n', start) + 2;
+  check('Lanthorn Host still has its invite builder', start >= 0);
+  const inviteLink = new Function(nodeJs.slice(start, end) + '\nreturn inviteLink;')();
+  const made = inviteLink({ mesh_destination: 'A1B2C3D4E5F60718293A4B5C6D7E8F90', game_id: 'counter-strike-16', name: "  Dust2 (EU)! ñ*' ~ok  " });
+  check('a node-made invite is the launcher\'s own link',
+    made === 'lanthorn://join/a1b2c3d4e5f60718293a4b5c6d7e8f90?game=counter-strike-16&name=Dust2%20%28EU%29%21%20%C3%B1%2A%27%20~ok', made);
 }
 
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
