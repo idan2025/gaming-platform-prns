@@ -1644,15 +1644,12 @@ struct InterfaceFacts {
 /// - Degraded counts as up: it still carries traffic, and the engine counts it
 ///   online too (`ConnectionState::is_online`).
 /// - LAN auto-discovery that has found nobody reports `Disconnected`. That is
-///   searching, not a fault, so it is `idle`: shown, but not as down. It is
-///   not proof that no neighbour is linked either: the engine pinned in
-///   `ENGINE.md` can report `Disconnected` on the side that dialled a
-///   neighbour whose side reports the same link up, so the UI says
-///   "searching" and claims nothing more.
-/// - A fleet member is one neighbour auto-discovery reached. Only those that
-///   are up are listed; one that is not carries nothing, and listing it read
-///   as a second broken connection. Their failures still show, through the
-///   supervisor's own state.
+///   searching, not a fault, so it is `idle`: shown, but not as down.
+/// - A fleet member is one link auto-discovery made. Only those that are up
+///   are listed. One is always there and almost never up: the engine dials
+///   the network's gateway on the rendezvous port (42699) in case the router
+///   hosts a rendezvous, which ordinary routers do not. Listed, it read as a
+///   neighbour that was down.
 /// - Ordered relays first, then auto-discovery, then its peers, each by label:
 ///   the engine's order changes from one poll to the next, which redrew the
 ///   card and moved rows under the pointer.
