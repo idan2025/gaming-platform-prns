@@ -170,6 +170,45 @@ pub struct InstanceStatus {
     pub bots: Option<u8>,
 }
 
+/// What one running server is using, as Docker's own counters say.
+///
+/// **Counters, not rates.** CPU time, bytes on the network and bytes to disk
+/// only ever grow, and a rate is the change between two readings, so whoever
+/// polls works it out from consecutive samples. That keeps the agent free of
+/// per-caller history: two browsers watching the same node each get rates over
+/// their own poll interval, and an agent restart loses nothing anyone needed.
+///
+/// `None` is "Docker did not report it", never zero, for the same reason
+/// `players_now` makes that distinction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceUsage {
+    pub instance_id: String,
+    /// Milliseconds since the Unix epoch when the agent took this reading. The
+    /// divisor for every rate, so it is the agent's clock, read once per
+    /// container, and not the time the response reached the browser.
+    pub sampled_at_ms: u64,
+    /// CPU time this container has used, in nanoseconds, all cores together.
+    pub cpu_total_ns: u64,
+    /// CPU time the whole machine has spent, in nanoseconds, all cores
+    /// together. A container's share is its change over this one's.
+    pub system_cpu_ns: Option<u64>,
+    /// Cores the container can see. Usually the machine's.
+    pub online_cpus: Option<u64>,
+    /// Memory in use, without the page cache the kernel can drop at will —
+    /// the figure `docker stats` shows, not the raw cgroup total.
+    pub memory_bytes: Option<u64>,
+    /// The container's memory limit; the machine's memory when none is set.
+    pub memory_limit_bytes: Option<u64>,
+    /// Bytes received and sent, summed over the container's interfaces.
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    /// Bytes read from and written to disk.
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+    /// Processes and threads in the container.
+    pub pids: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecError {
     EmptyId,

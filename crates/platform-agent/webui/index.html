@@ -103,6 +103,12 @@
 
     <main class="content">
       <section id="tab-panel-servers" class="tab-panel" role="tabpanel" aria-labelledby="tab-servers">
+        <div id="node-usage" class="node-usage hidden" title="All running servers on this node together, live">
+          <div><span class="metric-label">CPU</span><span id="node-usage-cpu" class="node-usage-value">—</span></div>
+          <div><span class="metric-label">Memory</span><span id="node-usage-mem" class="node-usage-value">—</span></div>
+          <div><span class="metric-label">Network</span><span id="node-usage-net" class="node-usage-value">—</span></div>
+          <div class="node-usage-note">live, every 2 s</div>
+        </div>
         <div class="list-head">
           <div></div><div>Server</div><div>Status</div><div>Map</div><div>Players</div><div>Port</div><div>Mesh address</div><div>Uptime</div><div></div>
         </div>
