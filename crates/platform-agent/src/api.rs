@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -108,6 +108,8 @@ pub fn router_full(
         .route("/capacity", get(capacity))
         .route("/instances", get(list).post(create))
         .route("/usage", get(usage))
+        .route("/storage", get(storage))
+        .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
@@ -466,6 +468,30 @@ async fn usage(State(state): State<ApiState>) -> ApiResult<Vec<crate::instance::
     state.agent
         .usage()
         .await
+        .map(Json)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    lines: Option<usize>,
+}
+
+/// The tail of one server's log, as plain text.
+async fn logs(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    state.agent
+        .logs(&id, q.lines.unwrap_or(200))
+        .await
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+async fn storage(State(state): State<ApiState>) -> ApiResult<crate::agent::Storage> {
+    state.agent
+        .storage()
         .map(Json)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
 }

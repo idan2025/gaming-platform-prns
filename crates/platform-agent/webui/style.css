@@ -253,10 +253,27 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .error-banner button, .toast button { background: none; border: 0; color: inherit; opacity: 0.7; cursor: pointer; font-size: 18px; line-height: 1; }
 .build-version { position: fixed; right: 14px; bottom: 8px; font-size: 11px; color: var(--text-3); pointer-events: none; z-index: 5; }
 
+/* Disk space where game files live, in the sidebar card. */
+.disk-line { display: flex; align-items: center; gap: 7px; margin: -4px 0 12px; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.disk-line svg { width: 14px; height: 14px; flex: none; }
+.disk-line.low { color: var(--warn); font-weight: 600; }
+
+/* Server log: a wide dialog with the tail in a scrolling block. */
+.modal.modal-wide { max-width: 980px; }
+.log-head { display: flex; align-items: center; gap: 8px; }
+.log-head h3 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.log-lines { height: 32px; width: auto; }
+.log-text {
+  margin: 0; height: min(60vh, 560px); overflow: auto; padding: 10px 12px;
+  background: var(--bg-side); border: 1px solid var(--line); border-radius: var(--radius);
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--text-2);
+  white-space: pre-wrap; word-break: break-word;
+}
+
 /* Live usage: a strip under each running server, read every 2 s. */
 .inst > .usage {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px;
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px;
   margin-top: 6px; padding: 10px 0 2px; border-top: 1px solid var(--line);
 }
 .metric { min-width: 0; }
@@ -270,6 +287,9 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .metric-mem .spark path { stroke: var(--warn); }
 .metric-net .spark path { stroke: #6aa8ff; }
 .metric-disk .spark { visibility: hidden; }
+.metric-players .spark path { stroke: var(--text-2); }
+.metric.warn .metric-value, .metric.warn .metric-sub { color: var(--warn); }
+.metric.warn .spark path { stroke: var(--bad); }
 .node-usage {
   display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 28px;
   margin-bottom: 12px; padding: 12px 16px;

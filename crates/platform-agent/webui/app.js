@@ -9,6 +9,12 @@ const POLL_MS = 5000;
 // while a server is busy. Two minutes of history at this rate.
 const USAGE_MS = 2000;
 const USAGE_HISTORY = 60;
+// Below this much free space where game files live, the page warns before a
+// download. A Source game's install is several GB; a GoldSrc one about one.
+const LOW_DISK_BYTES = 10 * 1024 ** 3;
+// The log view: how often it re-reads while open, and how much it may ask for.
+const LOG_REFRESH_MS = 2000;
+const LOG_LINE_CHOICES = [200, 1000, 2000];
 
 // The map-name alphabet, kept in step with `validate_map_name` in
 // crates/game-bridge/src/console.rs. The node is the authority — this only
@@ -36,7 +42,10 @@ const state = {
     prev: new Map(),     // instance_id -> last raw sample (Docker's counters)
     now: new Map(),      // instance_id -> {cpu, mem, memLimit, rx, tx, read, write, pids} per second
     hist: new Map(),     // instance_id -> {cpu: [], mem: [], net: []}
+    players: new Map(),  // instance_id -> players_now per list poll (5 s)
   },
+  storage: null,         // {path, free_bytes, total_bytes}, or null on an older agent
+  logTimer: null,
 };
 
 const ICON = {
@@ -51,6 +60,8 @@ const ICON = {
   more: '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
   download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/>',
+  link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
+  log: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
 };
 function icon(name) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -152,6 +163,27 @@ async function api(method, path, body) {
     throw { error: msg, status: resp.status };
   }
   return data;
+}
+
+// The same as api(), for an endpoint that answers plain text (a server log).
+async function apiText(path) {
+  let resp;
+  try {
+    resp = await fetch(path, { headers: { "Authorization": "Bearer " + (state.token || "") } });
+  } catch (e) {
+    throw { __network: true, error: "Could not reach the node. " + (e && e.message ? e.message : "") };
+  }
+  if (resp.status === 401) {
+    setToken(null);
+    showTokenScreen();
+    throw { __auth: true, error: "The token is wrong or no longer valid." };
+  }
+  if (!resp.ok) {
+    let msg = "Request failed (" + resp.status + ").";
+    try { const d = await resp.json(); if (d && typeof d.error === "string") msg = d.error; } catch (_) {}
+    throw { error: msg, status: resp.status };
+  }
+  return resp.text();
 }
 
 function withInFlight(promise) {
@@ -256,10 +288,17 @@ async function poll() {
   if (!state.token) return;
   if (state.inFlight > 0) { maybeSchedulePoll(); return; }
   try {
-    const [cap, insts] = await Promise.all([api("GET", "/capacity"), api("GET", "/instances")]);
+    const [cap, insts, storage] = await Promise.all([
+      api("GET", "/capacity"), api("GET", "/instances"),
+      // An agent older than this page has no /storage; the line just stays hidden.
+      api("GET", "/storage").catch(e => { if (e && e.__auth) throw e; return null; }),
+    ]);
     state.capacity = cap;
     state.instances = Array.isArray(insts) ? insts : [];
+    state.storage = storage;
+    recordPlayers();
     renderStatusPill();
+    renderStorage();
     renderInstances();
   } catch (e) {
     if (e && e.__auth) return;
@@ -267,6 +306,30 @@ async function poll() {
   } finally {
     if (state.token) maybeSchedulePoll();
   }
+}
+
+// ---------- disk space ----------
+
+function renderStorage() {
+  const line = $("disk-line");
+  if (!line) return;
+  const s = state.storage;
+  line.classList.toggle("hidden", !s);
+  if (!s) return;
+  const low = s.free_bytes < LOW_DISK_BYTES;
+  line.classList.toggle("low", low);
+  $("disk-text").textContent = formatBytes(s.free_bytes) + " free";
+  line.title = (low ? "Low on space. A game download may not fit. " : "") +
+    formatBytes(s.free_bytes) + " free of " + formatBytes(s.total_bytes) + " where game files are kept (" + s.path + ").";
+}
+
+// Asked before anything that may download a game. True when there is room,
+// when the node cannot say, or when the operator goes ahead anyway.
+function roomForDownload() {
+  const s = state.storage;
+  if (!s || s.free_bytes >= LOW_DISK_BYTES) return true;
+  return confirm("Only " + formatBytes(s.free_bytes) + " is free on this node's disk.\n\n" +
+    "A game's files can take several GB, and a download that runs out of space fails partway. Go ahead anyway?");
 }
 
 // ---------- live usage ----------
@@ -339,6 +402,22 @@ function ingestUsage(samples) {
   renderUsage();
 }
 
+// Players come from the list's own poll (every 5 s), which already asks each
+// game. "Could not ask" is a gap in the line, never a zero.
+function recordPlayers() {
+  const hist = state.usage.players;
+  const seen = new Set();
+  for (const inst of state.instances) {
+    if (inst.state !== "running") continue;
+    seen.add(inst.instance_id);
+    let h = hist.get(inst.instance_id);
+    if (!h) { h = []; hist.set(inst.instance_id, h); }
+    h.push(inst.players_now == null ? null : inst.players_now);
+    if (h.length > USAGE_HISTORY) h.shift();
+  }
+  for (const id of [...hist.keys()]) if (!seen.has(id)) hist.delete(id);
+}
+
 function formatRate(bytesPerSec) {
   if (bytesPerSec == null || !isFinite(bytesPerSec)) return "—";
   return formatBytes(Math.round(bytesPerSec)) + "/s";
@@ -349,12 +428,18 @@ function formatRate(bytesPerSec) {
 const SPARK_W = 120, SPARK_H = 26;
 function sparkPath(values, floor) {
   if (!values || values.length < 2) return "";
-  const max = Math.max(floor, ...values);
+  const max = Math.max(floor, ...values.filter(v => v != null));
   const step = SPARK_W / (USAGE_HISTORY - 1);
   const x0 = SPARK_W - step * (values.length - 1);
-  return values.map((v, i) =>
-    (i ? "L" : "M") + (x0 + i * step).toFixed(1) + " " + (SPARK_H - 1 - (v / max) * (SPARK_H - 2)).toFixed(1)
-  ).join(" ");
+  // A null is a reading that could not be taken: the line breaks there
+  // rather than dropping to zero.
+  let out = "", pen = false;
+  values.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    out += (pen ? "L" : "M") + (x0 + i * step).toFixed(1) + " " + (SPARK_H - 1 - (v / max) * (SPARK_H - 2)).toFixed(1) + " ";
+    pen = true;
+  });
+  return out.trim();
 }
 
 function buildUsageStrip() {
@@ -375,7 +460,8 @@ function buildUsageStrip() {
     m.appendChild(el("div", "metric-sub"));
     return m;
   };
-  strip.append(metric("cpu", "CPU"), metric("mem", "Memory"), metric("net", "Network"), metric("disk", "Disk"));
+  strip.append(metric("players", "Players"), metric("cpu", "CPU"), metric("mem", "Memory"),
+    metric("net", "Network"), metric("disk", "Disk"));
   return strip;
 }
 
@@ -400,6 +486,14 @@ function renderUsage() {
     strip.classList.toggle("hidden", !show);
     if (!show) continue;
     const h = u.hist.get(id) || { cpu: [], mem: [], net: [] };
+    const players = u.players.get(id) || [];
+    if (inst.players_now == null) {
+      setMetric(strip, "players", "—", "the game did not answer", sparkPath(players, 4),
+        "This game answers no player query, or did not answer this time. Not the same as empty.");
+    } else {
+      const peak = Math.max(0, ...players.filter(v => v != null));
+      setMetric(strip, "players", String(inst.players_now), "peak " + peak + " in view", sparkPath(players, 4));
+    }
     if (now.warming) {
       setMetric(strip, "cpu", "—", "measuring…");
       setMetric(strip, "net", "—", "measuring…");
@@ -417,10 +511,14 @@ function renderUsage() {
         "read " + formatRate(now.read) + " · write " + formatRate(now.write), "");
     }
     if (now.mem != null) mem += now.mem;
+    // Near its limit, Docker kills a server outright. Say so before it does.
+    const tight = now.mem != null && now.memLimit && now.mem / now.memLimit > 0.9;
+    strip.querySelector(".metric-mem").classList.toggle("warn", !!tight);
     setMetric(strip, "mem", formatBytes(now.mem),
-      now.memLimit ? "of " + formatBytes(now.memLimit) : "",
+      now.memLimit ? (tight ? "near its limit of " : "of ") + formatBytes(now.memLimit) : "",
       sparkPath(h.mem, 64 * 1024 * 1024),
-      "Memory in use, not counting file cache the system can drop at any time.");
+      tight ? "Over 90% of this server's memory limit. If it reaches the limit, Docker stops it. Raise memory_limit_bytes for this game in agent.toml."
+        : "Memory in use, not counting file cache the system can drop at any time.");
   }
   const total = $("node-usage");
   if (total) {
@@ -683,7 +781,12 @@ function openInstanceMenu(id, x, y) {
   items.push({ label: "Announce now", icon: "megaphone", disabled: !cap.canAnnounce,
     title: cap.canAnnounce ? "Announce this server on the mesh now." : "Only a running server on the mesh can be announced.",
     action: () => onAnnounce(id) });
+  items.push({ label: "Copy invite link", icon: "link", disabled: !inst.mesh_destination,
+    title: inst.mesh_destination ? "A lanthorn:// link: anyone with Lanthorn who clicks it gets this server opened, ready to join."
+      : "Only a server on the mesh has an invite link.",
+    action: () => copyValue(inviteLink(inst)) });
   items.push({ label: "Copy mesh address", icon: "copy", disabled: !inst.mesh_destination, action: () => copyValue(inst.mesh_destination) });
+  items.push({ label: "Show log", icon: "log", action: () => onShowLog(id) });
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
   showMenu(x, y, items);
@@ -922,6 +1025,9 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
   }
   if (!game.runnable) { showError("This game cannot start here: " + (game.reason || "")); return; }
 
+  // Starting a game that is not installed yet downloads it first.
+  if (!roomForDownload()) return;
+
   const instance_id = randomInstanceId(gameId);
   if (!/^[a-z0-9._-]{1,64}$/.test(instance_id)) { showError("Could not make a valid id for this server."); return; }
 
@@ -1004,6 +1110,7 @@ async function watchInstall(gameId) {
 
 async function onInstall(gameId) {
   if (state.installing.get(gameId)) return;
+  if (!roomForDownload()) return;
   state.installing.set(gameId, true);
   state.installingMsg.delete(gameId);
   state.installDone.delete(gameId);
@@ -1022,6 +1129,79 @@ async function onInstall(gameId) {
     state.installing.delete(gameId);
     renderGames();
   }
+}
+
+// ---------- invite links ----------
+
+// The launcher's format (`launcher-core/src/invite.rs`):
+// lanthorn://join/<destination>?game=<id>&name=<name>. Encoded the way that
+// file encodes, so a link made here and one made in the launcher are the
+// same string. A link only selects a server in the launcher; it joins nothing.
+function inviteLink(inst) {
+  const enc = v => encodeURIComponent(v).replace(/[!'()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+  const q = [];
+  if (inst.game_id) q.push("game=" + enc(inst.game_id));
+  const name = (inst.name || "").trim();
+  if (name) q.push("name=" + enc(Array.from(name).slice(0, 64).join("")));
+  return "lanthorn://join/" + String(inst.mesh_destination).toLowerCase() + (q.length ? "?" + q.join("&") : "");
+}
+
+// ---------- server log ----------
+
+// Read-only on purpose. A box that typed into the server's console would be a
+// free-text console line from a web page, which `console.rs` exists to stop.
+function onShowLog(instanceId) {
+  const inst = instById(instanceId);
+  let lines = LOG_LINE_CHOICES[0];
+  const back = openModal("log-dialog", null, (body, close) => {
+    const head = el("div", "log-head");
+    head.appendChild(el("h3", null, "Log · " + ((inst && inst.name) || instanceId)));
+    const spacer = el("div", "toolbar-spacer");
+    const pick = el("select", "field log-lines");
+    pick.setAttribute("aria-label", "How many lines");
+    for (const n of LOG_LINE_CHOICES) {
+      const o = el("option", null, "Last " + n + " lines");
+      o.value = String(n);
+      pick.appendChild(o);
+    }
+    pick.addEventListener("change", () => { lines = parseInt(pick.value, 10); refresh(true); });
+    const copy = el("button", "btn", "Copy");
+    copy.type = "button";
+    copy.addEventListener("click", () => copyValue(pre.textContent));
+    const shut = el("button", "btn", "Close");
+    shut.type = "button";
+    shut.addEventListener("click", close);
+    head.append(spacer, pick, copy, shut);
+    const pre = el("pre", "log-text", "Reading the log…");
+    pre.tabIndex = 0;
+    const foot = el("div", "muted small log-foot", "Updates every 2 s while open. Read-only.");
+    body.append(head, pre, foot);
+
+    let first = true;
+    async function refresh(jump) {
+      if (state.logTimer) { clearTimeout(state.logTimer); state.logTimer = null; }
+      if (!$("log-dialog")) return;
+      try {
+        const text = await apiText("/instances/" + encodeURIComponent(instanceId) + "/logs?lines=" + lines);
+        if (!$("log-dialog")) return;
+        // Follow the end only for a reader who is already there; someone
+        // scrolled up to read is left where they are.
+        const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+        if (pre.textContent !== text) {
+          pre.textContent = text || "(nothing written yet)";
+          if (first || jump || atEnd) pre.scrollTop = pre.scrollHeight;
+        }
+        first = false;
+        foot.textContent = "Updates every 2 s while open. Read-only.";
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        foot.textContent = (e && e.error) || "Could not read the log.";
+      }
+      if ($("log-dialog")) state.logTimer = setTimeout(() => refresh(false), LOG_REFRESH_MS);
+    }
+    refresh(true);
+  });
+  back.querySelector(".modal").classList.add("modal-wide");
 }
 
 // ---------- server actions ----------
@@ -1490,6 +1670,9 @@ document.addEventListener("DOMContentLoaded", () => {
     state.rows.clear();
     state.usage.prev.clear(); state.usage.now.clear(); state.usage.hist.clear();
     state.usage.supported = true;
+    state.usage.players.clear();
+    state.storage = null;
+    renderStorage();
     state.installing.clear();
     state.installingMsg.clear();
     state.installDone.clear();
@@ -1520,7 +1703,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeMenu();
-      for (const id of ["start-dialog", "map-dialog", "bots-dialog"]) closeModal(id);
+      for (const id of ["start-dialog", "map-dialog", "bots-dialog", "log-dialog"]) closeModal(id);
     }
   });
 

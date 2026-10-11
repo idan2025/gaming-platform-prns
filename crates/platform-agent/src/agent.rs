@@ -44,6 +44,41 @@ use crate::uplink_wire::CapacityResp;
 const BOT_APPLY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 const BOT_APPLY_ATTEMPTS: u32 = 10;
 
+/// Free and total bytes on the filesystem holding `path`.
+// statvfs's field types differ by platform (u64 on Linux, u32 and c_ulong on
+// macOS), so the conversions are real somewhere even where they are not here.
+#[allow(clippy::useless_conversion)]
+pub fn disk_space(path: &std::path::Path) -> Result<Storage> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .context("the path contains a NUL byte")?;
+    // SAFETY: an all-zero statvfs is a valid value of a plain C struct.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a valid, writable
+    // statvfs for the call to fill.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading free space at {}", path.display()));
+    }
+    let frsize = u64::from(st.f_frsize);
+    Ok(Storage {
+        path: path.display().to_string(),
+        // f_bavail, not f_bfree: what an unprivileged writer can use.
+        free_bytes: u64::from(st.f_bavail) * frsize,
+        total_bytes: u64::from(st.f_blocks) * frsize,
+    })
+}
+
+/// Most log lines one request may ask for.
+pub const MAX_LOG_LINES: usize = 2000;
+
+/// Disk space where this node keeps game content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Storage {
+    pub path: String,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 pub struct Agent {
     config: AgentConfig,
     layout: StoreLayout,
@@ -1053,6 +1088,19 @@ impl Agent {
         Ok(instances)
     }
 
+    /// The last lines a server wrote, for a person working out why it will not
+    /// start. Capped so a request cannot ask Docker for a game's whole history.
+    pub async fn logs(&self, instance_id: &str, lines: usize) -> Result<String> {
+        self.docker.logs_tail(instance_id, lines.clamp(1, MAX_LOG_LINES)).await
+    }
+
+    /// Free and total space on the filesystem holding `data_root`, where game
+    /// content is installed. A full disk otherwise surfaces only as a failed
+    /// download, after the time it took to fill it.
+    pub fn storage(&self) -> Result<Storage> {
+        disk_space(&self.config().data_root)
+    }
+
     /// What every running server on this node is using right now.
     ///
     /// Only running containers are read: a stopped one has no counters worth
@@ -1130,5 +1178,22 @@ impl Agent {
             Err(_) => Vec::new(),
         };
         Ok(self.layout.orphan_instance_dirs(&live, &entries))
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::disk_space;
+
+    #[test]
+    fn free_space_is_read_and_is_never_more_than_the_disk() {
+        let s = disk_space(&std::env::temp_dir()).unwrap();
+        assert!(s.total_bytes > 0);
+        assert!(s.free_bytes <= s.total_bytes, "{s:?}");
+    }
+
+    #[test]
+    fn a_missing_path_is_an_error_not_an_empty_disk() {
+        assert!(disk_space(std::path::Path::new("/no/such/path/here")).is_err());
     }
 }
