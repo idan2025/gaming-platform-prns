@@ -74,7 +74,7 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
-## Unreleased
+## v0.2.34
 
 ### Lanthorn Host shows a server's player cap
 
