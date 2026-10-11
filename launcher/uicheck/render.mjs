@@ -304,6 +304,22 @@ await run('the detail pane survives a re-render', {
     !!doc.querySelector('#detail .detail-body'));
 });
 
+// The pane re-renders on every poll; its picture must not. A new <img> each
+// time starts transparent and fades in, which made the artwork blink.
+await run('the detail picture is not rebuilt by a re-render', {
+  status: running,
+  rows: () => [row()],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
+  const before = doc.querySelector('#detail .detail-hero > .art');
+  check('the detail pane has artwork', !!before);
+  win.eval('renderDetail()');
+  await win.pollAll();
+  const after = doc.querySelector('#detail .detail-hero > .art');
+  check('the same artwork element survives a re-render and a poll', before === after);
+});
+
 // Binding a local port always succeeds. If nobody could route to the server,
 // the launcher has to say so — otherwise the game sits on "establishing
 // connection" while the launcher claims success, which is exactly what a stale
