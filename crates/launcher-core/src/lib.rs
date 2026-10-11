@@ -267,6 +267,10 @@ pub struct InterfaceSummary {
     pub id: String,
     pub label: String,
     pub connected: bool,
+    /// Not connected, and not failing either: LAN auto-discovery with no
+    /// neighbour to talk to. The UI shows it as searching rather than down,
+    /// and does not count it against the connections that are up.
+    pub idle: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -751,23 +755,28 @@ impl Launcher {
                 let inventory = session.handle().interface_inventory();
                 let names: std::collections::HashMap<_, _> = inventory
                     .iter()
-                    .filter_map(|e| Some((e.snapshot.id, e.name.as_deref()?)))
+                    .filter_map(|e| Some((e.snapshot.id, e.name.clone()?)))
                     .collect();
-                let interfaces = inventory
+                let facts = inventory
                     .iter()
-                    .map(|e| (interface_label(e.name.as_deref(), &e.snapshot, &names), e.snapshot))
-                    .map(|(label, s)| InterfaceSummary {
-                        id: hex::encode(s.id.as_bytes()),
-                        label,
-                        // Degraded still carries traffic; the engine counts
-                        // it online too (`ConnectionState::is_online`).
-                        connected: matches!(
-                            s.connection,
-                            prns_core::interfaces::ConnectionState::Connected
-                                | prns_core::interfaces::ConnectionState::Degraded
-                        ),
+                    .map(|e| {
+                        let s = &e.snapshot;
+                        let owner = match s.membership {
+                            prns_core::interfaces::Membership::FleetMember { supervisor_id } => {
+                                Some(names.get(&supervisor_id).cloned())
+                            }
+                            prns_core::interfaces::Membership::Independent => None,
+                        };
+                        InterfaceFacts {
+                            id: hex::encode(s.id.as_bytes()),
+                            kind: s.id.kind(),
+                            name: e.name.clone(),
+                            owner,
+                            connection: s.connection,
+                        }
                     })
                     .collect();
+                let interfaces = interface_summaries(facts);
                 BrowseStatus {
                     running: true,
                     interfaces,
@@ -1618,35 +1627,89 @@ fn parse_hash(hex_str: &str) -> Result<DestinationHash> {
         .ok_or_else(|| anyhow!("a destination hash is 16 bytes (32 hex chars)"))
 }
 
-/// What a person reads for one interface: the name the bridge gave it (the
-/// relay's address, "LAN auto-discovery"), else a plain word for its kind. A
-/// fleet member, such as a neighbour LAN auto-discovery connected to, has no
-/// name of its own; it is labelled as a peer of the interface that made it,
-/// rather than as a second relay.
-fn interface_label(
-    name: Option<&str>,
-    s: &prns_core::interfaces::InterfaceSnapshot,
-    names: &std::collections::HashMap<prns_core::interfaces::InterfaceId, &str>,
-) -> String {
-    use prns_core::interfaces::{InterfaceKind, Membership};
-    if let Membership::FleetMember { supervisor_id } = s.membership {
-        if name.is_none() {
-            if let Some(owner) = names.get(&supervisor_id) {
-                return format!("{owner} · peer");
+/// One engine interface, reduced to what the status line needs. Kept apart
+/// from the engine's snapshot so the rules below are testable without a node.
+struct InterfaceFacts {
+    id: String,
+    kind: Option<prns_core::interfaces::InterfaceKind>,
+    /// The name the bridge gave it: the relay's address, "LAN auto-discovery".
+    name: Option<String>,
+    /// `Some` for a fleet member, holding its supervisor's name if it has one.
+    owner: Option<Option<String>>,
+    connection: prns_core::interfaces::ConnectionState,
+}
+
+/// The status line's rows, in a fixed order.
+///
+/// - Degraded counts as up: it still carries traffic, and the engine counts it
+///   online too (`ConnectionState::is_online`).
+/// - LAN auto-discovery that has found nobody reports `Disconnected`. That is
+///   searching, not a fault, so it is `idle`: shown, but not as down. It is
+///   not proof that no neighbour is linked either: the engine pinned in
+///   `ENGINE.md` can report `Disconnected` on the side that dialled a
+///   neighbour whose side reports the same link up, so the UI says
+///   "searching" and claims nothing more.
+/// - A fleet member is one neighbour auto-discovery reached. Only those that
+///   are up are listed; one that is not carries nothing, and listing it read
+///   as a second broken connection. Their failures still show, through the
+///   supervisor's own state.
+/// - Ordered relays first, then auto-discovery, then its peers, each by label:
+///   the engine's order changes from one poll to the next, which redrew the
+///   card and moved rows under the pointer.
+fn interface_summaries(facts: Vec<InterfaceFacts>) -> Vec<InterfaceSummary> {
+    use prns_core::interfaces::{ConnectionState, InterfaceKind};
+    let mut rows: Vec<(u8, InterfaceSummary)> = facts
+        .into_iter()
+        .filter_map(|f| {
+            let connected = matches!(f.connection, ConnectionState::Connected | ConnectionState::Degraded);
+            if f.owner.is_some() && !connected {
+                return None;
             }
+            let auto = f.kind == Some(InterfaceKind::AutoWifi);
+            let label = interface_label(&f);
+            let rank = match (&f.owner, auto) {
+                (Some(_), _) => 2,
+                (None, true) => 1,
+                (None, false) => 0,
+            };
+            Some((
+                rank,
+                InterfaceSummary {
+                    id: f.id,
+                    label,
+                    connected,
+                    idle: auto && f.connection == ConnectionState::Disconnected,
+                },
+            ))
+        })
+        .collect();
+    rows.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| a.label.cmp(&b.label)).then_with(|| a.id.cmp(&b.id)));
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
+/// What a person reads for one interface: the name the bridge gave it, else a
+/// plain word for its kind. A neighbour auto-discovery connected to has no
+/// name of its own and is labelled as a peer of the interface that made it,
+/// rather than as a second relay.
+fn interface_label(f: &InterfaceFacts) -> String {
+    use prns_core::interfaces::InterfaceKind;
+    if let Some(Some(owner)) = &f.owner {
+        if f.name.is_none() {
+            return format!("{owner} · peer");
         }
     }
-    let base = match (name, s.id.kind()) {
-        (Some(name), _) => name.to_string(),
+    let base = match (&f.name, f.kind) {
+        (Some(name), _) => name.clone(),
         (None, Some(InterfaceKind::TcpClient)) => "Relay".to_string(),
         (None, Some(InterfaceKind::TcpServer)) => "Listening for relays".to_string(),
         (None, Some(InterfaceKind::AutoWifi)) => "LAN auto-discovery".to_string(),
         (None, Some(kind)) => format!("{kind:?}"),
-        (None, None) => hex::encode(&s.id.as_bytes()[..2]),
+        (None, None) => f.id.chars().take(4).collect(),
     };
-    match s.membership {
-        Membership::FleetMember { .. } => format!("{base} · peer"),
-        Membership::Independent => base,
+    if f.owner.is_some() {
+        format!("{base} · peer")
+    } else {
+        base
     }
 }
 
@@ -1932,6 +1995,61 @@ mod tests {
         assert!(l.remove_interface("tcp:hub:4789").await.unwrap());
         assert_eq!(l.interfaces().await.len(), 1);
         assert!(!l.remove_interface("tcp:hub:4789").await.unwrap());
+    }
+
+    fn facts(
+        id: &str,
+        kind: prns_core::interfaces::InterfaceKind,
+        name: Option<&str>,
+        owner: Option<Option<&str>>,
+        connection: prns_core::interfaces::ConnectionState,
+    ) -> InterfaceFacts {
+        InterfaceFacts {
+            id: id.into(),
+            kind: Some(kind),
+            name: name.map(str::to_string),
+            owner: owner.map(|o| o.map(str::to_string)),
+            connection,
+        }
+    }
+
+    /// Measured on a LAN with no other node: auto-discovery reports
+    /// Disconnected, with a Disconnected member under it. Shown as two
+    /// connections down, that read as a broken launcher next to a working
+    /// relay.
+    #[test]
+    fn auto_discovery_with_nobody_around_is_searching_not_down() {
+        use prns_core::interfaces::{ConnectionState::*, InterfaceKind::*};
+        let rows = interface_summaries(vec![
+            facts("c", TcpClient, None, Some(Some("LAN auto-discovery")), Disconnected),
+            facts("b", AutoWifi, Some("LAN auto-discovery"), None, Disconnected),
+            facts("a", TcpClient, Some("hub:4789"), None, Connected),
+        ]);
+        let shown: Vec<(&str, bool, bool)> =
+            rows.iter().map(|r| (r.label.as_str(), r.connected, r.idle)).collect();
+        assert_eq!(shown, [("hub:4789", true, false), ("LAN auto-discovery", false, true)]);
+    }
+
+    /// A neighbour that is up is listed under auto-discovery, by its owner's
+    /// name; a relay that is failing is down, not idle.
+    #[test]
+    fn a_reached_neighbour_is_listed_and_a_failing_relay_is_down() {
+        use prns_core::interfaces::{ConnectionState::*, InterfaceKind::*};
+        let rows = interface_summaries(vec![
+            facts("c", TcpClient, None, Some(Some("LAN auto-discovery")), Degraded),
+            facts("b", AutoWifi, Some("LAN auto-discovery"), None, Connected),
+            facts("a", TcpClient, Some("hub:4789"), None, Reconnecting),
+        ]);
+        let shown: Vec<(&str, bool, bool)> =
+            rows.iter().map(|r| (r.label.as_str(), r.connected, r.idle)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("hub:4789", false, false),
+                ("LAN auto-discovery", true, false),
+                ("LAN auto-discovery · peer", true, false),
+            ]
+        );
     }
 
     /// The browse node dials one relay. Saving a second has to replace the

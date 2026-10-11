@@ -475,6 +475,26 @@ await run('the Connections card follows the poll', {
   check('once it connects the card says up', card().includes('up') && !card().includes('down'), card());
 });
 
+// On a LAN with no other node, auto-discovery reports Disconnected. That is
+// searching, and showing it as down read as a broken launcher.
+await run('auto-discovery with nobody around is searching, not down', {
+  status: { running: true, heard_total: 0, interfaces: [
+    { id: '1', label: 'hub:4789', connected: true, idle: false },
+    { id: '2', label: 'LAN auto-discovery', connected: false, idle: true },
+  ] },
+  rows: () => [],
+}, async (win, doc) => {
+  const side = doc.querySelector('#status').textContent;
+  check('the idle interface is not counted as down', side.includes('1 of 1 connection up'), side);
+  const bar = doc.querySelector('#statusbar-text');
+  check('the status bar says searching', bar.textContent.includes('LAN auto-discovery (searching)'), bar.textContent);
+  check('and does not flag it', !bar.querySelector('.sb-bad'));
+  win.setView('connections');
+  await settle();
+  const card = doc.querySelector('#conn-node').textContent;
+  check('the card says searching', card.includes('searching') && !card.includes('down'), card);
+});
+
 // The checkbox was OR-ed with the saved setting and never saved itself, so
 // once auto-discovery was saved there was no way to switch it off.
 await run('LAN auto-discovery can be switched off', {
@@ -494,6 +514,31 @@ await run('LAN auto-discovery can be switched off', {
   check('unticking forgets the saved interface', lastArgs.get('remove_interface')?.id === 'auto', JSON.stringify(lastArgs.get('remove_interface')));
   await win.startBrowse();
   check('and Connect no longer asks for it', lastArgs.get('start_browse')?.opts?.auto === false, JSON.stringify(lastArgs.get('start_browse')));
+});
+
+// Unticking with only a relay saved removes nothing, so the box must start
+// from the saved set; defaulting it on brought auto-discovery back each start.
+await run('a relay saved without auto-discovery starts unticked', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+  interfaces: [{ id: 'tcp:hub:4789', label: 'hub:4789', kind: 'tcp', in_use: true }],
+  savedOpts: { tcp: 'hub:4789', auto: false },
+}, async (win, doc) => {
+  const t = doc.body.textContent;
+  check('the empty list does not promise the local network', t.includes('Connects through hub:4789.'), t.slice(0, 600));
+  win.setView('connections');
+  await settle();
+  check('the box is unticked', !doc.querySelector('#connections-body .toggle-row input').checked);
+  await win.startBrowse();
+  check('Connect does not ask for it', lastArgs.get('start_browse')?.opts?.auto === false, JSON.stringify(lastArgs.get('start_browse')));
+});
+
+await run('with nothing saved, the local network is the default', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+}, async (win) => {
+  await win.startBrowse();
+  check('Connect asks for auto-discovery', lastArgs.get('start_browse')?.opts?.auto === true, JSON.stringify(lastArgs.get('start_browse')));
 });
 
 // A browse node dials one relay. An older settings file can hold several;

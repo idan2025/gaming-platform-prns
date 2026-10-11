@@ -288,7 +288,9 @@ function renderStatus() {
   if (!b) { s.appendChild(el('div', 'node-sub', 'Starting…')); return; }
 
   const running = b.running;
-  const ifaces = b.interfaces || [];
+  // An idle interface (LAN auto-discovery with nobody around) is searching,
+  // not down, so it is left out of "x of y up".
+  const ifaces = (b.interfaces || []).filter(i => !i.idle);
   const up = ifaces.filter(i => i.connected).length;
   const line = el('div', 'node-line');
   line.appendChild(el('span', 'dot ' + (running ? (up || !ifaces.length ? 'on' : 'warn') : '')));
@@ -323,9 +325,10 @@ function renderStatusBar() {
   const shown = state.servers.length;
   bar.appendChild(el('span', 'sb-item', shown + (shown === 1 ? ' server' : ' servers') + ' online'));
   (b.interfaces || []).forEach(i => {
-    const item = el('span', 'sb-item' + (i.connected ? '' : ' sb-bad'));
-    item.appendChild(el('span', 'dot ' + (i.connected ? 'on' : 'warn')));
-    item.appendChild(el('span', '', i.label + (i.connected ? '' : ' (down)')));
+    const bad = !i.connected && !i.idle;
+    const item = el('span', 'sb-item' + (bad ? ' sb-bad' : ''));
+    item.appendChild(el('span', 'dot ' + (i.connected ? 'on' : i.idle ? '' : 'warn')));
+    item.appendChild(el('span', '', i.label + (i.connected ? '' : i.idle ? ' (searching)' : ' (down)')));
     bar.appendChild(item);
   });
 }
@@ -522,7 +525,7 @@ function renderEmptyNotRunning() {
   const saved = state.savedOpts || {};
   const via = saved.tcp || (state.tcpPeer || '').trim();
   wrap.appendChild(el('p', 'small muted', via
-    ? 'Connects through ' + via + (saved.auto || state.autoDiscover ? ' and your local network.' : '.')
+    ? 'Connects through ' + via + (state.autoDiscover ? ' and your local network.' : '.')
     : 'Connects over your local network. Add a relay under Connections to reach further.'));
   const row = el('div', 'btn-row');
   const btn = el('button', 'btn btn-primary btn-lg', 'Connect to the mesh');
@@ -1769,7 +1772,7 @@ async function loadInterfaces() {
 function refreshConnectionsNode() {
   const b = state.browse;
   const key = JSON.stringify(b && b.running
-    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected])
+    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected, i.idle])
     : null);
   if (key === state.connNodeKey || pressedInside($('conn-node'))) return;
   renderConnectionsNode();
@@ -1782,7 +1785,7 @@ function renderConnectionsNode() {
   const b = state.browse;
   const running = !!(b && b.running);
   state.connNodeKey = JSON.stringify(running
-    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected])
+    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected, i.idle])
     : null);
   const head = el('div', 'card-head');
   head.appendChild(el('span', 'dot ' + (running ? 'on' : '')));
@@ -1798,9 +1801,9 @@ function renderConnectionsNode() {
     const list = el('div', 'item-list');
     ifaces.forEach(i => {
       const row = el('div', 'item');
-      row.appendChild(el('span', 'dot ' + (i.connected ? 'on' : 'warn')));
+      row.appendChild(el('span', 'dot ' + (i.connected ? 'on' : i.idle ? '' : 'warn')));
       row.appendChild(el('span', 'item-main', i.label));
-      row.appendChild(el('span', 'muted small', i.connected ? 'up' : 'down'));
+      row.appendChild(el('span', 'muted small', i.connected ? 'up' : i.idle ? 'searching' : 'down'));
       list.appendChild(row);
     });
     host.appendChild(list);
@@ -1965,7 +1968,10 @@ async function init() {
     state.interfaces = await invoke('list_interfaces') || [];
     state.savedOpts = await invoke('saved_browse_opts') || {};
     if (state.savedOpts.tcp && !state.tcpPeer) state.tcpPeer = state.savedOpts.tcp;
-    if (state.savedOpts.auto) state.autoDiscover = true;
+    // With anything saved, the saved set decides. Only a launcher with nothing
+    // saved defaults to looking on the local network: otherwise an unticked
+    // box, which saves nothing, came back ticked at every start.
+    if (state.interfaces.length) state.autoDiscover = !!state.savedOpts.auto;
   } catch (_) { /* an older backend simply has none */ }
   renderConnections();
   loadInterfaces();
