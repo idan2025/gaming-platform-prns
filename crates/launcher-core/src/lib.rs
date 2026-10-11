@@ -750,9 +750,12 @@ impl Launcher {
                     .map(|s| InterfaceSummary {
                         id: hex::encode(s.id.as_bytes()),
                         label: interface_label(&s),
+                        // Degraded still carries traffic; the engine counts
+                        // it online too (`ConnectionState::is_online`).
                         connected: matches!(
                             s.connection,
                             prns_core::interfaces::ConnectionState::Connected
+                                | prns_core::interfaces::ConnectionState::Degraded
                         ),
                     })
                     .collect();

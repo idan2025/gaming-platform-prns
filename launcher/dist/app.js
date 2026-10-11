@@ -1551,6 +1551,7 @@ async function pollServers() {
     } catch (e) { /* ignore secondary failure */ }
   }
   renderStatus();
+  refreshConnectionsNode();
   renderList();
   renderLegacyNotice();
   if (state.detail) {
@@ -1745,12 +1746,28 @@ async function loadInterfaces() {
   renderConnections();
 }
 
+// The Connections card is drawn when the view opens and right after Connect,
+// which is before a TCP interface has finished dialling. Without this it kept
+// saying "down" for a connection that came up a second later. Redrawn only on
+// a change, so the poll does not rebuild the button under the pointer.
+function refreshConnectionsNode() {
+  const b = state.browse;
+  const key = JSON.stringify(b && b.running
+    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected])
+    : null);
+  if (key === state.connNodeKey) return;
+  renderConnectionsNode();
+}
+
 function renderConnectionsNode() {
   const host = $('conn-node');
   if (!host) return;
   host.textContent = '';
   const b = state.browse;
   const running = !!(b && b.running);
+  state.connNodeKey = JSON.stringify(running
+    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected])
+    : null);
   const head = el('div', 'card-head');
   head.appendChild(el('span', 'dot ' + (running ? 'on' : '')));
   head.appendChild(el('h2', '', running ? 'Connected' : 'Not connected'));
