@@ -16,9 +16,9 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 4 | Installed-game detection | every player | M | proposed |
 | 5 | Tray icon and notifications | hosts, regulars | M | proposed |
 | 6 | Chat and player names in rooms | LAN-room players | L | proposed |
-| 7 | Node: console, resources, schedules, backups | node operators | M–L | proposed |
+| 7 | Node: console, resources, schedules, backups | node operators | M–L | **started**: live usage, read-only log, disk space |
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
-| 9 | Playability check before joining | players on slow links | S | proposed |
+| 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
@@ -169,6 +169,16 @@ exists in settings (`player_name`).
   never copied per instance.
 - Everything rides behind the API token, like every other mutating route.
 
+**Done (after v0.2.32).** Per running server: CPU, memory, network, disk and
+players, every 2 s with two minutes of history, and a node total
+(`GET /usage`, `Agent::usage`). It sends Docker's counters and the page works
+out rates, so the agent keeps no per-viewer history. Memory turns amber above
+90% of the limit. A read-only log tail (`GET /instances/:id/logs`, through
+`assert_managed`), free disk space where content lives (`GET /storage`) with a
+warning before a download on a nearly full disk, and "Copy invite link" in a
+server's menu, byte for byte the launcher's link (pinned on both sides).
+**Not yet:** sending a console line, schedules, backups.
+
 ## 8. In-launcher pack browser
 
 Already planned as `PLAN.md` §13 (the marketplace). Adds: install a signed
@@ -190,6 +200,11 @@ numbers; today the player finds out after the game times out.
 **Rules.** A warning, never a block — the player decides. No probe is sent
 that the detail pane does not already send (`relay.rs`: one server, because a
 person opened it).
+
+**Started (after v0.2.32).** The detail pane puts the probe's round trip in
+words under the numbers: close, a little delay, expect lag, very far. No
+number, no hint. **Not yet:** comparing with the pack's `min_link_class` and
+the interface the server was heard on.
 
 ## 10. Controller and big-screen mode
 
