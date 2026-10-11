@@ -492,7 +492,10 @@ function renderUsage() {
         "This game answers no player query, or did not answer this time. Not the same as empty.");
     } else {
       const peak = Math.max(0, ...players.filter(v => v != null));
-      setMetric(strip, "players", String(inst.players_now), "peak " + peak + " in view", sparkPath(players, 4));
+      const full = inst.max_players_now != null && inst.players_now >= inst.max_players_now;
+      setMetric(strip, "players", playersText(inst),
+        full ? "full" : (inst.bots ? inst.bots + " bots asked for · peak " + peak : "peak " + peak + " in view"),
+        sparkPath(players, inst.max_players_now || 4), playersTitle(inst));
     }
     if (now.warming) {
       setMetric(strip, "cpu", "—", "measuring…");
@@ -583,6 +586,17 @@ function formatUptime(secs) {
   if (h > 0) return h + "h " + m + "m";
   if (m > 0) return m + "m " + s + "s";
   return s + "s";
+}
+
+// "14/16": the cap is what the game reported in the same query, so an agent
+// older than this page (no max_players_now) shows the count alone.
+function playersText(inst) {
+  return String(inst.players_now) + (inst.max_players_now != null ? "/" + inst.max_players_now : "");
+}
+function playersTitle(inst) {
+  // A2S counts bots among players; say how many this node asked for, so a
+  // full-looking server of bots reads as one.
+  return "Read from the game just now" + (inst.bots ? ", including the " + inst.bots + " bots this node asked for" : "") + ".";
 }
 
 function instById(id) { return state.instances.find(i => i.instance_id === id) || null; }
@@ -692,8 +706,8 @@ function renderInstances() {
       playersCell.title = "could not ask this game";
       playersCell.classList.add("muted-em");
     } else {
-      playersCell.textContent = String(inst.players_now);
-      playersCell.removeAttribute("title");
+      playersCell.textContent = playersText(inst);
+      playersCell.title = playersTitle(inst);
       playersCell.classList.remove("muted-em");
     }
 
