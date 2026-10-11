@@ -110,6 +110,10 @@ pub fn router_full(
         .route("/usage", get(usage))
         .route("/storage", get(storage))
         .route("/instances/:id/logs", get(logs))
+        .route("/instances/:id/players", get(players))
+        .route("/instances/:id/restart-on-crash", post(set_restart_on_crash))
+        .route("/orphans/summary", get(orphans_summary))
+        .route("/orphans/clean", post(orphans_clean))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
@@ -487,6 +491,53 @@ async fn logs(
         .logs(&id, q.lines.unwrap_or(200))
         .await
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+/// Who is on a server, from the game. 404 for an unknown instance; `null` for
+/// a game that could not be asked, which the page must not show as empty.
+async fn players(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<Option<Vec<crate::agent::PlayerRow>>> {
+    state.agent
+        .players(&id)
+        .await
+        .map(Json)
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct RestartOnCrashReq {
+    on: bool,
+}
+
+async fn set_restart_on_crash(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RestartOnCrashReq>,
+) -> ApiResult<serde_json::Value> {
+    state.agent
+        .set_restart_on_crash(&id, req.on)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "restart_on_crash": req.on })))
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+async fn orphans_summary(State(state): State<ApiState>) -> ApiResult<crate::agent::OrphanReport> {
+    state.agent
+        .orphan_report()
+        .await
+        .map(Json)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Deletes leftover instance directories. Only on request: see `clean_orphans`.
+async fn orphans_clean(State(state): State<ApiState>) -> ApiResult<crate::agent::OrphanReport> {
+    state.agent
+        .clean_orphans()
+        .await
+        .map(Json)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn storage(State(state): State<ApiState>) -> ApiResult<crate::agent::Storage> {

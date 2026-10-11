@@ -402,6 +402,7 @@ impl Hosting {
                 // request has no field for one, and inventing a default here
                 // would put players in a game nobody asked to share.
                 bots: None,
+                restart_on_crash: false,
                 owner: None,
             };
             let created = client

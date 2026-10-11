@@ -63,6 +63,12 @@ pub struct InstanceSpec {
     /// fails the create rather than being rewritten.
     #[serde(default)]
     pub map: Option<String>,
+    /// Start this server again if it crashes (`agent.rs`, `check_crashes`).
+    /// Off unless asked for, and changeable later: it is kept beside the
+    /// instance, not on the container, because a container's labels are fixed
+    /// at create.
+    #[serde(default)]
+    pub restart_on_crash: bool,
     /// Who asked for this, when something else is deploying on a user's behalf.
     /// An identity hash in hex; opaque to the agent.
     ///
@@ -166,6 +172,18 @@ pub struct InstanceStatus {
     /// cap, still reports its real one.
     #[serde(default)]
     pub max_players_now: Option<u32>,
+    /// How a stopped server ended, read from Docker. `None` while it runs, and
+    /// for a container Docker would not describe.
+    #[serde(default)]
+    pub last_exit: Option<LastExit>,
+    /// Whether this node starts the server again when it crashes.
+    #[serde(default)]
+    pub restart_on_crash: Option<bool>,
+    /// Crash restarts in the last hour. The agent stops trying after
+    /// `MAX_CRASH_RESTARTS_PER_HOUR`, so a server that dies at boot is left
+    /// stopped rather than started forever.
+    #[serde(default)]
+    pub crash_restarts: Option<u32>,
     /// How many bots this node last asked this server to hold, when it asked at
     /// all.
     ///
@@ -175,6 +193,33 @@ pub struct InstanceStatus {
     /// same name. `None` means nobody has set a count on this instance.
     #[serde(default)]
     pub bots: Option<u8>,
+}
+
+/// How a container last ended, as `docker inspect` records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastExit {
+    pub code: i64,
+    /// The kernel killed it for going over its memory limit.
+    pub oom_killed: bool,
+    /// RFC 3339, as Docker writes it.
+    pub finished_at: Option<String>,
+    /// Docker's own error, when the container could not even start.
+    pub error: Option<String>,
+}
+
+impl LastExit {
+    /// Whether this ending was a crash rather than a stop.
+    ///
+    /// A stop ends in 0, or in the signal a stop sends: SIGTERM (143), SIGINT
+    /// (130), or SIGKILL (137) once `docker stop`'s grace runs out. Anything
+    /// else - a segfault (139), an abort (134), an error exit - is a crash,
+    /// and so is the kernel's out-of-memory kill, which also reads as 137.
+    /// Docker's start error counts too: the server never ran.
+    pub fn is_crash(&self) -> bool {
+        self.oom_killed
+            || self.error.as_deref().is_some_and(|e| !e.is_empty())
+            || !matches!(self.code, 0 | 130 | 137 | 143)
+    }
 }
 
 /// What one running server is using, as Docker's own counters say.
@@ -333,6 +378,7 @@ mod tests {
             extra_ports: BTreeMap::new(),
             map: None,
             bots: None,
+            restart_on_crash: false,
             owner: None,
         }
     }
@@ -428,6 +474,9 @@ mod tests {
             mesh_destination: None,
             players_now: Some(14),
             max_players_now: Some(16),
+            last_exit: None,
+            restart_on_crash: None,
+            crash_restarts: None,
             map_now: Some("cs_italy_cz".into()),
             bots: Some(14),
         };
@@ -438,5 +487,24 @@ mod tests {
         older.as_object_mut().unwrap().remove("max_players_now");
         let back: InstanceStatus = serde_json::from_value(older).unwrap();
         assert_eq!(back.max_players_now, None);
+    }
+
+    fn exit(code: i64) -> LastExit {
+        LastExit { code, oom_killed: false, finished_at: None, error: None }
+    }
+
+    /// A stop is never mistaken for a crash, or a crash-restart would undo
+    /// every Stop the operator pressed; and a crash is never mistaken for a
+    /// stop, or restart-on-crash would do nothing.
+    #[test]
+    fn a_stop_is_not_a_crash_and_a_crash_is_not_a_stop() {
+        for stop in [0, 130, 137, 143] {
+            assert!(!exit(stop).is_crash(), "exit {stop} is how a stop ends");
+        }
+        for crash in [1, 2, 134, 139, 255] {
+            assert!(exit(crash).is_crash(), "exit {crash} is a crash");
+        }
+        assert!(LastExit { oom_killed: true, ..exit(137) }.is_crash(), "out of memory reads as 137 too");
+        assert!(LastExit { error: Some("no such file".into()), ..exit(0) }.is_crash());
     }
 }

@@ -177,7 +177,10 @@ out rates, so the agent keeps no per-viewer history. Memory turns amber above
 `assert_managed`), free disk space where content lives (`GET /storage`) with a
 warning before a download on a nearly full disk, and "Copy invite link" in a
 server's menu, byte for byte the launcher's link (pinned on both sides).
-**Not yet:** sending a console line, schedules, backups.
+Then: a players list per server, why a stopped server ended (crash, signal,
+out of memory), restart-on-crash done by the agent (`check_crashes`, at most
+5 an hour, never after a Stop), and cleanup of leftover instance folders on
+request. **Not yet:** sending a console line, schedules, backups.
 
 ## 8. In-launcher pack browser
 
@@ -203,8 +206,9 @@ person opened it).
 
 **Started (after v0.2.32).** The detail pane puts the probe's round trip in
 words under the numbers: close, a little delay, expect lag, very far. No
-number, no hint. **Not yet:** comparing with the pack's `min_link_class` and
-the interface the server was heard on.
+number, no hint. Then the pack's `min_link_class` against the interface the
+server was heard on: a tier 2+ game over LoRa or another radio link is warned
+about, a tier 1 game is told joins will be slow. Only the first hop is known.
 
 ## 10. Controller and big-screen mode
 

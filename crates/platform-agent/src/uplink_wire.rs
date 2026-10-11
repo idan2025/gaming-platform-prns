@@ -278,6 +278,7 @@ mod tests {
             extra_ports: Default::default(),
             map: None,
             bots: None,
+            restart_on_crash: false,
             owner: None,
         }
     }
@@ -297,6 +298,9 @@ mod tests {
             owner: None,
             players_now: None,
             max_players_now: None,
+            last_exit: None,
+            restart_on_crash: None,
+            crash_restarts: None,
             map_now: None,
             bots: None,
         }

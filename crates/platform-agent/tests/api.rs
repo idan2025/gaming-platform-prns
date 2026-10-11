@@ -96,7 +96,10 @@ async fn without_the_token_every_route_is_refused() {
     };
     let client = reqwest::Client::new();
 
-    for path in ["/health", "/capacity", "/instances", "/orphans", "/games"] {
+    for path in [
+        "/health", "/capacity", "/instances", "/orphans", "/games", "/usage", "/storage",
+        "/orphans/summary", "/instances/x/logs", "/instances/x/players",
+    ] {
         let status = client
             .get(format!("http://{addr}{path}"))
             .send()
@@ -124,6 +127,18 @@ async fn without_the_token_every_route_is_refused() {
         .unwrap()
         .status();
     assert_eq!(status, 401, "delete answered without a token");
+
+    // Nor are the routes that delete files or change what restarts.
+    for path in ["/orphans/clean", "/instances/x/restart-on-crash"] {
+        let status = client
+            .post(format!("http://{addr}{path}"))
+            .json(&serde_json::json!({ "on": true }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "{path} answered without a token");
+    }
 
     // The right token works, or the test above proves only that the API is
     // broken.
@@ -478,4 +493,54 @@ async fn stopping_an_unknown_instance_is_a_clean_error() {
     // And the agent is still alive afterwards.
     let health = reqwest::get(format!("http://{addr}/health")).await.unwrap();
     assert!(health.status().is_success());
+}
+
+
+/// Cleaning up leftovers deletes old instance directories that have no
+/// container, and nothing else: a directory touched in the last ten minutes
+/// may belong to a create that has not made its container yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn cleaning_leftovers_removes_only_old_directories_without_a_container() {
+    let Some((addr, dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let instances = dir.path().join("instances");
+    let old = instances.join("long-gone");
+    let fresh = instances.join("being-created");
+    std::fs::create_dir_all(old.join("writable")).unwrap();
+    std::fs::write(old.join("writable/save.dat"), vec![0u8; 4096]).unwrap();
+    std::fs::create_dir_all(&fresh).unwrap();
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&old).unwrap().set_modified(hour_ago).unwrap();
+
+    let client = reqwest::Client::new();
+    let summary: serde_json::Value =
+        client.get(format!("http://{addr}/orphans/summary")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(summary["count"], 1, "{summary}");
+    assert_eq!(summary["skipped_recent"], 1, "{summary}");
+    assert!(summary["bytes"].as_u64().unwrap() >= 4096, "{summary}");
+
+    let done: serde_json::Value =
+        client.post(format!("http://{addr}/orphans/clean")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(done["count"], 1, "{done}");
+    assert!(!old.exists(), "the leftover was not removed");
+    assert!(fresh.exists(), "a directory a create may still need was removed");
+}
+
+/// Restart-on-crash is only for a server this node has.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_on_crash_for_an_unknown_server_is_refused() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let status = reqwest::Client::new()
+        .post(format!("http://{addr}/instances/nobody-here/restart-on-crash"))
+        .json(&serde_json::json!({ "on": true }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 404);
 }

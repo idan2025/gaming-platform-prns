@@ -458,6 +458,26 @@ has gone. Rules a later change could quietly break:
   free URL in an unreviewed pack would be a beacon reporting who browses.
   `every_shipped_pack_has_art` holds every shipped pack to having one.
 
+**A crashed server is restarted by the agent, never by Docker** (2026-10-11,
+`Agent::check_crashes`). Rules a later change could quietly break:
+- **No Docker restart policy.** `docker.rs` creates with none on purpose: a
+  container Docker brings back is back behind the agent, and nothing rebuilds
+  its mesh bridge, so the server would run unreachable. The crash watch goes
+  through `Agent::restart`, which re-bridges.
+- **A Stop is never undone.** A stop ends in 0, 130, 137 or 143, and the agent
+  also remembers what it stopped (`stopped_here`). Only another code, an
+  out-of-memory kill or a start error is a crash (`LastExit::is_crash`), and
+  the first pass after the agent starts only marks exits as seen. Caught by
+  `a_stop_is_not_a_crash_and_a_crash_is_not_a_stop` and `tests/crash_restart.rs`.
+- **At most `MAX_CRASH_RESTARTS_PER_HOUR` (5)**, then the server stays stopped
+  with its last exit on the page.
+- **The opt-in is a file beside `mesh.identity`**, not a label: labels are
+  fixed at create and this can be changed later.
+- **Leftover instance folders are deleted only when asked**
+  (`POST /orphans/clean`), re-derived from the containers that exist at that
+  moment, and never one touched in the last ten minutes: a create makes its
+  folders before its container.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

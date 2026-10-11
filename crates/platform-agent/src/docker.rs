@@ -33,7 +33,7 @@ use game_bridge::framing::CHANNEL_GAME;
 use game_bridge::profile::GameTransport;
 
 use crate::config::{GameRuntime, GAME_LABEL, INSTANCE_LABEL, MANAGED_LABEL, OWNER_LABEL, PORTS_LABEL};
-use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceUsage};
+use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceUsage, LastExit};
 use crate::store::Mount;
 
 /// How long a container gets to exit on its own before Docker kills it.
@@ -575,6 +575,34 @@ impl DockerRuntime {
             }
         }
         Ok(TaskOutcome { exit_code, output })
+    }
+
+    /// How a managed container last ended. `None` while it is running or
+    /// coming up: an exit code there would be the previous run's.
+    ///
+    /// Read-only, from a container `list_managed` found, like `usage`.
+    pub async fn last_exit(&self, container_id: &str) -> Result<Option<LastExit>> {
+        let info = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .with_context(|| format!("inspecting container {container_id}"))?;
+        let Some(state) = info.state else { return Ok(None) };
+        if state.running == Some(true) || state.restarting == Some(true) {
+            return Ok(None);
+        }
+        // Docker writes this zero time for a container that never finished:
+        // created and not yet started, which is not an ending.
+        let finished_at = state.finished_at.filter(|t| !t.starts_with("0001-"));
+        if finished_at.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(LastExit {
+            code: state.exit_code.unwrap_or(0),
+            oom_killed: state.oom_killed.unwrap_or(false),
+            finished_at,
+            error: state.error.filter(|e| !e.is_empty()),
+        }))
     }
 
     /// The last `lines` lines a managed container wrote, stdout and stderr

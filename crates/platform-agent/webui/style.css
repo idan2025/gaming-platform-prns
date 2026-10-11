@@ -258,6 +258,24 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .disk-line svg { width: 14px; height: 14px; flex: none; }
 .disk-line.low { color: var(--warn); font-weight: 600; }
 
+/* A crashed server, and its reason in the map column. */
+.state-crashed { background: var(--bad-soft); color: var(--bad); }
+.bad-text { color: var(--bad) !important; }
+.inst .cell-players.clickable { cursor: pointer; }
+.inst .cell-players.clickable:hover { color: var(--text); text-decoration: underline dotted; }
+
+/* Leftover folders notice, above the list. */
+.notice-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding: 10px 14px; background: var(--surface); border: 1px dashed var(--line-strong); border-radius: var(--radius-lg); color: var(--text-2); font-size: 13px; }
+.notice-bar span { flex: 1; min-width: 0; }
+.btn.btn-small { height: 28px; padding: 0 10px; font-size: 12.5px; }
+
+/* Players dialog. */
+.modal.modal-mid { max-width: 620px; }
+.players-table { max-height: min(60vh, 520px); overflow: auto; }
+.players-row { display: grid; grid-template-columns: minmax(0, 1fr) 70px 90px; gap: 12px; padding: 7px 4px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.players-headrow { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-3); }
+.players-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* Server log: a wide dialog with the tail in a scrolling block. */
 .modal.modal-wide { max-width: 980px; }
 .log-head { display: flex; align-items: center; gap: 8px; }

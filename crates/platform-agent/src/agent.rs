@@ -18,9 +18,9 @@
 //! seeded from the ports of containers already running. Without that, an agent
 //! that restarted would cheerfully hand a live instance's port to a new one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
@@ -106,6 +106,86 @@ pub struct Agent {
     /// One mesh bridge per running instance. Empty and inert on a node with no
     /// `[mesh]` section, which is the LAN-only behaviour that came before.
     mesh: Arc<crate::mesh::MeshBridges>,
+    /// Restart-on-crash bookkeeping (`check_crashes`).
+    crashes: Mutex<CrashWatch>,
+}
+
+/// How often the agent looks for servers that crashed.
+pub const CRASH_CHECK_EVERY: Duration = Duration::from_secs(10);
+/// Crash restarts allowed per server per hour. A server that dies at boot is
+/// started five times and then left stopped, with its last exit on the page.
+pub const MAX_CRASH_RESTARTS_PER_HOUR: usize = 5;
+/// An orphaned instance directory touched this recently is left alone: a create
+/// in progress makes its directories before its container exists, and would
+/// otherwise lose them to a cleanup that ran in between.
+pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(600);
+/// The marker beside an instance that asks for restart-on-crash. Beside
+/// `mesh.identity`, never mounted into the container.
+const RESTART_MARKER: &str = "restart-on-crash";
+
+/// What the crash watch remembers. In memory on purpose: an agent restart
+/// forgets its counts, and it also starts by marking every exit already on the
+/// node as seen, so it never restarts a server that stopped before it ran.
+#[derive(Default)]
+struct CrashWatch {
+    /// Seeded on the first pass; until then nothing is restarted.
+    seeded: bool,
+    /// The exit already looked at, per instance, by its `finished_at`.
+    seen: HashMap<String, String>,
+    /// Stopped through this agent since its last start: a stop, never a crash,
+    /// whatever its exit code.
+    stopped_here: HashSet<String>,
+    /// When each crash restart happened.
+    restarts: HashMap<String, Vec<Instant>>,
+}
+
+impl CrashWatch {
+    fn recent(&mut self, id: &str) -> usize {
+        let hour = Duration::from_secs(3600);
+        let list = self.restarts.entry(id.to_string()).or_default();
+        list.retain(|t| t.elapsed() < hour);
+        list.len()
+    }
+}
+
+/// One player, as the game itself reports it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlayerRow {
+    pub name: String,
+    pub score: i32,
+    pub connected_secs: u32,
+}
+
+/// What a cleanup of leftover instance directories did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrphanReport {
+    pub count: usize,
+    pub bytes: u64,
+    /// Too new to touch (`ORPHAN_MIN_AGE`).
+    pub skipped_recent: usize,
+    /// Could not be removed; the first error says why.
+    pub failed: usize,
+    pub error: Option<String>,
+}
+
+/// Bytes under a directory, not following symlinks.
+fn dir_size(path: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(path) else { return 0 };
+    rd.filter_map(|e| e.ok())
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn recently_touched(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < ORPHAN_MIN_AGE)
 }
 
 impl Agent {
@@ -155,6 +235,7 @@ impl Agent {
             packs,
             specs: Mutex::new(BTreeMap::new()),
             mesh,
+            crashes: Mutex::new(CrashWatch::default()),
         })
     }
 
@@ -671,6 +752,13 @@ impl Agent {
             }
         }
 
+        self.crashes.lock().await.stopped_here.remove(&spec.instance_id);
+        if spec.restart_on_crash {
+            if let Err(e) = self.set_restart_on_crash(&spec.instance_id, true).await {
+                tracing::warn!(instance = %spec.instance_id, error = %format!("{e:#}"), "restart-on-crash could not be turned on");
+            }
+        }
+
         Ok(InstanceStatus {
             instance_id: spec.instance_id,
             game_id: spec.game_id,
@@ -698,6 +786,9 @@ impl Agent {
             owner: spec.owner,
             players_now: None,
             max_players_now: None,
+            last_exit: None,
+            restart_on_crash: None,
+            crash_restarts: None,
             map_now: None,
             bots: spec.bots,
         })
@@ -708,7 +799,9 @@ impl Agent {
         // stopped advertises a destination that accepts a link and then relays
         // to a closed port — worse than not being listed at all.
         self.mesh.stop(instance_id).await;
-        self.docker.stop(instance_id).await
+        self.docker.stop(instance_id).await?;
+        self.crashes.lock().await.stopped_here.insert(instance_id.to_string());
+        Ok(())
     }
 
     /// The maps this node actually has for a game, read off the content copy.
@@ -908,6 +1001,7 @@ impl Agent {
     pub async fn restart(&self, instance_id: &str) -> Result<()> {
         self.mesh.stop(instance_id).await;
         self.docker.restart(instance_id).await?;
+        self.crashes.lock().await.stopped_here.remove(instance_id);
 
         let instances = self.list().await?;
         let Some(instance) = instances.iter().find(|i| i.instance_id == instance_id) else {
@@ -1046,6 +1140,9 @@ impl Agent {
                     // is the one that does.
                     players_now: None,
                     max_players_now: None,
+                    last_exit: None,
+                    restart_on_crash: None,
+                    crash_restarts: None,
                     map_now: None,
                     // This run's memory of what was asked for. A restarted
                     // agent has none, exactly like `spec` itself — the
@@ -1096,6 +1193,18 @@ impl Agent {
             instance.max_players_now = s.as_ref().map(|(_, m, _)| *m);
             instance.map_now = s.map(|(_, _, m)| m);
         }
+        let mut crashes = self.crashes.lock().await;
+        for instance in instances.iter_mut() {
+            instance.restart_on_crash = Some(self.restart_on_crash(&instance.instance_id));
+            instance.crash_restarts = Some(crashes.recent(&instance.instance_id) as u32);
+        }
+        drop(crashes);
+        // Only a stopped server has an ending worth showing, and there are few.
+        for instance in instances.iter_mut().filter(|i| i.state == InstanceState::Stopped) {
+            if let Some(cid) = instance.container_id.as_deref() {
+                instance.last_exit = self.docker.last_exit(cid).await.ok().flatten();
+            }
+        }
         Ok(instances)
     }
 
@@ -1140,6 +1249,13 @@ impl Agent {
     /// the game is a container this agent started, not a stranger on the
     /// network.
     async fn live_stats(&self, instance: &InstanceStatus) -> Option<(u32, u32, String)> {
+        self.ask_game(instance)
+            .await
+            .map(|s| (u32::from(s.info.players), u32::from(s.info.max_players), s.info.map))
+    }
+
+    /// One A2S query to a running instance's game, when its pack declares one.
+    async fn ask_game(&self, instance: &InstanceStatus) -> Option<game_bridge::a2s::A2sStats> {
         if instance.state != InstanceState::Running {
             return None;
         }
@@ -1157,12 +1273,150 @@ impl Agent {
                 // as empty.
                 let ip: std::net::IpAddr = instance.container_ip.as_ref()?.parse().ok()?;
                 let addr = std::net::SocketAddr::new(ip, profile.default_port);
-                game_bridge::a2s::query(addr)
-                    .await
-                    .ok()
-                    .map(|s| (u32::from(s.info.players), u32::from(s.info.max_players), s.info.map))
+                game_bridge::a2s::query(addr).await.ok()
             }
         }
+    }
+
+    /// Who is on a server right now, as its game reports it: names, scores and
+    /// time connected. Bots are in the list; A2S does not tell them apart.
+    ///
+    /// `Ok(None)` is "the game could not be asked" - not running, no query
+    /// protocol in its pack, or no answer - which is not an empty server.
+    pub async fn players(&self, instance_id: &str) -> Result<Option<Vec<PlayerRow>>> {
+        let instances = self.list().await?;
+        let instance = instances
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
+        Ok(self.ask_game(instance).await.map(|s| {
+            s.players_list
+                .into_iter()
+                .map(|p| PlayerRow {
+                    name: p.name,
+                    score: p.score,
+                    connected_secs: p.duration_secs.max(0.0) as u32,
+                })
+                .collect()
+        }))
+    }
+
+    fn restart_marker(&self, instance_id: &str) -> Result<std::path::PathBuf> {
+        Ok(self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join(RESTART_MARKER))
+    }
+
+    /// Whether this server is started again when it crashes.
+    pub fn restart_on_crash(&self, instance_id: &str) -> bool {
+        self.restart_marker(instance_id).map(|p| p.is_file()).unwrap_or(false)
+    }
+
+    /// Turn restart-on-crash on or off for a server this agent manages.
+    pub async fn set_restart_on_crash(&self, instance_id: &str, on: bool) -> Result<()> {
+        if !self.docker.list_managed().await?.iter().any(|c| c.instance_id == instance_id) {
+            return Err(anyhow!("no instance {instance_id:?} on this node"));
+        }
+        let marker = self.restart_marker(instance_id)?;
+        if on {
+            if let Some(dir) = marker.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&marker, b"")?;
+        } else if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+        Ok(())
+    }
+
+    /// Start again every server that asked for it and crashed since the last
+    /// look. Run every `CRASH_CHECK_EVERY` from `main`.
+    ///
+    /// The agent restarts it, not Docker: a restart policy would bring the
+    /// container back behind the agent's back, and nothing would put it on
+    /// the mesh again (`docker.rs`, "No restart policy on purpose"). Going
+    /// through `restart` rebuilds the bridge like a person's Restart does.
+    pub async fn check_crashes(&self) {
+        let containers = match self.docker.list_managed().await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut due = Vec::new();
+        {
+            let mut watch = self.crashes.lock().await;
+            for c in containers.iter().filter(|c| c.state == InstanceState::Stopped) {
+                let Ok(Some(exit)) = self.docker.last_exit(&c.container_id).await else { continue };
+                let key = exit.finished_at.clone().unwrap_or_default();
+                if watch.seen.get(&c.instance_id) == Some(&key) {
+                    continue;
+                }
+                watch.seen.insert(c.instance_id.clone(), key);
+                if !watch.seeded
+                    || watch.stopped_here.contains(&c.instance_id)
+                    || !exit.is_crash()
+                    || !self.restart_on_crash(&c.instance_id)
+                {
+                    continue;
+                }
+                if watch.recent(&c.instance_id) >= MAX_CRASH_RESTARTS_PER_HOUR {
+                    tracing::warn!(instance = %c.instance_id, code = exit.code,
+                        "crashed again; already restarted {MAX_CRASH_RESTARTS_PER_HOUR} times this hour, leaving it stopped");
+                    continue;
+                }
+                watch.restarts.entry(c.instance_id.clone()).or_default().push(Instant::now());
+                due.push((c.instance_id.clone(), exit));
+            }
+            watch.seeded = true;
+        }
+        for (id, exit) in due {
+            tracing::warn!(instance = %id, code = exit.code, oom_killed = exit.oom_killed, "server crashed; starting it again");
+            if let Err(e) = self.restart(&id).await {
+                tracing::warn!(instance = %id, error = %format!("{e:#}"), "could not restart a crashed server");
+            }
+        }
+    }
+
+    /// Leftover instance directories: how many, and how much they hold.
+    pub async fn orphan_report(&self) -> Result<OrphanReport> {
+        let dirs = self.orphan_dirs().await?;
+        let mut report = OrphanReport::default();
+        for d in &dirs {
+            if recently_touched(d) {
+                report.skipped_recent += 1;
+                continue;
+            }
+            report.count += 1;
+            report.bytes += dir_size(d);
+        }
+        Ok(report)
+    }
+
+    /// Delete leftover instance directories, because the operator asked.
+    ///
+    /// Never on its own (`orphan_dirs` says why). What is deleted is
+    /// re-derived here, from the containers that exist now, so a server
+    /// created since the page last looked is never touched; and a directory
+    /// touched in the last `ORPHAN_MIN_AGE` is skipped, which covers a create
+    /// that has made its directories but not yet its container.
+    pub async fn clean_orphans(&self) -> Result<OrphanReport> {
+        let dirs = self.orphan_dirs().await?;
+        let mut report = OrphanReport::default();
+        for d in &dirs {
+            if recently_touched(d) {
+                report.skipped_recent += 1;
+                continue;
+            }
+            let bytes = dir_size(d);
+            match std::fs::remove_dir_all(d) {
+                Ok(()) => {
+                    report.count += 1;
+                    report.bytes += bytes;
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    report.error.get_or_insert_with(|| format!("{}: {e}", d.display()));
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Instance directories with no corresponding container.
