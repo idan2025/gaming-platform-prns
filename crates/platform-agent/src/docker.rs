@@ -577,6 +577,38 @@ impl DockerRuntime {
         Ok(TaskOutcome { exit_code, output })
     }
 
+    /// The last `lines` lines a managed container wrote, stdout and stderr
+    /// interleaved as Docker kept them.
+    ///
+    /// Read-only, and only through `assert_managed`: the log of a stranger's
+    /// container on the same machine is not this agent's to show. There is no
+    /// counterpart that writes: a free-text console line from a web page is
+    /// exactly what `console.rs` exists to prevent.
+    pub async fn logs_tail(&self, spec_id: &str, lines: usize) -> Result<String> {
+        use futures_util::StreamExt;
+        let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
+        self.assert_managed(&name).await?;
+        let mut logs = self.docker.logs(
+            &name,
+            Some(LogsOptions::<String> {
+                stdout: true,
+                stderr: true,
+                tail: lines.to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut output = String::new();
+        while let Some(next) = logs.next().await {
+            match next.with_context(|| format!("reading the log of {name}"))? {
+                LogOutput::StdOut { message } | LogOutput::StdErr { message } | LogOutput::Console { message } => {
+                    output.push_str(&String::from_utf8_lossy(&message));
+                }
+                LogOutput::StdIn { .. } => {}
+            }
+        }
+        Ok(output)
+    }
+
     /// One reading of a managed container's resource counters.
     ///
     /// Takes the container id from `list_managed`, so it only ever reads a

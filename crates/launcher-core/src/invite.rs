@@ -201,4 +201,20 @@ mod tests {
             assert!(v.get(key).is_some(), "the UI reads `{key}`");
         }
     }
+
+    /// Lanthorn Host builds invite links in JavaScript (`inviteLink` in
+    /// `crates/platform-agent/webui/app.js`). This is the string it produces
+    /// for this server, copied from it: if either side's encoding drifts, a
+    /// node's invite stops matching the launcher's own.
+    #[test]
+    fn a_link_from_lanthorn_host_is_the_link_this_side_makes() {
+        const FROM_NODE: &str = "lanthorn://join/a1b2c3d4e5f60718293a4b5c6d7e8f90?game=counter-strike-16&name=Dust2%20%28EU%29%21%20%C3%B1%2A%27%20~ok";
+        let hash = "A1B2C3D4E5F60718293A4B5C6D7E8F90";
+        assert_eq!(link(hash, Some("counter-strike-16"), Some("  Dust2 (EU)! ñ*' ~ok  "), false), FROM_NODE);
+        let i = parse(FROM_NODE).unwrap();
+        assert_eq!(i.destination_hash, hash.to_ascii_lowercase());
+        assert_eq!(i.game_id.as_deref(), Some("counter-strike-16"));
+        assert_eq!(i.name.as_deref(), Some("Dust2 (EU)! ñ*' ~ok"));
+        assert!(!i.room);
+    }
 }

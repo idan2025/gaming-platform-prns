@@ -617,6 +617,64 @@ async fn a_console_line_reaches_a_running_container() {
     );
 }
 
+/// The log view reads what the server wrote, and only the tail asked for.
+#[tokio::test]
+async fn a_server_log_tail_is_what_the_container_wrote() {
+    let Some(rt) = runtime_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_console_image() {
+        return;
+    }
+    let id = format!("logtail{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+    let mut runtime = test_runtime();
+    runtime.image = CONSOLE_IMAGE.to_string();
+    rt.create_and_start(&spec(&id), &runtime, &[], &one_port(27204)).await.unwrap();
+    for line in ["first", "second", "third"] {
+        rt.send_console_line(&id, line).await.unwrap();
+    }
+    let mut tail = String::new();
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tail = rt.logs_tail(&id, 2).await.unwrap_or_default();
+        if tail.contains("CONSOLE:third") {
+            break;
+        }
+    }
+    docker_rm(&name);
+    assert!(tail.contains("CONSOLE:second") && tail.contains("CONSOLE:third"), "{tail:?}");
+    assert!(!tail.contains("CONSOLE:first"), "asked for two lines, got more: {tail:?}");
+}
+
+/// Reading a log is still touching a container: a stranger's is refused.
+#[tokio::test]
+async fn the_log_of_a_container_this_agent_did_not_create_is_refused() {
+    let Some(rt) = runtime_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_test_image() {
+        return;
+    }
+    let id = format!("unmanagedlog{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+    let started = std::process::Command::new("docker")
+        .args(["run", "-d", "--name", &name, TEST_IMAGE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(started, Ok(s) if s.success()) {
+        return;
+    }
+    let err = rt.logs_tail(&id, 10).await.unwrap_err().to_string();
+    docker_rm(&name);
+    assert!(err.contains("not managed by this agent"), "{err}");
+}
+
 /// One call is one command. A newline in the line would be a second command
 /// nobody asked for, and the map name that produced it is already refused by
 /// `console.rs` — this is the backstop at the last point before the bytes leave.
