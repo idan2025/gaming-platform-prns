@@ -74,6 +74,37 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.32
+
+The first release a v0.2.31 launcher can update to by itself: on the Windows
+installer, the macOS app and the AppImage, Update now in the banner is all it
+takes.
+
+### Connections no longer say "down" when they are working
+
+The Connections page drew itself once, while a relay was still connecting, and
+never looked again, so a working relay kept showing as down. It now updates as
+connections come and go, and a relay that is connected but slow counts as up.
+
+LAN auto-discovery with nobody else on your network now reads **searching**
+instead of down, and is not counted against you in "x of y connections up".
+That made a perfectly good setup look broken. A neighbour it finds shows as
+"LAN auto-discovery · peer", connections are named by their address instead
+of `TcpClient` / `AutoWifi`, and rows no longer jump around.
+
+### Settings that stick
+
+- A relay you save now replaces the one you had. Before, a relay added later
+  was used until the next restart and then the old one came back.
+- LAN auto-discovery can be turned off, and stays off after a restart.
+- The saved-server count on Connections is up to date when you open it.
+
+### Buttons that do not miss clicks
+
+Parts of the window redrew every two seconds, so a click that happened to
+span a redraw was lost: Leave room most noticeably. They now redraw only when
+something changed, and never while you are pressing a button in them.
+
 ## v0.2.31
 
 ### Mesh Game Servers is now Lanthorn
