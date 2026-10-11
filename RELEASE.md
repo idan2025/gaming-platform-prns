@@ -74,6 +74,14 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host shows a server's player cap
+
+Players read `14/16` instead of `14`, both in the list and in the live usage
+strip, with the cap the game itself reports. A server whose players are bots
+this node asked for says so, and a full one says "full".
+
 ## v0.2.33
 
 ### Lanthorn Host shows what each server is using, live

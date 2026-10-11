@@ -697,6 +697,7 @@ impl Agent {
             uptime_secs: Some(0),
             owner: spec.owner,
             players_now: None,
+            max_players_now: None,
             map_now: None,
             bots: spec.bots,
         })
@@ -1044,6 +1045,7 @@ impl Agent {
                     // placement — so it never queries a game. `list_detailed`
                     // is the one that does.
                     players_now: None,
+                    max_players_now: None,
                     map_now: None,
                     // This run's memory of what was asked for. A restarted
                     // agent has none, exactly like `spec` itself — the
@@ -1090,8 +1092,9 @@ impl Agent {
         let queries = instances.iter().map(|i| self.live_stats(i));
         let stats = futures_util::future::join_all(queries).await;
         for (instance, s) in instances.iter_mut().zip(stats) {
-            instance.players_now = s.as_ref().map(|(p, _)| *p);
-            instance.map_now = s.map(|(_, m)| m);
+            instance.players_now = s.as_ref().map(|(p, _, _)| *p);
+            instance.max_players_now = s.as_ref().map(|(_, m, _)| *m);
+            instance.map_now = s.map(|(_, _, m)| m);
         }
         Ok(instances)
     }
@@ -1136,7 +1139,7 @@ impl Agent {
     /// The query is aimed at the published port on this node's own loopback:
     /// the game is a container this agent started, not a stranger on the
     /// network.
-    async fn live_stats(&self, instance: &InstanceStatus) -> Option<(u32, String)> {
+    async fn live_stats(&self, instance: &InstanceStatus) -> Option<(u32, u32, String)> {
         if instance.state != InstanceState::Running {
             return None;
         }
@@ -1157,7 +1160,7 @@ impl Agent {
                 game_bridge::a2s::query(addr)
                     .await
                     .ok()
-                    .map(|s| (u32::from(s.info.players), s.info.map))
+                    .map(|s| (u32::from(s.info.players), u32::from(s.info.max_players), s.info.map))
             }
         }
     }

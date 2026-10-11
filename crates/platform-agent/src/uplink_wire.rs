@@ -296,6 +296,7 @@ mod tests {
             uptime_secs: None,
             owner: None,
             players_now: None,
+            max_players_now: None,
             map_now: None,
             bots: None,
         }

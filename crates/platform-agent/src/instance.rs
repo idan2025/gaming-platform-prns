@@ -159,6 +159,13 @@ pub struct InstanceStatus {
     /// show the difference rather than render an empty string.
     #[serde(default)]
     pub map_now: Option<String>,
+    /// The server's player cap, as the game reports it in the same query as
+    /// `players_now`. `None` under the same rule: the game could not be asked.
+    /// What the game says rather than the spec's `max_players`, because an
+    /// instance started by an older agent, or one whose config overrides the
+    /// cap, still reports its real one.
+    #[serde(default)]
+    pub max_players_now: Option<u32>,
     /// How many bots this node last asked this server to hold, when it asked at
     /// all.
     ///
@@ -399,5 +406,37 @@ mod tests {
         let json = serde_json::to_string(&InstanceState::Unknown).unwrap();
         assert_eq!(json, "\"unknown\"");
         assert_ne!(InstanceState::Unknown, InstanceState::Stopped);
+    }
+
+    /// Lanthorn Host reads these keys by name, and JavaScript reads a renamed
+    /// one as `undefined`: a rename would turn "14/16" back into "14" and
+    /// nothing would fail. An older agent's reply, without the cap, still
+    /// parses.
+    #[test]
+    fn the_player_cap_is_sent_under_the_key_the_page_reads() {
+        let s = InstanceStatus {
+            instance_id: "cz".into(),
+            game_id: "condition-zero".into(),
+            name: "Testing CZ".into(),
+            state: InstanceState::Running,
+            port: Some(27303),
+            ports: Vec::new(),
+            container_id: None,
+            uptime_secs: None,
+            owner: None,
+            container_ip: None,
+            mesh_destination: None,
+            players_now: Some(14),
+            max_players_now: Some(16),
+            map_now: Some("cs_italy_cz".into()),
+            bots: Some(14),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["players_now"], 14);
+        assert_eq!(v["max_players_now"], 16);
+        let mut older = v.clone();
+        older.as_object_mut().unwrap().remove("max_players_now");
+        let back: InstanceStatus = serde_json::from_value(older).unwrap();
+        assert_eq!(back.max_players_now, None);
     }
 }
