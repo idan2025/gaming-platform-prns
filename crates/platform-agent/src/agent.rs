@@ -47,6 +47,7 @@ const BOT_APPLY_ATTEMPTS: u32 = 10;
 /// Free and total bytes on the filesystem holding `path`.
 // statvfs's field types differ by platform (u64 on Linux, u32 and c_ulong on
 // macOS), so the conversions are real somewhere even where they are not here.
+#[cfg(unix)]
 #[allow(clippy::useless_conversion)]
 pub fn disk_space(path: &std::path::Path) -> Result<Storage> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
@@ -66,6 +67,13 @@ pub fn disk_space(path: &std::path::Path) -> Result<Storage> {
         free_bytes: u64::from(st.f_bavail) * frsize,
         total_bytes: u64::from(st.f_blocks) * frsize,
     })
+}
+
+/// A node runs on Linux (Docker's socket); the agent still builds elsewhere,
+/// and there free space is simply not reported. The page hides the line.
+#[cfg(not(unix))]
+pub fn disk_space(path: &std::path::Path) -> Result<Storage> {
+    Err(anyhow!("free space is not read on this platform ({})", path.display()))
 }
 
 /// Most log lines one request may ask for.
@@ -1185,6 +1193,7 @@ impl Agent {
 mod storage_tests {
     use super::disk_space;
 
+    #[cfg(unix)]
     #[test]
     fn free_space_is_read_and_is_never_more_than_the_disk() {
         let s = disk_space(&std::env::temp_dir()).unwrap();
