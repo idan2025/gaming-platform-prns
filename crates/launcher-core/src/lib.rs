@@ -267,6 +267,10 @@ pub struct InterfaceSummary {
     pub id: String,
     pub label: String,
     pub connected: bool,
+    /// Not connected, and not failing either: LAN auto-discovery with no
+    /// neighbour to talk to. The UI shows it as searching rather than down,
+    /// and does not count it against the connections that are up.
+    pub idle: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +327,11 @@ pub struct InterfaceEntry {
     pub id: String,
     pub label: String,
     pub kind: String,
+    /// Whether Connect uses it. A browse node dials one relay, so only the
+    /// first saved TCP address is used; an older settings file can still hold
+    /// more, and listing those as if they worked is how a player loses track
+    /// of which relay they are on.
+    pub in_use: bool,
 }
 
 fn kind_of(i: &LauncherInterface) -> String {
@@ -743,19 +752,31 @@ impl Launcher {
         match &inner.browse {
             None => BrowseStatus { running: false, interfaces: Vec::new(), heard_total: 0 },
             Some(session) => {
-                let interfaces = session
-                    .handle()
-                    .interfaces()
-                    .into_iter()
-                    .map(|s| InterfaceSummary {
-                        id: hex::encode(s.id.as_bytes()),
-                        label: interface_label(&s),
-                        connected: matches!(
-                            s.connection,
-                            prns_core::interfaces::ConnectionState::Connected
-                        ),
+                let inventory = session.handle().interface_inventory();
+                let names: std::collections::HashMap<_, _> = inventory
+                    .iter()
+                    .filter_map(|e| Some((e.snapshot.id, e.name.clone()?)))
+                    .collect();
+                let facts = inventory
+                    .iter()
+                    .map(|e| {
+                        let s = &e.snapshot;
+                        let owner = match s.membership {
+                            prns_core::interfaces::Membership::FleetMember { supervisor_id } => {
+                                Some(names.get(&supervisor_id).cloned())
+                            }
+                            prns_core::interfaces::Membership::Independent => None,
+                        };
+                        InterfaceFacts {
+                            id: hex::encode(s.id.as_bytes()),
+                            kind: s.id.kind(),
+                            name: e.name.clone(),
+                            owner,
+                            connection: s.connection,
+                        }
                     })
                     .collect();
+                let interfaces = interface_summaries(facts);
                 BrowseStatus {
                     running: true,
                     interfaces,
@@ -1426,7 +1447,13 @@ impl Launcher {
             .await
             .interfaces
             .iter()
-            .map(|i| InterfaceEntry { id: i.id(), label: i.label(), kind: kind_of(i) })
+            .scan(false, |tcp_seen, i| {
+                let in_use = match i {
+                    LauncherInterface::Tcp { .. } => !std::mem::replace(tcp_seen, true),
+                    _ => true,
+                };
+                Some(InterfaceEntry { id: i.id(), label: i.label(), kind: kind_of(i), in_use })
+            })
             .collect()
     }
 
@@ -1437,7 +1464,10 @@ impl Launcher {
     /// player add a relay, see nothing new, and conclude the launcher is
     /// broken. `start_browse` applies the whole saved set.
     ///
-    /// Re-adding the same address replaces it rather than stacking a duplicate.
+    /// A TCP address replaces any saved before it rather than stacking: the
+    /// browse node dials one relay, and keeping the old one first meant a relay
+    /// the player had just added was used until the launcher restarted, then
+    /// silently swapped back.
     pub async fn add_interface(&self, iface: LauncherInterface) -> Result<()> {
         if let LauncherInterface::Tcp { addr } = &iface {
             if addr.trim().is_empty() {
@@ -1446,7 +1476,10 @@ impl Launcher {
         }
         let mut settings = self.settings.lock().await;
         let id = iface.id();
-        settings.interfaces.retain(|i| i.id() != id);
+        let is_tcp = matches!(iface, LauncherInterface::Tcp { .. });
+        settings.interfaces.retain(|i| {
+            i.id() != id && !(is_tcp && matches!(i, LauncherInterface::Tcp { .. }))
+        });
         settings.interfaces.push(iface);
         self.persist(&settings)?;
         Ok(())
@@ -1594,10 +1627,86 @@ fn parse_hash(hex_str: &str) -> Result<DestinationHash> {
         .ok_or_else(|| anyhow!("a destination hash is 16 bytes (32 hex chars)"))
 }
 
-fn interface_label(s: &prns_core::interfaces::InterfaceSnapshot) -> String {
-    match s.id.kind() {
-        Some(kind) => format!("{kind:?}"),
-        None => hex::encode(&s.id.as_bytes()[..2]),
+/// One engine interface, reduced to what the status line needs. Kept apart
+/// from the engine's snapshot so the rules below are testable without a node.
+struct InterfaceFacts {
+    id: String,
+    kind: Option<prns_core::interfaces::InterfaceKind>,
+    /// The name the bridge gave it: the relay's address, "LAN auto-discovery".
+    name: Option<String>,
+    /// `Some` for a fleet member, holding its supervisor's name if it has one.
+    owner: Option<Option<String>>,
+    connection: prns_core::interfaces::ConnectionState,
+}
+
+/// The status line's rows, in a fixed order.
+///
+/// - Degraded counts as up: it still carries traffic, and the engine counts it
+///   online too (`ConnectionState::is_online`).
+/// - LAN auto-discovery that has found nobody reports `Disconnected`. That is
+///   searching, not a fault, so it is `idle`: shown, but not as down.
+/// - A fleet member is one link auto-discovery made. Only those that are up
+///   are listed. One is always there and almost never up: the engine dials
+///   the network's gateway on the rendezvous port (42699) in case the router
+///   hosts a rendezvous, which ordinary routers do not. Listed, it read as a
+///   neighbour that was down.
+/// - Ordered relays first, then auto-discovery, then its peers, each by label:
+///   the engine's order changes from one poll to the next, which redrew the
+///   card and moved rows under the pointer.
+fn interface_summaries(facts: Vec<InterfaceFacts>) -> Vec<InterfaceSummary> {
+    use prns_core::interfaces::{ConnectionState, InterfaceKind};
+    let mut rows: Vec<(u8, InterfaceSummary)> = facts
+        .into_iter()
+        .filter_map(|f| {
+            let connected = matches!(f.connection, ConnectionState::Connected | ConnectionState::Degraded);
+            if f.owner.is_some() && !connected {
+                return None;
+            }
+            let auto = f.kind == Some(InterfaceKind::AutoWifi);
+            let label = interface_label(&f);
+            let rank = match (&f.owner, auto) {
+                (Some(_), _) => 2,
+                (None, true) => 1,
+                (None, false) => 0,
+            };
+            Some((
+                rank,
+                InterfaceSummary {
+                    id: f.id,
+                    label,
+                    connected,
+                    idle: auto && f.connection == ConnectionState::Disconnected,
+                },
+            ))
+        })
+        .collect();
+    rows.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| a.label.cmp(&b.label)).then_with(|| a.id.cmp(&b.id)));
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
+/// What a person reads for one interface: the name the bridge gave it, else a
+/// plain word for its kind. A neighbour auto-discovery connected to has no
+/// name of its own and is labelled as a peer of the interface that made it,
+/// rather than as a second relay.
+fn interface_label(f: &InterfaceFacts) -> String {
+    use prns_core::interfaces::InterfaceKind;
+    if let Some(Some(owner)) = &f.owner {
+        if f.name.is_none() {
+            return format!("{owner} · peer");
+        }
+    }
+    let base = match (&f.name, f.kind) {
+        (Some(name), _) => name.clone(),
+        (None, Some(InterfaceKind::TcpClient)) => "Relay".to_string(),
+        (None, Some(InterfaceKind::TcpServer)) => "Listening for relays".to_string(),
+        (None, Some(InterfaceKind::AutoWifi)) => "LAN auto-discovery".to_string(),
+        (None, Some(kind)) => format!("{kind:?}"),
+        (None, None) => f.id.chars().take(4).collect(),
+    };
+    if f.owner.is_some() {
+        format!("{base} · peer")
+    } else {
+        base
     }
 }
 
@@ -1883,6 +1992,91 @@ mod tests {
         assert!(l.remove_interface("tcp:hub:4789").await.unwrap());
         assert_eq!(l.interfaces().await.len(), 1);
         assert!(!l.remove_interface("tcp:hub:4789").await.unwrap());
+    }
+
+    fn facts(
+        id: &str,
+        kind: prns_core::interfaces::InterfaceKind,
+        name: Option<&str>,
+        owner: Option<Option<&str>>,
+        connection: prns_core::interfaces::ConnectionState,
+    ) -> InterfaceFacts {
+        InterfaceFacts {
+            id: id.into(),
+            kind: Some(kind),
+            name: name.map(str::to_string),
+            owner: owner.map(|o| o.map(str::to_string)),
+            connection,
+        }
+    }
+
+    /// Measured on a LAN with no other node: auto-discovery reports
+    /// Disconnected, with a Disconnected member under it. Shown as two
+    /// connections down, that read as a broken launcher next to a working
+    /// relay.
+    #[test]
+    fn auto_discovery_with_nobody_around_is_searching_not_down() {
+        use prns_core::interfaces::{ConnectionState::*, InterfaceKind::*};
+        let rows = interface_summaries(vec![
+            facts("c", TcpClient, None, Some(Some("LAN auto-discovery")), Disconnected),
+            facts("b", AutoWifi, Some("LAN auto-discovery"), None, Disconnected),
+            facts("a", TcpClient, Some("hub:4789"), None, Connected),
+        ]);
+        let shown: Vec<(&str, bool, bool)> =
+            rows.iter().map(|r| (r.label.as_str(), r.connected, r.idle)).collect();
+        assert_eq!(shown, [("hub:4789", true, false), ("LAN auto-discovery", false, true)]);
+    }
+
+    /// A neighbour that is up is listed under auto-discovery, by its owner's
+    /// name; a relay that is failing is down, not idle.
+    #[test]
+    fn a_reached_neighbour_is_listed_and_a_failing_relay_is_down() {
+        use prns_core::interfaces::{ConnectionState::*, InterfaceKind::*};
+        let rows = interface_summaries(vec![
+            facts("c", TcpClient, None, Some(Some("LAN auto-discovery")), Degraded),
+            facts("b", AutoWifi, Some("LAN auto-discovery"), None, Connected),
+            facts("a", TcpClient, Some("hub:4789"), None, Reconnecting),
+        ]);
+        let shown: Vec<(&str, bool, bool)> =
+            rows.iter().map(|r| (r.label.as_str(), r.connected, r.idle)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("hub:4789", false, false),
+                ("LAN auto-discovery", true, false),
+                ("LAN auto-discovery · peer", true, false),
+            ]
+        );
+    }
+
+    /// The browse node dials one relay. Saving a second has to replace the
+    /// first, or the new one is used until a restart and then quietly dropped
+    /// for the old one, which `saved_browse_opts` picks because it is first.
+    #[tokio::test]
+    async fn a_new_relay_replaces_the_saved_one() {
+        let l = Launcher::new(Vec::new());
+        l.add_interface(LauncherInterface::Tcp { addr: "old:4789".into() }).await.unwrap();
+        l.add_interface(LauncherInterface::Auto).await.unwrap();
+        l.add_interface(LauncherInterface::Tcp { addr: "new:4789".into() }).await.unwrap();
+
+        let saved = l.interfaces().await;
+        assert_eq!(saved.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["auto", "tcp:new:4789"]);
+        assert!(saved.iter().all(|i| i.in_use));
+        assert_eq!(l.saved_browse_opts().await.tcp.as_deref(), Some("new:4789"));
+    }
+
+    /// Settings written before relays replaced each other can hold several.
+    /// Only the first is dialled, so the rest must not read as working.
+    #[tokio::test]
+    async fn extra_saved_relays_are_marked_unused() {
+        let l = Launcher::new(Vec::new());
+        l.settings.lock().await.interfaces = vec![
+            LauncherInterface::Tcp { addr: "a:1".into() },
+            LauncherInterface::Auto,
+            LauncherInterface::Tcp { addr: "b:2".into() },
+        ];
+        let in_use: Vec<bool> = l.interfaces().await.iter().map(|i| i.in_use).collect();
+        assert_eq!(in_use, [true, true, false]);
     }
 
     /// A TCP interface with no address would attach to nothing and report

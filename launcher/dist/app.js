@@ -288,7 +288,9 @@ function renderStatus() {
   if (!b) { s.appendChild(el('div', 'node-sub', 'Starting…')); return; }
 
   const running = b.running;
-  const ifaces = b.interfaces || [];
+  // An idle interface (LAN auto-discovery with nobody around) is searching,
+  // not down, so it is left out of "x of y up".
+  const ifaces = (b.interfaces || []).filter(i => !i.idle);
   const up = ifaces.filter(i => i.connected).length;
   const line = el('div', 'node-line');
   line.appendChild(el('span', 'dot ' + (running ? (up || !ifaces.length ? 'on' : 'warn') : '')));
@@ -323,9 +325,10 @@ function renderStatusBar() {
   const shown = state.servers.length;
   bar.appendChild(el('span', 'sb-item', shown + (shown === 1 ? ' server' : ' servers') + ' online'));
   (b.interfaces || []).forEach(i => {
-    const item = el('span', 'sb-item' + (i.connected ? '' : ' sb-bad'));
-    item.appendChild(el('span', 'dot ' + (i.connected ? 'on' : 'warn')));
-    item.appendChild(el('span', '', i.label + (i.connected ? '' : ' (down)')));
+    const bad = !i.connected && !i.idle;
+    const item = el('span', 'sb-item' + (bad ? ' sb-bad' : ''));
+    item.appendChild(el('span', 'dot ' + (i.connected ? 'on' : i.idle ? '' : 'warn')));
+    item.appendChild(el('span', '', i.label + (i.connected ? '' : i.idle ? ' (searching)' : ' (down)')));
     bar.appendChild(item);
   });
 }
@@ -522,7 +525,7 @@ function renderEmptyNotRunning() {
   const saved = state.savedOpts || {};
   const via = saved.tcp || (state.tcpPeer || '').trim();
   wrap.appendChild(el('p', 'small muted', via
-    ? 'Connects through ' + via + (saved.auto || state.autoDiscover ? ' and your local network.' : '.')
+    ? 'Connects through ' + via + (state.autoDiscover ? ' and your local network.' : '.')
     : 'Connects over your local network. Add a relay under Connections to reach further.'));
   const row = el('div', 'btn-row');
   const btn = el('button', 'btn btn-primary btn-lg', 'Connect to the mesh');
@@ -743,7 +746,8 @@ function setView(name) {
   // The toolbar's search and filters act on the server list only.
   $('filters').classList.toggle('toolbar-dim', name !== 'servers');
   if (name === 'rooms') { loadLanHelper().then(() => renderRoomPanel(true)); }
-  if (name === 'connections') renderConnections();
+  // loadInterfaces re-reads the saved-server count, which grows while browsing.
+  if (name === 'connections') loadInterfaces();
   if (name === 'settings') renderSettings();
 }
 
@@ -1197,7 +1201,10 @@ function browseOpts() {
   const saved = state.savedOpts || {};
   return {
     tcp: tcp !== '' ? tcp : (saved.tcp || null),
-    auto: state.autoDiscover || !!saved.auto,
+    // The checkbox starts from the saved set and saves itself when changed,
+    // so it alone decides; OR-ing in the saved value made it impossible to
+    // switch off.
+    auto: !!state.autoDiscover,
   };
 }
 
@@ -1526,6 +1533,15 @@ function setActive(hash) {
 }
 
 // ---------- polling ----------
+// A press that spans a redraw is lost: the pointer goes down on the old button
+// and up on its replacement, and no click fires. Redraws driven by the poll
+// wait for the press to end; the next tick catches up.
+let pressTarget = null;
+document.addEventListener('pointerdown', e => { pressTarget = e.target; }, true);
+document.addEventListener('pointerup', () => { pressTarget = null; }, true);
+document.addEventListener('pointercancel', () => { pressTarget = null; }, true);
+function pressedInside(host) { return !!(host && pressTarget && host.contains(pressTarget)); }
+
 async function pollStatus() {
   try {
     state.browse = await invoke('browse_status');
@@ -1551,11 +1567,15 @@ async function pollServers() {
     } catch (e) { /* ignore secondary failure */ }
   }
   renderStatus();
+  refreshConnectionsNode();
   renderList();
   renderLegacyNotice();
   if (state.detail) {
     const fresh = rowByHash(state.detail.hash);
-    if (fresh) { state.detail.announce = { ...fresh }; renderDetail(); }
+    if (fresh) {
+      state.detail.announce = { ...fresh };
+      if (!pressedInside($('detail'))) renderDetail();
+    }
   }
 }
 async function pollAll() {
@@ -1745,12 +1765,28 @@ async function loadInterfaces() {
   renderConnections();
 }
 
+// The Connections card is drawn when the view opens and right after Connect,
+// which is before a TCP interface has finished dialling. Without this it kept
+// saying "down" for a connection that came up a second later. Redrawn only on
+// a change, so the poll does not rebuild the button under the pointer.
+function refreshConnectionsNode() {
+  const b = state.browse;
+  const key = JSON.stringify(b && b.running
+    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected, i.idle])
+    : null);
+  if (key === state.connNodeKey || pressedInside($('conn-node'))) return;
+  renderConnectionsNode();
+}
+
 function renderConnectionsNode() {
   const host = $('conn-node');
   if (!host) return;
   host.textContent = '';
   const b = state.browse;
   const running = !!(b && b.running);
+  state.connNodeKey = JSON.stringify(running
+    ? (b.interfaces || []).map(i => [i.id, i.label, i.connected, i.idle])
+    : null);
   const head = el('div', 'card-head');
   head.appendChild(el('span', 'dot ' + (running ? 'on' : '')));
   head.appendChild(el('h2', '', running ? 'Connected' : 'Not connected'));
@@ -1765,9 +1801,9 @@ function renderConnectionsNode() {
     const list = el('div', 'item-list');
     ifaces.forEach(i => {
       const row = el('div', 'item');
-      row.appendChild(el('span', 'dot ' + (i.connected ? 'on' : 'warn')));
+      row.appendChild(el('span', 'dot ' + (i.connected ? 'on' : i.idle ? '' : 'warn')));
       row.appendChild(el('span', 'item-main', i.label));
-      row.appendChild(el('span', 'muted small', i.connected ? 'up' : 'down'));
+      row.appendChild(el('span', 'muted small', i.connected ? 'up' : i.idle ? 'searching' : 'down'));
       list.appendChild(row);
     });
     host.appendChild(list);
@@ -1804,13 +1840,12 @@ function renderConnections() {
   tcp.oninput = () => { state.tcpPeer = tcp.value; };
   const save = el('button', 'btn btn-primary', 'Save');
   save.type = 'button';
-  save.title = 'Save these so this launcher uses them every time';
+  save.title = 'Save this relay so the launcher uses it every time. It replaces the one saved before.';
   save.onclick = async () => {
     save.disabled = true;
     try {
       const addr = (state.tcpPeer || '').trim();
       if (addr) await invoke('add_interface', { kind: 'tcp', addr });
-      if (state.autoDiscover) await invoke('add_interface', { kind: 'auto', addr: null });
       state.savedOpts = await invoke('saved_browse_opts') || state.savedOpts;
       await loadInterfaces();
       hideError();
@@ -1825,7 +1860,21 @@ function renderConnections() {
   const auto = el('input');
   auto.type = 'checkbox';
   auto.checked = state.autoDiscover;
-  auto.onchange = () => { state.autoDiscover = auto.checked; };
+  auto.onchange = async () => {
+    const on = auto.checked;
+    auto.disabled = true;
+    try {
+      if (on) await invoke('add_interface', { kind: 'auto', addr: null });
+      else await invoke('remove_interface', { id: 'auto' });
+      state.autoDiscover = on;
+      state.savedOpts = await invoke('saved_browse_opts') || state.savedOpts;
+      await loadInterfaces();
+      if (state.browse && state.browse.running) toast('Saved. Reconnect to use it.');
+    } catch (e) {
+      auto.checked = !on;
+      showError('Could not save that: ' + errText(e));
+    } finally { auto.disabled = false; }
+  };
   autoWrap.appendChild(auto);
   autoWrap.appendChild(el('span', '', 'Also find neighbours on this local network'));
   add.appendChild(autoWrap);
@@ -1844,6 +1893,11 @@ function renderConnections() {
     const row = el('div', 'item');
     row.appendChild(icon(i.kind === 'auto' ? 'lan' : 'plug'));
     row.appendChild(el('span', 'item-main', i.label));
+    if (i.in_use === false) {
+      const unused = el('span', 'muted small', 'unused');
+      unused.title = 'Only one relay is dialled, the first saved. Forget this one, or forget the other and save this again.';
+      row.appendChild(unused);
+    }
     const del = el('button', 'btn btn-danger', 'Forget');
     del.type = 'button';
     del.onclick = async () => {
@@ -1914,7 +1968,10 @@ async function init() {
     state.interfaces = await invoke('list_interfaces') || [];
     state.savedOpts = await invoke('saved_browse_opts') || {};
     if (state.savedOpts.tcp && !state.tcpPeer) state.tcpPeer = state.savedOpts.tcp;
-    if (state.savedOpts.auto) state.autoDiscover = true;
+    // With anything saved, the saved set decides. Only a launcher with nothing
+    // saved defaults to looking on the local network: otherwise an unticked
+    // box, which saves nothing, came back ticked at every start.
+    if (state.interfaces.length) state.autoDiscover = !!state.savedOpts.auto;
   } catch (_) { /* an older backend simply has none */ }
   renderConnections();
   loadInterfaces();
@@ -1992,6 +2049,11 @@ function renderRoomBanner() {
   const b = $('room-banner');
   if (!b) return;
   const r = state.room;
+  // Called on every poll; rebuilding Leave under the pointer every 2 s lost
+  // clicks, so it redraws only when the room changed.
+  const sig = JSON.stringify(r && r.active ? r : null);
+  if (sig === state.roomBannerSig || pressedInside(b)) return;
+  state.roomBannerSig = sig;
   if (!r || !r.active) { b.classList.add('hidden'); b.textContent = ''; return; }
   b.classList.remove('hidden');
   const blocked = roomFirewallDropped(r).length > 0;

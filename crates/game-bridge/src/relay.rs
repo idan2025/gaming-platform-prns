@@ -1487,7 +1487,7 @@ fn spawn_server_link_relay(
         // instead of a silently missing port mid-session.
         let mut sockets: BTreeMap<u8, Arc<UdpSocket>> = BTreeMap::new();
         for (channel, addr) in std::iter::once((framing::CHANNEL_GAME, game_addr))
-            .chain(extra_udp.into_iter())
+            .chain(extra_udp)
         {
             let sock = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => Arc::new(s),
@@ -2295,7 +2295,8 @@ pub fn attach_interfaces(node: &PrnsNodeHandle, tcp: Option<&str>, auto: bool) {
                 tokio::spawn(async move {
                     match TcpServer::bind(&addr).await {
                         Ok(srv) => {
-                            node.supervise(srv);
+                            let attached = node.supervise(srv);
+                            let _ = node.set_interface_name(attached.id(), format!("Listening on {addr}"));
                             info!(tcp = %addr, "attached TCP server interface");
                         }
                         Err(e) => error!(tcp = %addr, error = ?e, "failed to bind TCP server"),
@@ -2303,7 +2304,10 @@ pub fn attach_interfaces(node: &PrnsNodeHandle, tcp: Option<&str>, auto: bool) {
                 });
             } else if port > 0 {
                 let client = TcpClientInterface::new(addr.to_string());
-                node.attach(client);
+                // Named so a status line can say which relay is down; the
+                // engine's own label is only the kind, "TcpClient".
+                let attached = node.attach(client);
+                let _ = node.set_interface_name(attached.id(), addr);
                 info!(tcp = %addr, "attached TCP client interface");
             }
         } else {
@@ -2311,7 +2315,8 @@ pub fn attach_interfaces(node: &PrnsNodeHandle, tcp: Option<&str>, auto: bool) {
         }
     }
     if auto {
-        node.attach(AutoWifi::default());
+        let attached = node.attach(AutoWifi::default());
+        let _ = node.set_interface_name(attached.id(), "LAN auto-discovery");
         info!("attached Wi-Fi/LAN auto-discovery interface");
     }
     if tcp.is_none() && !auto {

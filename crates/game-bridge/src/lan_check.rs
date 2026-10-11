@@ -184,11 +184,11 @@ fn udp_packet(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u
 fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum: u32 = 0;
     for part in parts {
-        let mut chunks = part.chunks_exact(2);
-        for c in &mut chunks {
-            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        let (pairs, rest) = part.as_chunks::<2>();
+        for c in pairs {
+            sum += u16::from_be_bytes(*c) as u32;
         }
-        if let [last] = chunks.remainder() {
+        if let [last] = rest {
             sum += (*last as u32) << 8;
         }
     }
