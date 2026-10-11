@@ -74,6 +74,31 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host shows what each server is using, live
+
+Each running server on the node's page now has a strip with its players, CPU,
+memory, network and disk, updated every 2 seconds with small graphs of the
+last two minutes, and the top of the page shows the whole node's total. CPU
+is counted like `docker stats`: 100% is one full core. Memory turns amber when
+a server nears its limit, before Docker stops it for running out.
+
+### A server's log, an invite link and free disk space, on the node's page
+
+- **Show log** in a server's menu opens the last 200, 1000 or 2000 lines it
+  wrote, following new lines while it is open. It is read-only.
+- **Copy invite link** gives the same `lanthorn://join/…` link the launcher
+  makes, so you can share a server straight from the node.
+- The sidebar shows the free disk space where game files are kept, and the
+  page asks before a download when less than 10 GB is left.
+
+### The launcher
+
+- The game picture in a server's details no longer blinks every two seconds.
+- Under the numbers, the details now say what the round trip means for
+  playing: close by, a little delay, expect lag, or very far.
+
 ## v0.2.32
 
 The first release a v0.2.31 launcher can update to by itself: on the Windows
