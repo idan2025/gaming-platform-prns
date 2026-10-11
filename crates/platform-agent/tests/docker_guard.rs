@@ -262,6 +262,52 @@ async fn an_instance_can_be_created_started_stopped_and_removed() {
     outcome.expect("the instance lifecycle should complete");
 }
 
+/// Usage is read off a live container, and only one this agent made: the
+/// counters a person watches are Docker's, so the test asks the daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_instance_reports_its_usage() {
+    let Some(rt) = runtime_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_test_image() {
+        eprintln!("skipping: could not build the test image");
+        return;
+    }
+    let id = format!("usage{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+    let dir = std::env::temp_dir().join(format!("gpp-usage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mounts = vec![Mount { host_path: dir.clone(), container_path: "/game".into(), read_only: true }];
+
+    let outcome = async {
+        rt.create_and_start(&spec(&id), &test_runtime(), &mounts, &one_port(27198)).await?;
+        let c = rt
+            .list_managed()
+            .await?
+            .into_iter()
+            .find(|c| c.instance_id == id)
+            .expect("the agent's own container is listed");
+        let first = rt.usage(&id, &c.container_id).await?;
+        let second = rt.usage(&id, &c.container_id).await?;
+        Ok::<_, anyhow::Error>((first, second))
+    }
+    .await;
+    docker_rm(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (first, second) = outcome.expect("usage should be readable");
+
+    assert_eq!(first.instance_id, id);
+    assert!(first.pids.unwrap_or(0) >= 1, "a running container has a process: {first:?}");
+    assert!(first.memory_bytes.is_some(), "memory went unreported: {first:?}");
+    // The test runtime caps the container at 64 MiB; the limit read back is
+    // that cap, not the machine's memory.
+    assert_eq!(first.memory_limit_bytes, Some(64 * 1024 * 1024));
+    assert!(second.sampled_at_ms >= first.sampled_at_ms);
+    assert!(second.cpu_total_ns >= first.cpu_total_ns, "a CPU counter went backwards");
+}
+
 /// A multi-port game (`GAMES.md` §3) against a real daemon: a UDP game port and
 /// a TCP RCON port on one container, published on different host ports, and read
 /// back with each channel still attached to the right one.

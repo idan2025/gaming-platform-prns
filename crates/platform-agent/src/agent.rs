@@ -1053,6 +1053,27 @@ impl Agent {
         Ok(instances)
     }
 
+    /// What every running server on this node is using right now.
+    ///
+    /// Only running containers are read: a stopped one has no counters worth
+    /// showing, and asking Docker for them costs a round trip each. A container
+    /// whose stats could not be read is left out rather than reported as idle —
+    /// an absent row is "unknown", a row of zeros would be a claim.
+    pub async fn usage(&self) -> Result<Vec<crate::instance::InstanceUsage>> {
+        let containers = self.docker.list_managed().await?;
+        let reads = containers
+            .iter()
+            .filter(|c| c.state == InstanceState::Running)
+            .map(|c| self.docker.usage(&c.instance_id, &c.container_id));
+        Ok(futures_util::future::join_all(reads)
+            .await
+            .into_iter()
+            .filter_map(|r| {
+                r.map_err(|e| tracing::debug!("container stats unavailable: {e:#}")).ok()
+            })
+            .collect())
+    }
+
     /// Ask one instance's game what it is doing, if it can be asked: how many
     /// players, and which map.
     ///

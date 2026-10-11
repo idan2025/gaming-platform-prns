@@ -107,6 +107,7 @@ pub fn router_full(
         .route("/health", get(health))
         .route("/capacity", get(capacity))
         .route("/instances", get(list).post(create))
+        .route("/usage", get(usage))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
@@ -454,6 +455,16 @@ async fn health(State(state): State<ApiState>) -> Json<serde_json::Value> {
 async fn list(State(state): State<ApiState>) -> ApiResult<Vec<InstanceStatus>> {
     state.agent
         .list_detailed()
+        .await
+        .map(Json)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Docker's resource counters for every running server. Rates are the
+/// caller's to work out from two readings (`InstanceUsage`).
+async fn usage(State(state): State<ApiState>) -> ApiResult<Vec<crate::instance::InstanceUsage>> {
+    state.agent
+        .usage()
         .await
         .map(Json)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))

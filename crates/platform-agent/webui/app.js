@@ -5,6 +5,10 @@
 
 const TOKEN_KEY = "agent_token";
 const POLL_MS = 5000;
+// Resource usage is read faster than the list: it is what someone watches
+// while a server is busy. Two minutes of history at this rate.
+const USAGE_MS = 2000;
+const USAGE_HISTORY = 60;
 
 // The map-name alphabet, kept in step with `validate_map_name` in
 // crates/game-bridge/src/console.rs. The node is the authority — this only
@@ -26,6 +30,13 @@ const state = {
   installing: new Map(), // game_id -> true (install in flight)
   installingMsg: new Map(), // game_id -> string message (post-completion)
   installDone: new Map(), // game_id -> "ok" | "error" marker
+  usage: {
+    timer: null,
+    supported: true,     // false once an older agent answers /usage with 404
+    prev: new Map(),     // instance_id -> last raw sample (Docker's counters)
+    now: new Map(),      // instance_id -> {cpu, mem, memLimit, rx, tx, read, write, pids} per second
+    hist: new Map(),     // instance_id -> {cpu: [], mem: [], net: []}
+  },
 };
 
 const ICON = {
@@ -138,7 +149,7 @@ async function api(method, path, body) {
   if (!resp.ok) {
     const msg = (data && typeof data.error === "string") ? data.error
       : ("Request failed (" + resp.status + " " + resp.statusText + ").");
-    throw { error: msg };
+    throw { error: msg, status: resp.status };
   }
   return data;
 }
@@ -230,9 +241,11 @@ function startPolling() {
   stopPolling();
   maybeSchedulePoll();
   poll();
+  pollUsage();
 }
 function stopPolling() {
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  if (state.usage.timer) { clearTimeout(state.usage.timer); state.usage.timer = null; }
 }
 function maybeSchedulePoll() {
   if (state.pollTimer) return;
@@ -253,6 +266,168 @@ async function poll() {
     if (e && e.__network) showError(e.error);
   } finally {
     if (state.token) maybeSchedulePoll();
+  }
+}
+
+// ---------- live usage ----------
+
+// Docker's counters only grow, so a rate is the change between two readings
+// (`InstanceUsage` in instance.rs). Read only while someone can see the
+// servers list: a hidden tab or the Games page asks the node for nothing.
+async function pollUsage() {
+  const u = state.usage;
+  if (u.timer) { clearTimeout(u.timer); u.timer = null; }
+  // One read at a time: a tab switch during a read must not start a second
+  // loop beside the first. The read in flight schedules the next.
+  if (u.busy || !state.token || !u.supported) return;
+  if (state.activeTab === "servers" && !document.hidden) {
+    u.busy = true;
+    try {
+      ingestUsage(await api("GET", "/usage"));
+    } catch (e) {
+      if (e && e.__auth) return;
+      // An agent older than this page has no /usage: hide the strips, once.
+      if (e && e.status === 404) { u.supported = false; renderUsage(); return; }
+    } finally {
+      u.busy = false;
+    }
+  }
+  if (state.token && !u.timer) u.timer = setTimeout(pollUsage, USAGE_MS);
+}
+
+function ingestUsage(samples) {
+  const u = state.usage;
+  const seen = new Set();
+  for (const s of Array.isArray(samples) ? samples : []) {
+    const id = s.instance_id;
+    seen.add(id);
+    const p = u.prev.get(id);
+    u.prev.set(id, s);
+    const dt = p ? (s.sampled_at_ms - p.sampled_at_ms) / 1000 : 0;
+    // A counter that went backwards is a restarted container: start over
+    // rather than draw a negative rate.
+    if (!p || dt <= 0 || s.cpu_total_ns < p.cpu_total_ns || s.net_rx_bytes < p.net_rx_bytes) {
+      u.now.set(id, { warming: true, mem: s.memory_bytes, memLimit: s.memory_limit_bytes, pids: s.pids });
+      continue;
+    }
+    const dCpu = s.cpu_total_ns - p.cpu_total_ns;
+    const dSys = (s.system_cpu_ns != null && p.system_cpu_ns != null) ? s.system_cpu_ns - p.system_cpu_ns : 0;
+    const cpus = s.online_cpus || 1;
+    // `docker stats`' formula, so the two agree: 100% is one whole core.
+    // Without the machine's counter, wall-clock time stands in for it.
+    const cpu = dSys > 0 ? (dCpu / dSys) * cpus * 100 : dCpu / (dt * 1e9) * 100;
+    const now = {
+      cpu, cpus,
+      mem: s.memory_bytes, memLimit: s.memory_limit_bytes,
+      rx: (s.net_rx_bytes - p.net_rx_bytes) / dt,
+      tx: (s.net_tx_bytes - p.net_tx_bytes) / dt,
+      read: Math.max(0, s.disk_read_bytes - p.disk_read_bytes) / dt,
+      write: Math.max(0, s.disk_write_bytes - p.disk_write_bytes) / dt,
+      pids: s.pids,
+    };
+    u.now.set(id, now);
+    let h = u.hist.get(id);
+    if (!h) { h = { cpu: [], mem: [], net: [] }; u.hist.set(id, h); }
+    h.cpu.push(cpu);
+    h.mem.push(now.mem || 0);
+    h.net.push(now.rx + now.tx);
+    for (const k of ["cpu", "mem", "net"]) if (h[k].length > USAGE_HISTORY) h[k].shift();
+  }
+  // A server that stopped has no usage; keeping its old numbers would show a
+  // stopped server as busy.
+  for (const map of [u.prev, u.now, u.hist]) for (const id of [...map.keys()]) if (!seen.has(id)) map.delete(id);
+  renderUsage();
+}
+
+function formatRate(bytesPerSec) {
+  if (bytesPerSec == null || !isFinite(bytesPerSec)) return "—";
+  return formatBytes(Math.round(bytesPerSec)) + "/s";
+}
+
+// A sparkline as an SVG path. `floor` keeps an idle server's noise flat
+// instead of stretched to the full height.
+const SPARK_W = 120, SPARK_H = 26;
+function sparkPath(values, floor) {
+  if (!values || values.length < 2) return "";
+  const max = Math.max(floor, ...values);
+  const step = SPARK_W / (USAGE_HISTORY - 1);
+  const x0 = SPARK_W - step * (values.length - 1);
+  return values.map((v, i) =>
+    (i ? "L" : "M") + (x0 + i * step).toFixed(1) + " " + (SPARK_H - 1 - (v / max) * (SPARK_H - 2)).toFixed(1)
+  ).join(" ");
+}
+
+function buildUsageStrip() {
+  const strip = el("div", "usage hidden");
+  const metric = (key, label) => {
+    const m = el("div", "metric metric-" + key);
+    const top = el("div", "metric-top");
+    top.append(el("span", "metric-label", label), el("span", "metric-value"));
+    m.appendChild(top);
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 " + SPARK_W + " " + SPARK_H);
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("aria-hidden", "true");
+    svg.classList.add("spark");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    svg.appendChild(path);
+    m.appendChild(svg);
+    m.appendChild(el("div", "metric-sub"));
+    return m;
+  };
+  strip.append(metric("cpu", "CPU"), metric("mem", "Memory"), metric("net", "Network"), metric("disk", "Disk"));
+  return strip;
+}
+
+function setMetric(strip, key, value, sub, path, title) {
+  const m = strip.querySelector(".metric-" + key);
+  m.querySelector(".metric-value").textContent = value;
+  m.querySelector(".metric-sub").textContent = sub || "";
+  const p = m.querySelector(".spark path");
+  if (p) p.setAttribute("d", path || "");
+  if (title) m.title = title; else m.removeAttribute("title");
+}
+
+function renderUsage() {
+  const u = state.usage;
+  let cpu = 0, mem = 0, net = 0, counted = 0;
+  for (const [id, row] of state.rows) {
+    const strip = row.querySelector(".usage");
+    if (!strip) continue;
+    const inst = instById(id);
+    const now = u.now.get(id);
+    const show = u.supported && inst && inst.state === "running" && !!now;
+    strip.classList.toggle("hidden", !show);
+    if (!show) continue;
+    const h = u.hist.get(id) || { cpu: [], mem: [], net: [] };
+    if (now.warming) {
+      setMetric(strip, "cpu", "—", "measuring…");
+      setMetric(strip, "net", "—", "measuring…");
+      setMetric(strip, "disk", "—", "measuring…");
+    } else {
+      counted++;
+      cpu += now.cpu; net += now.rx + now.tx;
+      setMetric(strip, "cpu", Math.round(now.cpu) + "%",
+        now.pids != null ? now.pids + " processes" : "",
+        sparkPath(h.cpu, 25),
+        "100% is one whole CPU core; this machine has " + now.cpus + ". The same figure docker stats shows.");
+      setMetric(strip, "net", "↓ " + formatRate(now.rx), "↑ " + formatRate(now.tx),
+        sparkPath(h.net, 2048), "Everything the game server receives and sends, players' traffic included.");
+      setMetric(strip, "disk", formatRate(now.read + now.write),
+        "read " + formatRate(now.read) + " · write " + formatRate(now.write), "");
+    }
+    if (now.mem != null) mem += now.mem;
+    setMetric(strip, "mem", formatBytes(now.mem),
+      now.memLimit ? "of " + formatBytes(now.memLimit) : "",
+      sparkPath(h.mem, 64 * 1024 * 1024),
+      "Memory in use, not counting file cache the system can drop at any time.");
+  }
+  const total = $("node-usage");
+  if (total) {
+    total.classList.toggle("hidden", !u.supported || u.now.size === 0);
+    $("node-usage-cpu").textContent = counted ? Math.round(cpu) + "%" : "—";
+    $("node-usage-mem").textContent = formatBytes(mem);
+    $("node-usage-net").textContent = counted ? formatRate(net) : "—";
   }
 }
 
@@ -365,7 +540,7 @@ function buildRow(inst) {
   );
   row.append(artCell, nameCell, stateCell,
     el("div", "cell cell-map"), el("div", "cell cell-players"), el("div", "cell cell-port"),
-    el("div", "cell cell-mesh"), el("div", "cell cell-uptime"), actions);
+    el("div", "cell cell-mesh"), el("div", "cell cell-uptime"), actions, buildUsageStrip());
   row.addEventListener("contextmenu", (e) => {
     if (e.target.closest("input, textarea")) return;
     e.preventDefault();
@@ -457,6 +632,7 @@ function renderInstances() {
       state.rows.delete(id);
     }
   }
+  renderUsage();
   $("instances-empty").classList.toggle("hidden", state.instances.length !== 0);
   document.querySelector("#tab-panel-servers .list-head").classList.toggle("hidden", state.instances.length === 0);
 }
@@ -1282,6 +1458,7 @@ function setActiveTab(name) {
   // the operator is looking.
   if (name === "interfaces") loadInterfaces();
   if (name === "games") renderGames();
+  if (name === "servers") pollUsage();
 }
 
 function renderAll() {
@@ -1311,6 +1488,8 @@ document.addEventListener("DOMContentLoaded", () => {
     state.interfaces = [];
     state.rows.forEach(r => r.remove());
     state.rows.clear();
+    state.usage.prev.clear(); state.usage.now.clear(); state.usage.hist.clear();
+    state.usage.supported = true;
     state.installing.clear();
     state.installingMsg.clear();
     state.installDone.clear();
@@ -1344,6 +1523,9 @@ document.addEventListener("DOMContentLoaded", () => {
       for (const id of ["start-dialog", "map-dialog", "bots-dialog"]) closeModal(id);
     }
   });
+
+  // Usage pauses while the page is hidden; pick it up the moment it is back.
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.token) pollUsage(); });
 
   const t = getToken();
   if (t) tryConnect(t);

@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 use bollard::container::{
     AttachContainerOptions, Config, CreateContainerOptions, ListContainersOptions, LogOutput,
-    LogsOptions, RemoveContainerOptions, RestartContainerOptions, StopContainerOptions,
-    WaitContainerOptions,
+    LogsOptions, MemoryStatsStats, RemoveContainerOptions, RestartContainerOptions, Stats,
+    StatsOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
@@ -33,7 +33,7 @@ use game_bridge::framing::CHANNEL_GAME;
 use game_bridge::profile::GameTransport;
 
 use crate::config::{GameRuntime, GAME_LABEL, INSTANCE_LABEL, MANAGED_LABEL, OWNER_LABEL, PORTS_LABEL};
-use crate::instance::{InstancePort, InstanceSpec, InstanceState};
+use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceUsage};
 use crate::store::Mount;
 
 /// How long a container gets to exit on its own before Docker kills it.
@@ -577,6 +577,31 @@ impl DockerRuntime {
         Ok(TaskOutcome { exit_code, output })
     }
 
+    /// One reading of a managed container's resource counters.
+    ///
+    /// Takes the container id from `list_managed`, so it only ever reads a
+    /// container that listing already found carrying this agent's label. It
+    /// changes nothing, which is why it skips `assert_managed`'s extra inspect.
+    ///
+    /// `one-shot`: Docker answers at once instead of sampling twice a second
+    /// apart. The second sample only fills in `precpu_stats`, which this does
+    /// not use: the caller divides consecutive readings itself.
+    pub async fn usage(&self, instance_id: &str, container_id: &str) -> Result<InstanceUsage> {
+        use futures_util::StreamExt;
+        let stats = self
+            .docker
+            .stats(container_id, Some(StatsOptions { stream: false, one_shot: true }))
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("Docker returned no stats for {container_id}"))?
+            .with_context(|| format!("reading stats for {container_id}"))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Ok(usage_from(instance_id, &stats, now_ms))
+    }
+
     pub async fn stop(&self, spec_id: &str) -> Result<()> {
         let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
         self.assert_managed(&name).await?;
@@ -778,6 +803,50 @@ fn own_container_id() -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// Docker's stats, reduced to the counters a person watching a server needs.
+///
+/// Memory follows `docker stats`: the cgroup's usage less the inactive page
+/// cache, which the kernel reclaims the moment anything else wants it.
+/// Reporting the raw figure would show a server that read its maps once as
+/// using all of them forever.
+fn usage_from(instance_id: &str, stats: &Stats, sampled_at_ms: u64) -> InstanceUsage {
+    let inactive_file = match stats.memory_stats.stats {
+        Some(MemoryStatsStats::V1(v1)) => v1.total_inactive_file,
+        Some(MemoryStatsStats::V2(v2)) => v2.inactive_file,
+        None => 0,
+    };
+    let (net_rx_bytes, net_tx_bytes) = stats
+        .networks
+        .iter()
+        .flat_map(|n| n.values())
+        .chain(stats.network.iter())
+        .fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes, tx + n.tx_bytes));
+    let (mut disk_read_bytes, mut disk_write_bytes) = (0u64, 0u64);
+    for e in stats.blkio_stats.io_service_bytes_recursive.iter().flatten() {
+        // cgroup v1 also reports "Total", "Sync" and "Async", which are sums
+        // of these; counting them would multiply every byte.
+        match e.op.to_ascii_lowercase().as_str() {
+            "read" => disk_read_bytes += e.value,
+            "write" => disk_write_bytes += e.value,
+            _ => {}
+        }
+    }
+    InstanceUsage {
+        instance_id: instance_id.to_string(),
+        sampled_at_ms,
+        cpu_total_ns: stats.cpu_stats.cpu_usage.total_usage,
+        system_cpu_ns: stats.cpu_stats.system_cpu_usage,
+        online_cpus: stats.cpu_stats.online_cpus,
+        memory_bytes: stats.memory_stats.usage.map(|u| u.saturating_sub(inactive_file)),
+        memory_limit_bytes: stats.memory_stats.limit,
+        net_rx_bytes,
+        net_tx_bytes,
+        disk_read_bytes,
+        disk_write_bytes,
+        pids: stats.pids_stats.current,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +885,75 @@ mod tests {
             ]
         );
         assert!(decode_ports_label("").is_empty());
+    }
+
+    /// A real reply from Docker 29.7.2 on cgroup v2 (`one-shot`, so
+    /// `precpu_stats` is empty), trimmed of nothing bollard requires.
+    const STATS_V2: &str = r#"{
+        "read": "2026-10-11T17:31:17.241609712Z", "preread": "0001-01-01T00:00:00Z",
+        "num_procs": 0, "pids_stats": {"current": 11, "limit": 19144},
+        "networks": {
+            "eth0": {"rx_bytes": 2374199, "rx_packets": 14111, "rx_errors": 0, "rx_dropped": 0,
+                     "tx_bytes": 1995168, "tx_packets": 16365, "tx_errors": 0, "tx_dropped": 0},
+            "eth1": {"rx_bytes": 1, "rx_packets": 1, "rx_errors": 0, "rx_dropped": 0,
+                     "tx_bytes": 2, "tx_packets": 1, "tx_errors": 0, "tx_dropped": 0}
+        },
+        "memory_stats": {"usage": 50000000, "limit": 8000000000, "stats": {
+            "active_anon": 0, "active_file": 0, "anon": 0, "anon_thp": 0, "file": 0,
+            "file_dirty": 0, "file_mapped": 0, "file_writeback": 0, "inactive_anon": 0,
+            "inactive_file": 20000000, "kernel_stack": 0, "pgactivate": 0, "pgdeactivate": 0,
+            "pgfault": 0, "pglazyfree": 0, "pglazyfreed": 0, "pgmajfault": 0, "pgrefill": 0,
+            "pgscan": 0, "pgsteal": 0, "shmem": 0, "slab": 0, "slab_reclaimable": 0,
+            "slab_unreclaimable": 0, "sock": 0, "thp_collapse_alloc": 0, "thp_fault_alloc": 0,
+            "unevictable": 0, "workingset_activate": 0, "workingset_nodereclaim": 0,
+            "workingset_refault": 0}},
+        "blkio_stats": {"io_service_bytes_recursive": [
+            {"major": 8, "minor": 0, "op": "read", "value": 1003520},
+            {"major": 8, "minor": 0, "op": "write", "value": 8192}]},
+        "cpu_stats": {"cpu_usage": {"total_usage": 2195699000, "usage_in_kernelmode": 1053810000,
+                      "usage_in_usermode": 1141888000},
+                      "system_cpu_usage": 36887620000000, "online_cpus": 4,
+                      "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0}},
+        "precpu_stats": {"cpu_usage": {"total_usage": 0, "usage_in_kernelmode": 0, "usage_in_usermode": 0},
+                         "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0}},
+        "storage_stats": {}, "name": "/gpp", "id": "abc"
+    }"#;
+
+    #[test]
+    fn usage_is_read_off_a_real_docker_reply() {
+        let stats: Stats = serde_json::from_str(STATS_V2).expect("bollard parses Docker's reply");
+        let u = usage_from("srv", &stats, 1234);
+        assert_eq!(u.instance_id, "srv");
+        assert_eq!(u.sampled_at_ms, 1234);
+        assert_eq!(u.cpu_total_ns, 2_195_699_000);
+        assert_eq!(u.system_cpu_ns, Some(36_887_620_000_000));
+        assert_eq!(u.online_cpus, Some(4));
+        assert_eq!((u.net_rx_bytes, u.net_tx_bytes), (2_374_200, 1_995_170), "every interface counts");
+        assert_eq!((u.disk_read_bytes, u.disk_write_bytes), (1_003_520, 8192));
+        assert_eq!(u.pids, Some(11));
+        assert_eq!(u.memory_limit_bytes, Some(8_000_000_000));
+    }
+
+    /// `docker stats` subtracts the page cache the kernel can drop, and so must
+    /// this: a server that read its maps once would otherwise look like it
+    /// holds them in memory for good.
+    #[test]
+    fn memory_in_use_leaves_out_the_droppable_page_cache() {
+        let stats: Stats = serde_json::from_str(STATS_V2).unwrap();
+        assert_eq!(usage_from("srv", &stats, 0).memory_bytes, Some(30_000_000));
+    }
+
+    /// cgroup v1 lists the same bytes again under "Total", "Sync" and "Async".
+    #[test]
+    fn disk_bytes_are_not_counted_again_under_their_v1_totals() {
+        let v1 = STATS_V2.replace(
+            r#"{"major": 8, "minor": 0, "op": "write", "value": 8192}"#,
+            r#"{"major": 8, "minor": 0, "op": "Write", "value": 8192},
+               {"major": 8, "minor": 0, "op": "Sync", "value": 8192},
+               {"major": 8, "minor": 0, "op": "Total", "value": 1011712}"#,
+        );
+        let stats: Stats = serde_json::from_str(&v1).unwrap();
+        let u = usage_from("srv", &stats, 0);
+        assert_eq!((u.disk_read_bytes, u.disk_write_bytes), (1_003_520, 8192));
     }
 }
