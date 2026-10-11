@@ -23,7 +23,7 @@ account, no port forwarding, no central service, and no internet required.
 > | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance; a GoldSrc node image, so Counter-Strike 1.6 and Half-Life actually host; Day of Defeat, TFC and Opposing Force as packs; a Source node image, so Team Fortress 2, Counter-Strike: Source, Garry's Mod, HL2: Deathmatch and DoD: Source host, and six non-Valve Source games |
 > | Mode 3 | LAN rooms | started — a virtual LAN over Reticulum for games that only find each other by LAN broadcast (`PLAN.md` §14): rooms, a Linux and a Windows adapter, OpenTTD played end to end, rooms in the launcher, a room check that says what failed, and Need for Speed: Underground 2 and Most Wanted (2005) as packs |
 >
-> Current release: **v0.2.32**. What changed, release by release, is in
+> Current release: **v0.2.33**. What changed, release by release, is in
 > [`RELEASE.md`](RELEASE.md); building and tagging one is in there too.
 >
 > The working single-host implementation this generalizes is
@@ -200,6 +200,10 @@ the launcher as soon as it starts (v0.2.12). Every binary also answers
 Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
 the last three.
 
+- **v0.2.33** — Lanthorn Host shows each server's players, CPU, memory,
+  network and disk live, its log, an invite link and the node's free disk
+  space; the launcher's game picture stops blinking and the details say what
+  the round trip means for playing.
 - **v0.2.32** — Connections shows working relays as up, LAN auto-discovery
   with nobody around reads "searching" instead of down, saved relays and the
   auto-discovery switch stick after a restart, and buttons no longer miss
@@ -208,9 +212,6 @@ the last three.
   artwork, right-click menus, a live-only server list, Announce, invite links
   that open a server in a friend's launcher, and updates that install
   themselves from now on.
-- **v0.2.30** — a game that listens on the Wi-Fi's or the Ethernet's
-  address instead of the room's (under Wine or Proton, or natively with a
-  fixed address, on Linux or Windows) can be joined, with nothing to click.
 
 ## The idea
 
