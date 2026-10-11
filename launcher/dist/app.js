@@ -132,6 +132,26 @@ function fmtDuration(secs) {
   if (m > 0) return m + 'm ' + (secs % 60) + 's';
   return secs + 's';
 }
+// Interfaces that carry kilobits, not megabits: radio and serial links. Named
+// as launcher-core reports `source_interface.kind()` (prns InterfaceKind).
+const SLOW_LINKS = {
+  LoRa: 'LoRa radio', Rnode: 'an RNode radio', Kiss: 'a KISS radio modem', Ax25Kiss: 'packet radio',
+  Serial: 'a serial link', EspNow: 'ESP-NOW radio', BluetoothAuto: 'Bluetooth', BluetoothPeer: 'Bluetooth',
+};
+// Whether the link a server was heard on can carry its game (ROADMAP item 9,
+// GAMES.md §4). Only the first hop is known here; a fast first hop can still
+// lead to a slow one further on, so a fast one earns no promise either.
+function linkFit(a) {
+  const slow = SLOW_LINKS[a.interface_label];
+  if (!slow) return null;
+  const tier = a.min_link_class;
+  if (tier != null && tier >= 2) {
+    return { cls: 'feel-bad', text: 'This game needs a fast link, and this server was heard over ' + slow
+      + '. Expect a very slow join, or none.' };
+  }
+  return { cls: 'feel-far', text: 'Heard over ' + slow + '. A low-rate game like this can work, but joining will be slow.' };
+}
+
 // What a round trip means for playing, in words. The detail probe's round trip
 // is one request and its answer over an open link, which is close to what a
 // game's own packets see. The bands are rough on purpose: a hint before Join.
@@ -896,6 +916,14 @@ function renderDetail() {
   else stat(stats, 'Heard', fmtSeen(a.last_seen_secs));
   overview.appendChild(stats);
   const feel = !room && d.data ? playability(d.data.rtt_ms) : null;
+  const fit = !room && !legacy ? linkFit(a) : null;
+  if (fit) {
+    const n = el('p', 'note playability ' + fit.cls, fit.text);
+    n.id = 'detail-linkfit';
+    n.title = 'From the interface this server was heard on and the link tier its pack declares. '
+      + 'Only the first hop is known here. A warning, never a block.';
+    overview.appendChild(n);
+  }
   if (feel) {
     const n = el('p', 'note playability ' + feel.cls, feel.text);
     n.id = 'detail-playability';
