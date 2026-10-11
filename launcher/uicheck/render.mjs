@@ -20,6 +20,8 @@ const appJs = fs.readFileSync(`${DIST}app.js`, 'utf8');
 const failures = [];
 const consoleErrors = [];
 
+const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r => setTimeout(r, 0)); };
+
 function check(name, cond, detail = '') {
   if (!cond) failures.push(`${name}${detail ? ': ' + detail : ''}`);
 }
@@ -210,7 +212,7 @@ async function run(label, scenario, assertions) {
   window.eval(appJs);
   // init() runs a few awaits deep; let the microtask queue drain.
   for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0));
-  await assertions(window, window.document);
+  await assertions(window, window.document, scenario);
   window.clearInterval?.(undefined);
   dom.window.close();
 }
@@ -454,6 +456,77 @@ await run('saved mesh connections are shown', {
   check('no undefined in the interface list', !t.includes('undefined'), t.slice(0, 300));
 });
 
+// The Connections card was drawn right after Connect, while a TCP interface
+// was still dialling, and the poll never redrew it: it said "down" for a
+// connection that was up a second later.
+await run('the Connections card follows the poll', {
+  status: { running: true, interfaces: [{ id: '1', label: 'hub.example.org:4789', connected: false }], heard_total: 0 },
+  rows: () => [],
+}, async (win, doc, scenario) => {
+  win.setView('connections');
+  await settle();
+  const card = () => doc.querySelector('#conn-node').textContent;
+  check('a dialling interface reads as down', card().includes('down'), card());
+  const btn = doc.querySelector('#conn-node button');
+  await win.pollAll();
+  check('an unchanged state does not rebuild the card', doc.querySelector('#conn-node button') === btn);
+  scenario.status = { running: true, interfaces: [{ id: '1', label: 'hub.example.org:4789', connected: true }], heard_total: 0 };
+  await win.pollAll();
+  check('once it connects the card says up', card().includes('up') && !card().includes('down'), card());
+});
+
+// The checkbox was OR-ed with the saved setting and never saved itself, so
+// once auto-discovery was saved there was no way to switch it off.
+await run('LAN auto-discovery can be switched off', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+  interfaces: [{ id: 'auto', label: 'LAN auto-discovery', kind: 'auto', in_use: true }],
+  savedOpts: { tcp: null, auto: true },
+}, async (win, doc, scenario) => {
+  win.setView('connections');
+  await settle();
+  const box = doc.querySelector('#connections-body .toggle-row input');
+  check('the saved setting ticks the box', box && box.checked);
+  scenario.savedOpts = { tcp: null, auto: false };
+  box.checked = false;
+  box.dispatchEvent(new win.Event('change'));
+  await settle();
+  check('unticking forgets the saved interface', lastArgs.get('remove_interface')?.id === 'auto', JSON.stringify(lastArgs.get('remove_interface')));
+  await win.startBrowse();
+  check('and Connect no longer asks for it', lastArgs.get('start_browse')?.opts?.auto === false, JSON.stringify(lastArgs.get('start_browse')));
+});
+
+// A browse node dials one relay. An older settings file can hold several;
+// the ones not dialled must not read as working.
+await run('a saved relay that is not dialled says so', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+  interfaces: [
+    { id: 'tcp:a:1', label: 'a:1', kind: 'tcp', in_use: true },
+    { id: 'tcp:b:2', label: 'b:2', kind: 'tcp', in_use: false },
+  ],
+  savedOpts: { tcp: 'a:1', auto: false },
+}, async (win, doc) => {
+  win.setView('connections');
+  await settle();
+  const items = [...doc.querySelectorAll('#iface-list .item')].map(i => i.textContent);
+  check('the dialled relay is not marked', !items[0].includes('unused'), items[0]);
+  check('the other one is', items[1].includes('unused'), items[1]);
+});
+
+// The count was read at start and after Forget only.
+await run('the saved-server count is re-read when Connections opens', {
+  status: { running: false, interfaces: [], heard_total: 0 },
+  rows: () => [],
+  known: [],
+}, async (win, doc, scenario) => {
+  scenario.known = ['x', 'y', 'z'];
+  win.setView('connections');
+  await settle();
+  const t = doc.querySelector('#connections-body').textContent;
+  check('the count is current', t.includes('remembers 3 servers'), t.slice(-300));
+});
+
 // The game filter is built from the loaded packs, and its first entry clears
 // the filter. An <option> with no `value` attribute reports its own text as its
 // value, so this one once read back as the string "Any game" and was sent to
@@ -545,7 +618,6 @@ await run('browse not running', {
 
 // ---------- Mode 3 LAN rooms (PLAN.md §14, step 5) ----------
 
-const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r => setTimeout(r, 0)); };
 
 const noRoom = {
   active: false, role: null, game_id: null, name: null, room_hash: null, address: null,
@@ -593,6 +665,29 @@ const memberRoom = {
   pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
+
+// The banner was rebuilt on every 2 s poll, so a press on Leave that spanned
+// a tick went down on one button and up on its replacement: no click.
+await run('the room banner is not rebuilt under the pointer', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  room: memberRoom,
+  rows: () => [row()],
+}, async (win, doc, scenario) => {
+  const leave = doc.querySelector('#room-banner-leave');
+  check('a room shows Leave in the banner', !!leave);
+  await win.pollAll();
+  check('an unchanged room keeps the same button', doc.querySelector('#room-banner-leave') === leave);
+  leave.dispatchEvent(new win.Event('pointerdown', { bubbles: true }));
+  scenario.room = { ...memberRoom, members: [...memberRoom.members, { address: '198.19.9.9', is_self: false }] };
+  await win.pollAll();
+  check('a change waits while Leave is pressed', doc.querySelector('#room-banner-leave') === leave);
+  leave.dispatchEvent(new win.Event('pointerup', { bubbles: true }));
+  await win.pollAll();
+  check('and lands once the press ends', doc.querySelector('#room-banner').textContent.includes('3 members'),
+    doc.querySelector('#room-banner').textContent);
+});
 
 await run('a LAN room is a room, not a server', {
   status: running,

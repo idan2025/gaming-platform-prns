@@ -323,6 +323,11 @@ pub struct InterfaceEntry {
     pub id: String,
     pub label: String,
     pub kind: String,
+    /// Whether Connect uses it. A browse node dials one relay, so only the
+    /// first saved TCP address is used; an older settings file can still hold
+    /// more, and listing those as if they worked is how a player loses track
+    /// of which relay they are on.
+    pub in_use: bool,
 }
 
 fn kind_of(i: &LauncherInterface) -> String {
@@ -743,13 +748,17 @@ impl Launcher {
         match &inner.browse {
             None => BrowseStatus { running: false, interfaces: Vec::new(), heard_total: 0 },
             Some(session) => {
-                let interfaces = session
-                    .handle()
-                    .interfaces()
-                    .into_iter()
-                    .map(|s| InterfaceSummary {
+                let inventory = session.handle().interface_inventory();
+                let names: std::collections::HashMap<_, _> = inventory
+                    .iter()
+                    .filter_map(|e| Some((e.snapshot.id, e.name.as_deref()?)))
+                    .collect();
+                let interfaces = inventory
+                    .iter()
+                    .map(|e| (interface_label(e.name.as_deref(), &e.snapshot, &names), e.snapshot))
+                    .map(|(label, s)| InterfaceSummary {
                         id: hex::encode(s.id.as_bytes()),
-                        label: interface_label(&s),
+                        label,
                         // Degraded still carries traffic; the engine counts
                         // it online too (`ConnectionState::is_online`).
                         connected: matches!(
@@ -1429,7 +1438,13 @@ impl Launcher {
             .await
             .interfaces
             .iter()
-            .map(|i| InterfaceEntry { id: i.id(), label: i.label(), kind: kind_of(i) })
+            .scan(false, |tcp_seen, i| {
+                let in_use = match i {
+                    LauncherInterface::Tcp { .. } => !std::mem::replace(tcp_seen, true),
+                    _ => true,
+                };
+                Some(InterfaceEntry { id: i.id(), label: i.label(), kind: kind_of(i), in_use })
+            })
             .collect()
     }
 
@@ -1440,7 +1455,10 @@ impl Launcher {
     /// player add a relay, see nothing new, and conclude the launcher is
     /// broken. `start_browse` applies the whole saved set.
     ///
-    /// Re-adding the same address replaces it rather than stacking a duplicate.
+    /// A TCP address replaces any saved before it rather than stacking: the
+    /// browse node dials one relay, and keeping the old one first meant a relay
+    /// the player had just added was used until the launcher restarted, then
+    /// silently swapped back.
     pub async fn add_interface(&self, iface: LauncherInterface) -> Result<()> {
         if let LauncherInterface::Tcp { addr } = &iface {
             if addr.trim().is_empty() {
@@ -1449,7 +1467,10 @@ impl Launcher {
         }
         let mut settings = self.settings.lock().await;
         let id = iface.id();
-        settings.interfaces.retain(|i| i.id() != id);
+        let is_tcp = matches!(iface, LauncherInterface::Tcp { .. });
+        settings.interfaces.retain(|i| {
+            i.id() != id && !(is_tcp && matches!(i, LauncherInterface::Tcp { .. }))
+        });
         settings.interfaces.push(iface);
         self.persist(&settings)?;
         Ok(())
@@ -1597,10 +1618,35 @@ fn parse_hash(hex_str: &str) -> Result<DestinationHash> {
         .ok_or_else(|| anyhow!("a destination hash is 16 bytes (32 hex chars)"))
 }
 
-fn interface_label(s: &prns_core::interfaces::InterfaceSnapshot) -> String {
-    match s.id.kind() {
-        Some(kind) => format!("{kind:?}"),
-        None => hex::encode(&s.id.as_bytes()[..2]),
+/// What a person reads for one interface: the name the bridge gave it (the
+/// relay's address, "LAN auto-discovery"), else a plain word for its kind. A
+/// fleet member, such as a neighbour LAN auto-discovery connected to, has no
+/// name of its own; it is labelled as a peer of the interface that made it,
+/// rather than as a second relay.
+fn interface_label(
+    name: Option<&str>,
+    s: &prns_core::interfaces::InterfaceSnapshot,
+    names: &std::collections::HashMap<prns_core::interfaces::InterfaceId, &str>,
+) -> String {
+    use prns_core::interfaces::{InterfaceKind, Membership};
+    if let Membership::FleetMember { supervisor_id } = s.membership {
+        if name.is_none() {
+            if let Some(owner) = names.get(&supervisor_id) {
+                return format!("{owner} · peer");
+            }
+        }
+    }
+    let base = match (name, s.id.kind()) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(InterfaceKind::TcpClient)) => "Relay".to_string(),
+        (None, Some(InterfaceKind::TcpServer)) => "Listening for relays".to_string(),
+        (None, Some(InterfaceKind::AutoWifi)) => "LAN auto-discovery".to_string(),
+        (None, Some(kind)) => format!("{kind:?}"),
+        (None, None) => hex::encode(&s.id.as_bytes()[..2]),
+    };
+    match s.membership {
+        Membership::FleetMember { .. } => format!("{base} · peer"),
+        Membership::Independent => base,
     }
 }
 
@@ -1886,6 +1932,36 @@ mod tests {
         assert!(l.remove_interface("tcp:hub:4789").await.unwrap());
         assert_eq!(l.interfaces().await.len(), 1);
         assert!(!l.remove_interface("tcp:hub:4789").await.unwrap());
+    }
+
+    /// The browse node dials one relay. Saving a second has to replace the
+    /// first, or the new one is used until a restart and then quietly dropped
+    /// for the old one, which `saved_browse_opts` picks because it is first.
+    #[tokio::test]
+    async fn a_new_relay_replaces_the_saved_one() {
+        let l = Launcher::new(Vec::new());
+        l.add_interface(LauncherInterface::Tcp { addr: "old:4789".into() }).await.unwrap();
+        l.add_interface(LauncherInterface::Auto).await.unwrap();
+        l.add_interface(LauncherInterface::Tcp { addr: "new:4789".into() }).await.unwrap();
+
+        let saved = l.interfaces().await;
+        assert_eq!(saved.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["auto", "tcp:new:4789"]);
+        assert!(saved.iter().all(|i| i.in_use));
+        assert_eq!(l.saved_browse_opts().await.tcp.as_deref(), Some("new:4789"));
+    }
+
+    /// Settings written before relays replaced each other can hold several.
+    /// Only the first is dialled, so the rest must not read as working.
+    #[tokio::test]
+    async fn extra_saved_relays_are_marked_unused() {
+        let l = Launcher::new(Vec::new());
+        l.settings.lock().await.interfaces = vec![
+            LauncherInterface::Tcp { addr: "a:1".into() },
+            LauncherInterface::Auto,
+            LauncherInterface::Tcp { addr: "b:2".into() },
+        ];
+        let in_use: Vec<bool> = l.interfaces().await.iter().map(|i| i.in_use).collect();
+        assert_eq!(in_use, [true, true, false]);
     }
 
     /// A TCP interface with no address would attach to nothing and report

@@ -432,7 +432,9 @@ impl LanMessage {
                     return Err(LanDecodeError::Truncated);
                 }
                 let members = entries
-                    .chunks_exact(MEMBER_ENTRY_LEN)
+                    .as_chunks::<MEMBER_ENTRY_LEN>()
+                    .0
+                    .iter()
                     .take(count)
                     .map(|e| {
                         let mut id = [0u8; 16];
@@ -670,7 +672,7 @@ mod tests {
         let subnet = RoomSubnet::default();
         // Every derivation of this identity lands on .0 or .255.
         let mut bytes = [0u8; 16];
-        for pair in bytes.chunks_exact_mut(2) {
+        for pair in bytes.as_chunks_mut::<2>().0 {
             pair[1] = 0xff;
         }
         let mut t = MemberTable::new(subnet, 8);
