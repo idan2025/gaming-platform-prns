@@ -16,10 +16,11 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 4 | Installed-game detection | every player | M | proposed |
 | 5 | Tray icon and notifications | hosts, regulars | M | proposed |
 | 6 | Chat and player names in rooms | LAN-room players | L | proposed |
-| 7 | Node: console, resources, schedules, backups | node operators | M–L | **started**: live usage, read-only log, disk space |
+| 7 | Node: console, resources, schedules, backups | node operators | M–L | **started**: live usage, log, players, crash restarts |
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
+| 11 | Node: installed games and downloads | node operators | M | proposed |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 Recommended first: **1 and 2.** They remove the most friction for a new player:
@@ -217,6 +218,102 @@ join, play, leave. Good on a Steam Deck in Game Mode and on a TV.
 
 **How.** The Gamepad API in the webview, a second stylesheet, and focus that is
 always visible. The AppImage already runs on SteamOS.
+
+## 11. Node: installed games and downloads
+
+**What.** An **Installed** page in Lanthorn Host listing every game whose files
+are on this node, and every download in progress, with the controls to manage
+them:
+
+- One row per installed copy: the game, its version directory, its size on
+  disk, when it was installed, and which servers use it (running or stopped).
+- **Delete** a copy you no longer want, after a confirmation that names its
+  size and that nothing uses it.
+- Pressing **Install** on the Games page, or starting a server whose game is
+  not on the node yet, adds a row here at once, marked **Downloading**, with
+  live progress: bytes on disk so far, the rate, the time it has taken, and the
+  total when one is known. When it finishes the row becomes an ordinary
+  installed copy; when it fails, the row keeps the reason, as `install.rs`
+  already does.
+- **Cancel** on a download stops it and discards what it fetched.
+
+Packs and game files are different things and the page keeps them apart: a
+pack is the small `.toml` that says what a game is (the Games page), and the
+game files are what a download puts in `data_root/content/<game>/<version>/`.
+Deleting the files leaves the pack, so the game is still offered and can be
+downloaded again; removing the pack (an addition below) leaves the files.
+
+**Why.** A Source game is 2–29 GB and a node is somebody's disk. Today the
+only way to see what is installed, or get the space back, is a shell on the
+node, and a download shows nothing but how long it has been running. On this
+node on 2026-10-11, Counter-Strike 1.6 had two copies, `app90` (928 MB) and
+`app90-yapb` (931 MB), and only `app90-yapb` is the one `agent.toml` names: a
+gigabyte that nothing uses and nothing shows.
+
+**How.**
+- `GET /content`: every `content/<game>/<version>` directory with its size,
+  modification time, whether `agent.toml` names it as that game's
+  `content_version` (in use by new servers, or an older version), and the ids
+  of the containers that mount it. Read from the disk and from Docker, like
+  everything the agent reports; no database.
+- `DELETE /content/:game/:version`: deletes one copy. The path is built by
+  `StoreLayout::content_dir` from validated ids, never taken from the request.
+- Download progress: the install task already owns its staging directory
+  (`data_root/staging/<task>`, `content.rs`). Its size, read every few seconds,
+  is bytes landed so far; two readings give the rate. `InstallState::Running`
+  gains `bytes` and, when known, `total_bytes`.
+- `DELETE /content/:game/install` (cancel): stops the task's container,
+  discards the staging directory, records `Failed { error: "cancelled" }`.
+
+**Rules.**
+- **A copy a container mounts is never deleted, running or stopped.** Servers
+  bind-mount their game's files read-only, which is why existing content is
+  never replaced (`content.rs:888`), and a stopped server restarts from the
+  same mount. Delete
+  is refused with the list of servers using it; remove those first.
+- **No delete while that game is downloading.** The install would rename its
+  staging directory into a tree that was just removed.
+- **Progress is measured on disk, never parsed from steamcmd's output.**
+  `install.rs` already refuses that: a progress bar driven by a tool's console
+  is a promise that breaks the next time the tool is updated.
+- **A total is shown only when it is known**: the archive download's
+  `Content-Length` (not read today), or the size the same version had the last time this node
+  installed it. Otherwise the page shows bytes and rate and no percentage. An
+  invented total is a progress bar that lies.
+- **A cancelled or failed download installs nothing**, as a failed digest or a
+  non-zero steamcmd exit already does.
+- Behind the API token like every other route that deletes.
+
+**Decisions.**
+- Whether **Delete** offers to stop and remove the servers using a copy in the
+  same step, or only lists them. Listing is safer; one step is quicker.
+- Where a known total comes from for steamcmd games. A pack field such as
+  `approx_bytes` would be data, not code, and harmless if wrong, but it is a
+  number someone has to keep current.
+
+**More for this page.**
+- **Unused copies first.** A copy that `agent.toml` no longer names and no
+  container mounts is marked *unused*, with a one-click delete. That is the
+  928 MB above.
+- **Update a game.** Fetch the newest build into a new version directory,
+  point new servers at it, and leave the old one until nothing mounts it,
+  because existing content is never replaced in place. Then the old copy shows
+  up as unused.
+- **Verify files.** Run steamcmd's `validate` into a new copy and report
+  whether anything differed, for a server that crashes on a corrupt file.
+- **Room before downloading.** With a known total, refuse or warn before
+  starting a download that will not fit, instead of the 10 GB rule of thumb the
+  page uses now.
+- **Remove a pack.** Delete an imported pack's `.toml` from the Games page.
+  The built-in Sven Co-op pack cannot be removed (`PackTrust::BuiltIn`), and a
+  pack with servers still running is refused, like a copy in use.
+- **One download at a time, queued.** Two Source downloads at once each run
+  slower than one after the other, and a queue shows what is next.
+
+**Size.** M. The routes are small; the care is in the rules above, and each
+needs a test against a real daemon: delete refused while a stopped container
+mounts the copy, cancel leaves nothing in `content/`, and a progress total that
+is never invented.
 
 ---
 
