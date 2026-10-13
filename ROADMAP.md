@@ -221,6 +221,16 @@ always visible. The AppImage already runs on SteamOS.
 
 ## 11. Node: installed games and downloads
 
+**Status (2026-10-13): build plan steps 1–6 are built** (the Installed page,
+`GET /content`, delete, progress, cancel, unused copies first). Where it
+departs from the plan below, the code is right and says why: cancel is
+`DELETE /content/:game` (the install's own resource) rather than
+`/content/:game/install`, which would shadow a version named `install`; and
+`GET /content` answers `{copies, downloads}` so the page polls one route, not
+one per game. Both open decisions took the safe option: Delete only lists the
+servers using a copy (409 with their ids), and no total is shown for any
+download yet. Step 7's additions are still open.
+
 **What.** An **Installed** page in Lanthorn Host listing every game whose files
 are on this node, and every download in progress, with the controls to manage
 them:

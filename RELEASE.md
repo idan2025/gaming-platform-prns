@@ -74,6 +74,26 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host: an Installed page for game files
+
+- **Installed** lists every copy of a game's files on the node: its version,
+  size, when it was installed, and which servers use it, stopped ones
+  included. A copy that nothing uses and the node's config does not name is
+  marked **Unused** and listed first, with **Delete unused…** above the list.
+- **Delete…** frees a copy's space after asking. A copy any server uses,
+  running or stopped, is refused and the servers are named; so is any copy of
+  a game that is downloading. The game stays on the Games page and can be
+  downloaded again.
+- A download shows here while it runs: bytes on the node's disk so far, the
+  rate and how long it has taken, and **Cancel**, which discards what it
+  fetched. There is no percentage: no download knows its total yet, and the
+  page will not invent one.
+- The Games page's download message shows the bytes so far too.
+- Several error messages carried runs of spaces from broken line
+  continuations; they read as one sentence again.
+
 ## v0.2.35
 
 ### Lanthorn Host: who is playing, why a server stopped, and restarts after a crash

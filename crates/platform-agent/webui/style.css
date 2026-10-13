@@ -167,6 +167,25 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .state-stopped, .state-exited { background: var(--surface-3); color: var(--text-3); }
 .state-missing, .state-dead, .state-unknown { background: var(--bad-soft); color: var(--bad); }
 
+/* ---------- installed game files ---------- */
+.copy-head, .copy-row {
+  display: grid;
+  grid-template-columns: 76px minmax(170px, 2fr) 104px 110px minmax(120px, 1.5fr) 110px 110px;
+  column-gap: 14px; align-items: center;
+}
+.copy-head { padding: 0 12px 8px; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-3); border-bottom: 1px solid var(--line); }
+.copy-row { min-height: 56px; padding: 8px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); }
+.copy-row > div { min-width: 0; }
+.copy-row .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-row .sub { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-row .cell { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.copy-row .actions { display: flex; justify-content: flex-end; }
+.copy-row.unused { border-color: var(--warn); }
+.state-unused { background: var(--warn-soft); color: var(--warn); }
+.download-progress { display: flex; flex-direction: column; gap: 4px; }
+.dl-bar { height: 4px; border-radius: 2px; background: var(--surface-3); overflow: hidden; }
+.dl-bar i { display: block; height: 100%; background: var(--ok); }
+
 /* ---------- artwork ---------- */
 .art { position: relative; overflow: hidden; flex: none; border-radius: 6px; background: linear-gradient(135deg, hsl(var(--h, 215) 45% 30%), hsl(calc(var(--h, 215) + 40) 50% 18%)); display: flex; align-items: center; justify-content: center; }
 .art .art-letters { font-weight: 700; color: rgba(255, 255, 255, 0.9); }
@@ -334,6 +353,9 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .toolbar, .content { padding-left: 16px; padding-right: 16px; }
   .list-head { display: none; }
   .inst { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
+  .copy-head { display: none; }
+  .copy-row { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
+  .copy-row > :nth-child(n+3):not(.actions) { display: none; }
   .inst > :nth-child(n+3):not(.actions):not(.usage) { display: none; }
   .inst > .usage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }

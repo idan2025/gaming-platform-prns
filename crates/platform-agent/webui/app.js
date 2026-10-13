@@ -18,6 +18,8 @@ const LOG_LINE_CHOICES = [200, 1000, 2000];
 // Kept in step with MAX_CRASH_RESTARTS_PER_HOUR in agent.rs.
 const MAX_CRASH_RESTARTS = 5;
 const PLAYERS_REFRESH_MS = 5000;
+// The Installed page re-reads this often while it is open, like /usage.
+const INSTALLED_MS = 2000;
 
 // The map-name alphabet, kept in step with `validate_map_name` in
 // crates/game-bridge/src/console.rs. The node is the authority — this only
@@ -52,6 +54,16 @@ const state = {
   playersTimer: null,
   orphans: null,         // {count, bytes, skipped_recent} from /orphans/summary
   orphansCheckedAt: 0,
+  installed: {
+    timer: null,
+    busy: false,
+    supported: true,     // false once an older agent answers /content with 404/405
+    copies: [],          // InstalledCopy rows (agent.rs)
+    downloads: [],       // [{game, status}] running now
+    prev: new Map(),     // game_id -> {bytes, at}: the last reading, for a rate
+    rate: new Map(),     // game_id -> bytes per second
+    deleting: new Set(), // "game/version" being deleted
+  },
 };
 
 const ICON = {
@@ -167,7 +179,7 @@ async function api(method, path, body) {
   if (!resp.ok) {
     const msg = (data && typeof data.error === "string") ? data.error
       : ("Request failed (" + resp.status + " " + resp.statusText + ").");
-    throw { error: msg, status: resp.status };
+    throw { error: msg, status: resp.status, data };
   }
   return data;
 }
@@ -1165,7 +1177,8 @@ async function watchInstall(gameId) {
       }
       const st = (body && body.status) || {};
       if (st.state === "running") {
-        state.installingMsg.set(gameId, "Downloading game files… " + formatUptime(st.since_secs) + " so far.");
+        state.installingMsg.set(gameId, "Downloading game files… " +
+          (st.bytes ? formatBytes(st.bytes) + " in " : "") + formatUptime(st.since_secs) + " so far.");
         renderGames();
         continue;
       }
@@ -1173,6 +1186,11 @@ async function watchInstall(gameId) {
         state.installingMsg.set(gameId, st.already_installed ? "Already installed." : "Installed.");
         state.installDone.set(gameId, "ok");
         return true;
+      }
+      if (st.state === "failed" && st.error === "cancelled") {
+        state.installingMsg.set(gameId, "Download cancelled.");
+        state.installDone.set(gameId, "error");
+        return false;
       }
       if (st.state === "failed") {
         state.installingMsg.set(gameId, st.error || "Install failed.");
@@ -1812,10 +1830,223 @@ function wireMeshInterfaceForm() {
   });
 }
 
+// ---------- installed game files ----------
+
+// The node's copies of game files (`content/<game>/<version>`) and its
+// downloads. Packs are the Games page; this is what the downloads put on
+// disk. Read only while this page is open: sizes come off the disk.
+async function pollInstalled() {
+  const s = state.installed;
+  if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+  if (s.busy || !state.token || !s.supported) return;
+  if (state.activeTab !== "installed" || document.hidden) return;
+  s.busy = true;
+  try {
+    ingestInstalled(await api("GET", "/content"));
+  } catch (e) {
+    if (e && e.__auth) return;
+    // An agent older than this page has no GET /content.
+    if (e && (e.status === 404 || e.status === 405)) { s.supported = false; renderInstalled(); return; }
+    if (e && e.__network) showError(e.error);
+  } finally {
+    s.busy = false;
+  }
+  if (state.token && state.activeTab === "installed" && !s.timer) s.timer = setTimeout(pollInstalled, INSTALLED_MS);
+}
+
+function ingestInstalled(body) {
+  const s = state.installed;
+  s.copies = Array.isArray(body && body.copies) ? body.copies : [];
+  s.downloads = Array.isArray(body && body.downloads) ? body.downloads : [];
+  const now = Date.now();
+  const seen = new Set();
+  for (const d of s.downloads) {
+    const bytes = (d.status && d.status.bytes) || 0;
+    const last = s.prev.get(d.game);
+    // A rate needs two readings of the same download. Bytes can fall when
+    // steamcmd moves files out of its download area, which is not a negative
+    // speed: keep the last rate instead.
+    if (last && now > last.at && bytes >= last.bytes) s.rate.set(d.game, (bytes - last.bytes) * 1000 / (now - last.at));
+    s.prev.set(d.game, { bytes, at: now });
+    seen.add(d.game);
+  }
+  for (const g of [...s.prev.keys()]) if (!seen.has(g)) { s.prev.delete(g); s.rate.delete(g); }
+  renderInstalled();
+  const n = s.copies.length;
+  $("nav-installed-count").textContent = s.downloads.length ? "↓" + s.downloads.length : (n ? String(n) : "");
+}
+
+function instanceName(id) {
+  const inst = instById(id);
+  return inst && inst.name ? inst.name : id;
+}
+
+function formatDate(unix) {
+  if (!unix) return "—";
+  return new Date(unix * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function copyStatus(c) {
+  if (c.used_by && c.used_by.length) return ["In use", "state-running",
+    "Used by " + c.used_by.map(instanceName).join(", ") + ". Remove those servers before deleting these files."];
+  if (c.configured) return ["Ready", "state-stopped", "New servers of this game use these files."];
+  return ["Unused", "state-unused", "No server uses these files and this node's config does not name them. Deleting them frees the space."];
+}
+
+function renderInstalled() {
+  const s = state.installed;
+  const list = $("installed-list");
+  const empty = $("installed-empty");
+  const old = $("installed-old");
+  if (!list) return;
+  old.classList.toggle("hidden", s.supported);
+  if (!s.supported) { list.textContent = ""; empty.classList.add("hidden"); return; }
+  list.textContent = "";
+
+  const downloading = new Set(s.downloads.map(d => d.game));
+  for (const d of s.downloads) list.appendChild(buildDownloadRow(d));
+  for (const c of s.copies) list.appendChild(buildCopyRow(c, downloading.has(c.game_id)));
+  empty.classList.toggle("hidden", s.copies.length + s.downloads.length > 0);
+
+  const unused = s.copies.filter(c => c.unused);
+  const bar = $("installed-unused");
+  bar.classList.toggle("hidden", !unused.length);
+  if (unused.length) {
+    const bytes = unused.reduce((a, c) => a + (c.bytes || 0), 0);
+    $("installed-unused-text").textContent = unused.length + " cop" + (unused.length === 1 ? "y" : "ies") +
+      " of game files nothing uses, " + formatBytes(bytes) + ".";
+  }
+}
+
+function buildCopyRow(c, downloading) {
+  const row = el("div", "copy-row" + (c.unused ? " unused" : ""));
+  const artCell = el("div", "art-cell");
+  artCell.appendChild(art(c.game_id, "art-thumb"));
+  const nameCell = el("div");
+  nameCell.append(el("div", "name", gameName(c.game_id)), el("div", "sub", "Version " + c.version + " · " + formatBytes(c.bytes)));
+  const [word, cls, why] = copyStatus(c);
+  const stateCell = el("div");
+  const pill = el("span", "state-pill " + cls, word);
+  pill.title = why;
+  stateCell.appendChild(pill);
+  const usedBy = el("div", "cell", c.used_by && c.used_by.length ? c.used_by.map(instanceName).join(", ") : "—");
+  if (!(c.used_by && c.used_by.length)) usedBy.classList.add("muted-em");
+  const actions = el("div", "actions");
+  const key = c.game_id + "/" + c.version;
+  const del = el("button", "btn btn-small" + (c.unused ? " btn-danger" : ""), isDeleting(key) ? "Deleting…" : "Delete…");
+  del.type = "button";
+  const blocked = (c.used_by && c.used_by.length) ? "Servers use these files. Remove them first."
+    : downloading ? "This game is downloading. Cancel the download or wait for it to finish." : "";
+  del.disabled = !!blocked || isDeleting(key);
+  del.title = blocked || "Delete these files to free " + formatBytes(c.bytes) + ".";
+  del.addEventListener("click", () => onDeleteCopy(c));
+  actions.appendChild(del);
+  row.append(artCell, nameCell, stateCell, el("div", "cell", formatBytes(c.bytes)), usedBy,
+    el("div", "cell", formatDate(c.modified_unix)), actions);
+  return row;
+}
+function isDeleting(key) { return state.installed.deleting.has(key); }
+
+function buildDownloadRow(d) {
+  const st = d.status || {};
+  const row = el("div", "copy-row downloading");
+  const artCell = el("div", "art-cell");
+  artCell.appendChild(art(d.game, "art-thumb"));
+  const nameCell = el("div");
+  nameCell.append(el("div", "name", gameName(d.game)),
+    el("div", "sub", "Downloading · " + formatBytes((st.bytes || 0)) + " so far"));
+  const stateCell = el("div");
+  stateCell.appendChild(el("span", "state-pill state-starting", "Downloading"));
+  const bytes = st.bytes || 0;
+  const rate = state.installed.rate.get(d.game);
+  // A percentage only with a total someone actually knows; otherwise bytes
+  // and rate, never an invented end (install.rs, InstallState::Running).
+  const total = st.total_bytes;
+  const sizeCell = el("div", "cell", formatBytes(bytes) + (total ? " of " + formatBytes(total) : ""));
+  const progress = el("div", "cell download-progress");
+  if (total) {
+    const bar = el("div", "dl-bar");
+    const fill = el("i");
+    fill.style.width = Math.min(100, Math.round(100 * bytes / total)) + "%";
+    bar.appendChild(fill);
+    progress.appendChild(bar);
+  }
+  progress.appendChild(el("span", null, (rate != null ? formatRate(rate) + " · " : "") + formatUptime(st.since_secs || 0)));
+  progress.title = "Bytes on this node's disk so far, the rate between the last two readings, and how long it has run.";
+  const actions = el("div", "actions");
+  const cancel = el("button", "btn btn-small", "Cancel");
+  cancel.type = "button";
+  cancel.title = "Stop the download and discard what it fetched.";
+  cancel.addEventListener("click", () => onCancelDownload(d.game, cancel));
+  actions.appendChild(cancel);
+  row.append(artCell, nameCell, stateCell, sizeCell, progress, el("div", "cell muted-em", "—"), actions);
+  return row;
+}
+
+async function onDeleteCopy(c) {
+  const key = c.game_id + "/" + c.version;
+  if (!confirm("Delete " + gameName(c.game_id) + " version " + c.version + "?\n\n" +
+    "This frees " + formatBytes(c.bytes) + ". No server uses these files. " +
+    "The game stays on the Games page and can be downloaded again.\n\nThis cannot be undone.")) return;
+  state.installed.deleting.add(key);
+  renderInstalled();
+  try {
+    const r = await withInFlight(api("DELETE", "/content/" + encodeURIComponent(c.game_id) + "/" + encodeURIComponent(c.version)));
+    clearError();
+    toast("Deleted " + gameName(c.game_id) + " " + c.version + ", " + formatBytes(r && r.bytes) + " freed.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    const servers = e && e.data && Array.isArray(e.data.servers) ? e.data.servers : [];
+    showError(servers.length
+      ? "These files are used by " + servers.map(instanceName).join(", ") + ". Remove " + (servers.length === 1 ? "that server" : "those servers") + " first."
+      : (e && e.error) || "The files were not deleted.");
+  } finally {
+    state.installed.deleting.delete(key);
+  }
+  pollInstalled();
+}
+
+async function onCancelDownload(game, btn) {
+  if (!confirm("Cancel downloading " + gameName(game) + "?\n\nWhat it has fetched so far is discarded.")) return;
+  btn.disabled = true;
+  btn.textContent = "Cancelling…";
+  try {
+    await withInFlight(api("DELETE", "/content/" + encodeURIComponent(game)));
+    clearError();
+    toast("Download cancelled.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The download was not cancelled.");
+  }
+  pollInstalled();
+}
+
+async function onDeleteUnused() {
+  const unused = state.installed.copies.filter(c => c.unused);
+  if (!unused.length) return;
+  const bytes = unused.reduce((a, c) => a + (c.bytes || 0), 0);
+  if (!confirm("Delete " + unused.length + " unused cop" + (unused.length === 1 ? "y" : "ies") + " of game files (" + formatBytes(bytes) + ")?\n\n" +
+    unused.map(c => "• " + gameName(c.game_id) + " " + c.version + " — " + formatBytes(c.bytes)).join("\n") +
+    "\n\nNo server uses them and this node's config does not name them.\n\nThis cannot be undone.")) return;
+  let freed = 0, failed = null;
+  for (const c of unused) {
+    try {
+      const r = await withInFlight(api("DELETE", "/content/" + encodeURIComponent(c.game_id) + "/" + encodeURIComponent(c.version)));
+      freed += (r && r.bytes) || 0;
+    } catch (e) {
+      if (e && e.__auth) return;
+      failed = failed || (e && e.error) || "A copy was not deleted.";
+    }
+  }
+  if (failed) showError(failed); else clearError();
+  toast(formatBytes(freed) + " freed.");
+  pollInstalled();
+}
+
 // ---------- tabs ----------
 
-const TABS = ["servers", "games", "interfaces"];
-const TITLES = { servers: "Servers", games: "Games", interfaces: "Mesh" };
+const TABS = ["servers", "games", "installed", "interfaces"];
+const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh" };
 
 function setActiveTab(name) {
   if (!TABS.includes(name)) name = "servers";
@@ -1833,6 +2064,7 @@ function setActiveTab(name) {
   if (name === "interfaces") loadInterfaces();
   if (name === "games") renderGames();
   if (name === "servers") pollUsage();
+  if (name === "installed") pollInstalled();
 }
 
 function renderAll() {
@@ -1870,6 +2102,12 @@ document.addEventListener("DOMContentLoaded", () => {
     state.orphans = null;
     state.orphansCheckedAt = 0;
     renderOrphans();
+    state.installed.copies = [];
+    state.installed.downloads = [];
+    state.installed.supported = true;
+    state.installed.prev.clear(); state.installed.rate.clear();
+    $("nav-installed-count").textContent = "";
+    renderInstalled();
     state.installing.clear();
     state.installingMsg.clear();
     state.installDone.clear();
@@ -1883,6 +2121,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));
   $("announce-btn").addEventListener("click", () => onAnnounce(null));
   $("orphans-clean").addEventListener("click", onCleanOrphans);
+  $("installed-unused-btn").addEventListener("click", onDeleteUnused);
 
   $("iface-kind").addEventListener("change", () => {
     const tcp = $("iface-kind").value === "tcp";
@@ -1906,7 +2145,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // Usage pauses while the page is hidden; pick it up the moment it is back.
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.token) pollUsage(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.token) { pollUsage(); pollInstalled(); } });
 
   const t = getToken();
   if (t) tryConnect(t);

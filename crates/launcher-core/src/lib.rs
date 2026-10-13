@@ -1320,7 +1320,7 @@ impl Launcher {
         let opts = join_interfaces(inner.browse_opts.as_ref(), &saved_opts);
         if opts.tcp.is_none() && !opts.auto {
             return Err(anyhow!(
-                "this launcher has no mesh interface, so a join could not reach the server.                  Add a TCP peer or turn on LAN auto-discovery, then join again"
+                "this launcher has no mesh interface, so a join could not reach the server. Add a TCP peer or turn on LAN auto-discovery, then join again"
             ));
         }
         args.tcp = opts.tcp.clone();
@@ -2392,7 +2392,7 @@ query = "a2s"
         let chosen = join_interfaces(None, &BrowseOpts { tcp: None, auto: false });
         assert!(
             chosen.tcp.is_none() && !chosen.auto,
-            "this is the state join_server refuses; if it stops being detectable,              a join can silently reach nothing again"
+            "this is the state join_server refuses; if it stops being detectable, a join can silently reach nothing again"
         );
     }
 

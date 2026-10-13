@@ -42,6 +42,7 @@
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use game_bridge::content::PackContent;
 use sha2::{Digest, Sha256};
@@ -94,6 +95,8 @@ pub enum ProvisionError {
     DigestMismatch { expected: String, actual: String },
     /// An archive entry tried to write outside the destination.
     UnsafeEntry { entry: String, reason: &'static str },
+    /// The operator cancelled the download. Nothing it fetched was kept.
+    Cancelled,
     Io(io::Error),
 }
 
@@ -119,14 +122,17 @@ impl core::fmt::Display for ProvisionError {
             ),
             Self::NoSteamcmdImage { app_id } => write!(
                 f,
-                "this pack fetches Steam app {app_id}, and this node has no steamcmd_image                  configured. Which steamcmd runs is the operator's choice, like every other                  image on this node — a pack cannot name one"
+                "this pack fetches Steam app {app_id}, and this node has no steamcmd_image \
+                 configured. Which steamcmd runs is the operator's choice, like every other \
+                 image on this node — a pack cannot name one"
             ),
             Self::ToolFailed { tool, exit_code, output } => {
                 write!(f, "{tool} exited {exit_code}: {}", output.trim())
             }
             Self::NoContainerRuntime { driver } => write!(
                 f,
-                "the {driver:?} content driver runs a container and this agent has no Docker                  connection"
+                "the {driver:?} content driver runs a container and this agent has no Docker \
+                 connection"
             ),
             Self::BadSpec(e) => write!(f, "unusable [content] block: {e}"),
             Self::BadContentRef(e) => write!(f, "unusable content reference: {e}"),
@@ -143,6 +149,7 @@ impl core::fmt::Display for ProvisionError {
                 f,
                 "archive entry {entry:?} refused: {reason}. Entries are rejected, not repaired"
             ),
+            Self::Cancelled => write!(f, "cancelled"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -177,6 +184,63 @@ const STEAMCMD_ATTEMPTS: u32 = 2;
 /// The one steamcmd failure that is retried rather than reported.
 const STEAMCMD_TRANSIENT: &str = "(Missing configuration)";
 
+/// What a running install shares with whoever is watching it: where its bytes
+/// are landing, which container is doing the work, and whether the operator
+/// has asked it to stop.
+///
+/// Progress is read **off the disk** — the size of the staging directory —
+/// never parsed from a tool's console. A bar driven by steamcmd's own
+/// percentages is a promise that breaks the next time steamcmd changes what it
+/// prints (`install.rs`).
+#[derive(Debug, Default)]
+pub struct InstallProgress {
+    staging: std::sync::Mutex<Option<PathBuf>>,
+    task_container: std::sync::Mutex<Option<String>>,
+    cancelled: AtomicBool,
+}
+
+impl InstallProgress {
+    /// The staging directory this run is writing into, once it has one.
+    pub fn staging(&self) -> Option<PathBuf> {
+        self.staging.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Bytes on disk so far. Zero before the run has a staging directory.
+    pub fn bytes(&self) -> u64 {
+        self.staging().map(|d| dir_size(&d)).unwrap_or(0)
+    }
+
+    /// The provisioning container running now, if any.
+    pub fn task_container(&self) -> Option<String> {
+        self.task_container.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Ask the run to stop. It discards its staging directory and installs
+    /// nothing; stopping its container is the caller's half
+    /// (`DockerRuntime::remove_task`).
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn set_staging(&self, dir: &Path) {
+        *self.staging.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
+    }
+
+    fn set_task_container(&self, name: Option<String>) {
+        *self.task_container.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+}
+
+/// Discard a cancelled run's staging directory and say so.
+fn cancelled(staging: &Path) -> ProvisionError {
+    let _ = fs::remove_dir_all(staging);
+    ProvisionError::Cancelled
+}
+
 pub struct Provisioner {
     layout: StoreLayout,
     /// Whether this node may download. Off by default: a pack is a file
@@ -202,6 +266,20 @@ impl Provisioner {
         spec: &PackContent,
         docker: Option<&DockerRuntime>,
     ) -> Result<Provisioned, ProvisionError> {
+        self.ensure_tracked(content, spec, docker, None).await
+    }
+
+    /// [`ensure`](Self::ensure), reporting into `progress` and stopping when it
+    /// is cancelled. A cancelled run installs nothing, exactly as a failed
+    /// digest or a non-zero steamcmd exit does.
+    pub async fn ensure_tracked(
+        &self,
+        content: &ContentRef,
+        spec: &PackContent,
+        docker: Option<&DockerRuntime>,
+        progress: Option<&InstallProgress>,
+    ) -> Result<Provisioned, ProvisionError> {
+        let is_cancelled = || progress.is_some_and(InstallProgress::is_cancelled);
         spec.validate().map_err(ProvisionError::BadSpec)?;
         let dir = self
             .layout
@@ -221,8 +299,11 @@ impl Provisioner {
                     return Err(ProvisionError::FetchNotPermitted { url: url.clone() });
                 }
                 let staging = self.staging_root()?;
+                if let Some(p) = progress {
+                    p.set_staging(&staging);
+                }
                 let archive = staging.join("download");
-                let bytes = fetch(url, &archive).await;
+                let bytes = fetch(url, &archive, progress).await;
                 let result = bytes.and_then(|_| {
                     verify_digest(&archive, sha256)?;
                     let unpacked = staging.join("unpacked");
@@ -240,6 +321,9 @@ impl Provisioner {
                         return Err(e);
                     }
                 };
+                if is_cancelled() {
+                    return Err(cancelled(&staging));
+                }
                 if let Some(parent) = dir.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -266,6 +350,9 @@ impl Provisioner {
                 })?;
 
                 let staging = self.staging_root()?;
+                if let Some(p) = progress {
+                    p.set_staging(&staging);
+                }
                 let installed = staging.join("unpacked");
                 fs::create_dir_all(&installed)?;
                 // steamcmd keeps its own state — a Steam runtime, a login cache,
@@ -330,7 +417,16 @@ impl Provisioner {
                 let mut attempt = 0;
                 let outcome = loop {
                     attempt += 1;
+                    if is_cancelled() {
+                        return Err(cancelled(&staging));
+                    }
                     let name = format!("gpp-content-{app_id}-{task}-{attempt}");
+                    // Named before it exists, so a cancel arriving while it
+                    // is being created still knows what to remove; and
+                    // `run_to_completion` checks the flag again once it has.
+                    if let Some(p) = progress {
+                        p.set_task_container(Some(name.clone()));
+                    }
                     let outcome = docker
                         .run_to_completion(
                             &name,
@@ -339,8 +435,18 @@ impl Provisioner {
                             &mounts,
                             Some(TASK_MEMORY_LIMIT_BYTES),
                             &[format!("HOME={TASK_HOME_DIR}")],
+                            progress.map(|p| &p.cancelled),
                         )
                         .await;
+                    if let Some(p) = progress {
+                        p.set_task_container(None);
+                    }
+                    // Whatever the run says, a cancelled one is cancelled: its
+                    // container was removed under it, so its exit code and
+                    // output describe the removal, not the download.
+                    if is_cancelled() {
+                        return Err(cancelled(&staging));
+                    }
                     let outcome = match outcome {
                         Ok(outcome) => outcome,
                         Err(e) => {
@@ -400,7 +506,7 @@ impl Provisioner {
 
 /// Bytes under a directory, for reporting what an install cost. Best effort:
 /// a file that vanishes mid-walk is not worth failing a completed install over.
-fn dir_size(dir: &Path) -> u64 {
+pub(crate) fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -416,7 +522,11 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// Stream a URL to `dest`, refusing anything over `MAX_ARCHIVE_BYTES`.
-async fn fetch(url: &str, dest: &Path) -> Result<u64, ProvisionError> {
+async fn fetch(
+    url: &str,
+    dest: &Path,
+    progress: Option<&InstallProgress>,
+) -> Result<u64, ProvisionError> {
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| ProvisionError::Http { url: url.to_string(), detail: e.to_string() })?;
@@ -438,6 +548,9 @@ async fn fetch(url: &str, dest: &Path) -> Result<u64, ProvisionError> {
         .await
         .map_err(|e| ProvisionError::Http { url: url.to_string(), detail: e.to_string() })?
     {
+        if progress.is_some_and(InstallProgress::is_cancelled) {
+            return Err(ProvisionError::Cancelled);
+        }
         total += chunk.len() as u64;
         if total > MAX_ARCHIVE_BYTES {
             return Err(ProvisionError::TooLarge { limit: MAX_ARCHIVE_BYTES });
