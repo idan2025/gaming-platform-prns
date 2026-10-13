@@ -63,6 +63,7 @@ const state = {
     prev: new Map(),     // game_id -> {bytes, at}: the last reading, for a rate
     rate: new Map(),     // game_id -> bytes per second
     deleting: new Set(), // "game/version" being deleted
+    art: new Map(),      // row key -> its art element, kept across polls
   },
 };
 
@@ -116,6 +117,10 @@ function initials(name) {
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
   return (words[0][0] + words[1][0]).toUpperCase();
 }
+// Pictures that have loaded once. A list rebuilt on a poll makes new <img>
+// elements, and each would start transparent and fade in again: a blink every
+// poll. One already in the browser's cache is shown at once instead.
+const ART_LOADED = new Set();
 function art(gameId, cls) {
   const box = el("div", "art " + (cls || ""));
   box.style.setProperty("--h", String(hueOf(gameId)));
@@ -130,7 +135,8 @@ function art(gameId, cls) {
     for (const img of [bg, fg]) {
       img.alt = "";
       img.loading = "lazy";
-      img.onload = () => img.classList.add("loaded");
+      if (ART_LOADED.has(url)) img.classList.add("loaded");
+      img.onload = () => { ART_LOADED.add(url); img.classList.add("loaded"); };
       img.onerror = () => { bg.remove(); fg.remove(); };
       img.src = url;
       box.appendChild(img);
@@ -1903,9 +1909,21 @@ function renderInstalled() {
   if (!s.supported) { list.textContent = ""; empty.classList.add("hidden"); return; }
   list.textContent = "";
 
+  // Rows are rebuilt every poll, but each keeps its art element: a new picture
+  // per poll is a picture that blinks every two seconds.
+  const keep = new Set();
+  const artFor = (key, gameId) => {
+    keep.add(key);
+    let a = s.art.get(key);
+    if (!a) { a = art(gameId, "art-thumb"); s.art.set(key, a); }
+    return a;
+  };
   const downloading = new Set(s.downloads.map(d => d.game));
-  for (const d of s.downloads) list.appendChild(buildDownloadRow(d));
-  for (const c of s.copies) list.appendChild(buildCopyRow(c, downloading.has(c.game_id)));
+  for (const d of s.downloads) list.appendChild(buildDownloadRow(d, artFor("dl:" + d.game, d.game)));
+  for (const c of s.copies) {
+    list.appendChild(buildCopyRow(c, downloading.has(c.game_id), artFor(c.game_id + "/" + c.version, c.game_id)));
+  }
+  for (const k of [...s.art.keys()]) if (!keep.has(k)) s.art.delete(k);
   empty.classList.toggle("hidden", s.copies.length + s.downloads.length > 0);
 
   const unused = s.copies.filter(c => c.unused);
@@ -1918,10 +1936,10 @@ function renderInstalled() {
   }
 }
 
-function buildCopyRow(c, downloading) {
+function buildCopyRow(c, downloading, artEl) {
   const row = el("div", "copy-row" + (c.unused ? " unused" : ""));
   const artCell = el("div", "art-cell");
-  artCell.appendChild(art(c.game_id, "art-thumb"));
+  artCell.appendChild(artEl);
   const nameCell = el("div");
   nameCell.append(el("div", "name", gameName(c.game_id)), el("div", "sub", "Version " + c.version + " · " + formatBytes(c.bytes)));
   const [word, cls, why] = copyStatus(c);
@@ -1955,11 +1973,11 @@ function buildCopyRow(c, downloading) {
 }
 function isDeleting(key) { return state.installed.deleting.has(key); }
 
-function buildDownloadRow(d) {
+function buildDownloadRow(d, artEl) {
   const st = d.status || {};
   const row = el("div", "copy-row downloading");
   const artCell = el("div", "art-cell");
-  artCell.appendChild(art(d.game, "art-thumb"));
+  artCell.appendChild(artEl);
   const nameCell = el("div");
   nameCell.append(el("div", "name", gameName(d.game)),
     el("div", "sub", "Downloading · " + formatBytes((st.bytes || 0)) + " so far"));

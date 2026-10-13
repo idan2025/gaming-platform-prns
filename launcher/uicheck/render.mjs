@@ -1310,6 +1310,68 @@ await run('a copy that cannot replace itself links to the download page', {
     made === 'lanthorn://join/a1b2c3d4e5f60718293a4b5c6d7e8f90?game=counter-strike-16&name=Dust2%20%28EU%29%21%20%C3%B1%2A%27%20~ok', made);
 }
 
+// Lanthorn Host's Installed page polls every two seconds and rebuilds its rows.
+// A row that got a new picture each poll blinked: the new <img> starts
+// transparent and fades in. Each row must keep its picture, and a picture the
+// browser has loaded once must not fade in again anywhere.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const ART = 'https://upload.wikimedia.org/x.png';
+  const routes = {
+    '/health': { ok: true, version: 'test' },
+    '/capacity': { max_instances: 4, running: 0 },
+    '/instances': [],
+    '/storage': { path: '/x', free_bytes: 1e9, total_bytes: 2e9 },
+    '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 },
+    '/games': [{ id: 'g1', display_name: 'Game One', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0, art_url: ART }],
+    '/content': {
+      copies: [
+        { game_id: 'g1', version: 'a', bytes: 1, modified_unix: 1, configured: true, used_by: [], unused: false },
+        { game_id: 'g1', version: 'b', bytes: 1, modified_unix: 1, configured: false, used_by: [], unused: true },
+      ],
+      downloads: [{ game: 'g1', status: { state: 'running', since_secs: 1, bytes: 5 } }],
+    },
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  // jsdom has no CSS.escape; the page uses it for attribute selectors only.
+  w.CSS = { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+  w.fetch = async (path) => {
+    const body = routes[String(path).split('?')[0]];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
+      headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs + '\n;window.__installed = () => state.installed; window.__poll = pollInstalled; window.__art = art;');
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  w.document.getElementById('tab-installed').click();
+  await settle();
+  const imgs = () => [...w.document.querySelectorAll('#installed-list .art-fg')];
+  const first = imgs();
+  check('the Installed page shows a picture per row', first.length === 3, String(first.length));
+  for (const img of first) img.dispatchEvent(new w.Event('load'));
+  w.__installed().timer && w.clearTimeout(w.__installed().timer);
+  w.__installed().timer = null;
+  await w.__poll();
+  await settle();
+  const second = imgs();
+  check('a poll keeps every row\'s picture, so nothing blinks',
+    second.length === first.length && second.every((img, i) => img === first[i]));
+  check('a kept picture stays shown after a poll', second.every(img => img.classList.contains('loaded')));
+  // Any other list that builds a new picture: one already loaded is shown at
+  // once rather than faded in.
+  const fresh = w.__art('g1', 'art-thumb').querySelector('.art-fg');
+  check('a picture loaded once is not faded in again', fresh && fresh.classList.contains('loaded'));
+  w.__installed().timer && w.clearTimeout(w.__installed().timer);
+  w.close();
+}
+
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
 
 if (failures.length) {
