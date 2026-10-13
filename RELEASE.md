@@ -74,11 +74,6 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
-## Unreleased
-
-- Lanthorn Host's Installed page no longer makes each game's picture blink
-  every two seconds while it refreshes.
-
 ## v0.2.36
 
 ### Lanthorn Host: an Installed page for game files
@@ -103,6 +98,9 @@ is missing, which makes pushing a tag sufficient on its own.
   soon as the last server using it is removed. A game with nothing newer says
   it is up to date and leaves no extra copy.
 - The Games page's download message shows the bytes so far too.
+- Pictures on the Installed page stay put while it refreshes, rather than
+  blinking every two seconds. (Rebuilt into this release's files on
+  2026-10-13; the first v0.2.36 build blinked.)
 - Several error messages carried runs of spaces from broken line
   continuations; they read as one sentence again.
 
