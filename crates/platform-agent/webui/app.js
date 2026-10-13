@@ -1940,6 +1940,14 @@ function buildCopyRow(c, downloading) {
   del.disabled = !!blocked || isDeleting(key);
   del.title = blocked || "Delete these files to free " + formatBytes(c.bytes) + ".";
   del.addEventListener("click", () => onDeleteCopy(c));
+  if (c.updatable) {
+    const upd = el("button", "btn btn-small", "Update…");
+    upd.type = "button";
+    upd.disabled = downloading;
+    upd.title = downloading ? "This game is downloading already." : "Download the newest build into a new copy.";
+    upd.addEventListener("click", () => onUpdateGame(c));
+    actions.appendChild(upd);
+  }
   actions.appendChild(del);
   row.append(artCell, nameCell, stateCell, el("div", "cell", formatBytes(c.bytes)), usedBy,
     el("div", "cell", formatDate(c.modified_unix)), actions);
@@ -1981,6 +1989,86 @@ function buildDownloadRow(d) {
   actions.appendChild(cancel);
   row.append(artCell, nameCell, stateCell, sizeCell, progress, el("div", "cell muted-em", "—"), actions);
   return row;
+}
+
+// An update downloads the newest build into a new copy, beside the old one:
+// servers running now keep the files they started on, new ones get the new
+// build. The checkbox removes the old copy too, at once if no server uses it,
+// otherwise as soon as the last one using it is removed.
+function onUpdateGame(c) {
+  const name = gameName(c.game_id);
+  openModal("update-dialog", c.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Update " + name));
+    body.appendChild(el("p", "muted small",
+      "Downloads the newest build into a new copy beside version " + c.version + ". Only what changed is downloaded, " +
+      "and anything added to this copy, such as bots, comes along. New servers use the new copy; servers that exist now keep theirs."));
+    const wrap = el("label", "check");
+    const removeOld = el("input");
+    removeOld.type = "checkbox";
+    removeOld.id = "upd-remove-old";
+    removeOld.checked = true;
+    wrap.append(removeOld, el("span", null, "Remove the old version when the update is done"));
+    const used = (c.used_by || []).map(instanceName);
+    body.append(wrap, el("p", "muted small", used.length
+      ? "Used now by " + used.join(", ") + ": it is removed once " + (used.length === 1 ? "that server is" : "those servers are") + " removed."
+      : "Nothing uses it now, so it is removed as soon as the new copy is ready (" + formatBytes(c.bytes) + " freed)."));
+    body.appendChild(el("p", "muted small",
+      "Needs about " + formatBytes(c.bytes) + " free while it runs: the copy is made first, then updated."));
+    const actions = el("div", "form-actions");
+    actions.style.marginTop = "8px";
+    const cancel = el("button", "btn", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = close;
+    const go = el("button", "btn btn-primary", "Update");
+    go.type = "button";
+    go.addEventListener("click", async () => {
+      const s = state.storage;
+      if (s && s.free_bytes < c.bytes) {
+        showError("Only " + formatBytes(s.free_bytes) + " is free, and the update needs about " + formatBytes(c.bytes) + ".");
+        return;
+      }
+      go.disabled = true; go.textContent = "Starting…";
+      try {
+        await withInFlight(api("POST", "/content/" + encodeURIComponent(c.game_id), { update: true, remove_old: removeOld.checked }));
+        clearError();
+        close();
+        toast("Updating " + name + ".");
+        watchUpdate(c.game_id);
+        pollInstalled();
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "The update did not start.");
+        go.disabled = false; go.textContent = "Update";
+      }
+    });
+    actions.append(cancel, go);
+    body.appendChild(actions);
+  });
+}
+
+// Say how an update ended, once. The Installed list shows the rest.
+async function watchUpdate(gameId) {
+  for (;;) {
+    await new Promise(r => setTimeout(r, 3000));
+    let body;
+    try { body = await api("GET", "/content/" + encodeURIComponent(gameId)); }
+    catch (e) { if (e && e.__auth) return; continue; }
+    const st = (body && body.status) || {};
+    if (st.state === "running") continue;
+    if (st.state === "failed") {
+      if (st.error !== "cancelled") showError(gameName(gameId) + " was not updated: " + st.error);
+      return;
+    }
+    const u = st.update;
+    if (st.state === "done" && u) {
+      if (!u.to_version) toast(gameName(gameId) + " is already up to date.");
+      else toast(gameName(gameId) + " updated to " + u.to_version + "." +
+        (u.old === "removed" ? " The old version was removed." :
+         u.old === "waiting" ? " The old version is removed once " + u.old_used_by.map(instanceName).join(", ") + (u.old_used_by.length === 1 ? " is" : " are") + " removed." : ""));
+    }
+    pollInstalled();
+    return;
+  }
 }
 
 async function onDeleteCopy(c) {
@@ -2140,7 +2228,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       closeMenu();
-      for (const id of ["start-dialog", "map-dialog", "bots-dialog", "log-dialog", "players-dialog"]) closeModal(id);
+      for (const id of ["start-dialog", "map-dialog", "bots-dialog", "log-dialog", "players-dialog", "update-dialog"]) closeModal(id);
     }
   });
 

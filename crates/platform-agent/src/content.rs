@@ -59,6 +59,18 @@ use crate::store::{ContentRef, Mount, StoreLayout};
 pub const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_EXTRACTED_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
+/// What `update` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Updated {
+    /// A newer build is installed at `dir`, a new version directory beside
+    /// the old one. Build ids come from Steam's own manifest on disk, when
+    /// the copies have one.
+    NewBuild { dir: PathBuf, bytes: u64, from_build: Option<String>, to_build: Option<String> },
+    /// steamcmd found nothing newer. The copy it updated was discarded, so
+    /// no second identical copy is left on disk.
+    UpToDate { build: Option<String> },
+}
+
 /// What `ensure` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provisioned {
@@ -97,6 +109,11 @@ pub enum ProvisionError {
     UnsafeEntry { entry: String, reason: &'static str },
     /// The operator cancelled the download. Nothing it fetched was kept.
     Cancelled,
+    /// Only a `steamcmd` game can be updated: an `archive` pack pins its bytes
+    /// by digest, so a new build is a new pack, and a `manual` one is a person.
+    NotUpdatable { driver: &'static str },
+    /// The copy to update from is not installed.
+    NothingToUpdate { dir: PathBuf },
     Io(io::Error),
 }
 
@@ -150,6 +167,14 @@ impl core::fmt::Display for ProvisionError {
                 "archive entry {entry:?} refused: {reason}. Entries are rejected, not repaired"
             ),
             Self::Cancelled => write!(f, "cancelled"),
+            Self::NotUpdatable { driver } => write!(
+                f,
+                "only a game downloaded with steamcmd can be updated here; this pack's \
+                 content driver is {driver:?}. A new build of an archive pack is a new pack"
+            ),
+            Self::NothingToUpdate { dir } => {
+                write!(f, "there is no installed copy at {} to update", dir.display())
+            }
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -341,10 +366,9 @@ impl Provisioner {
                         url: format!("steam app {app_id}"),
                     });
                 }
-                let image = self
-                    .steamcmd_image
-                    .clone()
-                    .ok_or(ProvisionError::NoSteamcmdImage { app_id: *app_id })?;
+                if self.steamcmd_image.is_none() {
+                    return Err(ProvisionError::NoSteamcmdImage { app_id: *app_id });
+                }
                 let docker = docker.ok_or(ProvisionError::NoContainerRuntime {
                     driver: "steamcmd",
                 })?;
@@ -355,127 +379,8 @@ impl Provisioner {
                 }
                 let installed = staging.join("unpacked");
                 fs::create_dir_all(&installed)?;
-                // steamcmd keeps its own state — a Steam runtime, a login cache,
-                // logs — under `$HOME`, and it is run as the agent's user rather
-                // than root so the install it produces is one the agent can work
-                // in afterwards. That user has no home inside the image, and
-                // steamcmd's first act is then `mkdir: Permission denied`. So
-                // give it one in the staging directory, which is discarded when
-                // the run ends: only `unpacked` is promoted into the content
-                // tree, so none of steamcmd's own state becomes game content.
-                let steam_home = staging.join("steamhome");
-                fs::create_dir_all(&steam_home)?;
-                let mounts = [
-                    Mount {
-                        host_path: installed.clone(),
-                        container_path: TASK_INSTALL_DIR.into(),
-                        read_only: false,
-                    },
-                    Mount {
-                        host_path: steam_home.clone(),
-                        container_path: TASK_HOME_DIR.into(),
-                        read_only: false,
-                    },
-                ];
-                // Every argument here is built by this code. The pack supplied
-                // one number, and `+login anonymous` is not negotiable: an app
-                // that needs credentials is a `manual` pack (GAMES.md §5).
-                let mut cmd = vec![
-                    "+force_install_dir".to_string(),
-                    TASK_INSTALL_DIR.to_string(),
-                    "+login".to_string(),
-                    "anonymous".to_string(),
-                ];
-                // Which depots of a multi-mod app to fetch. Steam app 90 is the
-                // case: by default it installs Half-Life and Counter-Strike,
-                // and only `mod czero` brings Condition Zero as well. The name
-                // was validated as an identifier when the pack loaded
-                // (`content::validate_mod_name`) and is re-checked here,
-                // because "it was validated elsewhere" is how a shell-shaped
-                // string reaches a command line.
-                if let Some(name) = mod_dir {
-                    game_bridge::content::validate_mod_name(name)
-                        .map_err(ProvisionError::BadSpec)?;
-                    cmd.push("+app_set_config".to_string());
-                    cmd.push(app_id.to_string());
-                    cmd.push("mod".to_string());
-                    cmd.push(name.clone());
-                }
-                cmd.push("+app_update".to_string());
-                cmd.push(app_id.to_string());
-                cmd.push("validate".to_string());
-                cmd.push("+quit".to_string());
-                let task = staging.file_name().and_then(|n| n.to_str()).unwrap_or("task").to_string();
-                // steamcmd fails a fresh install now and then with `ERROR!
-                // Failed to install app '<id>' (Missing configuration)`, before
-                // a byte is downloaded — measured 2026-09-30 as two fresh runs
-                // in three for app 232250 (TF2), and the identical command then
-                // succeeded. Every run here starts from a fresh `$HOME`, so
-                // without a retry a node fails a TF2 install as often as not.
-                // One more attempt, for that error only, in the same staging
-                // directory and home: any other failure is reported as it was.
-                let mut attempt = 0;
-                let outcome = loop {
-                    attempt += 1;
-                    if is_cancelled() {
-                        return Err(cancelled(&staging));
-                    }
-                    let name = format!("gpp-content-{app_id}-{task}-{attempt}");
-                    // Named before it exists, so a cancel arriving while it
-                    // is being created still knows what to remove; and
-                    // `run_to_completion` checks the flag again once it has.
-                    if let Some(p) = progress {
-                        p.set_task_container(Some(name.clone()));
-                    }
-                    let outcome = docker
-                        .run_to_completion(
-                            &name,
-                            &image,
-                            cmd.clone(),
-                            &mounts,
-                            Some(TASK_MEMORY_LIMIT_BYTES),
-                            &[format!("HOME={TASK_HOME_DIR}")],
-                            progress.map(|p| &p.cancelled),
-                        )
-                        .await;
-                    if let Some(p) = progress {
-                        p.set_task_container(None);
-                    }
-                    // Whatever the run says, a cancelled one is cancelled: its
-                    // container was removed under it, so its exit code and
-                    // output describe the removal, not the download.
-                    if is_cancelled() {
-                        return Err(cancelled(&staging));
-                    }
-                    let outcome = match outcome {
-                        Ok(outcome) => outcome,
-                        Err(e) => {
-                            let _ = fs::remove_dir_all(&staging);
-                            return Err(ProvisionError::ToolFailed {
-                                tool: "steamcmd",
-                                exit_code: -1,
-                                output: format!("{e:#}"),
-                            });
-                        }
-                    };
-                    if outcome.exit_code != 0
-                        && attempt < STEAMCMD_ATTEMPTS
-                        && outcome.output.contains(STEAMCMD_TRANSIENT)
-                    {
-                        continue;
-                    }
-                    break outcome;
-                };
-                if outcome.exit_code != 0 {
-                    // A partial download is not content. Same rule as a failed
-                    // digest: nothing half-done becomes an install.
-                    let _ = fs::remove_dir_all(&staging);
-                    return Err(ProvisionError::ToolFailed {
-                        tool: "steamcmd",
-                        exit_code: outcome.exit_code,
-                        output: outcome.output,
-                    });
-                }
+                self.run_steamcmd(&staging, &installed, *app_id, mod_dir.as_deref(), true, docker, progress)
+                    .await?;
                 let bytes = dir_size(&installed);
                 if let Some(parent) = dir.parent() {
                     fs::create_dir_all(parent)?;
@@ -485,6 +390,241 @@ impl Provisioner {
                 Ok(Provisioned::Installed { dir, bytes })
             }
         }
+    }
+
+    /// Fetch the newest build of a steamcmd game into a **new** version
+    /// directory, `to`, starting from the installed copy `from`.
+    ///
+    /// `from` is copied into staging first and steamcmd updates the copy, so
+    /// only what changed is downloaded and whatever the operator added to
+    /// their copy (YaPB) comes along. `from` itself is never touched: servers
+    /// may have it mounted right now. No `validate` (`run_steamcmd` says
+    /// why). If Steam's manifest shows the same build afterwards, the copy is
+    /// discarded and the answer is `UpToDate`.
+    pub async fn update(
+        &self,
+        from: &ContentRef,
+        to: &ContentRef,
+        spec: &PackContent,
+        docker: Option<&DockerRuntime>,
+        progress: Option<&InstallProgress>,
+    ) -> Result<Updated, ProvisionError> {
+        spec.validate().map_err(ProvisionError::BadSpec)?;
+        let PackContent::Steamcmd { app_id, mod_dir } = spec else {
+            return Err(ProvisionError::NotUpdatable { driver: spec.driver_name() });
+        };
+        if !self.allow_fetch {
+            return Err(ProvisionError::FetchNotPermitted { url: format!("steam app {app_id}") });
+        }
+        if self.steamcmd_image.is_none() {
+            return Err(ProvisionError::NoSteamcmdImage { app_id: *app_id });
+        }
+        let docker = docker.ok_or(ProvisionError::NoContainerRuntime { driver: "steamcmd" })?;
+        let source = self.layout.content_dir(from).map_err(ProvisionError::BadContentRef)?;
+        let dir = self.layout.content_dir(to).map_err(ProvisionError::BadContentRef)?;
+        if !source.is_dir() {
+            return Err(ProvisionError::NothingToUpdate { dir: source });
+        }
+        if dir.exists() {
+            // Never over an existing copy: it is someone's, and may be mounted.
+            return Err(ProvisionError::Io(io::Error::other(format!(
+                "{} already exists; an update always makes a new version",
+                dir.display()
+            ))));
+        }
+
+        let staging = self.staging_root()?;
+        if let Some(p) = progress {
+            p.set_staging(&staging);
+        }
+        let installed = staging.join("unpacked");
+        // A plain copy, not hard links: steamcmd may write into a file in
+        // place, and a hard link would carry that write into the copy running
+        // servers have mounted. A cancel during the copy lands right after it.
+        let copied = {
+            let (src, dst) = (source.clone(), installed.clone());
+            tokio::task::spawn_blocking(move || copy_tree(&src, &dst))
+                .await
+                .map_err(|e| ProvisionError::Io(io::Error::other(e.to_string())))?
+        };
+        if let Err(e) = copied {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e.into());
+        }
+        if progress.is_some_and(InstallProgress::is_cancelled) {
+            return Err(cancelled(&staging));
+        }
+        let from_build = steam_build_id(&installed, *app_id);
+        self.run_steamcmd(&staging, &installed, *app_id, mod_dir.as_deref(), false, docker, progress)
+            .await?;
+        let to_build = steam_build_id(&installed, *app_id);
+        if from_build.is_some() && from_build == to_build {
+            let _ = fs::remove_dir_all(&staging);
+            return Ok(Updated::UpToDate { build: to_build });
+        }
+        let bytes = dir_size(&installed);
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&installed, &dir)?;
+        let _ = fs::remove_dir_all(&staging);
+        Ok(Updated::NewBuild { dir, bytes, from_build, to_build })
+    }
+
+    /// One steamcmd run into `installed`, inside `staging`, retried once on
+    /// [`STEAMCMD_TRANSIENT`]. On any failure, and on a cancel, the staging
+    /// directory is discarded and nothing is installed.
+    ///
+    /// `validate` is for a fresh install only. An update must not pass it:
+    /// `validate` checks every file against Valve's manifest and puts back any
+    /// the operator changed — `scripts/install-yapb.sh` points `liblist.gam`
+    /// at YaPB, and a validating update would silently take a node's bots
+    /// away.
+    #[allow(clippy::too_many_arguments)] // each is a separate fact about this run
+    async fn run_steamcmd(
+        &self,
+        staging: &Path,
+        installed: &Path,
+        app_id: u32,
+        mod_dir: Option<&str>,
+        validate: bool,
+        docker: &DockerRuntime,
+        progress: Option<&InstallProgress>,
+    ) -> Result<(), ProvisionError> {
+        let is_cancelled = || progress.is_some_and(InstallProgress::is_cancelled);
+        let staging = staging.to_path_buf();
+        let installed = installed.to_path_buf();
+        let image = match self.steamcmd_image.clone() {
+            Some(image) => image,
+            None => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(ProvisionError::NoSteamcmdImage { app_id });
+            }
+        };
+        // steamcmd keeps its own state — a Steam runtime, a login cache,
+        // logs — under `$HOME`, and it is run as the agent's user rather
+        // than root so the install it produces is one the agent can work
+        // in afterwards. That user has no home inside the image, and
+        // steamcmd's first act is then `mkdir: Permission denied`. So
+        // give it one in the staging directory, which is discarded when
+        // the run ends: only `unpacked` is promoted into the content
+        // tree, so none of steamcmd's own state becomes game content.
+        let steam_home = staging.join("steamhome");
+        fs::create_dir_all(&steam_home)?;
+        let mounts = [
+            Mount {
+                host_path: installed.clone(),
+                container_path: TASK_INSTALL_DIR.into(),
+                read_only: false,
+            },
+            Mount {
+                host_path: steam_home.clone(),
+                container_path: TASK_HOME_DIR.into(),
+                read_only: false,
+            },
+        ];
+        // Every argument here is built by this code. The pack supplied
+        // one number, and `+login anonymous` is not negotiable: an app
+        // that needs credentials is a `manual` pack (GAMES.md §5).
+        let mut cmd = vec![
+            "+force_install_dir".to_string(),
+            TASK_INSTALL_DIR.to_string(),
+            "+login".to_string(),
+            "anonymous".to_string(),
+        ];
+        // Which depots of a multi-mod app to fetch. Steam app 90 is the
+        // case: by default it installs Half-Life and Counter-Strike,
+        // and only `mod czero` brings Condition Zero as well. The name
+        // was validated as an identifier when the pack loaded
+        // (`content::validate_mod_name`) and is re-checked here,
+        // because "it was validated elsewhere" is how a shell-shaped
+        // string reaches a command line.
+        if let Some(name) = mod_dir {
+            game_bridge::content::validate_mod_name(name)
+                .map_err(ProvisionError::BadSpec)?;
+            cmd.push("+app_set_config".to_string());
+            cmd.push(app_id.to_string());
+            cmd.push("mod".to_string());
+            cmd.push(name.to_string());
+        }
+        cmd.push("+app_update".to_string());
+        cmd.push(app_id.to_string());
+        if validate {
+            cmd.push("validate".to_string());
+        }
+        cmd.push("+quit".to_string());
+        let task = staging.file_name().and_then(|n| n.to_str()).unwrap_or("task").to_string();
+        // steamcmd fails a fresh install now and then with `ERROR!
+        // Failed to install app '<id>' (Missing configuration)`, before
+        // a byte is downloaded — measured 2026-09-30 as two fresh runs
+        // in three for app 232250 (TF2), and the identical command then
+        // succeeded. Every run here starts from a fresh `$HOME`, so
+        // without a retry a node fails a TF2 install as often as not.
+        // One more attempt, for that error only, in the same staging
+        // directory and home: any other failure is reported as it was.
+        let mut attempt = 0;
+        let outcome = loop {
+            attempt += 1;
+            if is_cancelled() {
+                return Err(cancelled(&staging));
+            }
+            let name = format!("gpp-content-{app_id}-{task}-{attempt}");
+            // Named before it exists, so a cancel arriving while it
+            // is being created still knows what to remove; and
+            // `run_to_completion` checks the flag again once it has.
+            if let Some(p) = progress {
+                p.set_task_container(Some(name.clone()));
+            }
+            let outcome = docker
+                .run_to_completion(
+                    &name,
+                    &image,
+                    cmd.clone(),
+                    &mounts,
+                    Some(TASK_MEMORY_LIMIT_BYTES),
+                    &[format!("HOME={TASK_HOME_DIR}")],
+                    progress.map(|p| &p.cancelled),
+                )
+                .await;
+            if let Some(p) = progress {
+                p.set_task_container(None);
+            }
+            // Whatever the run says, a cancelled one is cancelled: its
+            // container was removed under it, so its exit code and
+            // output describe the removal, not the download.
+            if is_cancelled() {
+                return Err(cancelled(&staging));
+            }
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(ProvisionError::ToolFailed {
+                        tool: "steamcmd",
+                        exit_code: -1,
+                        output: format!("{e:#}"),
+                    });
+                }
+            };
+            if outcome.exit_code != 0
+                && attempt < STEAMCMD_ATTEMPTS
+                && outcome.output.contains(STEAMCMD_TRANSIENT)
+            {
+                continue;
+            }
+            break outcome;
+        };
+        if outcome.exit_code != 0 {
+            // A partial download is not content. Same rule as a failed
+            // digest: nothing half-done becomes an install.
+            let _ = fs::remove_dir_all(&staging);
+            return Err(ProvisionError::ToolFailed {
+                tool: "steamcmd",
+                exit_code: outcome.exit_code,
+                output: outcome.output,
+            });
+        }
+        Ok(())
     }
 
     /// A fresh staging directory on the same filesystem as the content tree, so
@@ -502,6 +642,42 @@ impl Provisioner {
         fs::create_dir_all(&dir)?;
         Ok(dir)
     }
+}
+
+/// The build id in Steam's own manifest for `app_id` under an install, if it
+/// has one. Read from the file steamcmd writes, never from its console.
+pub fn steam_build_id(install: &Path, app_id: u32) -> Option<String> {
+    let text = fs::read_to_string(install.join("steamapps").join(format!("appmanifest_{app_id}.acf"))).ok()?;
+    text.lines().find_map(|l| {
+        let mut parts = l.split('"').filter(|p| !p.trim().is_empty());
+        match (parts.next(), parts.next()) {
+            (Some(k), Some(v)) if k.eq_ignore_ascii_case("buildid") => Some(v.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// Copy a directory tree, keeping permissions (a dedicated server's binaries
+/// must stay executable) and symlinks as links.
+pub(crate) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    fs::set_permissions(dst, fs::metadata(src)?.permissions())?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if kind.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
+            #[cfg(not(unix))]
+            fs::copy(&from, &to).map(|_| ())?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Bytes under a directory, for reporting what an install cost. Best effort:

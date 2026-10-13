@@ -229,7 +229,9 @@ departs from the plan below, the code is right and says why: cancel is
 `GET /content` answers `{copies, downloads}` so the page polls one route, not
 one per game. Both open decisions took the safe option: Delete only lists the
 servers using a copy (409 with their ids), and no total is shown for any
-download yet. Step 7's additions are still open.
+download yet. From step 7, **Update a game** is built too, with a
+"remove the old version when done" option (`CLAUDE.md` has its rules);
+verify, room-before-download, remove a pack and a queue are still open.
 
 **What.** An **Installed** page in Lanthorn Host listing every game whose files
 are on this node, and every download in progress, with the controls to manage
