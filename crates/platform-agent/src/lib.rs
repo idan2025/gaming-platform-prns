@@ -20,3 +20,4 @@ pub mod ports;
 pub mod store;
 pub mod uplink;
 pub mod uplink_wire;
+pub mod updates;

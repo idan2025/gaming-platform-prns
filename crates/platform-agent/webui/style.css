@@ -181,6 +181,18 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .copy-row .cell { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .copy-row .actions { display: flex; justify-content: flex-end; gap: 6px; }
 .copy-row.unused { border-color: var(--warn); }
+/* A copy's update line spans the row under its name, so a long notice never
+   squeezes the columns above it. */
+.copy-row .update-line { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12.5px; color: var(--text-2); }
+.copy-row .update-line .new { color: var(--ok); font-weight: 600; }
+.copy-row .update-line .bad-text { color: var(--bad); }
+.link-btn { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; }
+.link-btn:disabled { color: var(--text-3); cursor: default; text-decoration: none; }
+.updates-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; margin-bottom: 12px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); font-size: 13px; color: var(--text-2); }
+.updates-field { display: flex; align-items: center; gap: 8px; }
+.updates-field select { width: auto; min-width: 150px; }
+.updates-field input { width: 84px; }
+.updates-note { flex: 1 1 260px; min-width: 0; font-size: 12px; color: var(--text-3); }
 .state-unused { background: var(--warn-soft); color: var(--warn); }
 .download-progress { display: flex; flex-direction: column; gap: 4px; }
 .dl-bar { height: 4px; border-radius: 2px; background: var(--surface-3); overflow: hidden; }
@@ -355,7 +367,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .inst { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
   .copy-head { display: none; }
   .copy-row { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
-  .copy-row > :nth-child(n+3):not(.actions) { display: none; }
+  .copy-row > :nth-child(n+3):not(.actions):not(.update-line) { display: none; }
   .inst > :nth-child(n+3):not(.actions):not(.usage) { display: none; }
   .inst > .usage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }

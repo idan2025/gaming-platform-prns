@@ -59,6 +59,20 @@ fn docker_rm(name: &str) {
         .status();
 }
 
+/// Removes its containers when dropped, so a test that fails part-way —
+/// an assert panicking inside it — still leaves no server on the daemon. A
+/// cleanup after the test body is skipped by exactly that panic, and once
+/// left a stopped server on a real node's page.
+struct Containers(Vec<String>);
+
+impl Drop for Containers {
+    fn drop(&mut self) {
+        for id in &self.0 {
+            docker_rm(&format!("gpp-{id}"));
+        }
+    }
+}
+
 fn task_containers() -> String {
     let out = std::process::Command::new("docker")
         .args(["ps", "-a", "--filter", "name=gpp-content-276060-", "--format", "{{.Names}}"])
@@ -162,6 +176,7 @@ async fn a_copy_a_stopped_server_mounts_is_not_deleted_until_the_server_is_remov
     };
     let id = format!("installed{}", std::process::id());
     docker_rm(&format!("gpp-{id}"));
+    let _cleanup = Containers(vec![id.clone()]);
 
     let outcome = async {
         agent.create(spec(&id)).await?;
@@ -190,7 +205,6 @@ async fn a_copy_a_stopped_server_mounts_is_not_deleted_until_the_server_is_remov
         anyhow::Ok(())
     }
     .await;
-    docker_rm(&format!("gpp-{id}"));
     outcome.unwrap();
 }
 
@@ -373,6 +387,7 @@ async fn an_update_moves_new_servers_and_removes_the_old_copy_once_unused() {
     for id in [&old_srv, &new_srv] {
         docker_rm(&format!("gpp-{id}"));
     }
+    let _cleanup = Containers(vec![old_srv.clone(), new_srv.clone()]);
 
     let outcome = async {
         agent.create(spec(&old_srv)).await?;
@@ -414,9 +429,6 @@ async fn an_update_moves_new_servers_and_removes_the_old_copy_once_unused() {
         anyhow::Ok(())
     }
     .await;
-    for id in [&old_srv, &new_srv] {
-        docker_rm(&format!("gpp-{id}"));
-    }
     outcome.unwrap();
 }
 

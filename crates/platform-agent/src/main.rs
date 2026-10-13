@@ -125,6 +125,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Update checks (`updates.rs`): nothing runs until the operator sets an
+    // interval on the Installed page.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(platform_agent::agent::UPDATE_CHECK_TICK).await;
+                agent.check_due_updates().await;
+            }
+        });
+    }
+
     // The Reticulum control uplink is opt-in via `[uplink]` in the config. When
     // present, the agent also announces a `platform-agent.control` destination
     // and answers authenticated create/stop/remove/list requests over a Link, so

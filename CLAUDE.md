@@ -530,6 +530,29 @@ change could quietly break:
   (`steamapps/appmanifest_<app>.acf`, `buildid`), never steamcmd's console.
   The same build before and after discards the copy: no identical second copy.
 
+**The node checks for new builds and keeps a disk reserve** (2026-10-13,
+`ROADMAP.md` §12 steps 1–2, `updates.rs`, `Provisioner::latest_build`,
+`install.rs`). Rules a later change could quietly break:
+- **Checks are off until the operator sets an interval** (`content-updates.json`
+  beside `content-active.json`, never `agent.toml`). A check is a steamcmd
+  container on the operator's image, anonymous, with an app id from the pack.
+- **The newest build is `branches/public/buildid` of the asked app, and Steam
+  nests `branches` inside `depots`** (measured for apps 90 and 232250). A
+  depot's own `public` manifest and the `beta` branch carry other numbers;
+  `the_public_build_is_read_from_its_own_branch_and_app_only` pins it. Task
+  logs keep 40 lines, so a check uses `run_for_output` with a long tail: the
+  document's first line would otherwise be cut off.
+- **A copy with no manifest is "unknown", never "up to date".**
+- **One download at a time per node.** Others wait as `Queued`, take no space,
+  and can be cancelled while they wait.
+- **A download starts only if it fits above the reserve, and is stopped when the
+  disk reaches it.** The reserve is the larger of 10% of the disk and 5 GB
+  unless the operator set one; an update needs its whole copy plus 10%. The stop
+  goes through the cancel path (nothing left, container removed) and the reason
+  replaces "cancelled". **Nothing is deleted to make room**: the refusal names
+  the unused copies that would. Caught by the two reserve tests in
+  `tests/update_checks.rs`, which fail with the gate or the watch removed.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

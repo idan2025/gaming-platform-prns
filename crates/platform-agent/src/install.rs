@@ -26,6 +26,15 @@
 //! * **A task holds no lock on the agent.** It owns a game id and reports a
 //!   state; everything about whether content is really on disk stays the
 //!   provisioner's business, which is checked again at start.
+//! * **One download at a time per node** (`ROADMAP.md` §12.2). The others wait
+//!   as `Queued`, take no space until they run, and can be cancelled while
+//!   they wait. That keeps the reserve arithmetic honest: what is free when a
+//!   download starts is not also promised to another.
+//! * **A download starts only if it fits above the reserve, and stops if it
+//!   reaches it** (`Agent::room_for`, `Agent::disk_reached_reserve`). The
+//!   check runs when the download leaves the queue, against the disk as it is
+//!   then; a stop goes through the same path as a cancel, so it leaves
+//!   nothing, and says why.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -56,6 +65,9 @@ pub enum InstallState {
         #[serde(skip_serializing_if = "Option::is_none")]
         total_bytes: Option<u64>,
     },
+    /// Waiting for the download running now to finish (one at a time per
+    /// node). Nothing is on disk for it yet.
+    Queued { since_secs: u64 },
     /// Finished. `bytes` is what landed, or 0 when it was already installed.
     /// `update` is present when this was an update rather than an install.
     Done {
@@ -77,10 +89,27 @@ struct Task {
     held: bool,
 }
 
+impl InstallState {
+    /// Running or waiting to: the slot is taken.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Queued { .. })
+    }
+}
+
+/// How often a running download looks at the disk.
+const DISK_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The installs this agent knows about, by game id.
-#[derive(Default)]
 pub struct Installs {
     tasks: Mutex<BTreeMap<String, Task>>,
+    /// One permit: the download running now.
+    queue: tokio::sync::Semaphore,
+}
+
+impl Default for Installs {
+    fn default() -> Self {
+        Self { tasks: Mutex::new(BTreeMap::new()), queue: tokio::sync::Semaphore::new(1) }
+    }
 }
 
 impl Installs {
@@ -99,6 +128,9 @@ impl Installs {
                     InstallState::Running { .. } => {
                         (t.started.elapsed().as_secs(), t.progress.clone())
                     }
+                    InstallState::Queued { .. } => {
+                        return InstallState::Queued { since_secs: t.started.elapsed().as_secs() }
+                    }
                     other => return other.clone(),
                 },
             }
@@ -109,12 +141,12 @@ impl Installs {
         InstallState::Running { since_secs, bytes: progress.bytes(), total_bytes: None }
     }
 
-    /// The games with an install running now.
+    /// The games with an install running now or waiting to.
     pub async fn running(&self) -> Vec<String> {
         let tasks = self.tasks.lock().await;
         tasks
             .iter()
-            .filter(|(_, t)| !t.held && matches!(t.state, InstallState::Running { .. }))
+            .filter(|(_, t)| !t.held && t.state.is_active())
             .map(|(g, _)| g.clone())
             .collect()
     }
@@ -128,7 +160,7 @@ impl Installs {
     pub async fn cancel(&self, game_id: &str) -> Result<Option<String>, NotRunning> {
         let tasks = self.tasks.lock().await;
         match tasks.get(game_id) {
-            Some(t) if !t.held && matches!(t.state, InstallState::Running { .. }) => {
+            Some(t) if !t.held && t.state.is_active() => {
                 t.progress.cancel();
                 Ok(t.progress.task_container())
             }
@@ -159,7 +191,7 @@ impl Installs {
     /// Whether an install for this game is running right now.
     pub async fn is_running(&self, game_id: &str) -> bool {
         let tasks = self.tasks.lock().await;
-        tasks.get(game_id).is_some_and(|t| matches!(t.state, InstallState::Running { .. }))
+        tasks.get(game_id).is_some_and(|t| t.state.is_active())
     }
 
     /// Claim the right to install this game, or report that someone already
@@ -175,21 +207,52 @@ impl Installs {
     async fn claim(&self, game_id: &str, held: bool) -> Option<Arc<InstallProgress>> {
         let mut tasks = self.tasks.lock().await;
         if let Some(t) = tasks.get(game_id) {
-            if matches!(t.state, InstallState::Running { .. }) {
+            if t.state.is_active() {
                 return None;
             }
         }
         let progress = Arc::new(InstallProgress::default());
+        // A download waits its turn; a delete's hold is not a download and
+        // takes the slot at once.
+        let state = if held {
+            InstallState::Running { since_secs: 0, bytes: 0, total_bytes: None }
+        } else {
+            InstallState::Queued { since_secs: 0 }
+        };
         tasks.insert(
             game_id.to_string(),
             Task {
-                state: InstallState::Running { since_secs: 0, bytes: 0, total_bytes: None },
+                state,
                 started: std::time::Instant::now(),
                 progress: progress.clone(),
                 held,
             },
         );
         Some(progress)
+    }
+
+    /// Wait for this node's one download slot, then mark the task running.
+    /// `None` if it was cancelled while it waited.
+    async fn take_turn(&self, game_id: &str, progress: &InstallProgress) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let permit = loop {
+            if progress.is_cancelled() {
+                return None;
+            }
+            // A short wait, then look at the cancel flag again: a queued
+            // download is cancelled without waiting out the one before it.
+            if let Ok(Ok(p)) = tokio::time::timeout(std::time::Duration::from_millis(250), self.queue.acquire()).await {
+                break p;
+            }
+        };
+        if progress.is_cancelled() {
+            return None;
+        }
+        let mut tasks = self.tasks.lock().await;
+        if let Some(t) = tasks.get_mut(game_id) {
+            t.state = InstallState::Running { since_secs: 0, bytes: 0, total_bytes: None };
+            t.started = std::time::Instant::now();
+        }
+        Some(permit)
     }
 
     /// Record how an install ended.
@@ -219,7 +282,21 @@ pub async fn spawn(
         return false;
     };
     tokio::spawn(async move {
-        let outcome = agent.ensure_content_tracked(&game_id, Some(&progress)).await;
+        let Some(_turn) = installs.take_turn(&game_id, &progress).await else {
+            installs.finish(&game_id, InstallState::Failed { error: "cancelled".into() }).await;
+            return;
+        };
+        // A fresh install's size is not known (`ROADMAP.md` §12.2), so it is
+        // held to the reserve alone; the watch below is what protects the
+        // disk. Content already there needs no room.
+        if agent.content_is_missing(&game_id).await {
+            if let Err(error) = agent.room_for(0).await {
+                tracing::warn!(game = %game_id, error = %error, "content install not started");
+                installs.finish(&game_id, InstallState::Failed { error }).await;
+                return;
+            }
+        }
+        let outcome = watched(&agent, &progress, agent.ensure_content_tracked(&game_id, Some(&progress))).await;
         let state = match outcome {
             Ok(crate::content::Provisioned::AlreadyInstalled(_)) => {
                 InstallState::Done { bytes: 0, already_installed: true, update: None }
@@ -230,7 +307,7 @@ pub async fn spawn(
             // The sentence is the product here: it names the missing directory,
             // the digest that did not match, or the switch the operator has not
             // turned on.
-            Err(e) => InstallState::Failed { error: format!("{e}") },
+            Err(e) => InstallState::Failed { error: progress.stop_reason().unwrap_or_else(|| format!("{e}")) },
         };
         if let InstallState::Failed { error } = &state {
             tracing::warn!(game = %game_id, error = %error, "content install failed");
@@ -254,20 +331,62 @@ pub async fn spawn_update(
         return false;
     };
     tokio::spawn(async move {
-        let state = match agent.update_content(&game_id, remove_old, Some(&progress)).await {
+        let Some(_turn) = installs.take_turn(&game_id, &progress).await else {
+            installs.finish(&game_id, InstallState::Failed { error: "cancelled".into() }).await;
+            return;
+        };
+        // An update copies the old copy first, so it needs that much and the
+        // delta; never started if that would take the disk below the reserve.
+        if let Err(error) = agent.room_for(agent.update_needs(&game_id)).await {
+            tracing::warn!(game = %game_id, error = %error, "content update not started");
+            installs.finish(&game_id, InstallState::Failed { error }).await;
+            return;
+        }
+        let outcome = watched(&agent, &progress, agent.update_content(&game_id, remove_old, Some(&progress))).await;
+        let state = match outcome {
             Ok(report) => {
                 tracing::info!(game = %game_id, to = ?report.to_version, old = %report.old, "content update finished");
                 let bytes = 0;
                 InstallState::Done { bytes, already_installed: report.to_version.is_none(), update: Some(report) }
             }
             Err(e) => {
-                tracing::warn!(game = %game_id, error = %e, "content update failed");
-                InstallState::Failed { error: format!("{e}") }
+                let error = progress.stop_reason().unwrap_or_else(|| format!("{e}"));
+                tracing::warn!(game = %game_id, error = %error, "content update failed");
+                InstallState::Failed { error }
             }
         };
         installs.finish(&game_id, state).await;
     });
     true
+}
+
+/// Run `work`, looking at the disk every [`DISK_WATCH_EVERY`]: once it reaches
+/// the reserve the run is stopped the way a cancel stops it — its flag set,
+/// its container removed — with the reason kept for its `Failed` state.
+async fn watched<T>(
+    agent: &crate::agent::Agent,
+    progress: &InstallProgress,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(work);
+    let mut tick = tokio::time::interval(DISK_WATCH_EVERY);
+    loop {
+        tokio::select! {
+            out = &mut work => return out,
+            _ = tick.tick() => {
+                if progress.is_cancelled() {
+                    continue;
+                }
+                if let Some(reason) = agent.disk_reached_reserve() {
+                    tracing::warn!(reason = %reason, "stopping a download at the disk reserve");
+                    progress.stop(reason);
+                    if let Some(name) = progress.task_container() {
+                        let _ = agent.docker().remove_task(&name).await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -354,12 +473,47 @@ mod tests {
         assert!(progress.is_cancelled());
     }
 
+    /// One download at a time: a second game waits as `Queued`, runs once the
+    /// first ends, and can be cancelled while it waits without waiting out
+    /// the first.
+    #[tokio::test]
+    async fn a_second_download_waits_its_turn_and_can_be_cancelled_while_waiting() {
+        let installs = Arc::new(Installs::new());
+        let a = installs.begin("a").await.unwrap();
+        let turn_a = installs.take_turn("a", &a).await.unwrap();
+        assert!(matches!(installs.state("a").await, InstallState::Running { .. }));
+
+        let b = installs.begin("b").await.unwrap();
+        let waiting = {
+            let (installs, b) = (installs.clone(), b.clone());
+            tokio::spawn(async move { installs.take_turn("b", &b).await.is_some() })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(matches!(installs.state("b").await, InstallState::Queued { .. }));
+        assert_eq!(installs.running().await, vec!["a".to_string(), "b".to_string()], "a queued one is listed");
+        assert!(installs.begin("b").await.is_none(), "a queued game's slot is taken");
+
+        // Cancelled while it waits: it gives up without the first finishing.
+        installs.cancel("b").await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap();
+        assert!(!got, "a cancelled download must not take a turn");
+
+        // And the next one runs once the first lets go.
+        installs.finish("b", InstallState::Failed { error: "cancelled".into() }).await;
+        let c = installs.begin("c").await.unwrap();
+        drop(turn_a);
+        let turn_c = tokio::time::timeout(std::time::Duration::from_secs(2), installs.take_turn("c", &c)).await.unwrap();
+        assert!(turn_c.is_some());
+        assert!(matches!(installs.state("c").await, InstallState::Running { .. }));
+    }
+
     /// No driver knows a download's total, so none is reported: a progress
     /// bar with an invented end is one that lies.
     #[tokio::test]
     async fn a_running_install_reports_no_total_it_does_not_know() {
         let installs = Installs::new();
-        installs.begin("g").await;
+        let progress = installs.begin("g").await.unwrap();
+        let _turn = installs.take_turn("g", &progress).await.unwrap();
         let json = serde_json::to_value(installs.state("g").await).unwrap();
         assert_eq!(json["state"], "running");
         assert_eq!(json["bytes"], 0);

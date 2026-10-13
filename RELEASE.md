@@ -74,6 +74,23 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host: knowing when a game has a new build, and never filling the disk
+
+- The Installed page can check Steam for each game's newest build, on a
+  schedule you pick (every 6 or 12 hours, daily or weekly) or with **Check
+  now**. Checks are off until you choose. A game with a new build says so on
+  its row and on the Installed tab; **Remind me tomorrow** and **Skip build**
+  hide the notice, and a newer build shows again.
+- Downloads keep space free for running servers: by default a tenth of the
+  disk, at least 5 GB, and you can set your own. A download or update that
+  would go below it does not start, and says which unused copies would make
+  room; one that gets there while running is stopped and leaves nothing
+  behind. Nothing is ever deleted for you.
+- One download at a time: the rest wait in line as **Queued**, and can be
+  cancelled while they wait.
+
 ## v0.2.36
 
 ### Lanthorn Host: an Installed page for game files

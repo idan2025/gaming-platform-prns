@@ -76,6 +76,26 @@ pub fn disk_space(path: &std::path::Path) -> Result<Storage> {
     Err(anyhow!("free space is not read on this platform ({})", path.display()))
 }
 
+/// How often the agent looks for update checks that are due. The interval
+/// itself is the operator's (`updates.rs`); this is only how soon after it
+/// passes a check starts.
+pub const UPDATE_CHECK_TICK: Duration = Duration::from_secs(60);
+
+/// Bytes as the page writes them, for sentences an operator reads.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
 /// Most log lines one request may ask for.
 pub const MAX_LOG_LINES: usize = 2000;
 
@@ -114,6 +134,10 @@ pub struct Agent {
     content_sizes: std::sync::Mutex<HashMap<std::path::PathBuf, (SystemTime, u64)>>,
     /// Which copy new servers use once an update has moved it (`active.rs`).
     active: crate::active::ActiveVersions,
+    /// Update checks, snoozes and the disk reserve (`updates.rs`).
+    updates: crate::updates::UpdateChecks,
+    /// One check at a time: they share steamcmd's `$HOME`.
+    check_lock: Mutex<()>,
 }
 
 /// How often the agent looks for servers that crashed.
@@ -344,6 +368,8 @@ impl Agent {
             crashes: Mutex::new(CrashWatch::default()),
             content_sizes: std::sync::Mutex::new(HashMap::new()),
             active: crate::active::ActiveVersions::load(&config_data_root),
+            updates: crate::updates::UpdateChecks::load(&config_data_root),
+            check_lock: Mutex::new(()),
         })
     }
 
@@ -1590,6 +1616,193 @@ impl Agent {
             report.old = if report.old_used_by.is_empty() { "removed" } else { "waiting" }.into();
         }
         Ok(report)
+    }
+
+    /// The operator's update-check and reserve settings (`updates.rs`).
+    pub fn update_settings(&self) -> crate::updates::Settings {
+        self.updates.settings()
+    }
+
+    pub fn set_update_settings(&self, settings: crate::updates::Settings) -> Result<(), String> {
+        self.updates.set_settings(settings)
+    }
+
+    /// The reserve on this node's disk, and the disk it was worked out from.
+    /// `None` where free space cannot be read (`disk_space`), and then there is
+    /// no reserve to keep: nothing is refused for a number nobody knows.
+    pub fn reserve(&self) -> Option<(Storage, u64)> {
+        let storage = self.storage().ok()?;
+        let reserve = self.updates.settings().reserve(storage.total_bytes);
+        Some((storage, reserve))
+    }
+
+    /// Why a download running now has to stop, if the disk has reached the
+    /// reserve (`install.rs` asks on every progress tick).
+    pub fn disk_reached_reserve(&self) -> Option<String> {
+        let (storage, reserve) = self.reserve()?;
+        (storage.free_bytes < reserve).then(|| {
+            format!(
+                "stopped: the disk reached this node's reserve ({} must stay free, {} is). Nothing it \
+                 fetched was kept. Free some space, such as unused copies on the Installed page, and \
+                 try again",
+                human_bytes(reserve),
+                human_bytes(storage.free_bytes)
+            )
+        })
+    }
+
+    /// The space an update of `game_id` is assumed to need: its active copy
+    /// and the delta (`updates::update_needs`). Zero when there is no copy.
+    pub fn update_needs(&self, game_id: &str) -> u64 {
+        let Some(version) = self.active_version(game_id) else { return 0 };
+        let content = ContentRef { game_id: game_id.to_string(), version };
+        let Ok(dir) = self.layout.content_dir(&content) else { return 0 };
+        if !dir.is_dir() {
+            return 0;
+        }
+        let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+        crate::updates::update_needs(self.content_size(&dir, modified))
+    }
+
+    /// Refuse a download of about `need` bytes that would take the disk below
+    /// the reserve, naming what it needs, what is free, and the unused copies
+    /// whose deletion would make room. **Nothing is deleted here**: making
+    /// room is the operator's call.
+    pub async fn room_for(&self, need: u64) -> Result<(), String> {
+        let Some((storage, reserve)) = self.reserve() else { return Ok(()) };
+        if crate::updates::fits(storage.free_bytes, need, reserve) {
+            return Ok(());
+        }
+        let above = storage.free_bytes.saturating_sub(reserve);
+        let mut msg = if need == 0 {
+            format!(
+                "not enough room: this node keeps {} free and has {} free, so nothing new is downloaded",
+                human_bytes(reserve),
+                human_bytes(storage.free_bytes)
+            )
+        } else {
+            format!(
+                "not enough room: this needs about {}, and {} is free above the {} this node keeps free",
+                human_bytes(need),
+                human_bytes(above),
+                human_bytes(reserve)
+            )
+        };
+        let unused: Vec<InstalledCopy> =
+            self.installed().await.unwrap_or_default().into_iter().filter(|c| c.unused).collect();
+        let freed: u64 = unused.iter().map(|c| c.bytes).sum();
+        if !unused.is_empty() {
+            let names: Vec<String> =
+                unused.iter().map(|c| format!("{} {} ({})", c.game_id, c.version, human_bytes(c.bytes))).collect();
+            let enough = crate::updates::fits(storage.free_bytes.saturating_add(freed), need, reserve);
+            msg.push_str(&format!(
+                ". Deleting the unused copies ({}) {} free enough",
+                names.join(", "),
+                if enough { "would" } else { "would still not" }
+            ));
+        }
+        Err(msg)
+    }
+
+    /// Ask Steam for `game_id`'s newest public build now, remember the answer,
+    /// and return the game's notice (`updates.rs`). Only a steamcmd game whose
+    /// active copy is installed is checked: an archive pack's digest pins its
+    /// bytes, and a manual game has nothing to ask.
+    pub async fn check_for_update(&self, game_id: &str) -> Result<crate::updates::UpdateNotice, String> {
+        let app_id = match self.packs.read().await.get(game_id).map(|p| p.content.clone()) {
+            None => return Err(format!("no game pack installed for {game_id:?}")),
+            Some(PackContent::Steamcmd { app_id, .. }) => app_id,
+            Some(other) => {
+                return Err(format!(
+                    "only a game downloaded with steamcmd has newer builds to check for; this pack's \
+                     content driver is {:?}",
+                    other.driver_name()
+                ))
+            }
+        };
+        let version = self.active_version(game_id).ok_or_else(|| format!("this node has no runtime configured for {game_id:?}"))?;
+        let content = ContentRef { game_id: game_id.to_string(), version: version.clone() };
+        let dir = self.layout.content_dir(&content).map_err(|e| format!("{e}"))?;
+        if !dir.is_dir() {
+            return Err(format!("{game_id} is not installed here, so there is nothing to update"));
+        }
+        let home = self.config.data_root.join("steamcmd-check");
+        let outcome = {
+            let _one = self.check_lock.lock().await;
+            self.content.latest_build(app_id, &self.docker, &home).await.map_err(|e| format!("{e}"))
+        };
+        if let Err(e) = &outcome {
+            tracing::warn!(game = %game_id, error = %e, "update check failed");
+        }
+        self.updates
+            .record(game_id, now_unix(), outcome)
+            .map_err(|e| format!("saving the check: {e}"))?;
+        Ok(self.notice_for(game_id, &version, app_id, &dir))
+    }
+
+    fn notice_for(
+        &self,
+        game_id: &str,
+        version: &str,
+        app_id: u32,
+        dir: &std::path::Path,
+    ) -> crate::updates::UpdateNotice {
+        let installed = crate::content::steam_build_id(dir, app_id);
+        crate::updates::UpdateNotice::new(game_id, version, installed, &self.updates.game(game_id), now_unix())
+    }
+
+    /// Every steamcmd game with an installed active copy, and what is known
+    /// about its newest build.
+    pub async fn update_notices(&self) -> Vec<crate::updates::UpdateNotice> {
+        let packs: Vec<(String, u32)> = self
+            .packs
+            .read()
+            .await
+            .values()
+            .filter_map(|p| match p.content {
+                PackContent::Steamcmd { app_id, .. } => Some((p.id.clone(), app_id)),
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (game_id, app_id) in packs {
+            let Some(version) = self.active_version(&game_id) else { continue };
+            let content = ContentRef { game_id: game_id.clone(), version: version.clone() };
+            let Ok(dir) = self.layout.content_dir(&content) else { continue };
+            if dir.is_dir() {
+                out.push(self.notice_for(&game_id, &version, app_id, &dir));
+            }
+        }
+        out
+    }
+
+    /// Run every check that is due under the operator's interval. Nothing at
+    /// all while checks are off, which is the default.
+    pub async fn check_due_updates(&self) {
+        let Some(hours) = self.updates.settings().check_every_hours else { return };
+        let now = now_unix();
+        for notice in self.update_notices().await {
+            if self.updates.game(&notice.game_id).due(now, hours) {
+                let _ = self.check_for_update(&notice.game_id).await;
+            }
+        }
+    }
+
+    /// Hide a game's notice for `hours`, or while `skip_build` is its newest
+    /// build; neither clears both. `None` and `false` show it again.
+    pub fn snooze_update(&self, game_id: &str, hours: Option<u32>, skip_build: bool) -> Result<(), String> {
+        let until = hours.map(|h| now_unix() + i64::from(h) * 3600);
+        let skip = if skip_build {
+            Some(
+                self.updates
+                    .game(game_id)
+                    .latest_build
+                    .ok_or_else(|| format!("{game_id} has not been checked yet, so there is no build to skip"))?,
+            )
+        } else {
+            None
+        };
+        self.updates.snooze(game_id, until, skip).map_err(|e| format!("saving the snooze: {e}"))
     }
 
     /// `<config version>-<yyyymmdd>`, with `-2`, `-3`… if that exists. Named

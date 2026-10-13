@@ -484,6 +484,38 @@ impl DockerRuntime {
         env: &[String],
         cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<TaskOutcome> {
+        self.run_task(name, image, cmd, mounts, memory_limit_bytes, env, cancelled, TASK_LOG_TAIL_LINES).await
+    }
+
+    /// [`run_to_completion`](Self::run_to_completion) for a task whose output
+    /// is the answer (steamcmd's `app_info_print`, `content.rs`): keeps up to
+    /// `tail_lines` of it rather than the few a failure message needs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_for_output(
+        &self,
+        name: &str,
+        image: &str,
+        cmd: Vec<String>,
+        mounts: &[Mount],
+        memory_limit_bytes: Option<i64>,
+        env: &[String],
+        tail_lines: usize,
+    ) -> Result<TaskOutcome> {
+        self.run_task(name, image, cmd, mounts, memory_limit_bytes, env, None, tail_lines).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_task(
+        &self,
+        name: &str,
+        image: &str,
+        cmd: Vec<String>,
+        mounts: &[Mount],
+        memory_limit_bytes: Option<i64>,
+        env: &[String],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        tail_lines: usize,
+    ) -> Result<TaskOutcome> {
         let binds: Vec<String> = mounts
             .iter()
             .map(|m| {
@@ -545,7 +577,7 @@ impl DockerRuntime {
         // Whatever happens next, the container goes away. A provisioning run
         // that failed and left itself behind would collide with the next
         // attempt by name and be much harder to explain than the failure was.
-        let result = self.await_task(name).await;
+        let result = self.await_task(name, tail_lines).await;
         let _ = self
             .docker
             .remove_container(name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
@@ -553,7 +585,7 @@ impl DockerRuntime {
         result
     }
 
-    async fn await_task(&self, name: &str) -> Result<TaskOutcome> {
+    async fn await_task(&self, name: &str, tail_lines: usize) -> Result<TaskOutcome> {
         use futures_util::StreamExt;
 
         self.docker
@@ -582,7 +614,7 @@ impl DockerRuntime {
             Some(LogsOptions::<String> {
                 stdout: true,
                 stderr: true,
-                tail: TASK_LOG_TAIL_LINES.to_string(),
+                tail: tail_lines.to_string(),
                 ..Default::default()
             }),
         );

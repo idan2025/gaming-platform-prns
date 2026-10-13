@@ -43,6 +43,7 @@ use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use game_bridge::content::PackContent;
 use sha2::{Digest, Sha256};
@@ -206,6 +207,16 @@ const TASK_MEMORY_LIMIT_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 /// run, and the second is what cleared it.
 const STEAMCMD_ATTEMPTS: u32 = 2;
 
+/// How much of `app_info_print` a check keeps. App 90's document is ~260
+/// lines (measured 2026-10-13); an app with many depots is longer, and a
+/// document cut at its head would lose the line the parser starts from.
+const CHECK_OUTPUT_LINES: usize = 20_000;
+
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// The one steamcmd failure that is retried rather than reported.
 const STEAMCMD_TRANSIENT: &str = "(Missing configuration)";
 
@@ -221,7 +232,12 @@ const STEAMCMD_TRANSIENT: &str = "(Missing configuration)";
 pub struct InstallProgress {
     staging: std::sync::Mutex<Option<PathBuf>>,
     task_container: std::sync::Mutex<Option<String>>,
-    cancelled: AtomicBool,
+    /// Shared rather than inline so a blocking copy on another thread can
+    /// watch it too (`copy_tree_until`).
+    cancelled: Arc<AtomicBool>,
+    /// Why the agent stopped the run itself, when it was not the operator:
+    /// the disk reaching its reserve (`install.rs`).
+    stop_reason: std::sync::Mutex<Option<String>>,
 }
 
 impl InstallProgress {
@@ -249,6 +265,22 @@ impl InstallProgress {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Cancel, saying why, when it is the agent and not the operator stopping
+    /// the run. The first reason given is kept.
+    pub fn stop(&self, reason: impl Into<String>) {
+        let mut slot = self.stop_reason.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(reason.into());
+        }
+        drop(slot);
+        self.cancel();
+    }
+
+    /// The reason [`stop`](Self::stop) was given, if it was used.
+    pub fn stop_reason(&self) -> Option<String> {
+        self.stop_reason.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_staging(&self, dir: &Path) {
@@ -443,11 +475,15 @@ impl Provisioner {
         // servers have mounted. A cancel during the copy lands right after it.
         let copied = {
             let (src, dst) = (source.clone(), installed.clone());
-            tokio::task::spawn_blocking(move || copy_tree(&src, &dst))
+            let flag = progress.map(|p| p.cancelled.clone()).unwrap_or_default();
+            tokio::task::spawn_blocking(move || copy_tree_until(&src, &dst, &flag))
                 .await
                 .map_err(|e| ProvisionError::Io(io::Error::other(e.to_string())))?
         };
         if let Err(e) = copied {
+            if progress.is_some_and(InstallProgress::is_cancelled) {
+                return Err(cancelled(&staging));
+            }
             let _ = fs::remove_dir_all(&staging);
             return Err(e.into());
         }
@@ -583,7 +619,7 @@ impl Provisioner {
                     &mounts,
                     Some(TASK_MEMORY_LIMIT_BYTES),
                     &[format!("HOME={TASK_HOME_DIR}")],
-                    progress.map(|p| &p.cancelled),
+                    progress.map(|p| &*p.cancelled),
                 )
                 .await;
             if let Some(p) = progress {
@@ -627,6 +663,67 @@ impl Provisioner {
         Ok(())
     }
 
+    /// The build Steam's public branch of `app_id` is on now, asked without
+    /// downloading the game (`ROADMAP.md` §12.1).
+    ///
+    /// Runs the operator's steamcmd image, anonymously, with
+    /// `+app_info_update 1 +app_info_print <app>`, and reads the answer's
+    /// `branches/public/buildid` (`public_build_id`). That is Steam's own app
+    /// data printed as a document, not a progress line: the same field the
+    /// manifest on disk carries, so the two compare like for like.
+    ///
+    /// `home` is steamcmd's `$HOME`, kept between checks: a fresh one makes
+    /// steamcmd fetch its own ~40 MB update on every run (measured 2026-10-13).
+    /// It holds steamcmd's state only, never game content, and an install
+    /// still gets a fresh one of its own.
+    pub async fn latest_build(
+        &self,
+        app_id: u32,
+        docker: &DockerRuntime,
+        home: &Path,
+    ) -> Result<String, ProvisionError> {
+        if !self.allow_fetch {
+            return Err(ProvisionError::FetchNotPermitted { url: format!("steam app {app_id}") });
+        }
+        let image = self.steamcmd_image.clone().ok_or(ProvisionError::NoSteamcmdImage { app_id })?;
+        fs::create_dir_all(home)?;
+        let mounts = [Mount { host_path: home.to_path_buf(), container_path: TASK_HOME_DIR.into(), read_only: false }];
+        // Built here, from one number the pack supplied; anonymous, as every
+        // steamcmd run on a node is.
+        let cmd: Vec<String> = ["+login", "anonymous", "+app_info_update", "1", "+app_info_print"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([app_id.to_string(), "+quit".to_string()])
+            .collect();
+        let mut seed = [0u8; 4];
+        getrandom::getrandom(&mut seed).map_err(|e| ProvisionError::Io(io::Error::other(e.to_string())))?;
+        let name = format!("gpp-check-{app_id}-{}", hex::encode(seed));
+        let outcome = docker
+            .run_for_output(
+                &name,
+                &image,
+                cmd,
+                &mounts,
+                Some(TASK_MEMORY_LIMIT_BYTES),
+                &[format!("HOME={TASK_HOME_DIR}")],
+                CHECK_OUTPUT_LINES,
+            )
+            .await
+            .map_err(|e| ProvisionError::ToolFailed { tool: "steamcmd", exit_code: -1, output: format!("{e:#}") })?;
+        if outcome.exit_code != 0 {
+            return Err(ProvisionError::ToolFailed {
+                tool: "steamcmd",
+                exit_code: outcome.exit_code,
+                output: last_lines(&outcome.output, 20),
+            });
+        }
+        public_build_id(&outcome.output, app_id).ok_or_else(|| ProvisionError::ToolFailed {
+            tool: "steamcmd",
+            exit_code: 0,
+            output: format!("Steam's answer for app {app_id} named no public build"),
+        })
+    }
+
     /// A fresh staging directory on the same filesystem as the content tree, so
     /// the final move is a rename rather than a copy.
     fn staging_root(&self) -> Result<PathBuf, ProvisionError> {
@@ -657,17 +754,71 @@ pub fn steam_build_id(install: &Path, app_id: u32) -> Option<String> {
     })
 }
 
+/// `branches` → `public` → `buildid` in steamcmd's `app_info_print` output for
+/// `app_id`. Steam puts `branches` inside `depots` (measured for app 90,
+/// 2026-10-13); one directly under the app is accepted too. A depot's own
+/// `public` manifest sits a level deeper, under its numeric id, and never
+/// matches.
+///
+/// The output is console text around one KeyValues document that starts at a
+/// line reading `"<app_id>"`. Only that document is read, so another app's
+/// block, or a `buildid` under another branch (`beta`, `steam_legacy`), is
+/// never taken for the public one.
+pub fn public_build_id(output: &str, app_id: u32) -> Option<String> {
+    let head = format!("\"{app_id}\"");
+    let start = output.lines().position(|l| l.trim() == head)?;
+    let mut path: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in output.lines().skip(start + 1) {
+        let t = line.trim();
+        if t == "{" {
+            path.push(pending.take().unwrap_or_default());
+            continue;
+        }
+        if t == "}" {
+            path.pop();
+            if path.is_empty() {
+                return None;
+            }
+            continue;
+        }
+        let quoted: Vec<&str> = t.split('"').skip(1).step_by(2).collect();
+        match quoted.as_slice() {
+            [key] => pending = Some(key.to_string()),
+            [key, value, ..] => {
+                let at = path.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
+                if (at == ["depots", "branches", "public"] || at == ["branches", "public"])
+                    && key.eq_ignore_ascii_case("buildid")
+                    && !value.is_empty()
+                {
+                    return Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Copy a directory tree, keeping permissions (a dedicated server's binaries
-/// must stay executable) and symlinks as links.
-pub(crate) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+/// must stay executable) and symlinks as links. Stops between files once
+/// `stop` is set: an update's copy is gigabytes, and a cancel, or the disk
+/// reaching its reserve, must not wait for all of it.
+pub(crate) fn copy_tree_until(src: &Path, dst: &Path, stop: &AtomicBool) -> io::Result<()> {
+    if stop.load(Ordering::SeqCst) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     fs::create_dir_all(dst)?;
     fs::set_permissions(dst, fs::metadata(src)?.permissions())?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let (from, to) = (entry.path(), dst.join(entry.file_name()));
         let kind = entry.file_type()?;
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
         if kind.is_dir() {
-            copy_tree(&from, &to)?;
+            copy_tree_until(&from, &to, stop)?;
         } else if kind.is_symlink() {
             #[cfg(unix)]
             std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
@@ -970,6 +1121,64 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// steamcmd's `app_info_print` for app 90 as measured on 2026-10-13,
+    /// trimmed: console noise before, `branches` inside `depots` as Steam
+    /// sends it, other branches with their own `buildid`, and a depot with a
+    /// `public` manifest (and a stand-in `buildid`) of its own.
+    const APP_INFO_90: &str = "[----] Downloading update (0 of 40,430 KB)...
+AppID : 90, change number : 38905983/38905983, last change : Tue Oct 13 17:43:25 2026
+\"90\"
+{
+\t\"common\"
+\t{
+\t\t\"name\"\t\t\"Half-Life Dedicated Server\"
+\t}
+\t\"depots\"
+\t{
+\t\t\"4\"
+\t\t{
+\t\t\t\"manifests\"
+\t\t\t{
+\t\t\t\t\"public\"
+\t\t\t\t{
+\t\t\t\t\t\"gid\"\t\t\"3422820008550101176\"
+\t\t\t\t\t\"buildid\"\t\t\"1\"
+\t\t\t\t}
+\t\t\t}
+\t\t}
+\t\t\"branches\"
+\t\t{
+\t\t\t\"steam_legacy\"
+\t\t\t{
+\t\t\t\t\"buildid\"\t\t\"5433925\"
+\t\t\t}
+\t\t\t\"public\"
+\t\t\t{
+\t\t\t\t\"buildid\"\t\t\"15961496\"
+\t\t\t\t\"timeupdated\"\t\t\"1728506475\"
+\t\t\t}
+\t\t\t\"beta\"
+\t\t\t{
+\t\t\t\t\"buildid\"\t\t\"17131367\"
+\t\t\t}
+\t\t}
+\t}
+}
+Unloading Steam API...OK
+";
+
+    /// Only `branches/public/buildid` of the asked app counts: not a depot's
+    /// `public` manifest, not the beta or legacy branch, not another app.
+    #[test]
+    fn the_public_build_is_read_from_its_own_branch_and_app_only() {
+        assert_eq!(public_build_id(APP_INFO_90, 90).as_deref(), Some("15961496"));
+        assert_eq!(public_build_id(APP_INFO_90, 10), None, "another app's document is not this one");
+        assert_eq!(public_build_id("Unloading Steam API...OK", 90), None);
+        // A document cut short names nothing rather than a wrong build.
+        let cut: String = APP_INFO_90.lines().take(12).collect::<Vec<_>>().join("\n");
+        assert_eq!(public_build_id(&cut, 90), None);
+    }
     use std::io::Cursor;
 
     fn tar_with(entries: &[(&str, &[u8])]) -> Vec<u8> {

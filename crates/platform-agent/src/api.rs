@@ -126,6 +126,10 @@ pub fn router_full(
             post(install_content).get(install_status).delete(cancel_install),
         )
         .route("/content/:game/:version", delete(delete_content))
+        .route("/updates", get(updates))
+        .route("/updates/settings", axum::routing::put(set_update_settings))
+        .route("/updates/:game/check", post(check_update))
+        .route("/updates/:game/snooze", post(snooze_update).delete(unsnooze_update))
         .route("/games", get(games))
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
@@ -840,6 +844,81 @@ async fn cancel_install(
             .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(Json(json!({ "game": game, "cancelled": true })))
+}
+
+// ---- Update checks and the disk reserve (`updates.rs`, `ROADMAP.md` §12) ----
+//
+// Their own resource rather than more routes under `/content/:game`: a static
+// segment there (`/content/:game/check`) would shadow a version of that name
+// for `DELETE /content/:game/:version`, as `install` would have.
+
+/// Settings, the reserve as it stands on this disk, and every game's notice.
+async fn updates(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let (storage, reserve) = match state.agent.reserve() {
+        Some((s, r)) => (Some(s), Some(r)),
+        None => (None, None),
+    };
+    Json(json!({
+        "settings": state.agent.update_settings(),
+        "reserve_bytes": reserve,
+        "default_reserve_bytes": storage.as_ref().map(|s| crate::updates::default_reserve(s.total_bytes)),
+        "storage": storage,
+        "games": state.agent.update_notices().await,
+    }))
+}
+
+async fn set_update_settings(
+    State(state): State<ApiState>,
+    Json(settings): Json<crate::updates::Settings>,
+) -> ApiResult<serde_json::Value> {
+    state.agent.set_update_settings(settings).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    Ok(updates(State(state)).await)
+}
+
+/// Check one game now. Holds the request for the check (about 25 s against
+/// Steam, measured 2026-10-13), and answers with the game's notice.
+async fn check_update(State(state): State<ApiState>, Path(game): Path<String>) -> ApiResult<serde_json::Value> {
+    if !state.agent.packs().await.contains_key(&game) {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
+    }
+    let notice = state.agent.check_for_update(&game).await.map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!(notice)))
+}
+
+/// `{"hours": 24}` hides a notice for a day; `{"skip_build": true}` hides it
+/// while the build it names is the newest.
+#[derive(Deserialize)]
+struct SnoozeRequest {
+    #[serde(default)]
+    hours: Option<u32>,
+    #[serde(default)]
+    skip_build: bool,
+}
+
+async fn snooze_update(
+    State(state): State<ApiState>,
+    Path(game): Path<String>,
+    Json(req): Json<SnoozeRequest>,
+) -> ApiResult<serde_json::Value> {
+    if !state.agent.packs().await.contains_key(&game) {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
+    }
+    if req.hours.is_none() && !req.skip_build {
+        return Err(fail(StatusCode::BAD_REQUEST, "say how long (hours) or skip_build"));
+    }
+    if req.hours.is_some_and(|h| h == 0 || h > crate::updates::MAX_CHECK_EVERY_HOURS) {
+        return Err(fail(StatusCode::BAD_REQUEST, "a snooze is between one hour and 30 days"));
+    }
+    state.agent.snooze_update(&game, req.hours, req.skip_build).map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    Ok(updates(State(state)).await)
+}
+
+async fn unsnooze_update(State(state): State<ApiState>, Path(game): Path<String>) -> ApiResult<serde_json::Value> {
+    if !state.agent.packs().await.contains_key(&game) {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
+    }
+    state.agent.snooze_update(&game, None, false).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(updates(State(state)).await)
 }
 
 // ---- Mesh interface configuration (`interfaces.rs`, `PLAN.md` §13.5) --------
