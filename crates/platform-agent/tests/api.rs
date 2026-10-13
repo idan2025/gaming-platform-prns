@@ -98,7 +98,8 @@ async fn without_the_token_every_route_is_refused() {
 
     for path in [
         "/health", "/capacity", "/instances", "/orphans", "/games", "/usage", "/storage",
-        "/orphans/summary", "/instances/x/logs", "/instances/x/players",
+        "/orphans/summary", "/instances/x/logs", "/instances/x/players", "/content",
+        "/content/sven-coop",
     ] {
         let status = client
             .get(format!("http://{addr}{path}"))
@@ -127,6 +128,17 @@ async fn without_the_token_every_route_is_refused() {
         .unwrap()
         .status();
     assert_eq!(status, 401, "delete answered without a token");
+
+    // Deleting a game's files, and cancelling its download.
+    for path in ["/content/sven-coop/test", "/content/sven-coop"] {
+        let status = client
+            .delete(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "DELETE {path} answered without a token");
+    }
 
     // Nor are the routes that delete files or change what restarts.
     for path in ["/orphans/clean", "/instances/x/restart-on-crash"] {

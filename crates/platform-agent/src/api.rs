@@ -120,7 +120,12 @@ pub fn router_full(
         .route("/instances/:id/bots", post(set_bots))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
-        .route("/content/:game", post(install_content).get(install_status))
+        .route("/content", get(installed))
+        .route(
+            "/content/:game",
+            post(install_content).get(install_status).delete(cancel_install),
+        )
+        .route("/content/:game/:version", delete(delete_content))
         .route("/games", get(games))
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
@@ -343,7 +348,7 @@ async fn mesh_interface_remove(
         // The engine cannot detach a live interface, and saying otherwise would
         // have an operator watch traffic keep flowing and conclude the button
         // is broken.
-        "note": "Forgotten for future bridges. Servers already running keep this                  interface until they restart.",
+        "note": "Forgotten for future bridges. Servers already running keep this interface until they restart.",
     })))
 }
 
@@ -748,6 +753,76 @@ async fn install_status(
     Path(game): Path<String>,
 ) -> Json<serde_json::Value> {
     Json(json!({ "game": game, "status": state.installs.state(&game).await }))
+}
+
+/// The Installed page's one read: every installed copy of every game's files
+/// (`Agent::installed`), and every download running now, so the page polls
+/// one route rather than one per game.
+async fn installed(State(state): State<ApiState>) -> ApiResult<serde_json::Value> {
+    let copies = state.agent
+        .installed()
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut downloads = Vec::new();
+    for game in state.installs.running().await {
+        let status = state.installs.state(&game).await;
+        downloads.push(json!({ "game": game, "status": status }));
+    }
+    Ok(Json(json!({ "copies": copies, "downloads": downloads })))
+}
+
+/// Delete one installed copy. Refused with 409 and the servers using it while
+/// any container mounts it, and while the game is downloading.
+async fn delete_content(
+    State(state): State<ApiState>,
+    Path((game, version)): Path<(String, String)>,
+) -> Response {
+    use crate::agent::DeleteContentError;
+    let held = state
+        .installs
+        .exclusive(&game, state.agent.delete_content(&game, &version))
+        .await;
+    match held {
+        Err(crate::install::NotRunning) => fail(
+            StatusCode::CONFLICT,
+            format!("{game} is downloading; cancel the download or wait for it to finish"),
+        )
+        .into_response(),
+        Ok(Ok(bytes)) => Json(json!({ "game": game, "version": version, "bytes": bytes })).into_response(),
+        Ok(Err(e)) => {
+            let status = match &e {
+                DeleteContentError::BadId(_) => StatusCode::BAD_REQUEST,
+                DeleteContentError::NotInstalled => StatusCode::NOT_FOUND,
+                DeleteContentError::InUse(_) => StatusCode::CONFLICT,
+                DeleteContentError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let servers = match &e {
+                DeleteContentError::InUse(ids) => ids.clone(),
+                _ => Vec::new(),
+            };
+            (status, Json(json!({ "error": e.to_string(), "servers": servers }))).into_response()
+        }
+    }
+}
+
+/// Cancel this game's download. The task stops its container, discards what
+/// it fetched and ends as `Failed { error: "cancelled" }`; poll `GET` on the
+/// same path to see it land.
+async fn cancel_install(
+    State(state): State<ApiState>,
+    Path(game): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let container = state.installs.cancel(&game).await.map_err(|_| {
+        fail(StatusCode::NOT_FOUND, format!("{game} is not downloading"))
+    })?;
+    if let Some(name) = container {
+        state.agent
+            .docker()
+            .remove_task(&name)
+            .await
+            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    Ok(Json(json!({ "game": game, "cancelled": true })))
 }
 
 // ---- Mesh interface configuration (`interfaces.rs`, `PLAN.md` §13.5) --------

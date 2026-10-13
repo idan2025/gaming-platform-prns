@@ -478,6 +478,33 @@ has gone. Rules a later change could quietly break:
   moment, and never one touched in the last ten minutes: a create makes its
   folders before its container.
 
+**The node lists and deletes installed game files** (2026-10-13, `ROADMAP.md`
+§11, `Agent::installed` / `delete_content`, the Installed page). Rules a later
+change could quietly break:
+- **A copy any managed container mounts is never deleted, running or
+  stopped.** A stopped server restarts from the same read-only mount. Which
+  copy a container uses is read off its `Mounts` (`ManagedContainer::mount_sources`),
+  not a label, so containers made before this still count. Caught by
+  `a_copy_a_stopped_server_mounts_is_not_deleted_until_the_server_is_removed`.
+- **Delete holds the game's install slot** (`Installs::exclusive`), and is
+  refused while that game downloads: the install would rename its staging
+  directory into a tree that was just removed.
+- **A copy is renamed out of `content/` before it is deleted**, so an
+  interrupted delete never leaves a partial tree `plan_and_check` reads as
+  installed. The path comes from `StoreLayout::content_dir` on validated ids
+  (`a_hostile_game_or_version_is_refused_never_turned_into_a_path`).
+- **Progress is the staging directory's size on disk, never steamcmd's
+  output**, and `total_bytes` is sent only when something knows it. Nothing
+  does yet, so it is always absent; the page shows a percentage only with
+  one. An invented total is a progress bar that lies.
+- **Cancel is `DELETE /content/:game`** (the install's own resource), not
+  `/content/:game/install`, which would shadow a version named `install`. It
+  sets the run's flag and removes its container through `remove_task`, which
+  touches only a container carrying `TASK_LABEL`; the run then discards its
+  staging directory and ends `Failed { error: "cancelled" }`. A cancel that
+  lands while the container is being created is caught by the flag check in
+  `run_to_completion`. Pinned by `a_download_shows_growing_bytes_and_a_cancel_leaves_nothing`.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

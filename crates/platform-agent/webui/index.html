@@ -72,6 +72,10 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="7" width="18" height="11" rx="4"/><path d="M8 11v3M6.5 12.5h3M15 12h.01M17.5 13.5h.01"/></svg>
         <span>Games</span><span class="nav-count" id="nav-games-count"></span>
       </button>
+      <button id="tab-installed" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-installed">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+        <span>Installed</span><span class="nav-count" id="nav-installed-count"></span>
+      </button>
       <button id="tab-interfaces" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-interfaces">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
         <span>Mesh</span>
@@ -129,6 +133,24 @@
       <section id="tab-panel-games" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-games">
         <p class="page-lead">Games this node has a pack for. A game this node cannot run says why.</p>
         <div id="games-grid" class="games-grid"></div>
+      </section>
+
+      <section id="tab-panel-installed" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-installed">
+        <p class="page-lead">Game files on this node's disk, and downloads in progress. Deleting files keeps the game on the Games page; it can be downloaded again.</p>
+        <div id="installed-unused" class="notice-bar hidden">
+          <span id="installed-unused-text"></span>
+          <button id="installed-unused-btn" type="button" class="btn btn-small">Delete unused…</button>
+        </div>
+        <div id="installed-old" class="notice-bar hidden"><span>This node's agent is older than this page and cannot list its game files. Update the agent.</span></div>
+        <div class="copy-head">
+          <div></div><div>Game</div><div>Status</div><div>Size</div><div>Used by</div><div>Installed</div><div></div>
+        </div>
+        <div id="installed-list" class="list"></div>
+        <div id="installed-empty" class="empty hidden">
+          <div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/></svg></div>
+          <h2>No game files yet</h2>
+          <p>Install a game from the Games page, or start a server and its files download first.</p>
+        </div>
       </section>
 
       <section id="tab-panel-interfaces" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-interfaces">

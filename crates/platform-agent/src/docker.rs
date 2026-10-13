@@ -160,6 +160,10 @@ pub struct ManagedContainer {
     /// report it, which reads downstream as "age unknown" and never as "age
     /// zero".
     pub created_unix: Option<i64>,
+    /// The host paths bind-mounted into it, as Docker reports them. This is
+    /// how the agent knows which installed copy of a game a server uses,
+    /// running or stopped, without a label an older container would not carry.
+    pub mount_sources: Vec<std::path::PathBuf>,
 }
 
 impl DockerRuntime {
@@ -265,6 +269,12 @@ impl DockerRuntime {
                     }),
                     owner: labels.get(OWNER_LABEL).cloned(),
                     game_id: labels.get(GAME_LABEL).cloned(),
+                    mount_sources: c
+                        .mounts
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|m| m.source.map(std::path::PathBuf::from))
+                        .collect(),
                 })
             })
             .collect())
@@ -463,6 +473,7 @@ impl DockerRuntime {
     /// it, gets no ports and no network restrictions beyond Docker's default,
     /// and is removed when it exits — a provisioning run that stayed around
     /// would show up in `list_managed` as an instance nobody asked for.
+    #[allow(clippy::too_many_arguments)] // each is a separate operator or run input; a struct would only rename them
     pub async fn run_to_completion(
         &self,
         name: &str,
@@ -471,6 +482,7 @@ impl DockerRuntime {
         mounts: &[Mount],
         memory_limit_bytes: Option<i64>,
         env: &[String],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<TaskOutcome> {
         let binds: Vec<String> = mounts
             .iter()
@@ -519,6 +531,16 @@ impl DockerRuntime {
             )
             .await
             .with_context(|| format!("creating task container {name} from {image}"))?;
+
+        // A cancel that arrived while the container was being created found
+        // nothing to remove; it is caught here, before anything runs.
+        if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            let _ = self
+                .docker
+                .remove_container(name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+                .await;
+            return Err(anyhow!("task {name} was cancelled before it started"));
+        }
 
         // Whatever happens next, the container goes away. A provisioning run
         // that failed and left itself behind would collide with the next
@@ -575,6 +597,37 @@ impl DockerRuntime {
             }
         }
         Ok(TaskOutcome { exit_code, output })
+    }
+
+    /// Stop and remove a provisioning task's container, because its download
+    /// was cancelled.
+    ///
+    /// Only a container carrying **both** `MANAGED_LABEL` and `TASK_LABEL`: a
+    /// cancel names a download, and must never be able to reach a game server.
+    /// One that is already gone is not an error — the run may have just ended.
+    pub async fn remove_task(&self, name: &str) -> Result<()> {
+        let info = match self.docker.inspect_container(name, None).await {
+            Ok(info) => info,
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                return Ok(())
+            }
+            Err(e) => return Err(e).with_context(|| format!("inspecting task container {name}")),
+        };
+        let labels = info.config.and_then(|c| c.labels).unwrap_or_default();
+        if !(labels.contains_key(MANAGED_LABEL) && labels.contains_key(TASK_LABEL)) {
+            return Err(anyhow!(
+                "container {name} is not a download task of this agent; refusing to touch it"
+            ));
+        }
+        match self
+            .docker
+            .remove_container(name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .await
+        {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing task container {name}")),
+        }
     }
 
     /// How a managed container last ended. `None` while it is running or
@@ -747,7 +800,7 @@ impl DockerRuntime {
             .unwrap_or(false);
         if !open_stdin {
             return Err(anyhow!(
-                "{spec_id} was started with no console attached, so it cannot be told                  anything — Docker would accept the message and discard it. Stdin is                  decided when a container is created, so a restart will not help: remove                  this server and start it again, and it will accept map changes"
+                "{spec_id} was started with no console attached, so it cannot be told anything — Docker would accept the message and discard it. Stdin is decided when a container is created, so a restart will not help: remove this server and start it again, and it will accept map changes"
             ));
         }
 
@@ -770,7 +823,7 @@ impl DockerRuntime {
             .await
             .with_context(|| {
                 format!(
-                    "attaching to {name}. A container created before this agent learned to                      talk to consoles was started with no stdin; restart the server once and                      it will accept commands"
+                    "attaching to {name}. A container created before this agent learned to talk to consoles was started with no stdin; restart the server once and it will accept commands"
                 )
             })?;
 

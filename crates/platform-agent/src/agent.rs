@@ -108,6 +108,10 @@ pub struct Agent {
     mesh: Arc<crate::mesh::MeshBridges>,
     /// Restart-on-crash bookkeeping (`check_crashes`).
     crashes: Mutex<CrashWatch>,
+    /// Sizes of installed copies, keyed by directory and its modification
+    /// time. A copy is never changed in place (`content.rs`), so a walk of a
+    /// 20 GB tree is done once, not on every poll of the page.
+    content_sizes: std::sync::Mutex<HashMap<std::path::PathBuf, (SystemTime, u64)>>,
 }
 
 /// How often the agent looks for servers that crashed.
@@ -168,6 +172,53 @@ pub struct OrphanReport {
     pub error: Option<String>,
 }
 
+/// One installed copy of a game's files, for the Installed page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstalledCopy {
+    pub game_id: String,
+    pub version: String,
+    pub bytes: u64,
+    /// When the directory was last modified, in unix seconds.
+    pub modified_unix: Option<i64>,
+    /// `agent.toml` names this version as the game's `content_version`, so
+    /// new servers of the game use it.
+    pub configured: bool,
+    /// Servers whose container mounts this copy, running or stopped.
+    pub used_by: Vec<String>,
+    /// Neither configured nor mounted: space nothing on this node will use.
+    pub unused: bool,
+}
+
+/// Why a copy was not deleted.
+#[derive(Debug)]
+pub enum DeleteContentError {
+    /// The game or version is not an id this node would ever have made a
+    /// directory from.
+    BadId(crate::store::PlanError),
+    NotInstalled,
+    /// These servers mount the copy. A stopped server restarts from the same
+    /// mount, so stopped ones count.
+    InUse(Vec<String>),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for DeleteContentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadId(e) => write!(f, "not a game or version id: {e}"),
+            Self::NotInstalled => write!(f, "that copy is not installed"),
+            Self::InUse(ids) => write!(
+                f,
+                "{} using these files: {}. Remove {} first",
+                if ids.len() == 1 { "a server is" } else { "servers are" },
+                ids.join(", "),
+                if ids.len() == 1 { "it" } else { "them" },
+            ),
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
 /// Bytes under a directory, not following symlinks.
 fn dir_size(path: &std::path::Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(path) else { return 0 };
@@ -178,6 +229,27 @@ fn dir_size(path: &std::path::Path) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// Every `<game>/<version>` directory under the content root.
+fn list_content_dirs(root: &std::path::Path) -> Vec<(String, String)> {
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for game in names(root) {
+        for version in names(&root.join(&game)) {
+            out.push((game.clone(), version));
+        }
+    }
+    out
 }
 
 fn recently_touched(path: &std::path::Path) -> bool {
@@ -236,6 +308,7 @@ impl Agent {
             specs: Mutex::new(BTreeMap::new()),
             mesh,
             crashes: Mutex::new(CrashWatch::default()),
+            content_sizes: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -458,10 +531,10 @@ impl Agent {
                 content.driver_name()
             ),
             (true, false) => format!(
-                "This pack's \"{}\" driver could fetch it, but this node has                  allow_content_fetch off — install it by hand or turn fetching on once you                  trust the pack",
+                "This pack's \"{}\" driver could fetch it, but this node has allow_content_fetch off — install it by hand or turn fetching on once you trust the pack",
                 content.driver_name()
             ),
-            (false, _) => "This pack's content driver is \"manual\": install the game there                            yourself"
+            (false, _) => "This pack's content driver is \"manual\": install the game there yourself"
                 .to_string(),
         }
     }
@@ -475,6 +548,16 @@ impl Agent {
     /// explicit step, run once per game and version, and `create` keeps failing
     /// fast with a sentence naming this one.
     pub async fn ensure_content(&self, game_id: &str) -> Result<Provisioned, ProvisionError> {
+        self.ensure_content_tracked(game_id, None).await
+    }
+
+    /// [`ensure_content`](Self::ensure_content), reporting progress and
+    /// honouring a cancel (`install.rs`).
+    pub async fn ensure_content_tracked(
+        &self,
+        game_id: &str,
+        progress: Option<&crate::content::InstallProgress>,
+    ) -> Result<Provisioned, ProvisionError> {
         let packs = self.packs.read().await;
         let pack = packs.get(game_id).ok_or_else(|| {
             ProvisionError::Io(std::io::Error::other(format!(
@@ -483,7 +566,7 @@ impl Agent {
         })?;
         let runtime = self.config.runtime_for(game_id).ok_or_else(|| {
             ProvisionError::Io(std::io::Error::other(format!(
-                "this node has no runtime configured for {game_id:?}, so there is no                  content_version to install into"
+                "this node has no runtime configured for {game_id:?}, so there is no content_version to install into"
             )))
         })?;
         let content = ContentRef {
@@ -492,7 +575,7 @@ impl Agent {
         };
         let provisioned = self
             .content
-            .ensure(&content, &pack.content, Some(&self.docker))
+            .ensure_tracked(&content, &pack.content, Some(&self.docker), progress)
             .await?;
         self.create_writable_mountpoints(&content, &self.writable_paths_for(game_id, pack))?;
         Ok(provisioned)
@@ -901,7 +984,7 @@ impl Agent {
             .console
             .ok_or_else(|| {
                 anyhow!(
-                    "the {:?} pack declares no console, so this node has no way to change its                      map without restarting the server",
+                    "the {:?} pack declares no console, so this node has no way to change its map without restarting the server",
                     instance.game_id
                 )
             })?
@@ -1372,6 +1455,118 @@ impl Agent {
                 tracing::warn!(instance = %id, error = %format!("{e:#}"), "could not restart a crashed server");
             }
         }
+    }
+
+    /// Every installed copy of every game's files on this node, unused ones
+    /// first.
+    ///
+    /// Read from the disk and from Docker, like everything the agent reports:
+    /// a copy is a directory `content/<game>/<version>`, and which servers use
+    /// it is which containers mount it. A directory whose name is not an id
+    /// this node would make is skipped rather than reported, since nothing
+    /// here could act on it.
+    pub async fn installed(&self) -> Result<Vec<InstalledCopy>> {
+        let containers = self.docker.list_managed().await?;
+        let root = self.config.data_root.join("content");
+        let mut copies = Vec::new();
+        for (game, version) in list_content_dirs(&root) {
+            let content = ContentRef { game_id: game.clone(), version: version.clone() };
+            let Ok(dir) = self.layout.content_dir(&content) else { continue };
+            let used_by: Vec<String> = containers
+                .iter()
+                .filter(|c| c.mount_sources.iter().any(|m| m.starts_with(&dir)))
+                .map(|c| c.instance_id.clone())
+                .collect();
+            let configured = self
+                .config
+                .runtime_for(&game)
+                .is_some_and(|r| r.content_version == version);
+            let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+            copies.push(InstalledCopy {
+                bytes: self.content_size(&dir, modified),
+                modified_unix: modified
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64),
+                unused: !configured && used_by.is_empty(),
+                game_id: game,
+                version,
+                configured,
+                used_by,
+            });
+        }
+        copies.sort_by(|a, b| {
+            b.unused.cmp(&a.unused).then_with(|| (&a.game_id, &a.version).cmp(&(&b.game_id, &b.version)))
+        });
+        Ok(copies)
+    }
+
+    fn content_size(&self, dir: &std::path::Path, modified: Option<SystemTime>) -> u64 {
+        let mut cache = self.content_sizes.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(m), Some((seen, bytes))) = (modified, cache.get(dir)) {
+            if *seen == m {
+                return *bytes;
+            }
+        }
+        let bytes = dir_size(dir);
+        if let Some(m) = modified {
+            cache.insert(dir.to_path_buf(), (m, bytes));
+        }
+        bytes
+    }
+
+    /// Delete one installed copy, because the operator asked. Returns the
+    /// bytes it held.
+    ///
+    /// **A copy any managed container mounts is never deleted, running or
+    /// stopped**: servers bind-mount their game's files, and a stopped server
+    /// restarts from the same mount. The caller also holds the game's install
+    /// slot (`Installs::exclusive`), so no download can rename its staging
+    /// directory into this tree while it goes.
+    ///
+    /// The path is built by `StoreLayout::content_dir` from validated ids,
+    /// never taken from the request; and the copy is first renamed out of
+    /// `content/`, so a delete that is interrupted never leaves a partial tree
+    /// that `plan_and_check` would read as installed.
+    pub async fn delete_content(&self, game_id: &str, version: &str) -> Result<u64, DeleteContentError> {
+        let content = ContentRef { game_id: game_id.to_string(), version: version.to_string() };
+        let dir = self.layout.content_dir(&content).map_err(DeleteContentError::BadId)?;
+        if !dir.is_dir() {
+            return Err(DeleteContentError::NotInstalled);
+        }
+        let containers = self.docker.list_managed().await.map_err(DeleteContentError::Other)?;
+        let used_by: Vec<String> = containers
+            .into_iter()
+            .filter(|c| c.mount_sources.iter().any(|m| m.starts_with(&dir)))
+            .map(|c| c.instance_id)
+            .collect();
+        if !used_by.is_empty() {
+            return Err(DeleteContentError::InUse(used_by));
+        }
+        let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+        let bytes = self.content_size(&dir, modified);
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed)
+            .map_err(|e| DeleteContentError::Other(anyhow!("no randomness for a trash name: {e}")))?;
+        let trash_root = self.config.data_root.join("staging");
+        let trash = trash_root.join(format!("deleting-{}", hex::encode(seed)));
+        let moved = std::fs::create_dir_all(&trash_root).and_then(|()| std::fs::rename(&dir, &trash));
+        moved.map_err(|e| DeleteContentError::Other(anyhow!("moving {} aside: {e}", dir.display())))?;
+        self.content_sizes.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
+        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&trash).map_err(|e| (trash, e)))
+            .await
+            .map_err(|e| DeleteContentError::Other(anyhow!("{e}")))?
+            .map_err(|(trash, e)| {
+                DeleteContentError::Other(anyhow!(
+                    "the copy is no longer installed, but deleting {} failed: {e}",
+                    trash.display()
+                ))
+            })?;
+        // An empty game directory is left by deleting its last copy; it holds
+        // nothing and would list as nothing.
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+        Ok(bytes)
     }
 
     /// Leftover instance directories: how many, and how much they hold.
