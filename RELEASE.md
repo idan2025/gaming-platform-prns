@@ -90,6 +90,13 @@ is missing, which makes pushing a tag sufficient on its own.
   rate and how long it has taken, and **Cancel**, which discards what it
   fetched. There is no percentage: no download knows its total yet, and the
   page will not invent one.
+- **Update…** on a Steam game's copy downloads the newest build into a new
+  copy beside it; only what changed is downloaded, and what was added to the
+  copy (such as YaPB bots) comes along. New servers use the new copy; servers
+  that exist keep theirs. Tick **Remove the old version when the update is
+  done** to delete the old copy too: at once if nothing uses it, otherwise as
+  soon as the last server using it is removed. A game with nothing newer says
+  it is up to date and leaves no extra copy.
 - The Games page's download message shows the bytes so far too.
 - Several error messages carried runs of spaces from broken line
   continuations; they read as one sentence again.

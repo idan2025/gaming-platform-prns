@@ -73,8 +73,18 @@ async fn serve(
     dir: &std::path::Path,
     version: &str,
 ) -> Option<(Arc<Agent>, std::net::SocketAddr)> {
+    serve_with(dir, version, SLOW_STEAMCMD, SLOW_DOCKERFILE, (27180, 27184)).await
+}
+
+async fn serve_with(
+    dir: &std::path::Path,
+    version: &str,
+    steamcmd: &str,
+    steamcmd_dockerfile: &str,
+    ports: (u16, u16),
+) -> Option<(Arc<Agent>, std::net::SocketAddr)> {
     if !ensure_image(SLEEPER, "FROM busybox\nCMD [\"sleep\", \"3600\"]\n")
-        || !ensure_image(SLOW_STEAMCMD, SLOW_DOCKERFILE)
+        || !ensure_image(steamcmd, steamcmd_dockerfile)
     {
         return None;
     }
@@ -86,21 +96,23 @@ async fn serve(
     let toml = format!(
         r#"
 data_root = "{}"
-max_instances = 2
+max_instances = 8
 api_bind = "127.0.0.1:0"
 allow_content_fetch = true
-steamcmd_image = "{SLOW_STEAMCMD}"
+steamcmd_image = "{steamcmd}"
 
 [port_range]
-start = 27180
-end = 27184
+start = {}
+end = {}
 
 [games.sven-coop]
 image = "{SLEEPER}"
 content_root = "/game"
 content_version = "{version}"
 "#,
-        dir.display()
+        dir.display(),
+        ports.0,
+        ports.1
     );
     let config = AgentConfig::parse(&toml).ok()?;
     let agent = Arc::new(Agent::new(config, vec![game_bridge::GamePack::sven_coop()]).await.ok()?);
@@ -307,4 +319,132 @@ async fn a_download_shows_growing_bytes_and_a_cancel_leaves_nothing() {
     }
     assert_eq!(done["status"]["state"], "done", "{done}");
     assert!(dir.path().join("content/sven-coop/fresh/part12").is_file());
+}
+
+/// Stands in for steamcmd's update: refuses `validate` (it would put back the
+/// files an operator changed, such as YaPB's `liblist.gam`), adds a file, and
+/// writes Steam's manifest at build 200.
+const UPDATE_STEAMCMD: &str = "gpp-test-steamcmd-update:latest";
+const UPDATE_DOCKERFILE: &str = r#"FROM busybox
+RUN printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = validate ] && { echo "validate on an update"; exit 9; }; done\nwhile [ "$1" != "+force_install_dir" ]; do shift || exit 3; done\nshift\nmkdir -p "$1/steamapps"\necho updated > "$1/updated.txt"\nprintf "\\"AppState\\"\\n{\\n\\t\\"buildid\\"\\t\\t\\"200\\"\\n}\\n" > "$1/steamapps/appmanifest_276060.acf"\n' > /fake && chmod +x /fake
+ENTRYPOINT ["/fake"]
+"#;
+
+fn seed_manifest(dir: &std::path::Path, build: &str) {
+    let apps = dir.join("content/sven-coop/test/steamapps");
+    std::fs::create_dir_all(&apps).unwrap();
+    std::fs::write(
+        apps.join("appmanifest_276060.acf"),
+        format!("\"AppState\"\n{{\n\t\"buildid\"\t\t\"{build}\"\n}}\n"),
+    )
+    .unwrap();
+}
+
+async fn wait_install(addr: std::net::SocketAddr) -> Value {
+    let mut st = Value::Null;
+    for _ in 0..120 {
+        st = get(addr, "/content/sven-coop").await;
+        if st["status"]["state"] != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    st
+}
+
+/// An update makes a new version from the old copy (keeping what the operator
+/// added), points new servers at it, and with "remove old" deletes the old
+/// copy only once the stopped server still mounting it is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_moves_new_servers_and_removes_the_old_copy_once_unused() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((agent, addr)) =
+        serve_with(dir.path(), "test", UPDATE_STEAMCMD, UPDATE_DOCKERFILE, (27185, 27189)).await
+    else {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    };
+    seed_manifest(dir.path(), "100");
+    let added = dir.path().join("content/sven-coop/test/svencoop/addons/yapb.so");
+    std::fs::create_dir_all(added.parent().unwrap()).unwrap();
+    std::fs::write(&added, b"operator's own").unwrap();
+    let pid = std::process::id();
+    let (old_srv, new_srv) = (format!("updold{pid}"), format!("updnew{pid}"));
+    for id in [&old_srv, &new_srv] {
+        docker_rm(&format!("gpp-{id}"));
+    }
+
+    let outcome = async {
+        agent.create(spec(&old_srv)).await?;
+        agent.stop(&old_srv).await?;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/content/sven-coop"))
+            .json(&serde_json::json!({ "update": true, "remove_old": true }))
+            .send()
+            .await?;
+        assert!(r.status().is_success());
+        let done = wait_install(addr).await;
+        let report = &done["status"]["update"];
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        let to = report["to_version"].as_str().expect("a new version").to_string();
+        assert!(to.starts_with("test-"), "{report}");
+        assert_eq!(report["from_build"], "100");
+        assert_eq!(report["to_build"], "200");
+        assert_eq!(report["old"], "waiting", "a stopped server still holds the old copy: {report}");
+        assert_eq!(report["old_used_by"], serde_json::json!([old_srv]));
+
+        let new_dir = dir.path().join("content/sven-coop").join(&to);
+        assert!(new_dir.join("updated.txt").is_file());
+        assert_eq!(std::fs::read(new_dir.join("svencoop/addons/yapb.so"))?, b"operator's own");
+        assert!(dir.path().join("content/sven-coop/test").is_dir(), "deleted while mounted");
+
+        // New servers land on the new copy; the old server keeps its own.
+        agent.create(spec(&new_srv)).await?;
+        let listed = get(addr, "/content").await;
+        let row = |v: &str| listed["copies"].as_array().unwrap().iter().find(|c| c["version"] == v).cloned().unwrap();
+        assert_eq!(row(&to)["configured"], true, "{listed}");
+        assert_eq!(row(&to)["used_by"], serde_json::json!([new_srv]));
+        assert_eq!(row("test")["configured"], false);
+
+        // The last server on the old copy goes, and the copy goes with it.
+        agent.remove(&old_srv).await?;
+        assert!(!dir.path().join("content/sven-coop/test").exists(), "the old copy outlived its last server");
+        assert!(new_dir.is_dir());
+        anyhow::Ok(())
+    }
+    .await;
+    for id in [&old_srv, &new_srv] {
+        docker_rm(&format!("gpp-{id}"));
+    }
+    outcome.unwrap();
+}
+
+/// Nothing newer: the copy steamcmd checked is discarded, so no second
+/// identical copy is left, and new servers stay where they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_with_nothing_newer_leaves_no_second_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((_agent, addr)) =
+        serve_with(dir.path(), "test", UPDATE_STEAMCMD, UPDATE_DOCKERFILE, (27185, 27189)).await
+    else {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    };
+    seed_manifest(dir.path(), "200");
+    reqwest::Client::new()
+        .post(format!("http://{addr}/content/sven-coop"))
+        .json(&serde_json::json!({ "update": true, "remove_old": true }))
+        .send()
+        .await
+        .unwrap();
+    let done = wait_install(addr).await;
+    assert_eq!(done["status"]["state"], "done", "{done}");
+    assert_eq!(done["status"]["update"]["to_version"], Value::Null, "{done}");
+    let versions: Vec<_> = std::fs::read_dir(dir.path().join("content/sven-coop")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    assert_eq!(versions, vec![std::ffi::OsString::from("test")]);
+    let staging: Vec<_> = std::fs::read_dir(dir.path().join("staging"))
+        .map(|rd| rd.filter_map(|e| e.ok()).collect())
+        .unwrap_or_default();
+    assert!(staging.is_empty());
 }

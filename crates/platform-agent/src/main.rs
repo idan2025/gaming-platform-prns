@@ -109,6 +109,9 @@ async fn main() -> Result<()> {
     // Containers outlive this process, so a restart can find servers running
     // that nothing is announcing. Put them back on the mesh before serving.
     agent.restore_mesh_bridges().await;
+    // Old copies an update was asked to remove, whose servers went away
+    // while the agent was down.
+    agent.sweep_old_copies().await;
 
     // Restart-on-crash (`Agent::check_crashes`). The first pass only marks
     // the exits already on this node as seen.

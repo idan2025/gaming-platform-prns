@@ -727,10 +727,23 @@ async fn remove(
 /// connection — so the request would time out while the work carried on
 /// invisibly. Now the work is a task and this reports its state; poll `GET` on
 /// the same path.
+/// `POST /content/:game` with `{"update": true}` updates an installed game
+/// instead (`Agent::update_content`); `remove_old` also deletes the previous
+/// copy, now or once the servers using it are gone. No body is an install.
+#[derive(Deserialize, Default)]
+struct InstallRequest {
+    #[serde(default)]
+    update: bool,
+    #[serde(default)]
+    remove_old: bool,
+}
+
 async fn install_content(
     State(state): State<ApiState>,
     Path(game): Path<String>,
+    body: Option<Json<InstallRequest>>,
 ) -> ApiResult<serde_json::Value> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
     // Refuse what will obviously fail *before* claiming a task, so a mistyped
     // game id is an error rather than a "Failed" state to poll for.
     if !state.agent.packs().await.contains_key(&game) {
@@ -739,8 +752,12 @@ async fn install_content(
             format!("no game pack installed for {game:?}"),
         ));
     }
-    let started =
-        crate::install::spawn(state.installs.clone(), state.agent.clone(), game.clone()).await;
+    let started = if req.update {
+        crate::install::spawn_update(state.installs.clone(), state.agent.clone(), game.clone(), req.remove_old)
+            .await
+    } else {
+        crate::install::spawn(state.installs.clone(), state.agent.clone(), game.clone()).await
+    };
     Ok(Json(json!({
         "game": game,
         "started": started,

@@ -505,6 +505,31 @@ change could quietly break:
   lands while the container is being created is caught by the flag check in
   `run_to_completion`. Pinned by `a_download_shows_growing_bytes_and_a_cancel_leaves_nothing`.
 
+**A game's files can be updated from the node** (2026-10-13,
+`Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later
+change could quietly break:
+- **An update never passes `validate` to steamcmd.** `validate` restores every
+  depot file to Valve's copy, and `scripts/install-yapb.sh` edits
+  `liblist.gam`, so a validating update silently takes a node's bots away. The
+  stand-in steamcmd in `tests/installed_content.rs` exits 9 on `validate`;
+  flipping the flag fails both update tests.
+- **An update makes a new version directory, from a plain copy of the old.**
+  Never in place (servers have it mounted) and never via hard links (steamcmd
+  may write a file in place, through the link into the mounted copy). Copying
+  first is also what keeps the operator's additions.
+- **`agent.toml` is never rewritten.** The version new servers use after an
+  update lives in `<data_root>/content-active.json`, and an entry applies only
+  while `content_version` still equals the `base` it was made from: an
+  operator who edits the config wins. A deleted active copy falls back to the
+  config's version (`Agent::active_version`).
+- **"Remove the old version" never deletes a mounted copy or the active one.**
+  It queues the old version; `sweep_old_copies` deletes it when nothing mounts
+  it, run after an update, after `Agent::remove` and at agent start. Servers
+  that exist keep the copy they were created on.
+- **Up to date is decided from Steam's manifest on disk**
+  (`steamapps/appmanifest_<app>.acf`, `buildid`), never steamcmd's console.
+  The same build before and after discards the copy: no identical second copy.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

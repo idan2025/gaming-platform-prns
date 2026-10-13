@@ -112,6 +112,8 @@ pub struct Agent {
     /// time. A copy is never changed in place (`content.rs`), so a walk of a
     /// 20 GB tree is done once, not on every poll of the page.
     content_sizes: std::sync::Mutex<HashMap<std::path::PathBuf, (SystemTime, u64)>>,
+    /// Which copy new servers use once an update has moved it (`active.rs`).
+    active: crate::active::ActiveVersions,
 }
 
 /// How often the agent looks for servers that crashed.
@@ -187,6 +189,23 @@ pub struct InstalledCopy {
     pub used_by: Vec<String>,
     /// Neither configured nor mounted: space nothing on this node will use.
     pub unused: bool,
+    /// The copy new servers use, of a game this node can update (`steamcmd`).
+    pub updatable: bool,
+}
+
+/// What an update did, for the Installed page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpdateReport {
+    pub from_version: String,
+    /// The new version directory, or `None` when there was nothing newer.
+    pub to_version: Option<String>,
+    pub from_build: Option<String>,
+    pub to_build: Option<String>,
+    /// What happened to the old copy: `kept`, `removed`, or `waiting` — asked
+    /// to be removed while servers still use it, and removed once they are.
+    pub old: String,
+    /// The servers the old copy is waiting for.
+    pub old_used_by: Vec<String>,
 }
 
 /// Why a copy was not deleted.
@@ -229,6 +248,20 @@ fn dir_size(path: &std::path::Path) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+/// Year, month and day of a day count since 1970-01-01 (Howard Hinnant's
+/// `civil_from_days`), so naming a version needs no date crate.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 /// Every `<game>/<version>` directory under the content root.
@@ -298,6 +331,7 @@ impl Agent {
             config.mesh.clone(),
             config.data_root.join("mesh-interfaces.json"),
         );
+        let config_data_root = config.data_root.clone();
         Ok(Self {
             config,
             layout,
@@ -309,6 +343,7 @@ impl Agent {
             mesh,
             crashes: Mutex::new(CrashWatch::default()),
             content_sizes: std::sync::Mutex::new(HashMap::new()),
+            active: crate::active::ActiveVersions::load(&config_data_root),
         })
     }
 
@@ -480,7 +515,7 @@ impl Agent {
 
         let content = ContentRef {
             game_id: spec.game_id.clone(),
-            version: runtime.content_version.clone(),
+            version: self.active_version_of(&spec.game_id, &runtime.content_version),
         };
         let plan = self
             .layout
@@ -571,7 +606,7 @@ impl Agent {
         })?;
         let content = ContentRef {
             game_id: game_id.to_string(),
-            version: runtime.content_version.clone(),
+            version: self.active_version_of(game_id, &runtime.content_version),
         };
         let provisioned = self
             .content
@@ -669,7 +704,7 @@ impl Agent {
         }
         let content = ContentRef {
             game_id: game_id.to_string(),
-            version: runtime.content_version.clone(),
+            version: self.active_version_of(game_id, &runtime.content_version),
         };
         match self.layout.content_dir(&content) {
             Ok(dir) => !dir.is_dir(),
@@ -916,7 +951,7 @@ impl Agent {
         let runtime = self.config.runtime_for(game_id).ok_or_else(|| {
             anyhow!("this node has no runtime configured for {game_id:?}")
         })?;
-        let version = runtime.content_version.clone();
+        let version = self.active_version_of(game_id, &runtime.content_version);
         drop(packs);
 
         crate::store::validate_writable_path(&maps_dir)
@@ -1154,6 +1189,9 @@ impl Agent {
         self.docker.remove(instance_id).await?;
         self.ports.lock().await.release_all(&held);
         self.specs.lock().await.remove(instance_id);
+        // The server may have been the last one holding an old copy the
+        // operator asked to remove after an update.
+        self.sweep_old_copies().await;
         Ok(())
     }
 
@@ -1457,6 +1495,158 @@ impl Agent {
         }
     }
 
+    /// The version new servers of `game` use: the one an update made active
+    /// (`active.rs`) while it is installed and `agent.toml` has not moved on,
+    /// else the config's.
+    pub fn active_version(&self, game_id: &str) -> Option<String> {
+        let runtime = self.config.runtime_for(game_id)?;
+        Some(self.active_version_of(game_id, &runtime.content_version))
+    }
+
+    fn active_version_of(&self, game_id: &str, config_version: &str) -> String {
+        let Some(active) = self.active.active(game_id, config_version) else {
+            return config_version.to_string();
+        };
+        let content = ContentRef { game_id: game_id.to_string(), version: active.clone() };
+        match self.layout.content_dir(&content) {
+            Ok(dir) if dir.is_dir() => active,
+            // Deleted since, or not an id: fall back rather than point new
+            // servers at nothing.
+            _ => config_version.to_string(),
+        }
+    }
+
+    /// Fetch the newest build of a game into a new version directory and make
+    /// it the one new servers use (`Provisioner::update`). With `remove_old`,
+    /// the previous copy is deleted now if nothing mounts it, or queued and
+    /// deleted once the servers using it are removed (`sweep_old_copies`).
+    ///
+    /// Servers already running keep the copy they were created on: a
+    /// container's mounts are fixed at create, and swapping files under a
+    /// running game is what "existing content is never replaced" forbids.
+    pub async fn update_content(
+        &self,
+        game_id: &str,
+        remove_old: bool,
+        progress: Option<&crate::content::InstallProgress>,
+    ) -> Result<UpdateReport, ProvisionError> {
+        let io = |m: String| ProvisionError::Io(std::io::Error::other(m));
+        let spec = {
+            let packs = self.packs.read().await;
+            packs
+                .get(game_id)
+                .ok_or_else(|| io(format!("no game pack installed for {game_id:?}")))?
+                .content
+                .clone()
+        };
+        let runtime = self
+            .config
+            .runtime_for(game_id)
+            .ok_or_else(|| io(format!("this node has no runtime configured for {game_id:?}")))?;
+        let base = runtime.content_version.clone();
+        let current = self.active_version_of(game_id, &base);
+        let from = ContentRef { game_id: game_id.to_string(), version: current.clone() };
+        let to_version = self.next_version_name(game_id, &base).map_err(io)?;
+        let to = ContentRef { game_id: game_id.to_string(), version: to_version.clone() };
+
+        let updated = self.content.update(&from, &to, &spec, Some(&self.docker), progress).await?;
+        let (to_version, from_build, to_build) = match updated {
+            crate::content::Updated::UpToDate { build } => {
+                return Ok(UpdateReport {
+                    from_version: current,
+                    to_version: None,
+                    from_build: build.clone(),
+                    to_build: build,
+                    old: "kept".into(),
+                    old_used_by: Vec::new(),
+                });
+            }
+            crate::content::Updated::NewBuild { from_build, to_build, .. } => {
+                (to_version, from_build, to_build)
+            }
+        };
+        self.active
+            .set_active(game_id, &base, &to_version)
+            .map_err(|e| io(format!("the new copy is installed, but recording it as active failed: {e}")))?;
+        let pack = self.packs.read().await.get(game_id).cloned();
+        if let Some(pack) = pack {
+            self.create_writable_mountpoints(&to, &self.writable_paths_for(game_id, &pack))?;
+        }
+
+        let mut report = UpdateReport {
+            from_version: current.clone(),
+            to_version: Some(to_version),
+            from_build,
+            to_build,
+            old: "kept".into(),
+            old_used_by: Vec::new(),
+        };
+        if remove_old {
+            self.active
+                .add_pending(game_id, &current)
+                .map_err(|e| io(format!("queueing the old copy for removal: {e}")))?;
+            self.sweep_old_copies().await;
+            report.old_used_by = self.copy_used_by(game_id, &current).await.unwrap_or_default();
+            report.old = if report.old_used_by.is_empty() { "removed" } else { "waiting" }.into();
+        }
+        Ok(report)
+    }
+
+    /// `<config version>-<yyyymmdd>`, with `-2`, `-3`… if that exists. Named
+    /// from the config's version, not the current one, so names never grow.
+    fn next_version_name(&self, game_id: &str, base: &str) -> Result<String, String> {
+        let days = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
+        let (y, m, d) = civil_from_days(days as i64);
+        let stem = format!("{base}-{y:04}{m:02}{d:02}");
+        for n in 1..100 {
+            let name = if n == 1 { stem.clone() } else { format!("{stem}-{n}") };
+            let content = ContentRef { game_id: game_id.to_string(), version: name.clone() };
+            let dir = self.layout.content_dir(&content).map_err(|e| format!("cannot name the new version {name:?}: {e}"))?;
+            if !dir.exists() {
+                return Ok(name);
+            }
+        }
+        Err(format!("too many updates of {game_id} today"))
+    }
+
+    async fn copy_used_by(&self, game_id: &str, version: &str) -> Result<Vec<String>> {
+        let content = ContentRef { game_id: game_id.to_string(), version: version.to_string() };
+        let dir = self.layout.content_dir(&content).map_err(|e| anyhow!("{e}"))?;
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .docker
+            .list_managed()
+            .await?
+            .into_iter()
+            .filter(|c| c.mount_sources.iter().any(|m| m.starts_with(&dir)))
+            .map(|c| c.instance_id)
+            .collect())
+    }
+
+    /// Delete old copies the operator asked to remove after an update, once
+    /// nothing mounts them. Never the active copy. Run after an update, after
+    /// a server is removed, and when the agent starts.
+    pub async fn sweep_old_copies(&self) {
+        for (game, version) in self.active.pending() {
+            if self.active_version(&game).as_deref() == Some(version.as_str()) {
+                continue;
+            }
+            match self.delete_content(&game, &version).await {
+                Ok(bytes) => {
+                    tracing::info!(game = %game, version = %version, bytes, "removed an old copy after an update");
+                    let _ = self.active.remove_pending(&game, &version);
+                }
+                Err(DeleteContentError::NotInstalled) | Err(DeleteContentError::BadId(_)) => {
+                    let _ = self.active.remove_pending(&game, &version);
+                }
+                Err(DeleteContentError::InUse(_)) => {}
+                Err(e) => tracing::warn!(game = %game, version = %version, error = %e, "could not remove an old copy"),
+            }
+        }
+    }
+
     /// Every installed copy of every game's files on this node, unused ones
     /// first.
     ///
@@ -1467,6 +1657,7 @@ impl Agent {
     /// here could act on it.
     pub async fn installed(&self) -> Result<Vec<InstalledCopy>> {
         let containers = self.docker.list_managed().await?;
+        let packs = self.packs.read().await;
         let root = self.config.data_root.join("content");
         let mut copies = Vec::new();
         for (game, version) in list_content_dirs(&root) {
@@ -1477,10 +1668,9 @@ impl Agent {
                 .filter(|c| c.mount_sources.iter().any(|m| m.starts_with(&dir)))
                 .map(|c| c.instance_id.clone())
                 .collect();
-            let configured = self
-                .config
-                .runtime_for(&game)
-                .is_some_and(|r| r.content_version == version);
+            let configured = self.active_version(&game).is_some_and(|v| v == version);
+            let updatable = configured
+                && packs.get(&game).is_some_and(|p| matches!(p.content, PackContent::Steamcmd { .. }));
             let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
             copies.push(InstalledCopy {
                 bytes: self.content_size(&dir, modified),
@@ -1488,6 +1678,7 @@ impl Agent {
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64),
                 unused: !configured && used_by.is_empty(),
+                updatable,
                 game_id: game,
                 version,
                 configured,
@@ -1638,6 +1829,18 @@ impl Agent {
             Err(_) => Vec::new(),
         };
         Ok(self.layout.orphan_instance_dirs(&live, &entries))
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::civil_from_days;
+
+    #[test]
+    fn day_counts_become_calendar_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(20_739), (2026, 10, 13));
     }
 }
 

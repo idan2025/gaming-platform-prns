@@ -57,7 +57,13 @@ pub enum InstallState {
         total_bytes: Option<u64>,
     },
     /// Finished. `bytes` is what landed, or 0 when it was already installed.
-    Done { bytes: u64, already_installed: bool },
+    /// `update` is present when this was an update rather than an install.
+    Done {
+        bytes: u64,
+        already_installed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        update: Option<crate::agent::UpdateReport>,
+    },
     /// Failed, carrying the sentence the operator has to act on.
     Failed { error: String },
 }
@@ -216,10 +222,10 @@ pub async fn spawn(
         let outcome = agent.ensure_content_tracked(&game_id, Some(&progress)).await;
         let state = match outcome {
             Ok(crate::content::Provisioned::AlreadyInstalled(_)) => {
-                InstallState::Done { bytes: 0, already_installed: true }
+                InstallState::Done { bytes: 0, already_installed: true, update: None }
             }
             Ok(crate::content::Provisioned::Installed { bytes, .. }) => {
-                InstallState::Done { bytes, already_installed: false }
+                InstallState::Done { bytes, already_installed: false, update: None }
             }
             // The sentence is the product here: it names the missing directory,
             // the digest that did not match, or the switch the operator has not
@@ -231,6 +237,34 @@ pub async fn spawn(
         } else {
             tracing::info!(game = %game_id, "content install finished");
         }
+        installs.finish(&game_id, state).await;
+    });
+    true
+}
+
+/// Start an update in the background, in the same slot an install uses: an
+/// update and an install of one game, or two updates, never run at once.
+pub async fn spawn_update(
+    installs: Arc<Installs>,
+    agent: Arc<crate::agent::Agent>,
+    game_id: String,
+    remove_old: bool,
+) -> bool {
+    let Some(progress) = installs.begin(&game_id).await else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let state = match agent.update_content(&game_id, remove_old, Some(&progress)).await {
+            Ok(report) => {
+                tracing::info!(game = %game_id, to = ?report.to_version, old = %report.old, "content update finished");
+                let bytes = 0;
+                InstallState::Done { bytes, already_installed: report.to_version.is_none(), update: Some(report) }
+            }
+            Err(e) => {
+                tracing::warn!(game = %game_id, error = %e, "content update failed");
+                InstallState::Failed { error: format!("{e}") }
+            }
+        };
         installs.finish(&game_id, state).await;
     });
     true
@@ -296,7 +330,7 @@ mod tests {
         let installs = Installs::new();
         installs.begin("g").await;
         assert_eq!(installs.exclusive("g", async {}).await, Err(NotRunning));
-        installs.finish("g", InstallState::Done { bytes: 1, already_installed: false }).await;
+        installs.finish("g", InstallState::Done { bytes: 1, already_installed: false, update: None }).await;
         // While held, nothing reports a download that is not one, and a
         // download cannot start.
         let inside = installs
