@@ -419,7 +419,8 @@ thing most likely to fill it and take every running server down with it.
 ### 12.1 Checking for a new build
 
 - Per game, on an interval the operator sets (a node-wide default and a
-  per-game override). **Off by default**, or a fixed default — open decision.
+  per-game override). **Off until the operator sets one** (decided
+  2026-10-13): nothing new runs on a node by surprise.
 - Steam games only. The check asks steamcmd for the public branch's build
   (`+app_info_update 1 +app_info_print <app>`) in a short-lived task container,
   anonymously, like an install, and compares it with the copy's own manifest
@@ -438,8 +439,8 @@ An update first copies the old copy (item 11: never in place, never hard
 links), so it needs that copy's size plus whatever the new build changes. The
 copy's size is already known (`InstalledCopy.bytes`).
 
-- **A reserve that nothing downloads into.** Configurable; default the larger
-  of 10% of the disk and 5 GB (open decision). `disk_space` already reads free
+- **A reserve that nothing downloads into.** Configurable; default **the
+  larger of 10% of the disk and 5 GB** (decided 2026-10-13). `disk_space` already reads free
   and total for the data root.
 - **Before a download starts:** it starts only if, after it, free space would
   still be above the reserve, counting the space already promised to downloads
@@ -482,9 +483,10 @@ recreating its container on the new copy. Per game:
   treated as empty — the same rule that keeps reaping from stopping a busy
   server (`hosting::record_for`, `exempt_from_reaping`).
 - **At a set time**: a daily window (04:00–06:00) or a one-off date. Inside the
-  window it still waits for empty, unless the operator allowed a forced move,
-  which first warns the players in game over the console (`console.rs` words,
-  never a command from a pack) — open decision whether to offer it at all.
+  window it still waits for empty, unless the operator allowed a forced move:
+  **off by default, opt-in per game**, and it first warns the players in game
+  over the console (`console.rs` words, never a command from a pack) (decided
+  2026-10-13).
 - **Never**: servers stay on the old copy until the operator restarts them;
   "remove the old version" then deletes it after the last one leaves (item 11's
   `sweep_old_copies`).
@@ -533,9 +535,10 @@ these, the file the operator wrote wins, the same way `active.rs`'s `base` does.
 
 Each step ships on its own.
 
-**Open decisions:** default check interval (off, or every 6 h); whether a
-window may ever force a move with players on (only as an opt-in with an
-in-game warning, if at all); the default reserve (larger of 10% and 5 GB).
+**Decided 2026-10-13:** checks are off until the operator sets an interval; a
+window may force a move with players on only as a per-game opt-in, after an
+in-game warning; the reserve defaults to the larger of 10% of the disk and
+5 GB.
 
 **Tests to write** (Docker-gated, busybox stand-ins, like
 `tests/installed_content.rs`):
