@@ -99,7 +99,7 @@ async fn without_the_token_every_route_is_refused() {
     for path in [
         "/health", "/capacity", "/instances", "/orphans", "/games", "/usage", "/storage",
         "/orphans/summary", "/instances/x/logs", "/instances/x/players", "/content",
-        "/content/sven-coop",
+        "/content/sven-coop", "/updates",
     ] {
         let status = client
             .get(format!("http://{addr}{path}"))
@@ -130,7 +130,7 @@ async fn without_the_token_every_route_is_refused() {
     assert_eq!(status, 401, "delete answered without a token");
 
     // Deleting a game's files, and cancelling its download.
-    for path in ["/content/sven-coop/test", "/content/sven-coop"] {
+    for path in ["/content/sven-coop/test", "/content/sven-coop", "/updates/sven-coop/snooze"] {
         let status = client
             .delete(format!("http://{addr}{path}"))
             .send()
@@ -138,6 +138,23 @@ async fn without_the_token_every_route_is_refused() {
             .unwrap()
             .status();
         assert_eq!(status, 401, "DELETE {path} answered without a token");
+    }
+
+    // Nor are the update routes: a check runs a container, a setting changes
+    // what downloads.
+    for (method, path) in [
+        (reqwest::Method::POST, "/updates/sven-coop/check"),
+        (reqwest::Method::POST, "/updates/sven-coop/snooze"),
+        (reqwest::Method::PUT, "/updates/settings"),
+    ] {
+        let status = client
+            .request(method.clone(), format!("http://{addr}{path}"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 401, "{method} {path} answered without a token");
     }
 
     // Nor are the routes that delete files or change what restarts.

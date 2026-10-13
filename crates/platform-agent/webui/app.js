@@ -65,6 +65,16 @@ const state = {
     deleting: new Set(), // "game/version" being deleted
     art: new Map(),      // row key -> its art element, kept across polls
   },
+  // GET /updates (updates.rs): settings, the reserve, and each game's notice.
+  updates: {
+    supported: true,     // false once an older agent answers 404
+    settings: null,      // {check_every_hours, reserve_bytes}
+    reserve: null,       // bytes downloads keep free on this disk
+    defaultReserve: null,
+    games: new Map(),    // game_id -> UpdateNotice
+    checking: new Set(), // game ids with a check running from this page
+    timer: null,
+  },
 };
 
 const ICON = {
@@ -299,10 +309,12 @@ function startPolling() {
   maybeSchedulePoll();
   poll();
   pollUsage();
+  loadUpdates();
 }
 function stopPolling() {
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
   if (state.usage.timer) { clearTimeout(state.usage.timer); state.usage.timer = null; }
+  if (state.updates.timer) { clearTimeout(state.updates.timer); state.updates.timer = null; }
 }
 function maybeSchedulePoll() {
   if (state.pollTimer) return;
@@ -1182,6 +1194,11 @@ async function watchInstall(gameId) {
         continue; // a blip in polling is not a failed install
       }
       const st = (body && body.status) || {};
+      if (st.state === "queued") {
+        state.installingMsg.set(gameId, "Waiting for another download to finish first.");
+        renderGames();
+        continue;
+      }
       if (st.state === "running") {
         state.installingMsg.set(gameId, "Downloading game files… " +
           (st.bytes ? formatBytes(st.bytes) + " in " : "") + formatUptime(st.since_secs) + " so far.");
@@ -1878,8 +1895,130 @@ function ingestInstalled(body) {
   }
   for (const g of [...s.prev.keys()]) if (!seen.has(g)) { s.prev.delete(g); s.rate.delete(g); }
   renderInstalled();
-  const n = s.copies.length;
-  $("nav-installed-count").textContent = s.downloads.length ? "↓" + s.downloads.length : (n ? String(n) : "");
+  renderInstalledBadge();
+}
+
+// Downloads first, then new builds nobody has hidden, then the copy count.
+function renderInstalledBadge() {
+  const s = state.installed;
+  const fresh = [...state.updates.games.values()].filter(g => g.available === true && !g.snoozed).length;
+  const badge = $("nav-installed-count");
+  badge.textContent = s.downloads.length ? "↓" + s.downloads.length
+    : fresh ? "↑" + fresh
+    : (s.copies.length ? String(s.copies.length) : "");
+  badge.title = s.downloads.length ? "Downloading" : fresh ? fresh + " game" + (fresh === 1 ? " has" : "s have") + " a new build" : "";
+}
+
+// ---------- update checks and the reserve (updates.rs) ----------
+
+const UPDATES_MS = 60000;
+
+async function loadUpdates() {
+  const u = state.updates;
+  if (u.timer) { clearTimeout(u.timer); u.timer = null; }
+  if (!state.token || !u.supported) return;
+  try {
+    ingestUpdates(await api("GET", "/updates"));
+  } catch (e) {
+    if (e && e.__auth) return;
+    if (e && (e.status === 404 || e.status === 405)) { u.supported = false; renderUpdatesBar(); return; }
+  }
+  if (state.token && !u.timer) u.timer = setTimeout(loadUpdates, UPDATES_MS);
+}
+
+function ingestUpdates(body) {
+  const u = state.updates;
+  if (!body) return;
+  u.settings = body.settings || null;
+  u.reserve = body.reserve_bytes ?? null;
+  u.defaultReserve = body.default_reserve_bytes ?? null;
+  u.games = new Map((Array.isArray(body.games) ? body.games : []).map(g => [g.game_id, g]));
+  renderUpdatesBar();
+  renderInstalled();
+  renderInstalledBadge();
+}
+
+const GB = 1024 * 1024 * 1024;
+
+// The settings strip. Left alone while the operator is typing in it.
+function renderUpdatesBar() {
+  const u = state.updates;
+  const bar = $("updates-bar");
+  if (!bar) return;
+  bar.classList.toggle("hidden", !u.supported || !u.settings);
+  if (!u.settings) return;
+  const every = $("updates-every");
+  if (document.activeElement !== every) every.value = u.settings.check_every_hours ? String(u.settings.check_every_hours) : "";
+  if (every.value === "" && u.settings.check_every_hours) {
+    // An interval set elsewhere that the list does not offer: show it rather than "Off".
+    const o = el("option", null, "Every " + u.settings.check_every_hours + " hours");
+    o.value = String(u.settings.check_every_hours);
+    every.appendChild(o);
+    every.value = o.value;
+  }
+  const reserve = $("updates-reserve");
+  if (document.activeElement !== reserve) {
+    reserve.value = u.settings.reserve_bytes != null ? String(Math.round(u.settings.reserve_bytes / GB * 10) / 10) : "";
+    reserve.placeholder = u.defaultReserve ? String(Math.round(u.defaultReserve / GB * 10) / 10) : "";
+  }
+  $("updates-reserve-note").textContent = u.reserve
+    ? "A download does not start if it would leave less than " + formatBytes(u.reserve) + " free, and stops if the disk gets there." +
+      (u.settings.reserve_bytes == null ? " Empty is the default: a tenth of the disk, at least 5 GB." : "")
+    : "";
+}
+
+async function saveUpdateSettings() {
+  const hours = $("updates-every").value;
+  const gb = $("updates-reserve").value.trim();
+  const settings = {
+    check_every_hours: hours ? Number(hours) : null,
+    reserve_bytes: gb === "" ? null : Math.round(Number(gb) * GB),
+  };
+  if (gb !== "" && !(Number(gb) >= 0)) { showError("Enter how many GB to keep free, or leave it empty for the default."); return; }
+  try {
+    ingestUpdates(await withInFlight(api("PUT", "/updates/settings", settings)));
+    clearError();
+    toast(settings.check_every_hours ? "Checking for new builds every " + (settings.check_every_hours >= 24 && settings.check_every_hours % 24 === 0
+      ? (settings.check_every_hours === 24 ? "day" : settings.check_every_hours / 24 + " days") : settings.check_every_hours + " hours") + "."
+      : "Saved. New builds are checked only when you ask.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The settings were not saved.");
+    renderUpdatesBar();
+  }
+}
+
+async function onCheckUpdate(gameId) {
+  const u = state.updates;
+  if (u.checking.has(gameId)) return;
+  u.checking.add(gameId);
+  renderInstalled();
+  try {
+    const n = await api("POST", "/updates/" + encodeURIComponent(gameId) + "/check");
+    u.games.set(gameId, n);
+    clearError();
+    if (n.error) showError(gameName(gameId) + ": the check failed. " + n.error);
+    else toast(n.available === true ? gameName(gameId) + ": build " + n.latest_build + " is out."
+      : n.available === false ? gameName(gameId) + " is up to date." : gameName(gameId) + ": Steam's newest build is " + n.latest_build + ".");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The check did not run.");
+  } finally {
+    u.checking.delete(gameId);
+    renderInstalled();
+    renderInstalledBadge();
+  }
+}
+
+async function onSnoozeUpdate(gameId, body) {
+  const path = "/updates/" + encodeURIComponent(gameId) + "/snooze";
+  try {
+    ingestUpdates(await withInFlight(body ? api("POST", path, body) : api("DELETE", path)));
+    clearError();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "That did not save.");
+  }
 }
 
 function instanceName(id) {
@@ -1969,7 +2108,71 @@ function buildCopyRow(c, downloading, artEl) {
   actions.appendChild(del);
   row.append(artCell, nameCell, stateCell, el("div", "cell", formatBytes(c.bytes)), usedBy,
     el("div", "cell", formatDate(c.modified_unix)), actions);
+  const notice = state.updates.games.get(c.game_id);
+  if (c.updatable && notice && notice.version === c.version) row.appendChild(buildUpdateLine(notice, downloading));
   return row;
+}
+
+function ago(unix) {
+  if (!unix) return "";
+  const s = Math.max(0, Date.now() / 1000 - unix);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + " min ago";
+  if (s < 86400) return Math.floor(s / 3600) + " h ago";
+  return Math.floor(s / 86400) + " d ago";
+}
+
+// What is known about this copy's newest build, and what can be done about it.
+// Built from the last GET /updates; the copies poll never changes it.
+function buildUpdateLine(n, downloading) {
+  const line = el("div", "update-line");
+  const checking = state.updates.checking.has(n.game_id);
+  const btn = (text, title, fn) => {
+    const b = el("button", "link-btn", text);
+    b.type = "button";
+    b.title = title;
+    b.disabled = checking;
+    b.addEventListener("click", fn);
+    return b;
+  };
+  const checkNow = btn("Check now", "Ask Steam for the newest build of this game (about half a minute).", () => onCheckUpdate(n.game_id));
+  if (checking) {
+    line.appendChild(el("span", null, "Checking with Steam…"));
+    return line;
+  }
+  const when = n.checked_unix ? " Checked " + ago(n.checked_unix) + "." : "";
+  if (n.available === true && !n.snoozed) {
+    const text = el("span");
+    text.append(el("strong", "new", "New build " + n.latest_build), " — this copy has " + n.installed_build + "." + when +
+      (downloading ? "" : " Update… downloads it beside this copy."));
+    line.appendChild(text);
+    line.append(
+      btn("Remind me tomorrow", "Hide this for a day.", () => onSnoozeUpdate(n.game_id, { hours: 24 })),
+      btn("Skip build " + n.latest_build, "Hide this until a newer build than " + n.latest_build + " comes out.",
+        () => onSnoozeUpdate(n.game_id, { skip_build: true })),
+      checkNow);
+  } else if (n.available === true) {
+    const why = n.skip_build === n.latest_build ? "skipped" :
+      "hidden until " + new Date(n.snooze_until_unix * 1000).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" });
+    line.appendChild(el("span", null, "Build " + n.latest_build + " is out, " + why + "." + when));
+    line.append(btn("Show", "Show this notice again.", () => onSnoozeUpdate(n.game_id, null)), checkNow);
+  } else if (n.available === false) {
+    line.appendChild(el("span", null, "Up to date (build " + n.installed_build + ")." + when));
+    line.appendChild(checkNow);
+  } else if (!n.installed_build && n.latest_build) {
+    line.appendChild(el("span", null, "Steam's newest build is " + n.latest_build +
+      "; this copy has no Steam manifest, so its own build is not known." + when));
+    line.appendChild(checkNow);
+  } else {
+    line.appendChild(el("span", null, n.checked_unix ? "No answer from Steam yet." : "Not checked for new builds yet."));
+    line.appendChild(checkNow);
+  }
+  if (n.error) {
+    const err = el("span", "bad-text", "Last check failed: " + n.error);
+    err.title = n.error;
+    line.appendChild(err);
+  }
+  return line;
 }
 function isDeleting(key) { return state.installed.deleting.has(key); }
 
@@ -1978,6 +2181,22 @@ function buildDownloadRow(d, artEl) {
   const row = el("div", "copy-row downloading");
   const artCell = el("div", "art-cell");
   artCell.appendChild(artEl);
+  if (st.state === "queued") {
+    // One download at a time per node (install.rs): nothing is on disk yet.
+    const nameCell = el("div");
+    nameCell.append(el("div", "name", gameName(d.game)), el("div", "sub", "Waiting for another download"));
+    const stateCell = el("div");
+    stateCell.appendChild(el("span", "state-pill state-stopped", "Queued"));
+    const actions = el("div", "actions");
+    const cancel = el("button", "btn btn-small", "Cancel");
+    cancel.type = "button";
+    cancel.title = "Take it out of the queue.";
+    cancel.addEventListener("click", () => onCancelDownload(d.game, cancel));
+    actions.appendChild(cancel);
+    row.append(artCell, nameCell, stateCell, el("div", "cell muted-em", "—"),
+      el("div", "cell muted-em", "waiting " + formatUptime(st.since_secs || 0)), el("div", "cell muted-em", "—"), actions);
+    return row;
+  }
   const nameCell = el("div");
   nameCell.append(el("div", "name", gameName(d.game)),
     el("div", "sub", "Downloading · " + formatBytes((st.bytes || 0)) + " so far"));
@@ -2030,8 +2249,11 @@ function onUpdateGame(c) {
     body.append(wrap, el("p", "muted small", used.length
       ? "Used now by " + used.join(", ") + ": it is removed once " + (used.length === 1 ? "that server is" : "those servers are") + " removed."
       : "Nothing uses it now, so it is removed as soon as the new copy is ready (" + formatBytes(c.bytes) + " freed)."));
+    const reserve = state.updates.reserve;
     body.appendChild(el("p", "muted small",
-      "Needs about " + formatBytes(c.bytes) + " free while it runs: the copy is made first, then updated."));
+      "Needs about " + formatBytes(Math.round(c.bytes * 1.1)) + " free while it runs: the copy is made first, then updated." +
+      (reserve ? " It does not start if that would leave less than " + formatBytes(reserve) +
+        " free, and stops if the disk gets there, so running servers never run out of space." : "")));
     const actions = el("div", "form-actions");
     actions.style.marginTop = "8px";
     const cancel = el("button", "btn", "Cancel");
@@ -2040,11 +2262,8 @@ function onUpdateGame(c) {
     const go = el("button", "btn btn-primary", "Update");
     go.type = "button";
     go.addEventListener("click", async () => {
-      const s = state.storage;
-      if (s && s.free_bytes < c.bytes) {
-        showError("Only " + formatBytes(s.free_bytes) + " is free, and the update needs about " + formatBytes(c.bytes) + ".");
-        return;
-      }
+      // The node decides whether it fits (Agent::room_for); a refusal
+      // arrives through watchUpdate with the copies that would make room.
       go.disabled = true; go.textContent = "Starting…";
       try {
         await withInFlight(api("POST", "/content/" + encodeURIComponent(c.game_id), { update: true, remove_old: removeOld.checked }));
@@ -2072,7 +2291,7 @@ async function watchUpdate(gameId) {
     try { body = await api("GET", "/content/" + encodeURIComponent(gameId)); }
     catch (e) { if (e && e.__auth) return; continue; }
     const st = (body && body.status) || {};
-    if (st.state === "running") continue;
+    if (st.state === "running" || st.state === "queued") continue;
     if (st.state === "failed") {
       if (st.error !== "cancelled") showError(gameName(gameId) + " was not updated: " + st.error);
       return;
@@ -2212,6 +2431,10 @@ document.addEventListener("DOMContentLoaded", () => {
     state.installed.downloads = [];
     state.installed.supported = true;
     state.installed.prev.clear(); state.installed.rate.clear();
+    state.updates.supported = true;
+    state.updates.settings = null;
+    state.updates.games.clear();
+    renderUpdatesBar();
     $("nav-installed-count").textContent = "";
     renderInstalled();
     state.installing.clear();
@@ -2228,6 +2451,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("announce-btn").addEventListener("click", () => onAnnounce(null));
   $("orphans-clean").addEventListener("click", onCleanOrphans);
   $("installed-unused-btn").addEventListener("click", onDeleteUnused);
+  $("updates-every").addEventListener("change", saveUpdateSettings);
+  $("updates-reserve").addEventListener("change", saveUpdateSettings);
 
   $("iface-kind").addEventListener("change", () => {
     const tcp = $("iface-kind").value === "tcp";
