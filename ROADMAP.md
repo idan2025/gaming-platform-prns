@@ -20,7 +20,8 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
-| 11 | Node: installed games and downloads | node operators | M | proposed |
+| 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36) |
+| 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | proposed |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 Recommended first: **1 and 2.** They remove the most friction for a new player:
@@ -397,6 +398,157 @@ gate anything Unix-only with `#[cfg(unix)]`, as `disk_space` does), CLAUDE.md
 records the rules a later change could break, `RELEASE.md` has an Unreleased
 entry, and on the node the 928 MB `counter-strike-16/app90` copy shows as
 unused and can be deleted from the page.
+
+## 12. Node: update checks, storage-safe downloads, moving servers
+
+**Status (2026-10-13): proposed.** Builds on item 11's **Update** button
+(`Provisioner::update`, `Agent::update_content`, `active.rs`), which already
+downloads a new build into a new copy beside the old one without touching
+anything a server uses.
+
+**What.** The node notices a new build by itself, downloads it only when the
+disk can take it, and moves servers onto it with as little downtime as a
+restart — never with a full disk, and never in the middle of a game unless the
+operator said so.
+
+**Why.** When Valve ships a game update, players' clients usually refuse a
+server on the old build: a node nobody updates is a node nobody can join. And
+an update is a full copy of a game's files, so on a small disk it is the one
+thing most likely to fill it and take every running server down with it.
+
+### 12.1 Checking for a new build
+
+- Per game, on an interval the operator sets (a node-wide default and a
+  per-game override). **Off by default**, or a fixed default — open decision.
+- Steam games only. The check asks steamcmd for the public branch's build
+  (`+app_info_update 1 +app_info_print <app>`) in a short-lived task container,
+  anonymously, like an install, and compares it with the copy's own manifest
+  (`content::steam_build_id`, `steamapps/appmanifest_<app>.acf`). Up to date is
+  decided from Steam's data, never from scraping steamcmd's progress output.
+- An `archive` pack has no "newer": its digest pins the bytes, so a new version
+  is a new pack. A `manual` game has no source to ask. Neither is checked.
+- A newer build shows on the Installed page ("New build 12345 — you have
+  12001") and as a mark on the Installed tab, and is carried in `GET /content`
+  so an index or a launcher could show it later.
+- **Snooze**: hide the notice for a time, or until a build newer than this one.
+
+### 12.2 Storage: never fill the node
+
+An update first copies the old copy (item 11: never in place, never hard
+links), so it needs that copy's size plus whatever the new build changes. The
+copy's size is already known (`InstalledCopy.bytes`).
+
+- **A reserve that nothing downloads into.** Configurable; default the larger
+  of 10% of the disk and 5 GB (open decision). `disk_space` already reads free
+  and total for the data root.
+- **Before a download starts:** it starts only if, after it, free space would
+  still be above the reserve, counting the space already promised to downloads
+  running now. Needed is estimated as the old copy's size plus an allowance for
+  the delta (10% of the copy, say). If it does not fit, it does not start, and
+  the notice says how much it needs, how much is free above the reserve, and
+  which **Unused** copies would free enough — with their Delete buttons. **An
+  automatic update never deletes anything to make room.**
+- **While it runs:** the download is already measured every 2 s
+  (`InstallProgress::bytes`). Free space is checked on the same tick; a
+  download that would cross the reserve is cancelled through the existing
+  cancel path (nothing left behind, item 11's rules) and says "stopped: the disk
+  reached the reserve". A running server never sees a full disk because of an
+  update.
+- **A fresh install** has no known size, so it gets the reserve check only
+  (item 11's open "room before download"). A pack could later declare an
+  approximate size; it would be a hint, never trusted — the check while running
+  is what actually protects the disk.
+- **One download at a time per node**, queued: a waiting update takes no space
+  until it runs, and the reserve arithmetic stays honest. This is item 11's
+  queue.
+- **Not doing: updating an unused copy in place to save space.** An interrupted
+  in-place update leaves a copy that is neither build, which is exactly what
+  "existing content is never replaced" (`CLAUDE.md`) exists to prevent.
+
+### 12.3 What happens when a build is found
+
+Per game:
+- **Notify** (default): the operator presses Update.
+- **Download automatically**: the new copy is downloaded in the background,
+  through 12.2's gate. No downtime — servers keep running on the old copy.
+
+### 12.4 Moving servers onto the new copy
+
+This is the only step with downtime. A server keeps the copy it was created on,
+and the copy is a bind mount fixed at container create, so moving it means
+recreating its container on the new copy. Per game:
+- **When empty**: recreate as soon as the server has 0 players. A server whose
+  player count is `None` (no query protocol, or it did not answer) is **never**
+  treated as empty — the same rule that keeps reaping from stopping a busy
+  server (`hosting::record_for`, `exempt_from_reaping`).
+- **At a set time**: a daily window (04:00–06:00) or a one-off date. Inside the
+  window it still waits for empty, unless the operator allowed a forced move,
+  which first warns the players in game over the console (`console.rs` words,
+  never a command from a pack) — open decision whether to offer it at all.
+- **Never**: servers stay on the old copy until the operator restarts them;
+  "remove the old version" then deletes it after the last one leaves (item 11's
+  `sweep_old_copies`).
+
+How it keeps downtime to the restart itself:
+- The download has finished before anything is stopped.
+- Servers move **one at a time**, not all at once.
+- **Same instance id, so the same name, ports and mesh address.** A server's
+  identity is `instances/<id>/mesh.identity` (`mesh::identity_path`), so a
+  recreate that keeps the instance id and its folder keeps its destination: it
+  stays the same row in every player's list and their bookmarks still work. The
+  move must not go through anything that deletes the instance folder.
+- **Rollback**: if the new copy's server does not come up (it exits, or the
+  crash watch would call it a crash), it is recreated on the old copy and the
+  page says why. The old copy is not swept while a move of its servers is in
+  flight.
+
+### 12.5 Settings
+
+A section on the Installed page: check interval, per-game Notify / Download,
+move policy (when empty / window / never), the reserve. Stored node-side beside
+`content-active.json`, **never in `agent.toml`**, which stays the operator's
+file and is never rewritten (item 11). If `agent.toml` later gains keys for
+these, the file the operator wrote wins, the same way `active.rs`'s `base` does.
+
+### Rules this has to respect
+
+- **A pack cannot name what runs.** The check and the download run the
+  operator's `steamcmd_image` with an app id from the pack; no new pack field
+  names an image, a command or a login.
+- **Silence is not zero.** `players_now: None` never counts as empty.
+- **No Docker restart policy, and every move re-bridges** — a recreated
+  container goes through the agent's own create and mesh path, like
+  `Agent::restart`, never left to Docker.
+- **Nothing automatic deletes** — not to make room, not after a failed move.
+  Deleting stays item 11's operator action and its old-version sweep.
+
+### Build order
+
+1. Check, notice, snooze (12.1).
+2. Storage gate, reserve and the queue (12.2), applied to the existing Update
+   button too, so manual updates get it first.
+3. Automatic download (12.3).
+4. Moving servers: when empty, window, one at a time, rollback (12.4).
+5. Settings section (12.5).
+
+Each step ships on its own.
+
+**Open decisions:** default check interval (off, or every 6 h); whether a
+window may ever force a move with players on (only as an opt-in with an
+in-game warning, if at all); the default reserve (larger of 10% and 5 GB).
+
+**Tests to write** (Docker-gated, busybox stand-ins, like
+`tests/installed_content.rs`):
+- a check against a stand-in steamcmd reporting a newer build shows it; the
+  same build shows nothing; an `archive` or `manual` game is never checked;
+- an update that does not fit above the reserve never starts and leaves
+  nothing; one that crosses it while running is cancelled and leaves nothing;
+  nothing is deleted to make room;
+- two queued updates never run at once;
+- a server with `players_now: None` is never moved by "when empty";
+- a moved server keeps its instance id, ports and mesh destination;
+- a move whose new server fails is rolled back onto the old copy, and the old
+  copy is not swept meanwhile.
 
 ---
 
