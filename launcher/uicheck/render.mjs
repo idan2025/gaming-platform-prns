@@ -971,7 +971,7 @@ await run('the Games page lists games and installs from a repository', {
   rows: () => [row()],
   games: [svenGame, { ...lanGame(), removable: true, trust: 'signed by an unknown key' }],
   repos: [{
-    url: 'https://packs.example/index.json', name: 'Example packs', error: null,
+    url: 'https://packs.example/index.json', name: 'Example packs', error: null, signer: 'ab12cd34ef56ab12cd34ef56ab12cd34',
     packs: [
       { id: 'sven-coop', display_name: 'Sven Co-op', art_url: null, lan: false, signed: false, state: 'shipped' },
       { id: 'quake', display_name: 'Quake <b>1</b>', art_url: null, lan: false, signed: true, state: 'available' },
@@ -983,6 +983,7 @@ await run('the Games page lists games and installs from a repository', {
   const t = doc.querySelector('#games-body')?.textContent || '';
   check('installed games are listed with their tier', t.includes('Sven Co-op') && t.includes('signed by an unknown key'), t);
   check('a repository is listed by name', t.includes('Example packs'), t);
+  check('who signed its list is shown', t.includes('List signed by ab12cd34ef56'), t);
   check('a repository that failed says why', t.includes('connection refused'), t);
   check('a pack name is text, never markup', !doc.querySelector('#games-body b') && t.includes('Quake <b>1</b>'));
   const shipped = doc.querySelector('[data-pack="sven-coop"]');

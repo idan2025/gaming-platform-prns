@@ -695,6 +695,10 @@ later change could quietly break:
   checked before it is used even in a URL (`repo::valid_file_name`).
 - **A shipped game is never replaced or removed from a repository**, and
   none is configured by default: a repository is a URL the player adds.
+- **A signed list is pinned at add** (`pack_repo_keys`): signed later by
+  another key, or no longer signed, it is refused, never quietly accepted.
+  Index signatures use their own domain (`INDEX_SIGNING_DOMAIN`), so they
+  never verify as pack signatures. `a_signed_list_is_held_to_the_key_it_was_added_with`.
 - **The index decides what is listed, never what is trusted.** Trust is each
   pack's own `.sig`, and the launcher shows a tier without gating on it, as
   at load. Repository art is not fetched for a pack not installed.

@@ -1033,8 +1033,9 @@ working, and each shortens the distance between installing and playing.
    **The static half is built 2026-10-15**: `game-bridge repo build <dir>`
    writes `index.json` (id, file, sha256, signed) beside the packs and their
    `.sig` files, for any web host. Trust stays per pack, in each pack's own
-   signature; the index itself is not signed yet, so it decides only what is
-   listed, never what is trusted. No review flow and no project repository
+   signature. `--identity` signs the index too (its own domain), and a
+   launcher pins the key at add; the index decides what is listed, never
+   what is trusted. No review flow and no project repository
    exist yet.
 
 ### 13.5 Host-side UI — Tauri, and where a web UI does and does not fit

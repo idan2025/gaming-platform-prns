@@ -36,7 +36,7 @@ usage: game-bridge server <game-id> [options]
        game-bridge lan-join <game-id> [options]
        game-bridge sign   <pack.toml> [options]
        game-bridge verify <pack.toml> [options]
-       game-bridge repo build <dir> [--name NAME]
+       game-bridge repo build <dir> [--name NAME] [--identity PATH [--days N]]
        game-bridge --help | --version
 
 roles (PLAN.md §1)
@@ -573,9 +573,13 @@ fn repo_cli(rest: &[String]) -> Result<()> {
     }
     let mut dir: Option<PathBuf> = None;
     let mut name: Option<String> = None;
+    let mut identity: Option<PathBuf> = None;
+    let mut days: u64 = 90;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--name" => name = Some(value(&mut it, "--name")?),
+            "--identity" => identity = Some(PathBuf::from(value(&mut it, "--identity")?)),
+            "--days" => days = parse_num(&value(&mut it, "--days")?, "--days")?,
             other if other.starts_with('-') => {
                 bail!("unknown option {other:?} for game-bridge repo build\n\n{USAGE}")
             }
@@ -592,7 +596,33 @@ fn repo_cli(rest: &[String]) -> Result<()> {
     let path = dir.join(game_bridge::repo::INDEX_FILE);
     let staging = dir.join(".index.json.partial");
     std::fs::write(&staging, &json).with_context(|| format!("writing {}", staging.display()))?;
-    std::fs::rename(&staging, &path).with_context(|| format!("writing {}", path.display()))?;
+    // A signed index lets a launcher notice the list changing hands: it pins
+    // the key it first saw. Written after the index, and removed when this
+    // build is unsigned, so a signature never sits beside another list.
+    let sig_path = dir.join(format!("{}{SIGNATURE_SUFFIX}", game_bridge::repo::INDEX_FILE));
+    match &identity {
+        Some(key_path) => {
+            let bytes = load_signing_identity(key_path)?;
+            let secret = PrivateIdentityMaterial::from_slice(&bytes[..])
+                .map_err(|e| anyhow!("identity at {}: {e:?}", key_path.display()))?;
+            let sig = PackSignature::sign_index(
+                &json,
+                &secret,
+                SystemTime::now(),
+                Duration::from_secs(days * 86_400),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            std::fs::write(&sig_path, sig.to_toml())
+                .with_context(|| format!("writing {}", sig_path.display()))?;
+            println!(
+                "signed by {}, valid {days} days: rebuild before then",
+                hex::encode(secret.public().identity_hash().as_bytes())
+            );
+        }
+        None => {
+            let _ = std::fs::remove_file(&sig_path);
+        }
+    }
     let signed = index.packs.iter().filter(|p| p.signed).count();
     println!(
         "{}: {} pack(s), {signed} signed, in {}",

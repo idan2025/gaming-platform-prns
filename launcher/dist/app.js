@@ -3712,6 +3712,13 @@ function renderGames() {
     const title = el('div', 'item-text');
     title.appendChild(el('div', 'item-title', r.name || 'Repository'));
     title.appendChild(el('div', 'item-sub mono', r.url));
+    if (!r.error) {
+      const who = el('div', 'item-sub', r.signer
+        ? 'List signed by ' + r.signer.slice(0, 12) + '… — held to that key'
+        : 'List not signed');
+      who.title = r.signer ? 'Lanthorn refuses this list if another key, or none, signs it later.' : '';
+      title.appendChild(who);
+    }
     head.appendChild(title);
     const rm = el('button', 'btn', 'Remove');
     rm.type = 'button';

@@ -44,6 +44,9 @@ const MAX_SIG_BYTES: usize = 16 * 1024;
 #[derive(Debug, Clone, Serialize)]
 pub struct PackRepoView {
     pub url: String,
+    /// Who signed its list, hex identity hash, when it is signed. Pinned when
+    /// the repository was added.
+    pub signer: Option<String>,
     /// What the repository calls itself, once its index was read.
     pub name: Option<String>,
     /// Why its index could not be read this time.
@@ -98,9 +101,39 @@ async fn fetch(url: &str, max: usize) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-async fn fetch_index(url: &str) -> Result<RepoIndex> {
+/// The index at `url` and who signed it, if anyone: `index.json.sig` beside
+/// it, under the index domain. A signature that is there and does not verify
+/// is an error, never an unsigned list.
+async fn fetch_index(url: &str) -> Result<(RepoIndex, Option<String>)> {
     let bytes = fetch(url, MAX_INDEX_BYTES).await?;
-    Ok(RepoIndex::parse(&bytes)?)
+    let index = RepoIndex::parse(&bytes)?;
+    let sig_url = format!("{url}{SIGNATURE_SUFFIX}");
+    let signer = match fetch_optional(&sig_url, MAX_SIG_BYTES).await? {
+        None => None,
+        Some(sig) => {
+            let text =
+                String::from_utf8(sig).map_err(|_| anyhow!("the list's signature is not text"))?;
+            let sig = PackSignature::parse(&text)
+                .map_err(|e| anyhow!("the list's signature is unreadable: {e}"))?;
+            let who = sig.verify_index(&bytes, SystemTime::now()).map_err(|e| {
+                anyhow!("the repository's list has a signature that does not hold: {e}")
+            })?;
+            Some(hex::encode(who.as_bytes()))
+        }
+    };
+    Ok((index, signer))
+}
+
+/// As [`fetch`], with a 404 meaning "not there".
+async fn fetch_optional(url: &str, max: usize) -> Result<Option<Vec<u8>>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
+    let response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    drop(response);
+    fetch(url, max).await.map(Some)
 }
 
 impl Launcher {
@@ -151,20 +184,43 @@ impl Launcher {
     /// a repository is refused now rather than listed as broken forever.
     pub async fn add_pack_repo(&self, url: &str) -> Result<PackRepoView> {
         let url = check_repo_url(url)?;
-        let index = fetch_index(&url).await?;
+        let (index, signer) = fetch_index(&url).await?;
         {
             let mut settings = self.settings.lock().await;
             if !settings.pack_repos.contains(&url) {
                 settings.pack_repos.push(url.clone());
+                // Pinned at add, the one moment the player chose this list.
+                match &signer {
+                    Some(key) => settings.pack_repo_keys.insert(url.clone(), key.clone()),
+                    None => settings.pack_repo_keys.remove(&url),
+                };
                 self.persist(&settings)?;
             }
         }
-        Ok(self.repo_view(url, Ok(index)))
+        Ok(self.repo_view(url, Ok((index, signer))))
+    }
+
+    /// The index at `url`, held to the key pinned for it, if one was.
+    async fn pinned_index(&self, url: &str) -> Result<(RepoIndex, Option<String>)> {
+        let pinned = self.settings.lock().await.pack_repo_keys.get(url).cloned();
+        let (index, signer) = fetch_index(url).await?;
+        if let Some(pin) = pinned {
+            if signer.as_deref() != Some(pin.as_str()) {
+                bail!(
+                    "this repository's list is {} the key it was added with ({}…). \
+                     Someone else may control it now; remove it and add it again only if you trust the change",
+                    if signer.is_some() { "signed by another key than" } else { "no longer signed by" },
+                    &pin[..8.min(pin.len())]
+                );
+            }
+        }
+        Ok((index, signer))
     }
 
     pub async fn remove_pack_repo(&self, url: &str) -> Result<()> {
         let mut settings = self.settings.lock().await;
         settings.pack_repos.retain(|u| u != url);
+        settings.pack_repo_keys.remove(url);
         self.persist(&settings)?;
         Ok(())
     }
@@ -173,18 +229,19 @@ impl Launcher {
     pub async fn browse_pack_repos(&self) -> Vec<PackRepoView> {
         let mut out = Vec::new();
         for url in self.pack_repos().await {
-            let index = fetch_index(&url).await;
+            let index = self.pinned_index(&url).await;
             out.push(self.repo_view(url, index));
         }
         out
     }
 
-    fn repo_view(&self, url: String, index: Result<RepoIndex>) -> PackRepoView {
-        let index = match index {
+    fn repo_view(&self, url: String, index: Result<(RepoIndex, Option<String>)>) -> PackRepoView {
+        let (index, signer) = match index {
             Ok(i) => i,
             Err(e) => {
                 return PackRepoView {
                     url,
+                    signer: None,
                     name: None,
                     error: Some(crate::error_text(e)),
                     packs: Vec::new(),
@@ -215,7 +272,7 @@ impl Launcher {
                 }
             })
             .collect();
-        PackRepoView { url, name: Some(index.name), error: None, packs: rows }
+        PackRepoView { url, signer, name: Some(index.name), error: None, packs: rows }
     }
 
     /// Install (or update) pack `id` from the repository at `url`.
@@ -232,7 +289,7 @@ impl Launcher {
                 );
             }
         }
-        let index = fetch_index(&url).await?;
+        let (index, _) = self.pinned_index(&url).await?;
         let entry = index.entry(id).ok_or_else(|| anyhow!("{url} does not list {id:?}"))?;
 
         // Hash before anything reads the bytes as a pack.
@@ -487,5 +544,66 @@ mod tests {
         assert!(l.remove_installed_pack("sven-coop").await.is_err());
         l.remove_pack_repo(&check_repo_url(&url).unwrap()).await.unwrap();
         assert!(l.pack_repos().await.is_empty());
+    }
+
+    fn sign_index(dir: &std::path::Path, seed: u8) {
+        let key = prns_core::identity::PrivateIdentityMaterial::from_slice(&[seed; 64]).unwrap();
+        let bytes = std::fs::read(dir.join(repo::INDEX_FILE)).unwrap();
+        let sig = PackSignature::sign_index(
+            &bytes,
+            &key,
+            SystemTime::now() - Duration::from_secs(60),
+            Duration::from_secs(86_400),
+        )
+        .unwrap();
+        std::fs::write(dir.join(format!("{}{SIGNATURE_SUFFIX}", repo::INDEX_FILE)), sig.to_toml())
+            .unwrap();
+    }
+
+    /// A list signed when it was added stays held to that key: signed by
+    /// another, or no longer signed, it is refused, and nothing installs
+    /// from it. A signature that does not hold is refused at add.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signed_list_is_held_to_the_key_it_was_added_with() {
+        let packs_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let served = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::copy(packs_src.join("half-life.toml"), served.path().join("half-life.toml"))
+            .unwrap();
+        build(served.path());
+        sign_index(served.path(), 3);
+        let url = format!("http://127.0.0.1:{}/", serve(served.path().to_path_buf()));
+        let l = Launcher::new(vec![GamePack::sven_coop()])
+            .with_settings_file(home.path().join("launcher.json"));
+        let view = l.add_pack_repo(&url).await.unwrap();
+        assert!(view.signer.is_some(), "a signed list says who signed it");
+
+        sign_index(served.path(), 4);
+        let view = &l.browse_pack_repos().await[0];
+        assert!(view.error.as_deref().unwrap_or("").contains("another key"), "{:?}", view.error);
+        assert!(l.install_repo_pack(&url, "half-life").await.is_err());
+
+        std::fs::remove_file(served.path().join("index.json.sig")).unwrap();
+        let view = &l.browse_pack_repos().await[0];
+        assert!(
+            view.error.as_deref().unwrap_or("").contains("no longer signed"),
+            "{:?}",
+            view.error
+        );
+
+        sign_index(served.path(), 3);
+        assert!(l.install_repo_pack(&url, "half-life").await.is_ok(), "the pinned key again");
+
+        // A signature for other bytes is refused when adding.
+        build(served.path());
+        std::fs::write(
+            served.path().join("index.json"),
+            b"{\"format\":1,\"name\":\"x\",\"packs\":[]}",
+        )
+        .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let l2 = Launcher::new(Vec::new()).with_settings_file(other.path().join("l.json"));
+        let e = l2.add_pack_repo(&url).await.unwrap_err().to_string();
+        assert!(e.contains("does not hold"), "{e}");
     }
 }

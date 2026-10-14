@@ -241,7 +241,8 @@ game-bridge repo build ./my-packs --name "My packs"        # writes index.json
 The player adds its address on the Games page (none ships) and installs from
 there; an installed pack is a file in `packs/` beside the settings and loads
 like a shipped one, with its tier shown. Still to decide: whether the project
-runs a reviewed repository (§13.2), and whether the index is signed too.
+runs a reviewed repository (§13.2). `repo build --identity` signs the
+list; a launcher pins that key when the repository is added.
 
 ## 9. Playability check before joining
 

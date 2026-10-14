@@ -113,6 +113,10 @@ pub struct LauncherSettings {
     /// Pack repositories the player added (`repo.rs`), as index URLs. None
     /// ships: a repository is opt-in.
     pub pack_repos: Vec<String>,
+    /// The key each repository's index was signed with when it was added,
+    /// hex identity hash by index URL. Once pinned, a list signed by another
+    /// key, or no longer signed, is refused (`repo.rs`).
+    pub pack_repo_keys: BTreeMap<String, String>,
     /// The first-run screen was finished or skipped (`PLAN.md` §13.3 step 4).
     pub first_run_done: bool,
 }
