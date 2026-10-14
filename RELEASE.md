@@ -74,7 +74,7 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
-## Unreleased
+## v0.2.40
 
 ### Lanthorn: chat and names in LAN rooms
 
@@ -104,6 +104,8 @@ is missing, which makes pushing a tag sufficient on its own.
   fetches it, refuses bytes the repository did not list or a signature that
   does not hold, and then applies its own `[pack_trust]` policy as before.
 - A pack's id may no longer contain a path: it names the pack's file.
+- Replacing a pack no longer leaves the old one's signature beside it, which
+  made the new pack fail to load.
 
 ### Lanthorn: quiet over a fullscreen game
 
