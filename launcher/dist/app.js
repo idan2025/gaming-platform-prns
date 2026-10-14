@@ -43,6 +43,11 @@ const state = {
   // Rows removed this session, kept out of the list at once rather than
   // waiting for the next poll to agree.
   removed: new Set(),
+  // Starred servers and rooms (ROADMAP item 3), from `favorites`. `favOnline`
+  // is what was up at the last poll, so a favorite coming up is told once.
+  favorites: [],
+  favSet: new Set(),
+  favOnline: null,
   // Mode 3 LAN rooms (PLAN.md §14). `roomsAvailable` is false for an older
   // shell without the room commands, which then shows no room UI at all
   // rather than buttons that throw.
@@ -82,6 +87,7 @@ const ICON = {
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/>',
   route: '<circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M8.5 18H15a3 3 0 000-6H9a3 3 0 010-6h6.5"/>',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/>',
+  star: '<path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/>',
   trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
   refresh: '<path d="M20 11a8 8 0 10-2.3 5.7M20 4v7h-7"/>',
   megaphone: '<path d="M4 10v4h3l5 4V6L7 10H4z"/><path d="M16 9a4 4 0 010 6"/>',
@@ -372,12 +378,13 @@ function createRowEl(row) {
   e.tabIndex = -1;
   e.innerHTML =
     '<div class="cell col-art" data-cell="art"></div>' +
-    '<div class="cell col-name"><div class="name-line"><div class="v" data-cell="name"></div></div><div class="sub" data-cell="iface"></div></div>' +
+    '<div class="cell col-name"><div class="name-line"><span class="fav-star" aria-label="Favorite"></span><div class="v" data-cell="name"></div></div><div class="sub" data-cell="iface"></div></div>' +
     '<div class="cell col-game"><div class="v" data-cell="game"></div></div>' +
     '<div class="cell col-map"><div class="v" data-cell="map"></div></div>' +
     '<div class="cell col-players"><div class="players"><div class="v" data-cell="players"></div><div class="bar" data-cell="bar"><i></i></div></div></div>' +
     '<div class="cell col-hops"><div class="v" data-cell="hops"></div></div>' +
     '<div class="cell col-seen"><div class="v" data-cell="seen"></div></div>';
+  e.querySelector('.fav-star').appendChild(icon('star'));
   updateRowEl(e, row);
   e.addEventListener('click', () => { setActive(row.destination_hash); openDetail(row.destination_hash); });
   e.addEventListener('dblclick', () => { openDetail(row.destination_hash); primaryAction(row.destination_hash); });
@@ -412,6 +419,7 @@ function updateRowEl(e, row) {
   const inUse = row.destination_hash === state.joinedHash
     || (state.room && state.room.active && state.room.room_hash === row.destination_hash);
   if (inUse) line.appendChild(el('span', 'badge joined-badge', isRoom(row) ? 'In room' : 'Joined'));
+  e.classList.toggle('fav', state.favSet.has(row.destination_hash));
   if (row.from_index) {
     // Second-hand evidence. The numbers are real, but somebody else heard
     // them, and `hops` is the distance from the index rather than from here.
@@ -495,12 +503,15 @@ function renderList() {
     state.rowEls.clear();
     if (b.heard_total === 0) renderEmptyNothingHeard();
     else renderEmptyFiltered();
+    renderOfflineFavorites(list);
     return;
   }
   const empty = list.querySelector('.empty');
   if (empty) empty.remove();
 
-  const sorted = sortServers(state.servers);
+  // Favorites that are up lead the list, in the chosen order among themselves.
+  const sorted = sortServers(state.servers).sort((a, b) =>
+    (state.favSet.has(b.destination_hash) ? 1 : 0) - (state.favSet.has(a.destination_hash) ? 1 : 0));
   const seen = new Set();
   for (const row of sorted) {
     seen.add(row.destination_hash);
@@ -518,6 +529,7 @@ function renderList() {
   for (const row of sorted) {
     list.appendChild(state.rowEls.get(row.destination_hash));
   }
+  renderOfflineFavorites(list);
 
   let anyActive = false;
   for (const [hash, e] of state.rowEls) {
@@ -667,6 +679,7 @@ function openRowMenu(hash, x, y) {
                  disabled: !row.game_id && !state.chosenGame.get(hash) });
   }
   items.push({ label: 'View details', icon: 'info', action: () => openDetail(hash) });
+  items.push(favMenuItem(hash));
   items.push('sep');
   items.push({ label: 'Trace path', icon: 'route', hint: 'ask the mesh', action: () => tracePath(hash) });
   items.push({ label: 'Copy invite link', icon: 'link', id: 'ctx-invite', action: () => copyInvite(row) });
@@ -898,9 +911,17 @@ function renderDetail() {
   inv.title = 'Copy a link that opens this ' + (room ? 'room' : 'server') + ' in a friend\u2019s Lanthorn';
   inv.prepend(icon('link'));
   inv.onclick = () => copyInvite(a);
+  const starred = state.favSet.has(d.hash);
+  const fav = el('button', 'btn btn-fav' + (starred ? ' on' : ''), starred ? 'Starred' : 'Star');
+  fav.id = 'detail-fav';
+  fav.type = 'button';
+  fav.title = starred ? 'Remove from favorites' : 'Add to favorites: always looked for, listed even when off, and you are told when it comes up';
+  fav.prepend(icon('star'));
+  fav.onclick = () => setFavorite(d.hash, !starred);
   // Ahead of the join message, which spans the whole row.
   const msg = actions.querySelector('.join-msg');
   actions.insertBefore(inv, msg);
+  actions.insertBefore(fav, msg);
   pane.appendChild(actions);
 
   // body
@@ -1633,8 +1654,78 @@ async function pollServers() {
     }
   }
 }
+async function pollFavorites() {
+  let favs;
+  try { favs = await invoke('favorites'); } catch (e) { return; } // an older core
+  state.favorites = Array.isArray(favs) ? favs : [];
+  state.favSet = new Set(state.favorites.map(f => f.destination_hash));
+  const online = new Set(state.favorites.filter(f => f.online).map(f => f.destination_hash));
+  // "It's up": only a change seen while running, never the first look.
+  if (state.favOnline && state.browse && state.browse.running) {
+    for (const f of state.favorites) {
+      if (online.has(f.destination_hash) && !state.favOnline.has(f.destination_hash)) {
+        favoriteCameUp(f);
+      }
+    }
+  }
+  state.favOnline = state.browse && state.browse.running ? online : null;
+}
+function favoriteCameUp(f) {
+  toast((f.name || 'A favorite server') + ' is up.');
+}
+function favMenuItem(hash) {
+  const on = state.favSet.has(hash);
+  return { label: on ? 'Remove from favorites' : 'Add to favorites', icon: 'star', action: () => setFavorite(hash, !on) };
+}
+async function setFavorite(hash, on) {
+  try {
+    await invoke('set_favorite', { destinationHash: hash, on });
+    hideError();
+    await pollFavorites();
+    // Starring something up now is not news.
+    if (state.favOnline && on) state.favOnline.add(hash);
+    renderList();
+    if (state.detail && state.detail.hash === hash) renderDetail();
+    toast(on ? 'Added to favorites. It is looked for even when it is off.' : 'Removed from favorites.');
+  } catch (err) {
+    showError('Could not change favorites: ' + errText(err));
+  }
+}
+// Favorites that are off, below the live list: the one place the list shows
+// something it has not heard, and it says so.
+function renderOfflineFavorites(list) {
+  let box = list.querySelector('.fav-offline');
+  const off = state.favorites.filter(f => !f.online && !state.servers.some(s => s.destination_hash === f.destination_hash));
+  if (!off.length) { if (box) box.remove(); return; }
+  if (!box) box = el('div', 'fav-offline');
+  const sig = JSON.stringify(off.map(f => [f.destination_hash, f.name, f.game_id, f.last_seen_secs == null ? null : Math.floor(f.last_seen_secs / 60)]));
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.textContent = '';
+    box.appendChild(el('div', 'fav-offline-head', 'Favorites · offline'));
+    for (const f of off) {
+      const r = el('div', 'fav-off-row');
+      r.appendChild(art(f.game_id, 'art-thumb', { fallbackName: f.name }));
+      const name = el('div', 'fav-off-name');
+      name.append(el('div', 'v', f.name || 'Unnamed server'),
+        el('div', 'sub', (f.game_id ? gameName(f.game_id) + ' · ' : '') +
+          (f.last_seen_secs == null ? 'not heard yet' : 'last heard ' + fmtSeen(f.last_seen_secs))));
+      const look = el('button', 'btn', 'Look now');
+      look.type = 'button';
+      look.title = 'Ask the mesh for it now. It is also asked about every minute.';
+      look.addEventListener('click', ev => { ev.stopPropagation(); tracePath(f.destination_hash); });
+      const unstar = el('button', 'btn', 'Unstar');
+      unstar.type = 'button';
+      unstar.addEventListener('click', ev => { ev.stopPropagation(); setFavorite(f.destination_hash, false); });
+      r.append(name, look, unstar);
+      box.appendChild(r);
+    }
+  }
+  list.appendChild(box);
+}
 async function pollAll() {
   await pollStatus();
+  await pollFavorites();
   await pollServers();
   await pollRoom();
 }

@@ -98,6 +98,14 @@ pub struct LauncherSettings {
     /// file written before it existed — means the check is on.
     #[serde(default)]
     pub update_check_off: bool,
+    /// Servers and rooms the player starred, as hex destination hashes.
+    ///
+    /// The one exception to "the list is what is live": a favorite that is
+    /// off is still shown, in its own section and plainly offline, because
+    /// the player asked to remember it (`ROADMAP.md` item 3). The keep-alive
+    /// asks about every favorite, however long ago it was heard.
+    #[serde(default)]
+    pub favorites: std::collections::BTreeSet<String>,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.

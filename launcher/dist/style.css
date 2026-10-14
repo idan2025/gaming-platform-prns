@@ -579,3 +579,18 @@ details.small > summary { cursor: pointer; color: var(--text-2); }
 .invite-form { display: flex; gap: 8px; padding: 6px 6px 4px; width: 360px; }
 .invite-form input { flex: 1; height: 32px; padding: 0 10px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); outline: none; font-family: var(--mono); font-size: 12px; }
 .invite-form input:focus { border-color: var(--accent); }
+
+/* ---------- favorites (ROADMAP item 3) ---------- */
+.row .fav-star { display: none; flex: none; width: 14px; height: 14px; color: var(--warn); }
+.row .fav-star svg { width: 14px; height: 14px; fill: currentColor; stroke: none; }
+.row.fav .fav-star { display: inline-flex; }
+.fav-offline { margin: 12px 8px 0; padding-top: 8px; border-top: 1px solid var(--line); }
+.fav-offline-head { padding: 4px 8px 6px; font-size: 11.5px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; }
+.fav-off-row { display: flex; align-items: center; gap: 12px; padding: 6px 8px; border-radius: var(--radius); opacity: 0.7; }
+.fav-off-row:hover { opacity: 1; background: var(--hover); }
+.fav-off-row .art-thumb { filter: grayscale(0.8); }
+.fav-off-name { flex: 1; min-width: 0; }
+.fav-off-name .v { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fav-off-name .sub { font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fav-off-row .btn { height: 28px; padding: 0 10px; font-size: 12.5px; }
+.btn-fav.on svg { color: var(--warn); fill: currentColor; }
