@@ -136,6 +136,10 @@ function makeInvoke(scenario) {
         return scenario.known ?? [];
       case 'refresh_known_servers':
         return (scenario.known ?? []).length;
+      case 'favorites':
+        return typeof scenario.favorites === 'function' ? scenario.favorites() : (scenario.favorites ?? []);
+      case 'set_favorite':
+        return null;
       case 'forget_server':
         return null;
       case 'take_invite': {
@@ -255,6 +259,40 @@ await run('two servers', {
   check('a legacy row is badged', legacyEl.textContent.includes('legacy'));
   check('no undefined leaked into the list', !text.includes('undefined'), text.slice(0, 200));
 });
+
+await run('favorites lead the list, and an offline one is shown as offline', {
+  status: running,
+  rows: () => [row(), row({ destination_hash: '11112222333344445555666677778888', name: 'Starred one', hops: 4 })],
+  favorites: [
+    { destination_hash: '11112222333344445555666677778888', name: 'Starred one', game_id: 'sven-coop', last_seen_secs: 2, online: true },
+    { destination_hash: 'ffffeeeeddddccccbbbbaaaa99998888', name: 'Friday night', game_id: 'sven-coop', last_seen_secs: 2 * 86400, online: false },
+  ],
+}, (win, doc) => {
+  const rows = [...doc.querySelectorAll('#list .row')];
+  check('a favorite that is up leads the list, whatever the sort', rows[0]?.dataset.hash === '11112222333344445555666677778888');
+  check('a favorite row is starred', rows[0]?.classList.contains('fav') && !rows[1]?.classList.contains('fav'));
+  const off = doc.querySelector('#list .fav-offline');
+  check('an offline favorite has its own section', !!off);
+  check('the offline section names it and says when it was heard',
+    off && off.textContent.includes('Friday night') && off.textContent.includes('last heard'), off?.textContent);
+  check('an offline favorite is never a live row', !rows.some(r => r.textContent.includes('Friday night')));
+});
+
+{
+  let up = false;
+  await run('a favorite coming up is told once', {
+    status: running,
+    rows: () => [row()],
+    favorites: () => [{ destination_hash: 'ffffeeeeddddccccbbbbaaaa99998888', name: 'Friday night', game_id: 'sven-coop', last_seen_secs: up ? 1 : 900, online: up }],
+  }, async (win, doc) => {
+    const toast = () => doc.querySelector('#toast')?.textContent || '';
+    check('nothing is announced on the first look', !toast().includes('Friday night is up'));
+    up = true;
+    await win.eval('pollAll()');
+    await settle();
+    check('a favorite coming up is announced', toast().includes('Friday night is up'), toast());
+  });
+}
 
 await run('detail pane', {
   status: running,

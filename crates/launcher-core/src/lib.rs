@@ -94,6 +94,22 @@ pub struct KnownServerView {
     pub last_seen_secs: u64,
 }
 
+/// A starred server or room, as the Favorites section lists it.
+///
+/// `online` is whether this launcher has heard it within [`STALE_AFTER`],
+/// the same test the live list uses, so a favorite is never "up" in one
+/// place and gone from the other.
+#[derive(Debug, Clone, Serialize)]
+pub struct FavoriteView {
+    pub destination_hash: String,
+    pub name: Option<String>,
+    pub game_id: Option<String>,
+    /// How long ago it was last heard, by this run or a remembered one;
+    /// `None` when it never was.
+    pub last_seen_secs: Option<u64>,
+    pub online: bool,
+}
+
 /// What one manual path request found (`Launcher::trace_path`).
 #[derive(Debug, Clone, Serialize)]
 pub struct PathTraceView {
@@ -975,6 +991,60 @@ impl Launcher {
         out
     }
 
+    /// Star or unstar a server or room by its destination hash.
+    pub async fn set_favorite(&self, destination_hash: &str, on: bool) -> Result<()> {
+        parse_hash(destination_hash).map_err(|e| anyhow!("not a destination: {e}"))?;
+        let hash = destination_hash.to_ascii_lowercase();
+        let mut settings = self.settings.lock().await;
+        let changed = if on { settings.favorites.insert(hash) } else { settings.favorites.remove(&hash) };
+        if changed {
+            self.persist(&settings)?;
+        }
+        Ok(())
+    }
+
+    /// Every favorite, online ones first, then by name.
+    pub async fn favorites(&self) -> Vec<FavoriteView> {
+        let heard: std::collections::HashMap<String, Duration> = {
+            let inner = self.inner.lock().await;
+            match inner.browse.as_ref() {
+                Some(session) => session
+                    .discovered()
+                    .await
+                    .into_iter()
+                    .map(|d| (hex::encode(d.destination_hash.as_bytes()), d.last_seen.elapsed()))
+                    .collect(),
+                None => Default::default(),
+            }
+        };
+        let now = unix_now();
+        let settings = self.settings.lock().await;
+        let mut out: Vec<FavoriteView> = settings
+            .favorites
+            .iter()
+            .map(|hash| {
+                let known = settings.known_servers.get(hash);
+                let live = heard.get(hash).copied();
+                let remembered = known
+                    .filter(|k| k.last_seen_unix > 0)
+                    .map(|k| now.saturating_sub(k.last_seen_unix));
+                FavoriteView {
+                    destination_hash: hash.clone(),
+                    name: known.and_then(|k| k.name.clone()),
+                    game_id: known.and_then(|k| k.game_id.clone()),
+                    last_seen_secs: live.map(|d| d.as_secs()).or(remembered),
+                    online: live.is_some_and(|d| d < STALE_AFTER),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.online.cmp(&a.online).then_with(|| {
+                a.name.as_deref().unwrap_or("~").to_lowercase().cmp(&b.name.as_deref().unwrap_or("~").to_lowercase())
+            })
+        });
+        out
+    }
+
     /// Remove one server from the list, or forget every remembered one when
     /// `hash` is `None`.
     ///
@@ -990,8 +1060,11 @@ impl Launcher {
         {
             let mut settings = self.settings.lock().await;
             match hash {
+                // Removing a row is also taking its star away: a favorite
+                // that stayed would put the row straight back.
                 Some(h) => {
                     settings.known_servers.remove(h);
+                    settings.favorites.remove(h);
                 }
                 None => settings.known_servers.clear(),
             }
@@ -1086,18 +1159,29 @@ impl Launcher {
                 .map(|d| hex::encode(d.destination_hash.as_bytes()))
                 .collect()
         };
-        let now = unix_now();
-        let hashes: Vec<String> = settings
-            .lock()
-            .await
+        let hashes = Self::keepalive_targets(&*settings.lock().await, &fresh, unix_now());
+        Self::ask_paths(inner, hashes).await
+    }
+
+    /// What one keep-alive pass asks about: favorites first, whenever they
+    /// were last heard, then other remembered servers seen within the
+    /// horizon; none the browse node heard lately.
+    fn keepalive_targets(
+        settings: &LauncherSettings,
+        fresh: &std::collections::HashSet<String>,
+        now: u64,
+    ) -> Vec<String> {
+        let favorites = settings.favorites.iter().filter(|h| !fresh.contains(*h)).cloned();
+        let recent = settings
             .known_servers
             .iter()
             .filter(|(hash, k)| {
-                !fresh.contains(*hash) && now.saturating_sub(k.last_seen_unix) < KEEPALIVE_HORIZON_SECS
+                !fresh.contains(*hash)
+                    && !settings.favorites.contains(*hash)
+                    && now.saturating_sub(k.last_seen_unix) < KEEPALIVE_HORIZON_SECS
             })
-            .map(|(hash, _)| hash.clone())
-            .collect();
-        Self::ask_paths(inner, hashes).await
+            .map(|(hash, _)| hash.clone());
+        favorites.chain(recent).collect()
     }
 
     /// Request a path to each destination, concurrently, each bounded by
@@ -2423,6 +2507,56 @@ query = "a2s"
         assert!(listed.is_empty(), "history must not be listed as a server: {listed:?}");
         // And a heard row goes stale off the list by default, not never.
         assert_eq!(input.to_query().max_age, Some(STALE_AFTER));
+    }
+
+    /// A favorite survives a restart, is shown offline rather than dropped,
+    /// carries the name it was last heard under, and goes with its row.
+    #[tokio::test]
+    async fn a_favorite_is_kept_shown_offline_and_goes_with_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launcher.json");
+        let hash = "0123456789abcdef0123456789abcdef";
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        let mut row = a_row(hash);
+        row.name = Some("Friday night".into());
+        l.remember_heard(&[row]).await;
+        assert!(l.set_favorite("not a hash", true).await.is_err());
+        l.set_favorite(&hash.to_uppercase(), true).await.unwrap();
+
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        let favs = l.favorites().await;
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0].destination_hash, hash);
+        assert_eq!(favs[0].name.as_deref(), Some("Friday night"));
+        assert!(!favs[0].online, "not heard this run is not online");
+        assert!(favs[0].last_seen_secs.is_some());
+        let keys = serde_json::to_value(&favs[0]).unwrap();
+        for key in ["destination_hash", "name", "game_id", "last_seen_secs", "online"] {
+            assert!(keys.get(key).is_some(), "the frontend reads {key}");
+        }
+
+        l.forget_server(Some(hash)).await.unwrap();
+        assert!(l.favorites().await.is_empty(), "Remove takes the star too");
+    }
+
+    /// The keep-alive asks about a favorite however long ago it was heard,
+    /// and before anything else; an ordinary remembered server only within
+    /// the horizon; nothing heard lately.
+    #[test]
+    fn the_keep_alive_always_asks_about_favorites_first() {
+        let now = 10 * KEEPALIVE_HORIZON_SECS;
+        let mut settings = LauncherSettings::default();
+        let old = KnownServer { last_seen_unix: now - 2 * KEEPALIVE_HORIZON_SECS, ..Default::default() };
+        let recent = KnownServer { last_seen_unix: now - 60, ..Default::default() };
+        settings.known_servers.insert("aa".into(), old.clone());
+        settings.known_servers.insert("bb".into(), recent.clone());
+        settings.known_servers.insert("cc".into(), recent);
+        settings.known_servers.insert("zz".into(), old);
+        settings.favorites.insert("zz".into());
+        settings.favorites.insert("never-heard".into());
+        let fresh: std::collections::HashSet<String> = ["cc".to_string()].into();
+        let asked = Launcher::keepalive_targets(&settings, &fresh, now);
+        assert_eq!(asked, vec!["never-heard".to_string(), "zz".into(), "bb".into()]);
     }
 
     /// Remembering survives a restart, which is the entire point of writing it

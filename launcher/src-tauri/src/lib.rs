@@ -144,6 +144,22 @@ async fn forget_server(
     state.launcher.forget_server(destination_hash.as_deref()).await.map_err(fmt_err)
 }
 
+/// Every starred server or room, online ones first.
+#[tauri::command]
+async fn favorites(state: tauri::State<'_, AppState>) -> Result<Vec<launcher_core::FavoriteView>, String> {
+    Ok(state.launcher.favorites().await)
+}
+
+/// Star or unstar a server or room.
+#[tauri::command]
+async fn set_favorite(
+    state: tauri::State<'_, AppState>,
+    destination_hash: String,
+    on: bool,
+) -> Result<(), String> {
+    state.launcher.set_favorite(&destination_hash, on).await.map_err(fmt_err)
+}
+
 /// Ask the mesh for a path to one destination now, and say what came back.
 #[tauri::command]
 async fn trace_path(
@@ -582,6 +598,8 @@ pub fn run() {
             known_servers,
             refresh_known_servers,
             forget_server,
+            favorites,
+            set_favorite,
             trace_path,
             announce_room,
             check_update,

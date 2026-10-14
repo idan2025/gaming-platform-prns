@@ -12,7 +12,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | --- | --- | --- | --- | --- |
 | 1 | Auto-update | every player | M | **done** (v0.2.31) |
 | 2 | Invite links | players with friends | S–M | **done** (v0.2.31) |
-| 3 | Favorites and "it's up" alerts | regulars | S | needs a decision |
+| 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
 | 4 | Installed-game detection | every player | M | proposed |
 | 5 | Tray icon and notifications | hosts, regulars | M | proposed |
 | 6 | Chat and player names in rooms | LAN-room players | L | proposed |
@@ -97,11 +97,13 @@ wrong for "my friend's server, when is it on?".
 **How.** A `favorites` set in settings; the keep-alive (`KEEPALIVE_EVERY`)
 asks for favorites first; an alert when one moves from unheard to heard.
 
-**Decide (needs the user).** The list shows only what is live. Should a
-favorite that is offline show at all — in its own "Favorites" section, greyed,
-"last online 2 days ago" — or only appear when it is up? Recommendation: its own
-section, clearly offline, because a favorite is something the player asked to
-remember; the main list stays live-only.
+**Decided (2026-10-14):** its own section, clearly offline, because a
+favorite is something the player asked to remember; the main list stays
+live-only. **Built:** Star from a row's menu or the detail pane; favorites
+that are up lead the list; offline ones sit below it with Look now and
+Unstar; the keep-alive asks about every favorite however long ago it was
+heard; a favorite coming up is told in the launcher (a native notification
+waits for item 5).
 
 ## 4. Installed-game detection
 

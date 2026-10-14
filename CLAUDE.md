@@ -443,6 +443,14 @@ has gone. Rules a later change could quietly break:
   settings, the browse node's own list (`BridgeSession::forget`, else
   `list_servers` re-remembers it), and index rows (hidden for the run).
   Pinned by `a_forgotten_server_stays_gone_until_it_announces_again`.
+- **Favorites are the one thing listed that was not heard** (2026-10-14,
+  `ROADMAP.md` item 3, the user's call). A starred server or room that is off
+  is shown in its own "Favorites · offline" section, greyed with when it was
+  last heard, never as a live row; one that is up is a normal row, starred and
+  first. `online` uses the same `STALE_AFTER` as the list. The keep-alive asks
+  about every favorite, however old (`keepalive_targets`), and Remove takes
+  the star too, or the row would come straight back. "It's up" is told only
+  for a change seen while browsing, never on the first look.
 - **Never hold the session lock across a network round trip.** A detail probe
   did, for a whole link timeout, and froze the list, the status and Remove
   behind it. Probes and traces clone the handle (`probe_details_via`).
