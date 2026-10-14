@@ -20,7 +20,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
-| 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36) |
+| 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
