@@ -92,7 +92,7 @@ fn human_bytes(n: u64) -> String {
     if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
@@ -1660,6 +1660,78 @@ impl Agent {
         } else if marker.exists() {
             std::fs::remove_file(&marker)?;
         }
+        Ok(())
+    }
+
+    /// Where a server's backups are kept: `backups/<id>` under the data root,
+    /// outside the instance folder, so they outlive the server's own files.
+    fn backups_dir(&self, instance_id: &str) -> Result<std::path::PathBuf> {
+        self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?;
+        Ok(self.config.data_root.join(crate::backups::BACKUPS_DIR).join(instance_id))
+    }
+
+    async fn ensure_instance(&self, instance_id: &str) -> Result<crate::docker::ManagedContainer> {
+        self.docker
+            .list_managed()
+            .await?
+            .into_iter()
+            .find(|c| c.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))
+    }
+
+    /// A server's backups, newest first (`backups.rs`).
+    pub async fn backups(&self, instance_id: &str) -> Result<Vec<crate::backups::Backup>> {
+        self.ensure_instance(instance_id).await?;
+        Ok(crate::backups::list(&self.backups_dir(instance_id)?))
+    }
+
+    /// Back up a server's writable files now. Running or stopped: a running
+    /// game may be writing a file at that moment, which the page says. Held
+    /// to the disk reserve like a download, by the files' full size.
+    pub async fn create_backup(&self, instance_id: &str) -> Result<crate::backups::Backup> {
+        self.ensure_instance(instance_id).await?;
+        let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
+        let dir = self.backups_dir(instance_id)?;
+        let need = {
+            let w = writable.clone();
+            tokio::task::spawn_blocking(move || crate::content::dir_size(&w)).await?
+        };
+        self.room_for(need).await.map_err(|e| anyhow!("{e}"))?;
+        let name = crate::backups::new_name(&dir, now_unix());
+        let made = tokio::task::spawn_blocking(move || crate::backups::create(&writable, &dir, &name)).await??;
+        tracing::info!(instance = %instance_id, backup = %made.name, bytes = made.bytes, "backed up a server's files");
+        Ok(made)
+    }
+
+    /// Put a backup back over a **stopped** server's writable files.
+    pub async fn restore_backup(&self, instance_id: &str, name: &str) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: its files cannot be swapped while it runs"));
+        }
+        if self.is_moving(instance_id) {
+            return Err(anyhow!("this server is being moved to a new copy; try again when that is done"));
+        }
+        let archive = crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))?;
+        let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for a staging name: {e}"))?;
+        let staging = self.config.data_root.join("staging").join(format!("restore-{}", hex::encode(seed)));
+        tokio::task::spawn_blocking(move || crate::backups::restore(&archive, &writable, &staging))
+            .await?
+            .map_err(|e| anyhow!("{e}"))?;
+        tracing::info!(instance = %instance_id, backup = %name, "restored a server's files");
+        Ok(())
+    }
+
+    pub async fn delete_backup(&self, instance_id: &str, name: &str) -> Result<()> {
+        self.ensure_instance(instance_id).await?;
+        let path = crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))?;
+        std::fs::remove_file(path)?;
         Ok(())
     }
 

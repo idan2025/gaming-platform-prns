@@ -6,6 +6,7 @@
 
 pub mod active;
 pub mod agent;
+pub mod backups;
 pub mod api;
 pub mod config;
 pub mod content;

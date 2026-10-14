@@ -120,6 +120,9 @@ pub fn router_full(
         .route("/instances/:id/console", post(send_console))
         .route("/instances/:id/restart-schedule", axum::routing::put(set_restart_schedule))
         .route("/restart-schedules", get(restart_schedules))
+        .route("/instances/:id/backups", get(list_backups).post(create_backup))
+        .route("/instances/:id/backups/:name", delete(delete_backup))
+        .route("/instances/:id/backups/:name/restore", post(restore_backup))
         .route("/instances/:id/bots", post(set_bots))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
@@ -748,6 +751,41 @@ async fn change_map(
         .await
         .map(|command| Json(json!({ "instance_id": id, "map": req.map, "command": command })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// A server's backups, newest first (`backups.rs`).
+async fn list_backups(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<Vec<crate::backups::Backup>> {
+    state.agent.backups(&id).await.map(Json).map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+/// Back up a server's writable files now.
+async fn create_backup(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<crate::backups::Backup> {
+    state.agent.create_backup(&id).await.map(Json).map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
+/// Put a backup back over a stopped server's files.
+async fn restore_backup(
+    State(state): State<ApiState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .restore_backup(&id, &name)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "restored": name })))
+        .map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
+async fn delete_backup(
+    State(state): State<ApiState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .delete_backup(&id, &name)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "deleted": name })))
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
 }
 
 /// Every server's daily restart window, by id (`schedule.rs`).
