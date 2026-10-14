@@ -14,7 +14,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 2 | Invite links | players with friends | S–M | **done** (v0.2.31) |
 | 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
 | 4 | Installed-game detection | every player | M | **built**: Installed badge, Flatpak/Snap Steam, file picker |
-| 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, four notifications |
+| 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, notifications, quiet over a fullscreen game |
 | 6 | Chat and player names in rooms | LAN-room players | L | **built** for rooms: chat, names, rate limit; server chat not started |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; no project repository yet |
