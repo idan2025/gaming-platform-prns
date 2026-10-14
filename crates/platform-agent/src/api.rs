@@ -118,6 +118,8 @@ pub fn router_full(
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
         .route("/instances/:id/console", post(send_console))
+        .route("/instances/:id/restart-schedule", axum::routing::put(set_restart_schedule))
+        .route("/restart-schedules", get(restart_schedules))
         .route("/instances/:id/bots", post(set_bots))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
@@ -745,6 +747,33 @@ async fn change_map(
         .change_map(&id, &req.map)
         .await
         .map(|command| Json(json!({ "instance_id": id, "map": req.map, "command": command })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// Every server's daily restart window, by id (`schedule.rs`).
+async fn restart_schedules(
+    State(state): State<ApiState>,
+) -> ApiResult<std::collections::BTreeMap<String, crate::agent::ScheduleStatus>> {
+    state.agent.restart_schedules().await.map(Json).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// `{"schedule": {"start_utc": 4, "end_utc": 6, "with_players": false}}` gives
+/// a server a daily restart window; `{"schedule": null}` takes it away.
+#[derive(Deserialize)]
+struct ScheduleReq {
+    schedule: Option<crate::schedule::RestartSchedule>,
+}
+
+async fn set_restart_schedule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ScheduleReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .set_restart_schedule(&id, req.schedule)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "schedule": req.schedule })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 
