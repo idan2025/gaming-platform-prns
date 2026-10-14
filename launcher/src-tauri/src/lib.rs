@@ -430,6 +430,35 @@ async fn set_game_path(
         .map_err(fmt_err)
 }
 
+/// Let the player pick their game's program in the system's own file
+/// dialog, then remember it like `set_game_path`. `None` when they cancelled.
+/// The dialog runs here rather than from the page, so the page needs no
+/// file-system permission at all.
+#[tauri::command]
+async fn pick_game_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    game_id: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_title("Pick your copy of the game").pick_file(move |picked| {
+        let _ = tx.send(picked);
+    });
+    let Some(picked) = rx.await.map_err(|_| "the file dialog closed unexpectedly".to_string())? else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| format!("that file cannot be used: {e}"))?;
+    state.launcher.set_game_path(&game_id, &path).await.map_err(fmt_err)?;
+    Ok(Some(path.display().to_string()))
+}
+
+/// Every game with a pack, and whether it is on this machine.
+#[tauri::command]
+async fn installed_games(state: tauri::State<'_, AppState>) -> Result<Vec<launcher_core::InstalledGameView>, String> {
+    Ok(state.launcher.installed_games().await)
+}
+
 #[tauri::command]
 async fn clear_game_path(state: tauri::State<'_, AppState>, game_id: String) -> Result<(), String> {
     state.launcher.clear_game_path(&game_id).await.map_err(fmt_err)
@@ -611,6 +640,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let packs = pack_dir(app.handle());
             let launcher = Launcher::from_pack_dir(&packs).with_portable(portable.is_some());
@@ -747,6 +777,8 @@ pub fn run() {
             notify,
             notifications_on,
             set_notifications_on,
+            pick_game_path,
+            installed_games,
             player_name,
             list_interfaces,
             add_interface,

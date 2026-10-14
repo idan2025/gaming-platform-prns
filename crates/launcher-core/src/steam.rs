@@ -170,6 +170,12 @@ fn steam_library_roots() -> Vec<PathBuf> {
             roots.push(home.join(".local/share/Steam"));
             roots.push(home.join(".steam/steam"));
             roots.push(home.join(".steam/root"));
+            // Flatpak and Snap keep Steam inside their own data folders, and
+            // a Steam Deck's desktop mode or an immutable distro often has
+            // only one of those.
+            roots.push(home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
+            roots.push(home.join(".var/app/com.valvesoftware.Steam/data/Steam"));
+            roots.push(home.join("snap/steam/common/.local/share/Steam"));
         }
     }
     roots.into_iter().filter(|p| p.exists()).collect()
@@ -203,7 +209,12 @@ fn steam_executable_candidates() -> Vec<PathBuf> {
             let home = PathBuf::from(home);
             c.push(home.join(".steam/steam/steam.sh"));
             c.push(home.join(".local/share/Steam/steam.sh"));
+            // Flatpak's exported launcher passes its arguments on to Steam,
+            // so `-applaunch` works through it like through the native one.
+            c.push(home.join(".local/share/flatpak/exports/bin/com.valvesoftware.Steam"));
         }
+        c.push(PathBuf::from("/var/lib/flatpak/exports/bin/com.valvesoftware.Steam"));
+        c.push(PathBuf::from("/snap/bin/steam"));
     }
     c
 }

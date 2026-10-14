@@ -53,6 +53,9 @@ const state = {
   notifications: true,
   roomSeen: null,
   roomCheckTold: null,
+  // Which games are on this machine (ROADMAP item 4), by game id, from
+  // `installed_games`. Read at start and after a Locate: it reads files.
+  installed: new Map(),
   // Mode 3 LAN rooms (PLAN.md §14). `roomsAvailable` is false for an older
   // shell without the room commands, which then shows no room UI at all
   // rather than buttons that throw.
@@ -425,6 +428,12 @@ function updateRowEl(e, row) {
     || (state.room && state.room.active && state.room.room_hash === row.destination_hash);
   if (inUse) line.appendChild(el('span', 'badge joined-badge', isRoom(row) ? 'In room' : 'Joined'));
   e.classList.toggle('fav', state.favSet.has(row.destination_hash));
+  const have = !legacy && row.game_id ? state.installed.get(row.game_id) : null;
+  if (have && have.installed) {
+    const b = el('span', 'badge installed-badge', 'Installed');
+    b.title = 'You have this game on this computer' + (have.launch_ready ? ', and Play can start it.' : '.');
+    line.appendChild(b);
+  }
   if (row.from_index) {
     // Second-hand evidence. The numbers are real, but somebody else heard
     // them, and `hops` is the distance from the index rather than from here.
@@ -1252,6 +1261,11 @@ function renderPackSection(gameId) {
   line.appendChild(el('span', 'badge ' + (TRUST_CLASS[pack.trust] || 'trust-warn'), pack.trust));
   sec.appendChild(line);
   sec.appendChild(el('p', 'pack-detail', pack.trust_detail || ''));
+  const have = state.installed.get(pack.id);
+  if (have) {
+    sec.appendChild(el('p', 'pack-detail ' + (have.installed ? 'have-game' : 'no-game'),
+      have.installed ? 'You have this game on this computer.' : 'This game was not found on this computer. Join anyway, then Locate it, or install it.'));
+  }
   if (pack.signer) {
     const kv = el('div', 'kv');
     kv.style.marginTop = '8px';
@@ -1427,9 +1441,35 @@ async function playServer() {
 
 // "Locate game": the launcher never guesses an executable, so the player points
 // it at their own copy once and it is remembered (settings.rs).
+async function loadInstalled() {
+  try {
+    const list = await invoke('installed_games');
+    state.installed = new Map((list || []).map(g => [g.game_id, g]));
+  } catch (_) { /* an older core: no badges */ }
+}
+
 async function locateGame(gameId) {
   const d = state.detail;
   if (!d || !gameId) return;
+  // The system's own file dialog first; the typed path only where that is
+  // missing.
+  let picked;
+  try {
+    picked = await invoke('pick_game_path', { gameId });
+  } catch (err) {
+    if (!/unknown command|not found/i.test(errText(err))) {
+      d.joinErr = true;
+      d.joinMsg = 'Could not use that file: ' + errText(err);
+      renderDetail();
+      return;
+    }
+    picked = undefined;
+  }
+  if (picked === null) return; // cancelled
+  if (picked !== undefined) {
+    await afterLocate(d, gameId, picked);
+    return;
+  }
   let hint = '';
   try {
     const loc = await invoke('game_location', { gameId });
@@ -1443,15 +1483,26 @@ async function locateGame(gameId) {
   if (trimmed === '') return;
   try {
     await invoke('set_game_path', { gameId, path: trimmed });
+    await afterLocate(d, gameId, trimmed);
+  } catch (err) {
+    d.joinErr = true;
+    d.joinMsg = 'Could not set the game path: ' + errText(err);
+    renderDetail();
+  }
+}
+async function afterLocate(d, gameId, path) {
+  try {
     const loc = await invoke('game_location', { gameId });
-    d.savedPath = loc.saved_path || trimmed;
+    d.savedPath = loc.saved_path || path;
     d.launchReady = !!loc.launch_ready;
     d.joinErr = !d.launchReady;
-    d.joinMsg = d.launchReady ? 'Game located. Press Play to start it.' : (loc.detail || 'That path did not work — try again.');
+    d.joinMsg = d.launchReady ? 'Game located. Press Play to start it.' : (loc.detail || 'That file did not work — try again.');
   } catch (err) {
     d.joinErr = true;
     d.joinMsg = 'Could not set the game path: ' + errText(err);
   }
+  await loadInstalled();
+  renderList();
   renderDetail();
 }
 
@@ -2119,6 +2170,7 @@ async function init() {
     }
   });
   await loadGames();
+  await loadInstalled();
   await loadVersion();
   // The saved interfaces, so Connect uses what was configured rather than
   // asking the player to retype a relay address they were given once.
