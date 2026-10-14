@@ -50,6 +50,10 @@ use serde::{Deserialize, Serialize};
 /// signature must never verify as a pack signature.
 pub const PACK_SIGNING_DOMAIN: &[u8; 32] = b"gaming-platform-prns/pack/v1\0\0\0\0";
 
+/// Domain separator for a pack repository's index (`repo.rs`). Its own, so
+/// an index signature never verifies as a pack signature or the reverse.
+pub const INDEX_SIGNING_DOMAIN: &[u8; 32] = b"gaming-platform-prns/index/v1\0\0\0";
+
 /// Signature-file schema version.
 pub const SIGNATURE_SCHEMA_VERSION: u32 = 1;
 
@@ -133,8 +137,12 @@ pub struct PackSignature {
 /// (window, pack) pairs produce the same material and a signature cannot be
 /// lifted from one pack onto another by shifting a boundary.
 pub fn signing_material(pack_bytes: &[u8], not_before: u64, not_after: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(PACK_SIGNING_DOMAIN.len() + 24 + pack_bytes.len());
-    msg.extend_from_slice(PACK_SIGNING_DOMAIN);
+    material_in(PACK_SIGNING_DOMAIN, pack_bytes, not_before, not_after)
+}
+
+fn material_in(domain: &[u8; 32], pack_bytes: &[u8], not_before: u64, not_after: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(domain.len() + 24 + pack_bytes.len());
+    msg.extend_from_slice(domain);
     msg.extend_from_slice(&not_before.to_be_bytes());
     msg.extend_from_slice(&not_after.to_be_bytes());
     msg.extend_from_slice(&(pack_bytes.len() as u64).to_be_bytes());
@@ -163,12 +171,32 @@ impl PackSignature {
         not_before: SystemTime,
         valid_for: Duration,
     ) -> Result<Self, SignatureError> {
+        Self::sign_in(PACK_SIGNING_DOMAIN, pack_bytes, secret, not_before, valid_for)
+    }
+
+    /// Sign a repository's `index.json` (`repo.rs`), under its own domain.
+    pub fn sign_index(
+        index_bytes: &[u8],
+        secret: &PrivateIdentityMaterial,
+        not_before: SystemTime,
+        valid_for: Duration,
+    ) -> Result<Self, SignatureError> {
+        Self::sign_in(INDEX_SIGNING_DOMAIN, index_bytes, secret, not_before, valid_for)
+    }
+
+    fn sign_in(
+        domain: &[u8; 32],
+        pack_bytes: &[u8],
+        secret: &PrivateIdentityMaterial,
+        not_before: SystemTime,
+        valid_for: Duration,
+    ) -> Result<Self, SignatureError> {
         let nb = unix_secs(not_before)?;
         let na = nb.saturating_add(valid_for.as_secs());
         if na <= nb {
             return Err(SignatureError::EmptyWindow);
         }
-        let signature = secret.sign(&signing_material(pack_bytes, nb, na));
+        let signature = secret.sign(&material_in(domain, pack_bytes, nb, na));
         Ok(Self {
             schema_version: SIGNATURE_SCHEMA_VERSION,
             public_key: hex::encode(secret.public().as_bytes()),
@@ -213,6 +241,24 @@ impl PackSignature {
         pack_bytes: &[u8],
         now: SystemTime,
     ) -> Result<IdentityHash, SignatureError> {
+        self.verify_in(PACK_SIGNING_DOMAIN, pack_bytes, now)
+    }
+
+    /// Verify a repository index's signature, under its own domain.
+    pub fn verify_index(
+        &self,
+        index_bytes: &[u8],
+        now: SystemTime,
+    ) -> Result<IdentityHash, SignatureError> {
+        self.verify_in(INDEX_SIGNING_DOMAIN, index_bytes, now)
+    }
+
+    fn verify_in(
+        &self,
+        domain: &[u8; 32],
+        pack_bytes: &[u8],
+        now: SystemTime,
+    ) -> Result<IdentityHash, SignatureError> {
         if self.not_after <= self.not_before {
             return Err(SignatureError::EmptyWindow);
         }
@@ -227,7 +273,7 @@ impl PackSignature {
             sig_bytes.as_slice().try_into().map_err(|_| SignatureError::MalformedSignature)?;
         let signature = prns_core::crypto::Ed25519Signature(sig_array);
 
-        let material = signing_material(pack_bytes, self.not_before, self.not_after);
+        let material = material_in(domain, pack_bytes, self.not_before, self.not_after);
         public.verify(&material, &signature).map_err(|_| SignatureError::BadSignature)?;
 
         // Cryptography first, clock second: a forged signature is reported as
@@ -464,6 +510,17 @@ mod tests {
 
     fn signed(seed: u8, valid_for: Duration) -> PackSignature {
         PackSignature::sign(PACK, &secret(seed), t0(), valid_for).unwrap()
+    }
+
+    /// An index signature and a pack signature are never interchangeable,
+    /// though the same key may make both.
+    #[test]
+    fn an_index_signature_is_not_a_pack_signature() {
+        let index = PackSignature::sign_index(PACK, &secret(1), t0(), Duration::from_secs(60)).unwrap();
+        let at = t0() + Duration::from_secs(1);
+        assert_eq!(index.verify_index(PACK, at), Ok(identity(1)));
+        assert_eq!(index.verify(PACK, at), Err(SignatureError::BadSignature));
+        assert_eq!(signed(1, Duration::from_secs(60)).verify_index(PACK, at), Err(SignatureError::BadSignature));
     }
 
     #[test]

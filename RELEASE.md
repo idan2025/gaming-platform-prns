@@ -111,7 +111,9 @@ is missing, which makes pushing a tag sufficient on its own.
   bytes are not what the repository lists, or whose signature does not hold,
   is refused. Lanthorn ships with no repository.
 - For pack authors: `game-bridge repo build <dir>` writes the `index.json`
-  that makes a folder of packs a repository.
+  that makes a folder of packs a repository; with `--identity` it signs the
+  list too, and Lanthorn then holds that repository to the key it was added
+  with.
 
 ## v0.2.39
 
