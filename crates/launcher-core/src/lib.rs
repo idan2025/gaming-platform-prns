@@ -18,6 +18,7 @@
 //! JavaScript reads a missing property as `undefined` rather than failing. The
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
+pub mod desktop;
 pub mod invite;
 pub mod lan;
 pub mod portable;

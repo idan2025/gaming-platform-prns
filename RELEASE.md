@@ -83,6 +83,11 @@ is missing, which makes pushing a tag sufficient on its own.
 - A room whose host runs an older Lanthorn still works; it says chat is
   missing until the host updates.
 
+### Lanthorn: quiet over a fullscreen game
+
+- On Windows, desktop notifications wait while a game or presentation is
+  fullscreen. Linux desktops and macOS already hold them back themselves.
+
 ### Lanthorn: a Games page, and packs from a repository
 
 - A new **Games** page lists the games Lanthorn knows, with whether each pack

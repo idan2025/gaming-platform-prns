@@ -247,6 +247,10 @@ async fn notify(
             return Ok(false);
         }
     }
+    // A fullscreen game has the screen: no banner over it.
+    if launcher_core::desktop::user_is_busy() {
+        return Ok(false);
+    }
     Ok(send_notification(&app, &title, &body))
 }
 
