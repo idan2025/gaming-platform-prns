@@ -524,6 +524,16 @@ change could quietly break:
   `a_file_check_names_what_it_put_back_and_changes_nothing_until_asked`, which
   fails if the same-bytes test or the `validate` flag is dropped.
 
+**The operator can type at a server's console** (2026-10-14, `ROADMAP.md`
+item 7, `Agent::send_console`, `POST /instances/:id/console`, the log
+dialog). Free text, `;` included — it is the operator's own server — but
+**exactly one line**: `console::validate_console_line` refuses any control
+character, a newline above all, and never strips one. Only for a game whose
+pack declares a console, every line is logged, and **only the loopback API
+has the route**: the uplink must never gain one, or an index could type at a
+node's servers. Caught by
+`an_operators_line_reaches_the_console_and_a_second_line_never_does`.
+
 **A game's files can be updated from the node** (2026-10-13,
 `Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later
 change could quietly break:

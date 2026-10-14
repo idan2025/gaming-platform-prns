@@ -16,7 +16,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 4 | Installed-game detection | every player | M | proposed |
 | 5 | Tray icon and notifications | hosts, regulars | M | proposed |
 | 6 | Chat and player names in rooms | LAN-room players | L | proposed |
-| 7 | Node: console, resources, schedules, backups | node operators | M–L | **started**: live usage, log, players, crash restarts |
+| 7 | Node: console, resources, schedules, backups | node operators | M–L | **started**: live usage, log, console, players, crash restarts |
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
@@ -182,7 +182,8 @@ server's menu, byte for byte the launcher's link (pinned on both sides).
 Then: a players list per server, why a stopped server ended (crash, signal,
 out of memory), restart-on-crash done by the agent (`check_crashes`, at most
 5 an hour, never after a Stop), and cleanup of leftover instance folders on
-request. **Not yet:** sending a console line, schedules, backups.
+request. Then (2026-10-14) a console line typed in the log dialog, one line
+at a time, loopback API only. **Not yet:** schedules, backups.
 
 ## 8. In-launcher pack browser
 

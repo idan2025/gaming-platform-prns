@@ -117,6 +117,7 @@ pub fn router_full(
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
+        .route("/instances/:id/console", post(send_console))
         .route("/instances/:id/bots", post(set_bots))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
@@ -744,6 +745,26 @@ async fn change_map(
         .change_map(&id, &req.map)
         .await
         .map(|command| Json(json!({ "instance_id": id, "map": req.map, "command": command })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(Deserialize)]
+struct ConsoleReq {
+    line: String,
+}
+
+/// Type one line at a running server's console (`Agent::send_console`). The
+/// answer, if the game gives one, shows in the server's log.
+async fn send_console(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ConsoleReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .send_console(&id, &req.line)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "sent": req.line })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 
