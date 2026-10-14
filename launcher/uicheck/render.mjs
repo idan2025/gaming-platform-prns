@@ -451,6 +451,39 @@ for (const [iface, tier, want] of [['LoRa', 2, /needs a fast link/], ['LoRa', 1,
   });
 }
 
+// Before Join, not after: a game that needs a fast link, heard over radio, is
+// marked in the list, and Join asks once more — and then joins.
+await run('a slow link is marked in the list and Join asks once', {
+  status: running,
+  rows: () => [row({ interface_label: 'LoRa', min_link_class: 2 }), row({ destination_hash: '0101'.repeat(8), name: 'Near', interface_label: 'TcpClient', min_link_class: 2 })],
+}, async (win, doc) => {
+  const rows = [...doc.querySelectorAll('#list .row')];
+  const marked = rows.filter(r => r.querySelector('.slow-badge')).map(r => r.dataset.hash);
+  check('only the radio-heard row is marked', marked.length === 1 && marked[0] === 'aabbccddeeff00112233445566778899', JSON.stringify(marked));
+  rows.find(r => r.dataset.hash === 'aabbccddeeff00112233445566778899').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const joins = () => calls.filter(c => c === 'join_server').length;
+  const before = joins();
+  doc.querySelector('#detail-join').click();
+  await settle();
+  check('the first press warns instead of joining', joins() === before && /Join anyway/.test(doc.querySelector('#detail').textContent));
+  check('the button says what a second press does', doc.querySelector('#detail-join').textContent === 'Join anyway');
+  doc.querySelector('#detail-join').click();
+  await settle();
+  check('a second press joins: a warning, never a block', joins() === before + 1);
+});
+
+await run('many hops and no round trip yet is said', {
+  status: running,
+  rows: () => [row({ hops: 7 })],
+  details: { ...details, reachable: false, rtt_ms: null },
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const hint = doc.querySelector('#detail-playability');
+  check('seven hops is a hint', !!hint && /7 hops away/.test(hint.textContent), hint && hint.textContent);
+});
+
 await run('no round trip, no playability hint', {
   status: running,
   rows: () => [row()],

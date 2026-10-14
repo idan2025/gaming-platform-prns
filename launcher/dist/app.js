@@ -176,6 +176,22 @@ function playability(rttMs) {
   if (rttMs < 500) return { cls: 'feel-far', text: 'Far away: expect lag in fast games.' };
   return { cls: 'feel-bad', text: 'Very far: fast games will struggle; slower ones may be fine.' };
 }
+// Before the probe answers there is no round trip, only the hop count, and
+// every hop across a mesh adds delay. Rough on purpose, like the rest.
+function hopsFeel(hops) {
+  if (hops == null || hops < 6) return null;
+  return { cls: 'feel-far', text: hopsText(hops) + ' away across the mesh: expect some delay. The round trip will say more.' };
+}
+// The one warning worth a second press on Join (never a block): the game
+// needs more than the link it was heard on, or the round trip is very far.
+// `null` when nothing is that bad.
+function joinWarning(a, data) {
+  const fit = a && !a.legacy ? linkFit(a) : null;
+  if (fit && fit.cls === 'feel-bad') return fit.text;
+  const feel = data ? playability(data.rtt_ms) : null;
+  if (feel && feel.cls === 'feel-bad' && a && a.min_link_class != null && a.min_link_class >= 2) return feel.text;
+  return null;
+}
 function hopsText(h) { return h == null ? 'Unknown' : h + (h === 1 ? ' hop' : ' hops'); }
 // The game a join would use: what the announce said, else what the player
 // chose for this destination. `null` means neither, and nothing may join.
@@ -432,6 +448,12 @@ function updateRowEl(e, row) {
   if (have && have.installed) {
     const b = el('span', 'badge installed-badge', 'Installed');
     b.title = 'You have this game on this computer' + (have.launch_ready ? ', and Play can start it.' : '.');
+    line.appendChild(b);
+  }
+  const fitRow = !legacy && !isRoom(row) ? linkFit(row) : null;
+  if (fitRow && fitRow.cls === 'feel-bad') {
+    const b = el('span', 'badge slow-badge', 'Slow link');
+    b.title = fitRow.text;
     line.appendChild(b);
   }
   if (row.from_index) {
@@ -950,7 +972,7 @@ function renderDetail() {
   if (!room && d.data && d.data.rtt_ms != null) stat(stats, 'Round trip', d.data.rtt_ms + ' ms');
   else stat(stats, 'Heard', fmtSeen(a.last_seen_secs));
   overview.appendChild(stats);
-  const feel = !room && d.data ? playability(d.data.rtt_ms) : null;
+  const feel = !room ? ((d.data && playability(d.data.rtt_ms)) || (!(d.data && d.data.rtt_ms != null) ? hopsFeel(a.hops) : null)) : null;
   const fit = !room && !legacy ? linkFit(a) : null;
   if (fit) {
     const n = el('p', 'note playability ' + fit.cls, fit.text);
@@ -1083,7 +1105,20 @@ function renderJoinActions(foot, d, gameId) {
   const join = el('button', 'btn btn-join', 'Join server');
   join.id = 'detail-join';
   join.type = 'button';
-  join.onclick = joinServer;
+  // A serious warning asks for a second press, and says why; it never stops
+  // a player who wants to try (ROADMAP item 9).
+  const warning = !d.joined && !d.joining ? joinWarning(d.announce, d.data) : null;
+  join.onclick = () => {
+    if (warning && !d.warnedJoin) {
+      d.warnedJoin = true;
+      d.joinErr = true;
+      d.joinMsg = warning + ' Press Join anyway to try.';
+      renderDetail();
+      return;
+    }
+    joinServer();
+  };
+  if (warning && d.warnedJoin) join.textContent = 'Join anyway';
   if (d.joining) { join.disabled = true; join.textContent = 'Joining…'; }
   else if (d.joined) { join.textContent = 'Join again'; }
   // No game, no join: say what is missing rather than failing in the error line.
