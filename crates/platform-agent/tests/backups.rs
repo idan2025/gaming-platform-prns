@@ -52,7 +52,7 @@ async fn agent_in(root: &std::path::Path, first_port: u16) -> Option<Agent> {
     let toml = format!(
         r#"
 data_root = "{}"
-max_instances = 2
+max_instances = 8
 api_bind = "127.0.0.1:0"
 
 [port_range]
