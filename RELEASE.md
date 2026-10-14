@@ -74,7 +74,34 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
-## Unreleased
+## v0.2.39
+
+### Lanthorn: favorites, installed games, a tray, slow-link warnings and big screen
+
+- **Star a server** from its right-click menu or the detail pane. Starred
+  servers that are up lead the list; one that is off has its own section with
+  when it was last heard, and you are told when it comes up.
+- Rows say **Installed** for a game on this computer. Steam is also found in
+  Flatpak and Snap installs, and Locate opens the system's file picker.
+- **A tray icon** while you are in a LAN room or joined to a server: closing
+  the window keeps the launcher running there. Otherwise closing quits, as
+  before. **Desktop notifications** (a favorite comes up, someone joins your
+  room, a room check fails, an update is ready) can be turned off in
+  Settings.
+- **Slow link**: a row is marked when the game needs a faster link than the
+  server was heard over, and the first press on Join says why and becomes
+  **Join anyway**. A warning, never a block.
+- **Big screen mode** for a TV or a Steam Deck, in Settings, and a controller
+  drives the list: up and down move, A opens, X joins, Y opens the menu, B
+  goes back, the shoulder buttons switch views, Start switches big screen.
+
+### Lanthorn Host
+
+- The node page works on a phone: the tabs get their own row, and the toolbar
+  and server rows fit at 320 px.
+- A server's **Put back** is now **Restore**.
+- A stop returns only once Docker's own list says the server stopped, so a
+  Remove right after a Stop is no longer refused as "stop the server first".
 
 ### Lanthorn Host: backups on a schedule, as files, and after a server is gone
 
