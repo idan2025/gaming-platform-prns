@@ -957,11 +957,123 @@ function buildGameCard(g) {
   return card;
 }
 
+// ---------- adding a game (POST /packs) ----------
+//
+// From a pack repository (game_bridge::repo: the node fetches the index, the
+// pack and its signature, and refuses bytes that are not the listed ones), or
+// from a pack's own address. The node reads the repository, not this page, so
+// no other origin is fetched from here. The last repository is remembered in
+// this browser only.
+const REPO_KEY = "lanthorn-host.repository";
+async function afterImport(res) {
+  const games = await api("GET", "/games");
+  state.games = Array.isArray(games) ? games : [];
+  renderGames();
+  clearError();
+  const p = res && res.imported;
+  if (!p) return;
+  let msg = p.display_name + (p.replaced ? " updated" : " added") + " — " + p.trust + ".";
+  if (!res.loaded) msg += " Not loaded: " + (res.refused_reason || "the node's pack trust refused it") + ".";
+  else if (!p.runnable) msg += " It needs a runtime in agent.toml before a server can start.";
+  toast(msg);
+}
+function openAddGameDialog() {
+  openModal("add-game-dialog", null, (body, close) => {
+    body.appendChild(el("h3", null, "Add a game"));
+    body.appendChild(el("p", "muted small", "A game is added by its pack: a small file that says which ports and "
+      + "files it needs. It never says what program runs; that is this node's own config. Each pack shows whether its author signed it."));
+    const form = el("form", "advanced-wrap");
+    form.autocomplete = "off";
+    let saved = "";
+    try { saved = localStorage.getItem(REPO_KEY) || ""; } catch (_) {}
+    const repo = field(form, "ag-repo", "Pack repository", { type: "text", placeholder: "https://… a repository's address", value: saved });
+    const list = el("div", "repo-packs");
+    const show = el("button", "btn", "Show its games");
+    show.type = "submit";
+    form.append(show, list);
+    const status = el("p", "muted small");
+    const render = (data, url) => {
+      list.textContent = "";
+      if (!data.packs.length) { list.appendChild(el("p", "muted small", "It lists no games.")); return; }
+      list.appendChild(el("p", "muted small", data.name));
+      data.packs.forEach(p => {
+        const row = el("div", "repo-pack");
+        const t = el("div", "repo-pack-text");
+        t.appendChild(el("strong", null, p.display_name));
+        t.appendChild(el("span", "muted small", " " + (p.signed ? "signed" : "unsigned") + (p.lan ? " · LAN rooms" : "")));
+        row.appendChild(t);
+        const label = { available: "Add", update: "Update", installed: "Added" }[p.status] || p.status;
+        const b = el("button", p.status === "installed" ? "btn" : "btn btn-primary", label);
+        b.type = "button";
+        b.dataset.pack = p.id;
+        b.disabled = p.status === "installed";
+        b.addEventListener("click", async () => {
+          b.disabled = true; b.textContent = "Adding…";
+          try {
+            const res = await withInFlight(api("POST", "/packs", { repository: url, id: p.id, replace: p.status === "update" }));
+            await afterImport(res);
+            close();
+          } catch (e) {
+            if (e && e.__auth) return;
+            status.textContent = (e && e.error) || "Not added.";
+            b.disabled = false; b.textContent = label;
+          }
+        });
+        row.appendChild(b);
+        list.appendChild(row);
+      });
+    };
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const url = repo.value.trim();
+      if (!url) return;
+      show.disabled = true; status.textContent = "Reading…";
+      try {
+        const data = await withInFlight(api("GET", "/packs/repository?url=" + encodeURIComponent(url)));
+        try { localStorage.setItem(REPO_KEY, url); } catch (_) {}
+        status.textContent = "";
+        render(data, url);
+      } catch (err) {
+        if (err && err.__auth) return;
+        status.textContent = (err && err.error) || "Could not read it.";
+      } finally { show.disabled = false; }
+    });
+    body.appendChild(form);
+    const one = el("form", "advanced-wrap");
+    one.autocomplete = "off";
+    const url = field(one, "ag-url", "Or one pack's address", { type: "text", placeholder: "https://…/game.toml" });
+    const go = el("button", "btn", "Add");
+    go.type = "submit";
+    one.appendChild(go);
+    one.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (!url.value.trim()) return;
+      go.disabled = true;
+      try {
+        const res = await withInFlight(api("POST", "/packs", { url: url.value.trim() }));
+        await afterImport(res);
+        close();
+      } catch (err) {
+        if (err && err.__auth) return;
+        status.textContent = (err && err.error) || "Not added.";
+      } finally { go.disabled = false; }
+    });
+    body.append(one, status);
+    const actions = el("div", "form-actions");
+    const cancel = el("button", "btn", "Close");
+    cancel.type = "button";
+    cancel.addEventListener("click", close);
+    actions.appendChild(cancel);
+    body.appendChild(actions);
+    repo.focus();
+  });
+}
+
 // Take a game's pack off the node (DELETE /packs/:id). The node refuses while
 // any server of the game exists and says which.
 async function onRemovePack(g) {
   if (!confirm("Remove " + g.display_name + " from this node?\n\nIts pack is deleted, so it leaves the Games page and no server of it can start. " +
-    "Its game files stay; delete them on the Installed page if you want the space. It can be added back by importing the pack again.")) return;
+    "Its game files stay; delete them on the Installed page if you want the space. It can be added back with Add a game.")) return;
   try {
     await withInFlight(api("DELETE", "/packs/" + encodeURIComponent(g.id)));
     const games = await api("GET", "/games");
@@ -3161,6 +3273,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   for (const t of TABS) $("tab-" + t).addEventListener("click", () => setActiveTab(t));
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
+  $("add-game-btn").addEventListener("click", openAddGameDialog);
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));
   $("announce-btn").addEventListener("click", () => onAnnounce(null));
   $("orphans-clean").addEventListener("click", onCleanOrphans);

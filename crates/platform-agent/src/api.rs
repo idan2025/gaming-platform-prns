@@ -150,6 +150,7 @@ pub fn router_full(
         .route("/games", get(games))
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
+        .route("/packs/repository", get(list_repository))
         .route("/packs/:id", delete(remove_pack))
         // Configuring the mesh interfaces binds sockets and joins meshes, so it
         // rides behind the same token gate as every container-creating route
@@ -372,6 +373,47 @@ async fn mesh_interface_remove(
         // is broken.
         "note": "Forgotten for future bridges. Servers already running keep this interface until they restart.",
     })))
+}
+
+#[derive(Deserialize)]
+struct RepositoryQuery {
+    url: String,
+}
+
+/// What a pack repository lists, and which of it this node has: `available`,
+/// `installed` (the same bytes) or `update` (other bytes). Read by the node,
+/// not the browser, so the page needs no cross-origin fetch; installing one
+/// is `POST /packs` with `repository` and `id`.
+async fn list_repository(
+    State(state): State<ApiState>,
+    Query(q): Query<RepositoryQuery>,
+) -> ApiResult<serde_json::Value> {
+    let index = crate::pack_import::read_repository(&q.url)
+        .await
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    let dir = state.pack_dir.clone();
+    let packs: Vec<_> = index
+        .packs
+        .iter()
+        .map(|e| {
+            let have = dir
+                .as_ref()
+                .and_then(|d| std::fs::read(crate::pack_import::pack_path(d, &e.id)).ok());
+            let status = match have {
+                None => "available",
+                Some(b) if game_bridge::repo::sha256_hex(&b) == e.sha256 => "installed",
+                Some(_) => "update",
+            };
+            json!({
+                "id": e.id,
+                "display_name": e.display_name,
+                "signed": e.signed,
+                "lan": e.lan,
+                "status": status,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "name": index.name, "packs": packs })))
 }
 
 /// Install a game pack into this running node (`pack_import.rs`).

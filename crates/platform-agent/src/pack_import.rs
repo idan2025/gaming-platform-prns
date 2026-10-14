@@ -61,6 +61,14 @@ pub struct ImportRequest {
     /// turn this into a way to read the node's disk.
     #[serde(default)]
     pub url: Option<String>,
+    /// A pack repository's address (`game_bridge::repo`), with `id`: the pack
+    /// is fetched beside its index, checked against the index's digest, and
+    /// its signature, if it has one, comes with it and must hold.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Which pack of `repository`.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Replace a pack with this id if one is already installed.
     #[serde(default)]
     pub replace: bool,
@@ -85,8 +93,10 @@ pub struct ImportedPack {
 
 #[derive(Debug)]
 pub enum ImportError {
-    /// Neither `toml` nor `url`, or both.
+    /// Not exactly one of `toml`, `url`, or `repository` with `id`.
     SourceNotClear,
+    /// The repository's bytes or signature are not what it promised.
+    Repository(String),
     UnsupportedUrlScheme(String),
     Fetch(String),
     TooLarge { bytes: usize },
@@ -102,9 +112,10 @@ impl core::fmt::Display for ImportError {
         match self {
             Self::SourceNotClear => write!(
                 f,
-                "give exactly one of `toml` or `url`: two sources for one pack is a way to \
-                 install the one you did not mean to"
+                "give exactly one of `toml`, `url`, or `repository` with `id`: two sources for \
+                 one pack is a way to install the one you did not mean to"
             ),
+            Self::Repository(e) => write!(f, "{e}; nothing was installed"),
             Self::UnsupportedUrlScheme(u) => write!(
                 f,
                 "pack url {u:?} must start with http:// or https://. A pack is fetched over \
@@ -140,9 +151,10 @@ pub async fn import(
     now: SystemTime,
     runtime_configured: impl Fn(&str) -> bool,
 ) -> Result<ImportedPack, ImportError> {
-    let src = match (&request.toml, &request.url) {
-        (Some(t), None) => t.clone(),
-        (None, Some(u)) => fetch_pack(u).await?,
+    let (src, sig) = match (&request.toml, &request.url, &request.repository, &request.id) {
+        (Some(t), None, None, None) => (t.clone(), None),
+        (None, Some(u), None, None) => (fetch_pack(u).await?, None),
+        (None, None, Some(r), Some(id)) => fetch_from_repository(r, id, now).await?,
         _ => return Err(ImportError::SourceNotClear),
     };
     if src.len() > MAX_PACK_BYTES {
@@ -162,7 +174,32 @@ pub async fn import(
         return Err(ImportError::AlreadyInstalled(pack.id.clone()));
     }
 
+    if let Some(wanted) = &request.id {
+        if wanted != &pack.id {
+            return Err(ImportError::Repository(format!(
+                "the repository lists {wanted:?} but the pack inside is {:?}",
+                pack.id
+            )));
+        }
+    }
+
     std::fs::create_dir_all(dir).map_err(|e| ImportError::Io(e.to_string()))?;
+    // A repository pack's signature goes in first, so the pack never sits
+    // beside a signature that is not its own; one from a repository with
+    // none takes a stale one away.
+    if request.repository.is_some() {
+        let sig_path = dir.join(format!("{}.toml{}", pack.id, game_bridge::signing::SIGNATURE_SUFFIX));
+        match &sig {
+            Some(text) => {
+                let staging = dir.join(format!(".{}.toml.sig.partial", pack.id));
+                std::fs::write(&staging, text).map_err(|e| ImportError::Io(e.to_string()))?;
+                std::fs::rename(&staging, &sig_path).map_err(|e| ImportError::Io(e.to_string()))?;
+            }
+            None => {
+                let _ = std::fs::remove_file(&sig_path);
+            }
+        }
+    }
     // Write beside and rename, so an interrupted import cannot leave a
     // half-written pack where the loader will find it — the same reason content
     // extraction stages and renames.
@@ -193,6 +230,78 @@ pub async fn import(
         file: path.display().to_string(),
         replaced: existed,
     })
+}
+
+/// Fetch pack `id` from the repository at `repository`: hashed against the
+/// index before it is read, and its signature, when the index says it has
+/// one, verified before anything is written. Returns the pack's text and the
+/// signature's.
+async fn fetch_from_repository(
+    repository: &str,
+    id: &str,
+    now: SystemTime,
+) -> Result<(String, Option<String>), ImportError> {
+    use game_bridge::repo::{beside, sha256_hex};
+    let index = read_repository(repository).await?;
+    let url = game_bridge::repo::check_repo_url(repository)
+        .map_err(|e| ImportError::Repository(e.to_string()))?;
+    let entry = index
+        .entry(id)
+        .ok_or_else(|| ImportError::Repository(format!("the repository does not list {id:?}")))?;
+    let bytes = fetch_bytes(&beside(&url, &entry.file), MAX_PACK_BYTES).await?;
+    if sha256_hex(&bytes) != entry.sha256 {
+        return Err(ImportError::Repository(
+            "the pack's bytes are not the ones the repository lists".into(),
+        ));
+    }
+    let src = String::from_utf8(bytes)
+        .map_err(|_| ImportError::NotAPack("the bytes are not UTF-8 text".to_string()))?;
+    let sig = if entry.signed {
+        let sig_url = beside(&url, &format!("{}{}", entry.file, game_bridge::signing::SIGNATURE_SUFFIX));
+        let text = String::from_utf8(fetch_bytes(&sig_url, 16 * 1024).await?)
+            .map_err(|_| ImportError::Repository("the pack's signature is not text".into()))?;
+        let parsed = game_bridge::signing::PackSignature::parse(&text)
+            .map_err(|e| ImportError::Repository(format!("the pack's signature is unreadable: {e}")))?;
+        // A signature that fails is a refusal, never an unsigned install.
+        parsed
+            .verify(src.as_bytes(), now)
+            .map_err(|e| ImportError::Repository(format!("the pack's signature does not hold: {e}")))?;
+        Some(text)
+    } else {
+        None
+    };
+    Ok((src, sig))
+}
+
+/// A repository's index, read now.
+pub async fn read_repository(repository: &str) -> Result<game_bridge::repo::RepoIndex, ImportError> {
+    let url = game_bridge::repo::check_repo_url(repository)
+        .map_err(|e| ImportError::Repository(e.to_string()))?;
+    let bytes = fetch_bytes(&url, game_bridge::repo::MAX_INDEX_BYTES).await?;
+    game_bridge::repo::RepoIndex::parse(&bytes).map_err(|e| ImportError::Repository(e.to_string()))
+}
+
+async fn fetch_bytes(url: &str, max: usize) -> Result<Vec<u8>, ImportError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ImportError::Fetch(e.to_string()))?;
+    let mut response =
+        client.get(url).send().await.map_err(|e| ImportError::Fetch(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ImportError::Fetch(format!("{} said {}", url, response.status())));
+    }
+    if response.content_length().is_some_and(|n| n as usize > max) {
+        return Err(ImportError::TooLarge { bytes: response.content_length().unwrap_or(0) as usize });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| ImportError::Fetch(e.to_string()))? {
+        body.extend_from_slice(&chunk);
+        if body.len() > max {
+            return Err(ImportError::TooLarge { bytes: body.len() });
+        }
+    }
+    Ok(body)
 }
 
 async fn fetch_pack(url: &str) -> Result<String, ImportError> {
@@ -297,7 +406,87 @@ query = "a2s"
 "#;
 
     fn paste(toml: &str, replace: bool) -> ImportRequest {
-        ImportRequest { toml: Some(toml.to_string()), url: None, replace }
+        ImportRequest { toml: Some(toml.to_string()), url: None, repository: None, id: None, replace }
+    }
+
+    /// Serve `dir` over plain HTTP on loopback.
+    fn serve(dir: std::path::PathBuf) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/');
+                let body = std::fs::read(dir.join(path));
+                let head = match &body {
+                    Ok(b) => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len()),
+                    Err(_) => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                };
+                let _ = stream.write_all(head.as_bytes());
+                if let Ok(b) = body {
+                    let _ = stream.write_all(&b);
+                }
+            }
+        });
+        port
+    }
+
+    /// From a repository: the digest decides, a signature comes along and
+    /// must hold, and a pack whose id is not the listed one is refused.
+    #[tokio::test]
+    async fn a_repository_pack_installs_only_as_listed_and_signed() {
+        let served = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(served.path().join("test-game.toml"), PACK).unwrap();
+        let key = prns_core::identity::PrivateIdentityMaterial::from_slice(&[9; 64]).unwrap();
+        let sig = game_bridge::signing::PackSignature::sign(
+            PACK.as_bytes(),
+            &key,
+            now() - std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(86_400),
+        )
+        .unwrap();
+        std::fs::write(served.path().join("test-game.toml.sig"), sig.to_toml()).unwrap();
+        let build = || {
+            let index = game_bridge::repo::RepoIndex::build(served.path(), "t").unwrap();
+            std::fs::write(served.path().join("index.json"), serde_json::to_vec(&index).unwrap())
+                .unwrap();
+        };
+        build();
+        let url = format!("http://127.0.0.1:{}/", serve(served.path().to_path_buf()));
+        let req = |id: &str, replace| ImportRequest {
+            toml: None,
+            url: None,
+            repository: Some(url.clone()),
+            id: Some(id.to_string()),
+            replace,
+        };
+
+        let out = run(&req("test-game", false), dir.path()).await.unwrap();
+        assert_eq!(out.trust, "signed by an unknown key");
+        assert!(dir.path().join("test-game.toml.sig").exists());
+        assert!(run(&req("absent", false), dir.path()).await.is_err());
+
+        // Other bytes than listed: refused, nothing changes.
+        std::fs::write(served.path().join("test-game.toml"), format!("{PACK}\n# changed\n")).unwrap();
+        let e = run(&req("test-game", true), dir.path()).await.unwrap_err().to_string();
+        assert!(e.contains("not the ones the repository lists"), "{e}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("test-game.toml")).unwrap(), PACK);
+
+        // Listed, but the signature is for the old bytes: refused, never unsigned.
+        build();
+        let e = run(&req("test-game", true), dir.path()).await.unwrap_err().to_string();
+        assert!(e.contains("does not hold"), "{e}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("test-game.toml")).unwrap(), PACK);
     }
 
     fn now() -> SystemTime {
@@ -354,6 +543,8 @@ query = "a2s"
         let req = ImportRequest {
             toml: None,
             url: Some("file:///etc/passwd".into()),
+            repository: None,
+            id: None,
             replace: false,
         };
         assert!(matches!(
@@ -365,12 +556,14 @@ query = "a2s"
     #[tokio::test]
     async fn a_request_with_no_source_or_two_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let neither = ImportRequest { toml: None, url: None, replace: false };
+        let neither = ImportRequest { toml: None, url: None, repository: None, id: None, replace: false };
         assert!(matches!(run(&neither, dir.path()).await, Err(ImportError::SourceNotClear)));
 
         let both = ImportRequest {
             toml: Some(PACK.into()),
             url: Some("https://example.org/p.toml".into()),
+            repository: None,
+            id: None,
             replace: false,
         };
         assert!(matches!(run(&both, dir.path()).await, Err(ImportError::SourceNotClear)));

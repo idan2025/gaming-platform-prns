@@ -177,6 +177,14 @@ pub struct GamePack {
     pub art: Option<String>,
 }
 
+/// Whether `id` can name a file: ASCII letters, digits, `-`, `_` and `.`,
+/// not starting with `.`. Every shipped pack's id passes.
+pub fn id_is_file_safe(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl GamePack {
     /// The picture a launcher shows for this game: the pack's `art`, else the
     /// Steam header of the app players own, else none.
@@ -404,6 +412,8 @@ pub enum PackError {
     /// The pack's `[lan]` block is not usable.
     InvalidLan(String),
     InvalidArt(String),
+    /// The pack's `id` could not safely name a file.
+    InvalidId(String),
 }
 
 impl core::fmt::Display for PackError {
@@ -421,6 +431,10 @@ impl core::fmt::Display for PackError {
             Self::InvalidLaunch(e) => write!(f, "pack describes an unusable launch: {e}"),
             Self::InvalidLan(e) => write!(f, "pack describes an unusable LAN: {e}"),
             Self::InvalidArt(e) => write!(f, "pack names unusable art: {e}"),
+            Self::InvalidId(id) => write!(
+                f,
+                "pack id {id:?} must be letters, digits, '-', '_' or '.', and not start with '.'"
+            ),
         }
     }
 }
@@ -504,6 +518,12 @@ impl GamePack {
         // Validate here, not at first use: a broken pack should fail when it is
         // loaded, with the file in hand, rather than when someone tries to host.
         pack.to_profile()?;
+        // The id names the pack's file wherever one is installed (a node's
+        // import, a launcher's repository install), so it must not be able to
+        // name a path.
+        if !id_is_file_safe(&pack.id) {
+            return Err(PackError::InvalidId(pack.id.clone()));
+        }
         pack.content.validate().map_err(PackError::InvalidContent)?;
         // A bad template is a bad pack, reported with the file in hand rather
         // than at the moment a player presses Join.
@@ -690,6 +710,20 @@ query = "a2s"
 
     /// The shipped pack and the built-in must not drift apart, or a user who
     /// edits the file gets different behaviour from one who does not.
+    /// An id becomes `<id>.toml` wherever a pack is installed, so one that
+    /// could name a path is a bad pack, not a write outside the directory.
+    #[test]
+    fn a_pack_id_that_could_name_a_path_is_refused() {
+        for id in ["../escape", "a/b", "a\\b", ".hidden", "C:x"] {
+            let src = SVEN_TOML.replacen("id = \"sven-coop\"", &format!("id = {id:?}"), 1);
+            assert!(matches!(GamePack::parse(&src), Err(PackError::InvalidId(_))), "{id}");
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        for pack in GamePack::load_dir(&dir).unwrap().packs {
+            assert!(id_is_file_safe(&pack.id), "{}", pack.id);
+        }
+    }
+
     #[test]
     fn shipped_sven_pack_matches_the_builtin() {
         assert_eq!(GamePack::parse(SVEN_TOML).unwrap(), GamePack::sven_coop());

@@ -106,6 +106,33 @@ fn valid_sha256(hex: &str) -> bool {
     hex.len() == 64 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
+/// A repository URL a launcher or node will fetch: `https`, or `http` to this
+/// machine only (a repository being tested). No query or fragment, so the
+/// packs beside the index are found by plain path.
+pub fn check_repo_url(url: &str) -> anyhow::Result<String> {
+    let url = url.trim();
+    let local =
+        ["http://localhost:", "http://localhost/", "http://127.0.0.1:", "http://127.0.0.1/"];
+    if !(url.starts_with("https://") || local.iter().any(|p| url.starts_with(p))) {
+        anyhow::bail!("a pack repository is an https:// address (http:// only for this computer)");
+    }
+    if url.contains(['?', '#', ' ', '\\']) || url.len() > 512 {
+        anyhow::bail!("a pack repository address has no query, fragment or spaces");
+    }
+    let url = if url.ends_with(INDEX_FILE) {
+        url.to_string()
+    } else {
+        format!("{}/{}", url.trim_end_matches('/'), INDEX_FILE)
+    };
+    Ok(url)
+}
+
+/// The address of `file` beside the index at `index_url`.
+pub fn beside(index_url: &str, file: &str) -> String {
+    let base = &index_url[..=index_url.rfind('/').unwrap_or(index_url.len() - 1)];
+    format!("{base}{file}")
+}
+
 /// SHA-256 of `bytes`, lowercase hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
