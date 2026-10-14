@@ -1011,6 +1011,10 @@ working, and each shortens the distance between installing and playing.
 4. **First run.** One screen: generate an identity, pick or auto-detect an
    interface, confirm. Ends at: a fresh install reaches a server list without
    editing a file.
+   **Built 2026-10-15** as one welcome screen: a name, this network and/or a
+   hub address, Start or Skip. No identity step: the launcher makes one the
+   first time it needs it. Shown once (`first_run_done`), and never on a
+   launcher that already has a connection saved.
 5. **Pack repository — the client half.** Browse listed packs in the launcher,
    see the tier before importing (§11.4 already renders it), import with one
    click into the pack directory. **Opt-in**: the launcher ships with no

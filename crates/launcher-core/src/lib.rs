@@ -1660,6 +1660,20 @@ impl Launcher {
         self.persist(&settings)
     }
 
+    /// Whether to show the first-run screen (`PLAN.md` §13.3 step 4): never
+    /// once it was finished or skipped, and never on a launcher that already
+    /// has a way onto the mesh saved, which is every launcher from before it.
+    pub async fn first_run(&self) -> bool {
+        let settings = self.settings.lock().await;
+        !settings.first_run_done && settings.interfaces.is_empty()
+    }
+
+    pub async fn finish_first_run(&self) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        settings.first_run_done = true;
+        self.persist(&settings)
+    }
+
     pub async fn notifications_on(&self) -> bool {
         !self.settings.lock().await.notifications_off
     }
@@ -2619,6 +2633,21 @@ query = "a2s"
 
         l.forget_server(Some(hash)).await.unwrap();
         assert!(l.favorites().await.is_empty(), "Remove takes the star too");
+    }
+
+    /// First run shows on a fresh launcher, never again once finished, and
+    /// never on one that already has a connection saved.
+    #[tokio::test]
+    async fn first_run_is_once_and_only_for_a_launcher_with_nothing_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launcher.json");
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        assert!(l.first_run().await);
+        l.finish_first_run().await.unwrap();
+        assert!(!Launcher::new(Vec::new()).with_settings_file(file).first_run().await);
+        let l = Launcher::new(Vec::new()).with_settings_file(dir.path().join("older.json"));
+        l.settings.lock().await.interfaces.push(LauncherInterface::Auto);
+        assert!(!l.first_run().await, "a launcher with a connection saved is past it");
     }
 
     /// Nothing is open on a fresh launcher, so closing it just quits; and
