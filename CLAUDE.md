@@ -682,6 +682,25 @@ later change could quietly break:
   the Installed page is rebuilt from `GET /updates` only, never while one of
   its controls has focus.
 
+**A pack repository is a cache of packs** (2026-10-15, ROADMAP item 8,
+`game_bridge::repo`, `launcher-core/src/repo.rs`, the Games page). Rules a
+later change could quietly break:
+- **Hash, then parse, then verify, then write.** The pack's bytes must be the
+  index's `sha256` before they are read as TOML; a signature that does not
+  hold refuses the install and is never turned into an unsigned one.
+  `packs_install_from_a_repository_only_as_listed_and_signed` fails with either
+  check removed.
+- **The installed file is named from the pack's id**, the id inside must be
+  the one the index listed, and an index's `file` is a bare `.toml` name
+  checked before it is used even in a URL (`repo::valid_file_name`).
+- **A shipped game is never replaced or removed from a repository**, and
+  none is configured by default: a repository is a URL the player adds.
+- **The index decides what is listed, never what is trusted.** Trust is each
+  pack's own `.sig`, and the launcher shows a tier without gating on it, as
+  at load. Repository art is not fetched for a pack not installed.
+- **One HTTP stack.** `launcher-core` uses the same reqwest 0.13 and rustls
+  with ring the Tauri updater brings; do not add a second TLS stack.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

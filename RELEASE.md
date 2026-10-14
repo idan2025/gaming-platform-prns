@@ -83,6 +83,17 @@ is missing, which makes pushing a tag sufficient on its own.
 - A room whose host runs an older Lanthorn still works; it says chat is
   missing until the host updates.
 
+### Lanthorn: a Games page, and packs from a repository
+
+- A new **Games** page lists the games Lanthorn knows, with whether each pack
+  is signed.
+- **Add a pack repository** by its address and install games from it with
+  one click; an update shows when the author publishes one. A pack whose
+  bytes are not what the repository lists, or whose signature does not hold,
+  is refused. Lanthorn ships with no repository.
+- For pack authors: `game-bridge repo build <dir>` writes the `index.json`
+  that makes a folder of packs a repository.
+
 ## v0.2.39
 
 ### Lanthorn: favorites, installed games, a tray, slow-link warnings and big screen

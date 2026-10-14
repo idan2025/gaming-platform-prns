@@ -110,6 +110,9 @@ pub struct LauncherSettings {
     /// Stored as "off" so every older settings file means on.
     #[serde(default)]
     pub notifications_off: bool,
+    /// Pack repositories the player added (`repo.rs`), as index URLs. None
+    /// ships: a repository is opt-in.
+    pub pack_repos: Vec<String>,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.

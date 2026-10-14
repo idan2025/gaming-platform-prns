@@ -1017,10 +1017,21 @@ working, and each shortens the distance between installing and playing.
    repository configured, and a repository is a URL the user adds. An index is a
    cache of the mesh; a repository is a cache of *packs*, and neither is ever
    the source of truth (`DESIGN.md` §0).
+   **Built 2026-10-15** (`launcher-core/src/repo.rs`, the Games page): add a
+   repository URL, see each pack's state, install, update and remove. A pack
+   is hashed against the index, parsed, its signature verified (a failing one
+   refuses the install, never downgrades it), then written beside the
+   settings file as `packs/<id>.toml`. A shipped game is never replaced.
 6. **Pack repository — the serving half.** A static, signed index of packs, plus
    the submission and review flow of §13.2. Deliberately last: a marketplace
    with nothing worth listing is furniture, and steps 1-4 are what make packs
    worth sharing.
+   **The static half is built 2026-10-15**: `game-bridge repo build <dir>`
+   writes `index.json` (id, file, sha256, signed) beside the packs and their
+   `.sig` files, for any web host. Trust stays per pack, in each pack's own
+   signature; the index itself is not signed yet, so it decides only what is
+   listed, never what is trusted. No review flow and no project repository
+   exist yet.
 
 ### 13.5 Host-side UI — Tauri, and where a web UI does and does not fit
 
