@@ -81,6 +81,22 @@ fn task_containers() -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The task containers once Docker's list has caught up with a removal. The
+/// list lags a remove by a moment (seen on the ARM runner), so an empty answer
+/// is waited for, up to 5 s; a container that is really left behind still
+/// fails.
+async fn task_containers_settled() -> String {
+    let mut left = task_containers();
+    for _ in 0..50 {
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        left = task_containers();
+    }
+    left
+}
+
 /// An agent whose Sven Co-op runtime points at `version`, with an installed
 /// copy at `content/sven-coop/test` carrying the pack's writable mountpoints.
 async fn serve(
@@ -317,7 +333,7 @@ async fn a_download_shows_growing_bytes_and_a_cancel_leaves_nothing() {
         .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
         .unwrap_or_default();
     assert!(staging.is_empty(), "staging left behind: {staging:?}");
-    assert_eq!(task_containers(), "", "the task container outlived its cancel");
+    assert_eq!(task_containers_settled().await, "", "the task container outlived its cancel");
 
     // A cancel is not a wedge: the next install runs to the end.
     let (status, _) = delete(addr, "/content/sven-coop").await;

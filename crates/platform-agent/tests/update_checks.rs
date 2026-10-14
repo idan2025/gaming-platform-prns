@@ -76,6 +76,22 @@ fn task_containers() -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The task containers once Docker's list has caught up with a removal. The
+/// list lags a remove by a moment (seen on the ARM runner), so an empty answer
+/// is waited for, up to 5 s; a container that is really left behind still
+/// fails.
+async fn task_containers_settled() -> String {
+    let mut left = task_containers();
+    for _ in 0..50 {
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        left = task_containers();
+    }
+    left
+}
+
 /// An agent with Sven Co-op (steamcmd) installed at `content/sven-coop/test`,
 /// its manifest at `build`, and a second game whose files a person installs
 /// (`manual`), which has nothing to check.
@@ -326,7 +342,7 @@ async fn a_download_that_reaches_the_reserve_is_stopped_and_leaves_nothing() {
     assert!(error.starts_with("stopped: the disk reached"), "{error}");
     assert!(!dir.path().join("content/sven-coop/test").exists(), "a stopped download installed");
     assert!(staging_is_empty(dir.path()), "staging left behind");
-    assert_eq!(task_containers(), "", "the task container outlived the stop");
+    assert_eq!(task_containers_settled().await, "", "the task container outlived the stop");
 }
 
 /// "Tell me" (the default) downloads nothing; "download it" fetches the found
@@ -379,7 +395,7 @@ async fn a_found_build_downloads_only_when_the_game_says_so_and_keeps_the_old_co
     assert_eq!(game["installed_build"], "300", "new servers use the new copy: {after}");
     assert_eq!(game["available"], false, "{after}");
     assert_eq!(game["on_new_build"], "download", "{after}");
-    assert!(task_containers().is_empty(), "no task container is left behind");
+    assert!(task_containers_settled().await.is_empty(), "no task container is left behind");
 }
 
 /// A game's own interval runs with the node's checks off, and "never" stops
@@ -498,7 +514,7 @@ async fn a_file_check_names_what_it_put_back_and_changes_nothing_until_asked() {
         send(reqwest::Method::POST, addr, "/content/sven-coop/nothing/use", json!({})).await;
     assert_eq!(status, 409, "only an installed copy");
     assert!(staging_is_empty(dir.path()));
-    assert!(task_containers().is_empty());
+    assert!(task_containers_settled().await.is_empty());
 }
 
 /// A copy that matches keeps nothing: no identical second copy.
