@@ -138,6 +138,10 @@ pub struct Agent {
     updates: crate::updates::UpdateChecks,
     /// One check at a time: they share steamcmd's `$HOME`.
     check_lock: Mutex<()>,
+    /// Downloads, queued one at a time (`install.rs`). Here rather than in
+    /// the API's state so an automatic download waits in the same queue as
+    /// the operator's.
+    installs: Arc<crate::install::Installs>,
 }
 
 /// How often the agent looks for servers that crashed.
@@ -370,7 +374,13 @@ impl Agent {
             active: crate::active::ActiveVersions::load(&config_data_root),
             updates: crate::updates::UpdateChecks::load(&config_data_root),
             check_lock: Mutex::new(()),
+            installs: Arc::new(crate::install::Installs::new()),
         })
+    }
+
+    /// This node's downloads and their queue.
+    pub fn installs(&self) -> Arc<crate::install::Installs> {
+        self.installs.clone()
     }
 
     /// The packs this agent will run, by game id.
@@ -1748,7 +1758,14 @@ impl Agent {
         dir: &std::path::Path,
     ) -> crate::updates::UpdateNotice {
         let installed = crate::content::steam_build_id(dir, app_id);
-        crate::updates::UpdateNotice::new(game_id, version, installed, &self.updates.game(game_id), now_unix())
+        crate::updates::UpdateNotice::new(
+            game_id,
+            version,
+            installed,
+            &self.updates.game(game_id),
+            &self.updates.policy(game_id),
+            now_unix(),
+        )
     }
 
     /// Every steamcmd game with an installed active copy, and what is known
@@ -1776,16 +1793,64 @@ impl Agent {
         out
     }
 
-    /// Run every check that is due under the operator's interval. Nothing at
-    /// all while checks are off, which is the default.
-    pub async fn check_due_updates(&self) {
-        let Some(hours) = self.updates.settings().check_every_hours else { return };
-        let now = now_unix();
-        for notice in self.update_notices().await {
-            if self.updates.game(&notice.game_id).due(now, hours) {
-                let _ = self.check_for_update(&notice.game_id).await;
+    /// Run every check that is due under the operator's interval (nothing
+    /// while checks are off, the default), then start the downloads a game's
+    /// "download it" asks for (§12.3).
+    pub async fn check_due_updates(self: &Arc<Self>) {
+        if let Some(hours) = self.updates.settings().check_every_hours {
+            let now = now_unix();
+            for notice in self.update_notices().await {
+                if self.updates.game(&notice.game_id).due(now, hours) {
+                    let _ = self.check_for_update(&notice.game_id).await;
+                }
             }
         }
+        self.start_automatic_downloads().await;
+    }
+
+    /// Start an update for every game set to download a found build, whose
+    /// copy is behind it, and which has not tried this build since its last
+    /// check. Through the same queue and reserve gate as the Update button,
+    /// and never removing the old copy: nothing automatic deletes.
+    pub async fn start_automatic_downloads(self: &Arc<Self>) {
+        let now = now_unix();
+        for notice in self.update_notices().await {
+            if notice.on_new_build != crate::updates::OnNewBuild::Download || notice.available != Some(true) {
+                continue;
+            }
+            let check = self.updates.game(&notice.game_id);
+            if !check.may_auto_download(now) {
+                continue;
+            }
+            let Some(build) = check.latest_build else { continue };
+            if self.installs.is_running(&notice.game_id).await {
+                continue;
+            }
+            if let Err(e) = self.updates.record_auto(&notice.game_id, &build, now) {
+                tracing::warn!(game = %notice.game_id, error = %e, "not downloading: could not record the attempt");
+                continue;
+            }
+            let started =
+                crate::install::spawn_update(self.installs.clone(), self.clone(), notice.game_id.clone(), false).await;
+            if started {
+                tracing::info!(game = %notice.game_id, build = %build, "downloading a new build automatically");
+            }
+        }
+    }
+
+    /// What `game_id` does when a check finds a newer build.
+    pub async fn set_update_policy(&self, game_id: &str, policy: crate::updates::GamePolicy) -> Result<(), String> {
+        match self.packs.read().await.get(game_id).map(|p| &p.content) {
+            None => return Err(format!("no game pack installed for {game_id:?}")),
+            Some(PackContent::Steamcmd { .. }) => {}
+            Some(other) => {
+                return Err(format!(
+                    "only a game downloaded with steamcmd has newer builds; this pack's content driver is {:?}",
+                    other.driver_name()
+                ))
+            }
+        }
+        self.updates.set_policy(game_id, policy).map_err(|e| format!("saving the choice: {e}"))
     }
 
     /// Hide a game's notice for `hours`, or while `skip_build` is its newest

@@ -98,7 +98,7 @@ pub fn router_full(
 ) -> Router {
     let state = ApiState {
         agent: agent.clone(),
-        installs: Arc::new(crate::install::Installs::new()),
+        installs: agent.installs(),
         token: token.map(Arc::new),
         pack_dir: pack_dir.map(Arc::new),
         interfaces,
@@ -130,6 +130,7 @@ pub fn router_full(
         .route("/updates/settings", axum::routing::put(set_update_settings))
         .route("/updates/:game/check", post(check_update))
         .route("/updates/:game/snooze", post(snooze_update).delete(unsnooze_update))
+        .route("/updates/:game/policy", axum::routing::put(set_update_policy))
         .route("/games", get(games))
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
@@ -882,7 +883,24 @@ async fn check_update(State(state): State<ApiState>, Path(game): Path<String>) -
         return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
     }
     let notice = state.agent.check_for_update(&game).await.map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    // A game set to download a found build starts now, not on the next tick.
+    state.agent.start_automatic_downloads().await;
     Ok(Json(json!(notice)))
+}
+
+/// `{"on_new_build": "download"}` or `"notify"`: what a found build does for
+/// this game (§12.3). Answers like `GET /updates`.
+async fn set_update_policy(
+    State(state): State<ApiState>,
+    Path(game): Path<String>,
+    Json(policy): Json<crate::updates::GamePolicy>,
+) -> ApiResult<serde_json::Value> {
+    if !state.agent.packs().await.contains_key(&game) {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
+    }
+    state.agent.set_update_policy(&game, policy).await.map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    state.agent.start_automatic_downloads().await;
+    Ok(updates(State(state)).await)
 }
 
 /// `{"hours": 24}` hides a notice for a day; `{"skip_build": true}` hides it

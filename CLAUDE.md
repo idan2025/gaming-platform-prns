@@ -552,6 +552,15 @@ change could quietly break:
   replaces "cancelled". **Nothing is deleted to make room**: the refusal names
   the unused copies that would. Caught by the two reserve tests in
   `tests/update_checks.rs`, which fail with the gate or the watch removed.
+- **A found build downloads by itself only for a game set to "download it"**
+  (`updates::OnNewBuild`, default `Notify`; §12.3). It is the Update
+  button's own path (`install::spawn_update`, same queue and reserve gate),
+  with the old copy **kept**: nothing automatic deletes. A snooze or a skipped
+  build holds it back, and a build it tried is tried again only after the next
+  check, so a download stopped at the reserve does not restart every minute.
+  The queue lives on the agent (`Agent::installs`) so the background loop and
+  the page share it. Caught by
+  `a_found_build_downloads_only_when_the_game_says_so_and_keeps_the_old_copy`.
 
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right

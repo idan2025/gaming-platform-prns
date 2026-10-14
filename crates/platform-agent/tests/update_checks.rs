@@ -4,7 +4,8 @@
 //! Skips itself without Docker, and builds its stand-in steamcmd images from
 //! busybox rather than pulling anything. Its own file, so the reserve test is
 //! not run beside tests that write or free megabytes on the same disk: it
-//! measures free space. Ports 27190–27194 are its own.
+//! measures free space, and its tests take turns (`ONE_AT_A_TIME`). Ports
+//! 27190–27194 are its own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,11 @@ fn ensure_image(tag: &str, dockerfile: &str) -> bool {
     let _ = std::fs::remove_dir_all(&dir);
     matches!(built, Ok(s) if s.success())
 }
+
+/// These tests run one at a time: the reserve tests measure free space, and
+/// "nothing left behind" looks at every task container for the app, so a
+/// download running in a neighbouring test would read as a leftover.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn task_containers() -> String {
     let out = std::process::Command::new("docker")
@@ -172,6 +178,7 @@ fn staging_is_empty(dir: &std::path::Path) -> bool {
 /// A game with no source to ask is never checked.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_check_finds_the_public_build_and_a_skip_hides_only_that_build() {
+    let _one = ONE_AT_A_TIME.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let Some(addr) = serve(dir.path(), CHECK_STEAMCMD, CHECK_DOCKERFILE, Some("100")).await else {
         eprintln!("skipping: no Docker daemon, or no test image");
@@ -227,6 +234,7 @@ async fn a_check_finds_the_public_build_and_a_skip_hides_only_that_build() {
 /// unused copy that would.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_that_does_not_fit_above_the_reserve_never_starts_and_deletes_nothing() {
+    let _one = ONE_AT_A_TIME.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let old = dir.path().join("content/sven-coop/old");
     std::fs::create_dir_all(&old).unwrap();
@@ -274,6 +282,7 @@ async fn an_update_that_does_not_fit_above_the_reserve_never_starts_and_deletes_
 /// staging, and the reason on the page instead of "cancelled".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_download_that_reaches_the_reserve_is_stopped_and_leaves_nothing() {
+    let _one = ONE_AT_A_TIME.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let Some(addr) = serve(dir.path(), BIG_STEAMCMD, BIG_DOCKERFILE, None).await else {
         eprintln!("skipping: no Docker daemon, or no test image");
@@ -309,4 +318,57 @@ async fn a_download_that_reaches_the_reserve_is_stopped_and_leaves_nothing() {
     assert!(!dir.path().join("content/sven-coop/test").exists(), "a stopped download installed");
     assert!(staging_is_empty(dir.path()), "staging left behind");
     assert_eq!(task_containers(), "", "the task container outlived the stop");
+}
+
+/// "Tell me" (the default) downloads nothing; "download it" fetches the found
+/// build beside the old copy through the same path as Update, and deletes
+/// nothing. A game with no source to ask cannot be set to download.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_build_downloads_only_when_the_game_says_so_and_keeps_the_old_copy() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let Some(addr) = serve(dir.path(), CHECK_STEAMCMD, CHECK_DOCKERFILE, Some("100")).await else {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    };
+    let (status, notice) =
+        send(reqwest::Method::POST, addr, "/updates/sven-coop/check", json!({})).await;
+    assert_eq!(status, 200, "{notice}");
+    assert_eq!(notice["available"], true, "{notice}");
+    assert_eq!(notice["on_new_build"], "notify", "telling is the default: {notice}");
+    let idle = get(addr, "/content/sven-coop").await;
+    assert_eq!(idle["status"]["state"], "idle", "a notice alone downloads nothing: {idle}");
+
+    let (status, err) = send(
+        reqwest::Method::PUT,
+        addr,
+        "/updates/handmade/policy",
+        json!({"on_new_build": "download"}),
+    )
+    .await;
+    assert_eq!(status, 409, "a manual game has nothing to download: {err}");
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        addr,
+        "/updates/sven-coop/policy",
+        json!({"on_new_build": "download"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let done = wait_install(addr).await;
+    assert_eq!(done["status"]["state"], "done", "the found build downloads by itself: {done}");
+    assert_eq!(done["status"]["update"]["to_build"], "300", "{done}");
+    assert_eq!(done["status"]["update"]["old"], "kept", "nothing automatic deletes: {done}");
+    assert!(
+        dir.path().join("content/sven-coop/test/steamapps").is_dir(),
+        "the old copy is still there"
+    );
+
+    let after = get(addr, "/updates").await;
+    let game = &after["games"][0];
+    assert_eq!(game["installed_build"], "300", "new servers use the new copy: {after}");
+    assert_eq!(game["available"], false, "{after}");
+    assert_eq!(game["on_new_build"], "download", "{after}");
+    assert!(task_containers().is_empty(), "no task container is left behind");
 }

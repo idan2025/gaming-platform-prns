@@ -21,7 +21,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36) |
-| 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **started**: checks, snooze, reserve, queue |
+| 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **started**: checks, snooze, reserve, queue (v0.2.37); automatic download |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 Recommended first: **1 and 2.** They remove the most friction for a new player:
@@ -401,12 +401,14 @@ unused and can be deleted from the page.
 
 ## 12. Node: update checks, storage-safe downloads, moving servers
 
-**Status (2026-10-13): steps 1 and 2 are built** — checks, the notice,
-snooze, the reserve, the queue (`updates.rs`, `CLAUDE.md` has the rules).
+**Status (2026-10-14): steps 1–3 are built** — checks, the notice,
+snooze, the reserve, the queue (`updates.rs`, `CLAUDE.md` has the rules), and
+per game "download it" (`OnNewBuild`, a link on the Installed row; the full
+settings section is still step 5).
 Where it departs from the text below, the code is right: the routes are their
 own resource, `/updates` (a static segment under `/content/:game` would shadow
 a version of that name for `DELETE`); and steamcmd nests `branches` inside
-`depots`, measured. Steps 3–5 are open.
+`depots`, measured. Steps 4–5 are open.
 
 Builds on item 11's **Update** button
 (`Provisioner::update`, `Agent::update_content`, `active.rs`), which already

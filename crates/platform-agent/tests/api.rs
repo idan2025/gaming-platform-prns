@@ -146,6 +146,7 @@ async fn without_the_token_every_route_is_refused() {
         (reqwest::Method::POST, "/updates/sven-coop/check"),
         (reqwest::Method::POST, "/updates/sven-coop/snooze"),
         (reqwest::Method::PUT, "/updates/settings"),
+        (reqwest::Method::PUT, "/updates/sven-coop/policy"),
     ] {
         let status = client
             .request(method.clone(), format!("http://{addr}{path}"))

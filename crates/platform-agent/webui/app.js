@@ -2007,6 +2007,23 @@ async function onCheckUpdate(gameId) {
     u.checking.delete(gameId);
     renderInstalled();
     renderInstalledBadge();
+    // A game set to download found builds may have started one.
+    pollInstalled();
+  }
+}
+
+// What a found build does for this game (updates.rs OnNewBuild).
+async function onUpdatePolicy(gameId, onNewBuild) {
+  try {
+    ingestUpdates(await withInFlight(api("PUT", "/updates/" + encodeURIComponent(gameId) + "/policy", { on_new_build: onNewBuild })));
+    clearError();
+    toast(onNewBuild === "download"
+      ? gameName(gameId) + ": new builds download automatically. Servers keep running on this copy."
+      : gameName(gameId) + ": new builds wait for you to press Update.");
+    pollInstalled();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "That did not save.");
   }
 }
 
@@ -2141,10 +2158,13 @@ function buildUpdateLine(n, downloading) {
     return line;
   }
   const when = n.checked_unix ? " Checked " + ago(n.checked_unix) + "." : "";
+  const auto = n.on_new_build === "download";
   if (n.available === true && !n.snoozed) {
     const text = el("span");
     text.append(el("strong", "new", "New build " + n.latest_build), " — this copy has " + n.installed_build + "." + when +
-      (downloading ? "" : " Update… downloads it beside this copy."));
+      (downloading ? (auto ? " Downloading it by itself." : "")
+        : auto ? " It downloads by itself when there is room; Update… does it now."
+        : " Update… downloads it beside this copy."));
     line.appendChild(text);
     line.append(
       btn("Remind me tomorrow", "Hide this for a day.", () => onSnoozeUpdate(n.game_id, { hours: 24 })),
@@ -2167,6 +2187,11 @@ function buildUpdateLine(n, downloading) {
     line.appendChild(el("span", null, n.checked_unix ? "No answer from Steam yet." : "Not checked for new builds yet."));
     line.appendChild(checkNow);
   }
+  line.appendChild(auto
+    ? btn("Downloads new builds automatically · turn off", "Go back to being told about a new build and pressing Update yourself.",
+      () => onUpdatePolicy(n.game_id, "notify"))
+    : btn("Download new builds automatically", "When a check finds a new build, download it beside this copy, within the disk reserve. " +
+      "Servers keep running on this copy; nothing is deleted.", () => onUpdatePolicy(n.game_id, "download")));
   if (n.error) {
     const err = el("span", "bad-text", "Last check failed: " + n.error);
     err.title = n.error;
