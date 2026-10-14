@@ -99,7 +99,7 @@ async fn without_the_token_every_route_is_refused() {
     for path in [
         "/health", "/capacity", "/instances", "/orphans", "/games", "/usage", "/storage",
         "/orphans/summary", "/instances/x/logs", "/instances/x/players", "/content",
-        "/content/sven-coop", "/updates", "/restart-schedules", "/instances/x/backups",
+        "/content/sven-coop", "/updates", "/restart-schedules", "/instances/x/backups", "/backups", "/instances/x/backup-schedule", "/instances/x/backups/20261014-051002.tar.gz/file",
     ] {
         let status = client
             .get(format!("http://{addr}{path}"))
@@ -155,6 +155,9 @@ async fn without_the_token_every_route_is_refused() {
         (reqwest::Method::POST, "/instances/anything/backups"),
         (reqwest::Method::POST, "/instances/anything/backups/20261014-051002.tar.gz/restore"),
         (reqwest::Method::DELETE, "/instances/anything/backups/20261014-051002.tar.gz"),
+        (reqwest::Method::PUT, "/instances/anything/backup-schedule"),
+        (reqwest::Method::DELETE, "/backups/anything"),
+        (reqwest::Method::POST, "/instances/anything/backups/import"),
     ] {
         let status = client
             .request(method.clone(), format!("http://{addr}{path}"))

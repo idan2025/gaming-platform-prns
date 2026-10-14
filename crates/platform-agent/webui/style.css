@@ -236,9 +236,15 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .card-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
 .card-actions .btn { flex: 1; }
 .backup-list { display: grid; gap: 6px; max-height: 260px; overflow: auto; margin: 8px 0; }
-.backup-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--surface-2); border-radius: var(--radius); }
-.backup-when { font-weight: 600; flex: 1; min-width: 0; }
-.backup-actions { display: flex; gap: 6px; }
+.backup-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px; background: var(--surface-2); border-radius: var(--radius); }
+.backup-when { font-weight: 600; flex: 1 0 auto; white-space: nowrap; }
+.backup-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+#backups-dialog .form-actions { flex-wrap: wrap; }
+.backup-sub { margin-left: 16px; padding: 6px 10px; }
+.backup-schedule { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 4px; }
+.backup-schedule label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; }
+.backup-schedule select.field { width: auto; min-width: 0; max-width: 100%; }
+.modal .backup-schedule input[type="number"] { width: 5em; }
 .btn-danger-text { color: var(--bad); }
 .schedule-hours { margin: 8px 0 4px 24px; }
 .console-form { display: flex; gap: 8px; margin-top: 8px; }

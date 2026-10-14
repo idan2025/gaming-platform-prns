@@ -556,6 +556,21 @@ mount keeps a source. A backup is held to the disk reserve and written beside
 and renamed. Backups live in `backups/<id>/`, outside the instance folder, and
 outlive the server. Caught by
 `a_backup_brings_a_servers_files_back_and_only_while_it_is_stopped`.
+**A backup schedule deletes only the backups it made** (their names are in
+`backup-schedule.json`, beside the instance), never one made by hand; a lost
+schedule file turns its backups into hand-made ones, the safe direction. It
+backs up only a running server, and records the attempt first. A removed
+server's backups are listed (`GET /backups`) and deleted only when asked; all
+at once (`DELETE /backups/:id`) only once the server is gone. Caught by
+`a_schedule_prunes_only_its_own_backups_and_a_removed_servers_stay`.
+**A backup can leave as a file and come in as one** (`GET
+/instances/:id/backups/:name/file`, `POST /instances/:id/backups/import`).
+An upload is streamed to a hidden partial file (never held in memory), needs
+a `Content-Length` held to the disk reserve and 4 GB, and is kept only if
+`backups::check_archive` extracts it under `content::extract`'s checks into
+`writable/` and nothing else; then it gets an agent-made name. Caught by
+`a_backup_exported_as_a_file_imports_and_restores_and_a_stranger_file_does_not`,
+which fails if the check is skipped.
 
 **A game's files can be updated from the node** (2026-10-13,
 `Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later
