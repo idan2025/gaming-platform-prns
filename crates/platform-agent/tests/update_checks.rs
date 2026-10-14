@@ -85,6 +85,15 @@ async fn serve(
     dockerfile: &str,
     build: Option<&str>,
 ) -> Option<std::net::SocketAddr> {
+    serve_agent(dir, steamcmd, dockerfile, build).await.map(|(addr, _)| addr)
+}
+
+async fn serve_agent(
+    dir: &std::path::Path,
+    steamcmd: &str,
+    dockerfile: &str,
+    build: Option<&str>,
+) -> Option<(std::net::SocketAddr, Arc<Agent>)> {
     if !ensure_image(steamcmd, dockerfile) {
         return None;
     }
@@ -129,11 +138,11 @@ content_version = "test"
     );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
     let addr = listener.local_addr().ok()?;
-    let router = api::router(agent);
+    let router = api::router(agent.clone());
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    Some(addr)
+    Some((addr, agent))
 }
 
 async fn get(addr: std::net::SocketAddr, path: &str) -> Value {
@@ -371,4 +380,49 @@ async fn a_found_build_downloads_only_when_the_game_says_so_and_keeps_the_old_co
     assert_eq!(game["available"], false, "{after}");
     assert_eq!(game["on_new_build"], "download", "{after}");
     assert!(task_containers().is_empty(), "no task container is left behind");
+}
+
+/// A game's own interval runs with the node's checks off, and "never" stops
+/// a game's checks with the node's on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_game_checks_on_its_own_interval_or_not_at_all() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let Some((addr, agent)) =
+        serve_agent(dir.path(), CHECK_STEAMCMD, CHECK_DOCKERFILE, Some("100")).await
+    else {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    };
+    agent.check_due_updates().await;
+    assert_eq!(
+        get(addr, "/updates").await["games"][0]["checked_unix"],
+        Value::Null,
+        "all off: nothing runs"
+    );
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        addr,
+        "/updates/sven-coop/policy",
+        json!({ "check_every_hours": 6 }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    agent.check_due_updates().await;
+    let checked = get(addr, "/updates").await;
+    assert_eq!(checked["games"][0]["latest_build"], "300", "its own interval ran: {checked}");
+    assert_eq!(checked["games"][0]["policy"]["check_every_hours"], 6, "{checked}");
+
+    // Never, with the node checking every hour and the last check made long ago.
+    send(reqwest::Method::PUT, addr, "/updates/sven-coop/policy", json!({ "checks_off": true }))
+        .await;
+    send(reqwest::Method::PUT, addr, "/updates/settings", json!({ "check_every_hours": 1 })).await;
+    let before = get(addr, "/updates").await["games"][0]["checked_unix"].clone();
+    agent.check_due_updates().await;
+    assert_eq!(
+        get(addr, "/updates").await["games"][0]["checked_unix"],
+        before,
+        "a game set to never is not checked"
+    );
 }

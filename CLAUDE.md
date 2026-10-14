@@ -590,6 +590,14 @@ later change could quietly break:
 - **One move at a time per node** (`move_lock`), and the crash watch leaves a
   server alone while its move watches it. A stopped server is not moved; it
   moves once it runs again.
+- **A game's choices are a patch, never a whole record** (`PolicyPatch`): a
+  page that saves one field must not reset the others. They live in
+  `content-updates.json` beside the node-wide settings, never in `agent.toml`.
+  A game's own check interval runs with the node's off, and "never" stops it
+  with the node's on (`GamePolicy::check_hours`,
+  `a_game_checks_on_its_own_interval_or_not_at_all`). The per-game section on
+  the Installed page is rebuilt from `GET /updates` only, never while one of
+  its controls has focus.
 
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right

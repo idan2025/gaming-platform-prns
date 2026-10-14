@@ -114,6 +114,9 @@ pub enum MoveServers {
     /// Inside a daily window, once nobody is playing, or with players on if
     /// the operator allowed a forced move.
     Window,
+    /// From a set date on, the same way: once nobody is playing, or with
+    /// players on if a forced move is allowed.
+    Once,
 }
 
 /// The operator's choices for one game. Kept apart from [`Settings`] so a
@@ -134,6 +137,16 @@ pub struct GamePolicy {
     /// game. Off unless the operator turns it on (decided 2026-10-13).
     #[serde(default)]
     pub force_in_window: bool,
+    /// For [`MoveServers::Once`]: when, in unix seconds.
+    #[serde(default)]
+    pub move_at_unix: Option<i64>,
+    /// Hours between this game's checks, over the node's interval; `None`
+    /// follows the node's (§12.1's per-game override).
+    #[serde(default)]
+    pub check_every_hours: Option<u32>,
+    /// Never check this game, whatever the node's interval.
+    #[serde(default)]
+    pub checks_off: bool,
 }
 
 fn default_window_end() -> u8 {
@@ -150,6 +163,9 @@ impl Default for GamePolicy {
             window_start_utc: 0,
             window_end_utc: default_window_end(),
             force_in_window: false,
+            move_at_unix: None,
+            check_every_hours: None,
+            checks_off: false,
         }
     }
 }
@@ -162,6 +178,10 @@ pub struct PolicyPatch {
     pub window_start_utc: Option<u8>,
     pub window_end_utc: Option<u8>,
     pub force_in_window: Option<bool>,
+    pub move_at_unix: Option<i64>,
+    /// `0` goes back to following the node's interval.
+    pub check_every_hours: Option<u32>,
+    pub checks_off: Option<bool>,
 }
 
 impl GamePolicy {
@@ -181,6 +201,21 @@ impl GamePolicy {
         if let Some(v) = patch.force_in_window {
             self.force_in_window = v;
         }
+        if let Some(v) = patch.check_every_hours {
+            if v > MAX_CHECK_EVERY_HOURS {
+                return Err(format!("a check interval is at most {MAX_CHECK_EVERY_HOURS} hours"));
+            }
+            self.check_every_hours = (v > 0).then_some(v);
+        }
+        if let Some(v) = patch.checks_off {
+            self.checks_off = v;
+        }
+        if let Some(v) = patch.move_at_unix {
+            self.move_at_unix = Some(v);
+        }
+        if self.move_servers == MoveServers::Once && self.move_at_unix.is_none() {
+            return Err("moving on a date needs the date".into());
+        }
         if self.window_start_utc > 23 || self.window_end_utc > 23 {
             return Err("a window's hours are 0 to 23".into());
         }
@@ -188,6 +223,15 @@ impl GamePolicy {
             return Err("a window has to be at least an hour long".into());
         }
         Ok(self)
+    }
+
+    /// Hours between this game's checks given the node's interval, or `None`
+    /// when it is not checked.
+    pub fn check_hours(&self, node: Option<u32>) -> Option<u32> {
+        if self.checks_off {
+            return None;
+        }
+        self.check_every_hours.or(node)
     }
 
     /// Whether `utc_hour` is inside the window.
@@ -200,33 +244,57 @@ impl GamePolicy {
         }
     }
 
-    /// What to do now with a running server that is not on the copy new
-    /// servers use. `humans` is how many people are on it, bots left out, and
-    /// `None` when the game could not be asked; `can_warn` is whether its game
-    /// has a console to warn them on.
-    pub fn move_decision(&self, humans: Option<u32>, utc_hour: u8, can_warn: bool) -> MoveDecision {
+    /// What to do now (`now`, unix seconds) with a running server that is not
+    /// on the copy new servers use. `humans` is how many people are on it,
+    /// bots left out, and `None` when the game could not be asked;
+    /// `can_warn` is whether its game has a console to warn them on.
+    pub fn move_decision(&self, humans: Option<u32>, now: i64, can_warn: bool) -> MoveDecision {
         let empty = humans == Some(0);
         let busy = || match humans {
             Some(n) => format!("{n} playing"),
             None => "it cannot be asked whether anyone is playing".to_string(),
         };
-        match self.move_servers {
-            MoveServers::Never => MoveDecision::Stay,
-            MoveServers::WhenEmpty if empty => MoveDecision::Move,
-            MoveServers::WhenEmpty => MoveDecision::Wait(format!("waiting for it to empty: {}", busy())),
-            MoveServers::Window if !self.in_window(utc_hour) => MoveDecision::Wait(format!(
-                "waiting for the window, {:02}:00 to {:02}:00 UTC",
-                self.window_start_utc, self.window_end_utc
-            )),
-            MoveServers::Window if empty => MoveDecision::Move,
-            MoveServers::Window if self.force_in_window && can_warn => MoveDecision::WarnThenMove,
-            MoveServers::Window if self.force_in_window => MoveDecision::Wait(format!(
+        let utc_hour = (now.rem_euclid(86_400) / 3600) as u8;
+        let (open, not_yet) = match self.move_servers {
+            MoveServers::Never => return MoveDecision::Stay,
+            MoveServers::WhenEmpty if empty => return MoveDecision::Move,
+            MoveServers::WhenEmpty => {
+                return MoveDecision::Wait(format!("waiting for it to empty: {}", busy()))
+            }
+            MoveServers::Window => (
+                self.in_window(utc_hour),
+                format!(
+                    "waiting for the window, {:02}:00 to {:02}:00 UTC",
+                    self.window_start_utc, self.window_end_utc
+                ),
+            ),
+            MoveServers::Once => {
+                let at = self.move_at_unix.unwrap_or(i64::MAX);
+                (now >= at, format!("waiting for {}", utc_stamp(at)))
+            }
+        };
+        if !open {
+            MoveDecision::Wait(not_yet)
+        } else if empty {
+            MoveDecision::Move
+        } else if self.force_in_window && can_warn {
+            MoveDecision::WarnThenMove
+        } else if self.force_in_window {
+            MoveDecision::Wait(format!(
                 "waiting for it to empty: {}. Its game has no console to warn players on, so it is never moved with them on",
                 busy()
-            )),
-            MoveServers::Window => MoveDecision::Wait(format!("in the window, waiting for it to empty: {}", busy())),
+            ))
+        } else {
+            MoveDecision::Wait(format!("waiting for it to empty: {}", busy()))
         }
     }
+}
+
+/// `2026-10-14 04:00 UTC`.
+fn utc_stamp(unix: i64) -> String {
+    let (y, m, d) = crate::agent::civil_from_days(unix.div_euclid(86_400));
+    let secs = unix.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, secs % 3600 / 60)
 }
 
 /// What [`GamePolicy::move_decision`] says to do.
@@ -621,11 +689,11 @@ mod tests {
     #[test]
     fn a_server_that_cannot_be_asked_is_never_empty() {
         let p = GamePolicy { move_servers: MoveServers::WhenEmpty, ..Default::default() };
-        assert_eq!(p.move_decision(Some(0), 12, true), MoveDecision::Move);
-        assert!(matches!(p.move_decision(None, 12, true), MoveDecision::Wait(_)));
-        assert!(matches!(p.move_decision(Some(2), 12, true), MoveDecision::Wait(_)));
+        assert_eq!(p.move_decision(Some(0), 12 * 3600, true), MoveDecision::Move);
+        assert!(matches!(p.move_decision(None, 12 * 3600, true), MoveDecision::Wait(_)));
+        assert!(matches!(p.move_decision(Some(2), 12 * 3600, true), MoveDecision::Wait(_)));
         assert_eq!(
-            GamePolicy::default().move_decision(Some(0), 12, true),
+            GamePolicy::default().move_decision(Some(0), 12 * 3600, true),
             MoveDecision::Stay,
             "never is the default"
         );
@@ -644,19 +712,19 @@ mod tests {
         assert!(p.in_window(23) && p.in_window(0) && p.in_window(3));
         assert!(!p.in_window(4) && !p.in_window(12));
         assert!(
-            matches!(p.move_decision(Some(0), 12, true), MoveDecision::Wait(_)),
+            matches!(p.move_decision(Some(0), 12 * 3600, true), MoveDecision::Wait(_)),
             "outside the window"
         );
-        assert_eq!(p.move_decision(Some(0), 1, true), MoveDecision::Move);
+        assert_eq!(p.move_decision(Some(0), 3600, true), MoveDecision::Move);
         assert!(
-            matches!(p.move_decision(Some(3), 1, true), MoveDecision::Wait(_)),
+            matches!(p.move_decision(Some(3), 3600, true), MoveDecision::Wait(_)),
             "no force by default"
         );
         let forced = GamePolicy { force_in_window: true, ..p.clone() };
-        assert_eq!(forced.move_decision(Some(3), 1, true), MoveDecision::WarnThenMove);
-        assert_eq!(forced.move_decision(None, 1, true), MoveDecision::WarnThenMove);
+        assert_eq!(forced.move_decision(Some(3), 3600, true), MoveDecision::WarnThenMove);
+        assert_eq!(forced.move_decision(None, 3600, true), MoveDecision::WarnThenMove);
         assert!(
-            matches!(forced.move_decision(Some(3), 1, false), MoveDecision::Wait(_)),
+            matches!(forced.move_decision(Some(3), 3600, false), MoveDecision::Wait(_)),
             "no console, no force"
         );
     }
@@ -685,5 +753,58 @@ mod tests {
                 ..Default::default()
             })
             .is_err());
+    }
+
+    /// A game follows the node's interval unless it has its own, or is off.
+    #[test]
+    fn a_game_can_check_on_its_own_interval_or_not_at_all() {
+        let p = GamePolicy::default();
+        assert_eq!(p.check_hours(None), None, "off with the node");
+        assert_eq!(p.check_hours(Some(24)), Some(24));
+        let own = p
+            .clone()
+            .patched(PolicyPatch { check_every_hours: Some(6), ..Default::default() })
+            .unwrap();
+        assert_eq!(own.check_hours(None), Some(6), "its own interval runs with the node's off");
+        assert_eq!(own.check_hours(Some(24)), Some(6));
+        let back =
+            own.patched(PolicyPatch { check_every_hours: Some(0), ..Default::default() }).unwrap();
+        assert_eq!(back.check_hours(Some(24)), Some(24), "0 follows the node again");
+        let off =
+            back.patched(PolicyPatch { checks_off: Some(true), ..Default::default() }).unwrap();
+        assert_eq!(off.check_hours(Some(24)), None);
+        assert!(GamePolicy::default()
+            .patched(PolicyPatch {
+                check_every_hours: Some(MAX_CHECK_EVERY_HOURS + 1),
+                ..Default::default()
+            })
+            .is_err());
+    }
+
+    /// A date waits until it comes, then moves like a window that stays open.
+    #[test]
+    fn a_date_waits_until_it_comes() {
+        let at = 1_791_000_000;
+        let p = GamePolicy::default()
+            .patched(PolicyPatch {
+                move_servers: Some(MoveServers::Once),
+                move_at_unix: Some(at),
+                ..Default::default()
+            })
+            .unwrap();
+        let MoveDecision::Wait(why) = p.move_decision(Some(0), at - 1, true) else { panic!() };
+        assert!(why.ends_with("UTC"), "{why}");
+        assert_eq!(p.move_decision(Some(0), at, true), MoveDecision::Move);
+        assert!(matches!(p.move_decision(Some(2), at + 99, true), MoveDecision::Wait(_)));
+        assert!(
+            GamePolicy::default()
+                .patched(PolicyPatch {
+                    move_servers: Some(MoveServers::Once),
+                    ..Default::default()
+                })
+                .is_err(),
+            "a date needs the date"
+        );
+        assert_eq!(utc_stamp(0), "1970-01-01 00:00 UTC");
     }
 }
