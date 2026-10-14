@@ -244,6 +244,13 @@ async fn a_client_with_extra_ports_sends_none_of_them_to_a_v1_server() {
     // announces generation 1 exactly like a deployed v0.1.10 peer.
     let mut server_profile = source_profile(game_port, 0, 0);
     server_profile.extra_ports = Vec::new();
+    // A name no other test in this binary announces. The client takes the
+    // first server of its game it hears, and the tests here run at once on
+    // ports picked by binding and releasing; two meshes that meet through a
+    // reused port let this client take a neighbour's generation-2 server and
+    // send it channel 2 — which answered, failing this test on CI while the
+    // gate was fine.
+    server_profile.app_name = "multi-port-v1-peer-test".to_string();
     assert_eq!(server_profile.protocol_version(), FRAMING_V1);
 
     let mut server_args = ServerArgs::new(server_profile);
@@ -257,7 +264,9 @@ async fn a_client_with_extra_ports_sends_none_of_them_to_a_v1_server() {
 
     // The client's own pack says three ports. Its own capability is not the
     // question; the peer's is.
-    let mut client_args = ClientArgs::new(source_profile(game_port, 1, 2));
+    let mut client_profile = source_profile(game_port, 1, 2);
+    client_profile.app_name = "multi-port-v1-peer-test".to_string();
+    let mut client_args = ClientArgs::new(client_profile);
     client_args.identity = dir.join("client.identity");
     client_args.tcp = Some(format!("127.0.0.1:{mesh_port}"));
     client_args.listen_port = listen_port;
@@ -285,11 +294,11 @@ async fn a_client_with_extra_ports_sends_none_of_them_to_a_v1_server() {
 
     // Channel 2 must go nowhere at all.
     let tv_local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let leaked = ask_udp(&tv_local, extra_local[&2], b"ping", Duration::from_secs(5)).await;
     assert!(
-        ask_udp(&tv_local, extra_local[&2], b"ping", Duration::from_secs(5))
-            .await
-            .is_none(),
-        "an extra port must not reach a server that never advertised framing v2"
+        leaked.is_none(),
+        "an extra port must not reach a server that never advertised framing v2 (answered {:?})",
+        leaked.map(|b| String::from_utf8_lossy(&b).into_owned())
     );
 
     // And the game port is unharmed by the attempt.
