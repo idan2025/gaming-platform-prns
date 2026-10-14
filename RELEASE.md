@@ -1622,6 +1622,13 @@ success for the parts that do not need proving.
 ## macOS bundles are unsigned
 
 There is no Apple Developer certificate here, so the `.dmg` is neither signed
-nor notarized and Gatekeeper will refuse it on first open. Right-click → Open,
-or `xattr -d com.apple.quarantine`. Signing is a paid account and a decision
-about identity, not a build flag.
+nor notarized and Gatekeeper will refuse it on first open. macOS 15 removed
+the old right-click → Open bypass: open the app once, let it be refused, then
+System Settings → Privacy & Security → **Open Anyway** (macOS 14 and older:
+right-click → Open). From a terminal, `xattr -d com.apple.quarantine
+/Applications/Lanthorn.app` does the same. This follows Apple's documented
+flow and has not been checked on a real Mac. Signing is a paid account and a
+decision about identity, not a build flag.
+
+The Mac app is **experimental**: browse and join only, no LAN rooms (there is
+no macOS adapter), and nobody on this project has run it.

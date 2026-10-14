@@ -198,14 +198,51 @@ async fn other_peoples_containers_are_not_listed() {
         eprintln!("skipping: no Docker daemon");
         return;
     };
-    let Ok(all) = std::process::Command::new("docker").args(["ps", "-aq"]).output() else {
-        return;
-    };
-    let total = String::from_utf8_lossy(&all.stdout).lines().count();
-    let managed = rt.list_managed().await.unwrap();
-    assert!(managed.len() <= total, "the agent claims more containers than exist");
+    // An unlabelled container of our own, named the way the agent names
+    // its own, so a name prefix alone would claim it.
+    let id = format!("notours{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+    let created = std::process::Command::new("docker")
+        .args(["create", "--name", &name, "busybox", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let managed = rt.list_managed().await;
+    docker_rm(&name);
+    let managed = managed.unwrap();
+    if matches!(created, Ok(s) if s.success()) {
+        assert!(
+            !managed.iter().any(|c| c.instance_id == id),
+            "an unlabelled container turned up in the managed list"
+        );
+    }
+    // Every container listed carries the label, by Docker's own account.
+    // Other tests create and remove containers concurrently, so one that is
+    // gone by the time it is inspected says nothing either way; counting
+    // `docker ps` against the list raced exactly that.
     for c in &managed {
         assert!(!c.instance_id.is_empty(), "a managed container with no instance label");
+        let Ok(out) = std::process::Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                &format!("{{{{index .Config.Labels \"{MANAGED_LABEL}\"}}}}"),
+                &c.container_id,
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let label = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !label.trim().is_empty() && label.trim() != "<no value>",
+            "{} is listed as managed without the label",
+            c.container_id
+        );
     }
 }
 
