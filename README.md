@@ -23,7 +23,7 @@ account, no port forwarding, no central service, and no internet required.
 > | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance; a GoldSrc node image, so Counter-Strike 1.6 and Half-Life actually host; Day of Defeat, TFC and Opposing Force as packs; a Source node image, so Team Fortress 2, Counter-Strike: Source, Garry's Mod, HL2: Deathmatch and DoD: Source host, and six non-Valve Source games |
 > | Mode 3 | LAN rooms | started — a virtual LAN over Reticulum for games that only find each other by LAN broadcast (`PLAN.md` §14): rooms, a Linux and a Windows adapter, OpenTTD played end to end, rooms in the launcher, a room check that says what failed, and Need for Speed: Underground 2 and Most Wanted (2005) as packs |
 >
-> Current release: **v0.2.37**. What changed, release by release, is in
+> Current release: **v0.2.38**. What changed, release by release, is in
 > [`RELEASE.md`](RELEASE.md); building and tagging one is in there too.
 >
 > The working single-host implementation this generalizes is
@@ -205,15 +205,16 @@ the launcher as soon as it starts (v0.2.12). Every binary also answers
 Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
 the last three.
 
+- **v0.2.38** — Lanthorn Host downloads a game's new build by itself if you
+  want, moves servers onto it when they are empty or in a window you set,
+  verifies game files, removes packs, and gives each server a console line, a
+  daily restart window and backups.
 - **v0.2.37** — Lanthorn Host checks Steam for a game's new build on a
   schedule you set, keeps disk space free for running servers (a download
   that would not fit never starts), and runs one download at a time.
 - **v0.2.36** — Lanthorn Host has an Installed page: every copy of a game's
   files with its size and the servers using it, Delete for what nothing uses,
   live download bytes with Cancel, and Update for a Steam game's files.
-- **v0.2.35** — Lanthorn Host lists who is playing, says why a server
-  stopped, can start a crashed server again, and cleans up leftover folders;
-  the launcher warns when a server is heard over a slow radio link.
 
 ## The idea
 

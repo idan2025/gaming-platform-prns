@@ -74,6 +74,42 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.38
+
+### Lanthorn Host: new builds that install themselves, and servers that move onto them
+
+- A game can be set to **download new builds automatically**. It uses the
+  same queue and disk reserve as Update, and keeps the old copy: nothing
+  automatic ever deletes. Remind me tomorrow and Skip build hold it back.
+- **Moving servers onto the new copy** is per game: never (the default), when
+  a server is empty, inside a daily window (optionally with players on, after
+  a warning in game), or once at a date you set. A server keeps its address,
+  name and port. One moves at a time; one that does not come up on the new
+  copy is put back on the old one.
+- Each game's update settings are on the Installed page: its own check
+  interval or none, what to do with a new build, and when to move servers.
+
+### Lanthorn Host: managing a node's games and servers
+
+- **Verify files** checks a game's files against Valve's on a copy, never the
+  one servers use, and lists every file it put back. Servers switch to the
+  repaired copy only when you press **Use this copy**, because a check also
+  undoes changes made on purpose (such as YaPB bots).
+- **Remove a pack** from the Games page. Refused while any server of that game
+  exists or it is downloading; the game's files stay.
+- **Log and console**: type a command at a running server, one line at a time,
+  from the node's own page only.
+- **Daily restart…**: a window per server. It restarts once a day when nobody
+  is on it or, if you allow it, after warning the players.
+- **Backups…**: back up a server's own files (saves, settings, logs) and put
+  them back while it is stopped. Backups are kept after a server is removed.
+- The Installed table no longer overflows at medium window widths.
+
+### Docs
+
+- The Mac app is marked experimental (browse and join, no LAN rooms), and how
+  to open an unsigned app on macOS 15 is written down.
+
 ## v0.2.37
 
 ### Lanthorn Host: knowing when a game has a new build, and never filling the disk
