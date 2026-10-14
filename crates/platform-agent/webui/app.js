@@ -1964,10 +1964,118 @@ function renderUpdatesBar() {
     reserve.value = u.settings.reserve_bytes != null ? String(Math.round(u.settings.reserve_bytes / GB * 10) / 10) : "";
     reserve.placeholder = u.defaultReserve ? String(Math.round(u.defaultReserve / GB * 10) / 10) : "";
   }
+  renderGameSettings();
   $("updates-reserve-note").textContent = u.reserve
     ? "A download does not start if it would leave less than " + formatBytes(u.reserve) + " free, and stops if the disk gets there." +
       (u.settings.reserve_bytes == null ? " Empty is the default: a tenth of the disk, at least 5 GB." : "")
     : "";
+}
+
+// Every game's own choices (updates.rs GamePolicy), saved one field at a time.
+// Rebuilt from GET /updates only, and never while a control in it has focus.
+function renderGameSettings() {
+  const u = state.updates;
+  const box = $("updates-games");
+  const list = $("updates-games-list");
+  if (!box || !list) return;
+  const games = [...u.games.values()].sort((a, b) => gameName(a.game_id).localeCompare(gameName(b.game_id)));
+  box.classList.toggle("hidden", !u.supported || !games.length);
+  if (list.contains(document.activeElement)) return;
+  list.textContent = "";
+  const head = el("div", "ug-row ug-head");
+  head.append(el("div", null, "Game"), el("div", null, "Check for new builds"), el("div", null, "When a new build is found"),
+    el("div", null, "Servers move to it"));
+  list.appendChild(head);
+  const nodeEvery = u.settings && u.settings.check_every_hours;
+  for (const n of games) {
+    const p = n.policy || {};
+    const row = el("div", "ug-row");
+    const select = (label, options, value, onChange) => {
+      const wrap = el("label", "ug-field");
+      wrap.dataset.label = label;
+      const sel = el("select", "field");
+      for (const [v, text] of options) {
+        const o = el("option", null, text);
+        o.value = v;
+        sel.appendChild(o);
+      }
+      sel.value = value;
+      sel.setAttribute("aria-label", gameName(n.game_id) + ": " + label);
+      sel.addEventListener("change", () => onChange(sel.value));
+      wrap.appendChild(sel);
+      return wrap;
+    };
+    const patch = body => saveGamePolicy(n.game_id, body);
+    const checks = p.checks_off ? "off" : p.check_every_hours ? String(p.check_every_hours) : "";
+    const checkOptions = [["", "Like the node (" + (nodeEvery ? everyText(nodeEvery) : "off") + ")"], ["off", "Never"],
+      ["6", "Every 6 hours"], ["12", "Every 12 hours"], ["24", "Every day"], ["168", "Every week"]];
+    if (checks && !checkOptions.some(([v]) => v === checks)) checkOptions.push([checks, "Every " + checks + " hours"]);
+    row.append(el("div", "ug-name", gameName(n.game_id)),
+      select("Check for new builds", checkOptions, checks, v => patch(v === "off" ? { checks_off: true }
+        : { checks_off: false, check_every_hours: v ? Number(v) : 0 })),
+      select("When a new build is found", [["notify", "Tell me"], ["download", "Download it"]], p.on_new_build || "notify",
+        v => patch({ on_new_build: v })),
+      select("Servers move to it", [["never", "Never"], ["when_empty", "When empty"], ["window", "In a daily window"], ["once", "On a date"]],
+        p.move_servers || "never", v => {
+          if (v === "once" && p.move_at_unix == null) {
+            // A date needs one: tomorrow at 05:00 here, changeable below.
+            const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(5, 0, 0, 0);
+            return patch({ move_servers: v, move_at_unix: Math.floor(d.getTime() / 1000) });
+          }
+          return patch({ move_servers: v });
+        }));
+    if (p.move_servers === "window" || p.move_servers === "once") {
+      const more = el("div", "ug-more");
+      if (p.move_servers === "window") {
+        const hours = el("div", "ug-hours");
+        const hourSel = (value, key) => {
+          const sel = el("select", "field");
+          for (let h = 0; h < 24; h++) { const o = el("option", null, localHour(h)); o.value = String(h); sel.appendChild(o); }
+          sel.value = String(value ?? 0);
+          sel.addEventListener("change", () => patch({ [key]: Number(sel.value) }));
+          return sel;
+        };
+        hours.append(hourSel(p.window_start_utc, "window_start_utc"), el("span", "muted small", "to"), hourSel(p.window_end_utc, "window_end_utc"));
+        more.appendChild(hours);
+      } else {
+        const at = el("input", "field");
+        at.type = "datetime-local";
+        const d = new Date((p.move_at_unix || 0) * 1000);
+        const pad = x => String(x).padStart(2, "0");
+        at.value = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+        at.setAttribute("aria-label", gameName(n.game_id) + ": move on");
+        at.addEventListener("change", () => { const t = new Date(at.value).getTime(); if (t) patch({ move_at_unix: Math.floor(t / 1000) }); });
+        more.appendChild(at);
+      }
+      const force = el("label", "check");
+      const box2 = el("input");
+      box2.type = "checkbox";
+      box2.checked = !!p.force_in_window;
+      box2.addEventListener("change", () => patch({ force_in_window: box2.checked }));
+      force.append(box2, el("span", "small", "Also with players on, after a warning in game"));
+      more.appendChild(force);
+      row.appendChild(more);
+    }
+    list.appendChild(row);
+  }
+}
+
+function everyText(h) {
+  return h % 168 === 0 ? (h === 168 ? "every week" : "every " + h / 168 + " weeks")
+    : h % 24 === 0 ? (h === 24 ? "every day" : "every " + h / 24 + " days") : "every " + h + " hours";
+}
+
+async function saveGamePolicy(gameId, body) {
+  try {
+    if (document.activeElement && $("updates-games-list").contains(document.activeElement)) document.activeElement.blur();
+    ingestUpdates(await withInFlight(api("PUT", "/updates/" + encodeURIComponent(gameId) + "/policy", body)));
+    clearError();
+    toast(gameName(gameId) + ": saved.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "That did not save.");
+    renderGameSettings();
+  }
 }
 
 async function saveUpdateSettings() {
@@ -2193,91 +2301,21 @@ function localHour(utcHour) {
 function moveSummary(p) {
   if (!p || p.move_servers === "never") return "Servers stay on their copy";
   if (p.move_servers === "when_empty") return "Servers move when empty";
+  if (p.move_servers === "once") return "Servers move from " + new Date((p.move_at_unix || 0) * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) +
+    (p.force_in_window ? ", players warned" : ", when empty");
   return "Servers move " + localHour(p.window_start_utc) + "–" + localHour(p.window_end_utc) +
     (p.force_in_window ? ", players warned" : ", when empty");
 }
 
-// When this game's servers move onto the copy new servers use (updates.rs MoveServers).
+// Open the per-game settings at this game's row.
 function onMovePolicy(n) {
-  const p = n.policy || { move_servers: "never", window_start_utc: 0, window_end_utc: 6, force_in_window: false };
-  openModal("move-dialog", n.game_id, (body, close) => {
-    body.appendChild(el("h3", null, "Moving " + gameName(n.game_id) + " servers to a new copy"));
-    body.appendChild(el("p", "muted small",
-      "After an update, servers keep the copy they started on. Moving one restarts it on the new copy with the same name, " +
-      "port and address. One server at a time; if it does not stay up, it goes back to its old copy."));
-    const choice = (value, text, sub) => {
-      const wrap = el("label", "check move-choice");
-      const r = el("input");
-      r.type = "radio";
-      r.name = "move-servers";
-      r.value = value;
-      r.checked = p.move_servers === value;
-      const t = el("span");
-      t.append(el("strong", null, text), el("span", "muted small", " " + sub));
-      wrap.append(r, t);
-      body.appendChild(wrap);
-      return r;
-    };
-    choice("never", "Never", "— they stay until you restart them on the new copy yourself.");
-    choice("when_empty", "When empty", "— as soon as nobody is playing. A server that does not answer is never treated as empty.");
-    const windowed = choice("window", "In a window", "— every day between these hours, once nobody is playing.");
-    const hours = el("div", "move-hours");
-    const hourSelect = (value) => {
-      const sel = el("select");
-      for (let h = 0; h < 24; h++) {
-        const o = el("option", null, localHour(h));
-        o.value = String(h);
-        sel.appendChild(o);
-      }
-      sel.value = String(value);
-      return sel;
-    };
-    const start = hourSelect(p.window_start_utc);
-    const end = hourSelect(p.window_end_utc);
-    hours.append(el("span", "muted small", "From "), start, el("span", "muted small", " to "), end,
-      el("span", "muted small", " your time"));
-    body.appendChild(hours);
-    const forceWrap = el("label", "check move-choice move-force");
-    const force = el("input");
-    force.type = "checkbox";
-    force.checked = !!p.force_in_window;
-    forceWrap.append(force, el("span", null, "In the window, move it with players on: they are warned in game a minute before"));
-    body.appendChild(forceWrap);
-    const sync = () => {
-      const on = windowed.checked;
-      start.disabled = end.disabled = force.disabled = !on;
-    };
-    body.querySelectorAll('input[name="move-servers"]').forEach(r => r.addEventListener("change", sync));
-    sync();
-    const actions = el("div", "form-actions");
-    actions.style.marginTop = "8px";
-    const cancel = el("button", "btn", "Cancel");
-    cancel.type = "button";
-    cancel.onclick = close;
-    const save = el("button", "btn btn-primary", "Save");
-    save.type = "button";
-    save.addEventListener("click", async () => {
-      const picked = body.querySelector('input[name="move-servers"]:checked');
-      const patch = { move_servers: picked ? picked.value : "never" };
-      if (patch.move_servers === "window") {
-        if (start.value === end.value) { showError("A window has to be at least an hour long."); return; }
-        Object.assign(patch, { window_start_utc: Number(start.value), window_end_utc: Number(end.value), force_in_window: force.checked });
-      }
-      save.disabled = true;
-      try {
-        ingestUpdates(await withInFlight(api("PUT", "/updates/" + encodeURIComponent(n.game_id) + "/policy", patch)));
-        clearError();
-        close();
-        toast(gameName(n.game_id) + ": " + moveSummary(state.updates.games.get(n.game_id)?.policy).toLowerCase() + ".");
-      } catch (e) {
-        if (e && e.__auth) { close(); return; }
-        showError((e && e.error) || "That did not save.");
-        save.disabled = false;
-      }
-    });
-    actions.append(cancel, save);
-    body.appendChild(actions);
-  });
+  const box = $("updates-games");
+  if (!box) return;
+  box.open = true;
+  renderGameSettings();
+  const sel = box.querySelector('select[aria-label="' + CSS.escape(gameName(n.game_id)) + ': Servers move to it"]');
+  box.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (sel) sel.focus({ preventScroll: true });
 }
 
 function ago(unix) {

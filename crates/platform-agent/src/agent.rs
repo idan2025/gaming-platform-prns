@@ -368,7 +368,7 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 /// Year, month and day of a day count since 1970-01-01 (Howard Hinnant's
 /// `civil_from_days`), so naming a version needs no date crate.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -1915,16 +1915,17 @@ impl Agent {
         out
     }
 
-    /// Run every check that is due under the operator's interval (nothing
-    /// while checks are off, the default), then start the downloads a game's
+    /// Run every check that is due under the operator's interval, the node's
+    /// or the game's own (nothing while both are off, the default), then start
+    /// the downloads a game's
     /// "download it" asks for (§12.3).
     pub async fn check_due_updates(self: &Arc<Self>) {
-        if let Some(hours) = self.updates.settings().check_every_hours {
-            let now = now_unix();
-            for notice in self.update_notices().await {
-                if self.updates.game(&notice.game_id).due(now, hours) {
-                    let _ = self.check_for_update(&notice.game_id).await;
-                }
+        let node = self.updates.settings().check_every_hours;
+        let now = now_unix();
+        for notice in self.update_notices().await {
+            let Some(hours) = self.updates.policy(&notice.game_id).check_hours(node) else { continue };
+            if self.updates.game(&notice.game_id).due(now, hours) {
+                let _ = self.check_for_update(&notice.game_id).await;
             }
         }
         self.start_automatic_downloads().await;
@@ -2185,7 +2186,6 @@ impl Agent {
                 containers.iter().any(|c| &c.instance_id == id) && !matches!(r.state, MoveState::Waiting { .. })
             });
         }
-        let hour = (now_unix().rem_euclid(86_400) / 3600) as u8;
         let games: Vec<(String, bool)> =
             self.packs.read().await.values().map(|p| (p.id.clone(), p.console.is_some())).collect();
         for (game_id, can_warn) in games {
@@ -2220,7 +2220,7 @@ impl Agent {
                     Some(i) => self.humans_on(i).await,
                     None => None,
                 };
-                let warn = match policy.move_decision(humans, hour, can_warn) {
+                let warn = match policy.move_decision(humans, now_unix(), can_warn) {
                     crate::updates::MoveDecision::Stay => continue,
                     crate::updates::MoveDecision::Wait(why) => {
                         self.log_move(&c.instance_id, &game_id, &from, &to, MoveState::Waiting { why });
