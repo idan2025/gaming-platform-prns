@@ -75,6 +75,9 @@ pub enum InstallState {
         already_installed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         update: Option<crate::agent::UpdateReport>,
+        /// Present when this was a check of the files (`Agent::verify_content`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verify: Option<Box<crate::agent::VerifyReport>>,
     },
     /// Failed, carrying the sentence the operator has to act on.
     Failed { error: String },
@@ -299,10 +302,10 @@ pub async fn spawn(
         let outcome = watched(&agent, &progress, agent.ensure_content_tracked(&game_id, Some(&progress))).await;
         let state = match outcome {
             Ok(crate::content::Provisioned::AlreadyInstalled(_)) => {
-                InstallState::Done { bytes: 0, already_installed: true, update: None }
+                InstallState::Done { bytes: 0, already_installed: true, update: None, verify: None }
             }
             Ok(crate::content::Provisioned::Installed { bytes, .. }) => {
-                InstallState::Done { bytes, already_installed: false, update: None }
+                InstallState::Done { bytes, already_installed: false, update: None, verify: None }
             }
             // The sentence is the product here: it names the missing directory,
             // the digest that did not match, or the switch the operator has not
@@ -347,11 +350,45 @@ pub async fn spawn_update(
             Ok(report) => {
                 tracing::info!(game = %game_id, to = ?report.to_version, old = %report.old, "content update finished");
                 let bytes = 0;
-                InstallState::Done { bytes, already_installed: report.to_version.is_none(), update: Some(report) }
+                InstallState::Done { bytes, already_installed: report.to_version.is_none(), update: Some(report), verify: None }
             }
             Err(e) => {
                 let error = progress.stop_reason().unwrap_or_else(|| format!("{e}"));
                 tracing::warn!(game = %game_id, error = %error, "content update failed");
+                InstallState::Failed { error }
+            }
+        };
+        installs.finish(&game_id, state).await;
+    });
+    true
+}
+
+/// Check a game's files against Valve's in the background
+/// (`Agent::verify_content`), in the same slot and queue as an install or an
+/// update, held to the same reserve: it copies the whole copy first.
+pub async fn spawn_verify(installs: Arc<Installs>, agent: Arc<crate::agent::Agent>, game_id: String) -> bool {
+    let Some(progress) = installs.begin(&game_id).await else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let Some(_turn) = installs.take_turn(&game_id, &progress).await else {
+            installs.finish(&game_id, InstallState::Failed { error: "cancelled".into() }).await;
+            return;
+        };
+        if let Err(error) = agent.room_for(agent.update_needs(&game_id)).await {
+            tracing::warn!(game = %game_id, error = %error, "file check not started");
+            installs.finish(&game_id, InstallState::Failed { error }).await;
+            return;
+        }
+        let outcome = watched(&agent, &progress, agent.verify_content(&game_id, Some(&progress))).await;
+        let state = match outcome {
+            Ok(report) => {
+                tracing::info!(game = %game_id, changed = report.changed_count, kept = ?report.repaired_version, "file check finished");
+                InstallState::Done { bytes: 0, already_installed: true, update: None, verify: Some(Box::new(report)) }
+            }
+            Err(e) => {
+                let error = progress.stop_reason().unwrap_or_else(|| format!("{e}"));
+                tracing::warn!(game = %game_id, error = %error, "file check failed");
                 InstallState::Failed { error }
             }
         };
@@ -449,7 +486,7 @@ mod tests {
         let installs = Installs::new();
         installs.begin("g").await;
         assert_eq!(installs.exclusive("g", async {}).await, Err(NotRunning));
-        installs.finish("g", InstallState::Done { bytes: 1, already_installed: false, update: None }).await;
+        installs.finish("g", InstallState::Done { bytes: 1, already_installed: false, update: None, verify: None }).await;
         // While held, nothing reports a download that is not one, and a
         // download cannot start.
         let inside = installs

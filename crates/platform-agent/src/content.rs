@@ -39,6 +39,7 @@
 //! is the operator's container image (`config.rs`), which is exactly where the
 //! "a pack cannot name what runs" line is drawn.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -70,6 +71,98 @@ pub enum Updated {
     /// steamcmd found nothing newer. The copy it updated was discarded, so
     /// no second identical copy is left on disk.
     UpToDate { build: Option<String> },
+}
+
+/// What `Provisioner::verify` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verified {
+    /// Every file matched Valve's, on the build the copy already had. The
+    /// copy that was checked was discarded.
+    Intact { build: Option<String> },
+    /// steamcmd put files back, or brought the copy to a newer build. The
+    /// repaired copy is at `dir`, a new version directory; `changed` names
+    /// the files that differed, relative to the copy's root.
+    Repaired { dir: PathBuf, changed: Vec<String>, from_build: Option<String>, to_build: Option<String> },
+}
+
+/// A copy of an installed game in staging, ready for steamcmd.
+struct SteamcmdCopy<'d> {
+    staging: PathBuf,
+    installed: PathBuf,
+    source: PathBuf,
+    dir: PathBuf,
+    app_id: u32,
+    mod_dir: Option<String>,
+    docker: &'d DockerRuntime,
+}
+
+impl SteamcmdCopy<'_> {
+    /// Rename the finished copy into place as its new version, and drop the
+    /// staging directory.
+    fn promote(self) -> Result<PathBuf, ProvisionError> {
+        if let Some(parent) = self.dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&self.installed, &self.dir)?;
+        let _ = fs::remove_dir_all(&self.staging);
+        Ok(self.dir)
+    }
+}
+
+/// Size and modification time of every regular file under `root`, by path
+/// relative to it. Links are not followed.
+fn file_stamps(root: &Path) -> BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                walk(root, &path, out);
+            } else if kind.is_file() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.insert(rel.to_path_buf(), (meta.len(), meta.modified().ok()));
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The files a steamcmd run changed or added, from stamps taken before and
+/// after: a size that changed, or a time that changed with bytes that now
+/// differ (`same_bytes` says whether they do). A rewrite with the same bytes
+/// is not a change. Its own bookkeeping under `steamapps/` is left out.
+fn changed_files(
+    before: &BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    after: &BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    same_bytes: impl Fn(&Path) -> bool,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(rel, _)| !rel.starts_with("steamapps"))
+        .filter(|(rel, (len, time))| match before.get(*rel) {
+            None => true,
+            Some((old_len, _)) if old_len != len => true,
+            Some((_, old_time)) if old_time != time => !same_bytes(rel),
+            Some(_) => false,
+        })
+        .map(|(rel, _)| rel.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Whether two files hold the same bytes. Unreadable is "not the same".
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    let hash = |p: &Path| -> Option<Vec<u8>> {
+        let mut file = fs::File::open(p).ok()?;
+        let mut hasher = Sha256::new();
+        io::copy(&mut file, &mut hasher).ok()?;
+        Some(hasher.finalize().to_vec())
+    };
+    matches!((hash(a), hash(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// What `ensure` did.
@@ -441,6 +534,81 @@ impl Provisioner {
         docker: Option<&DockerRuntime>,
         progress: Option<&InstallProgress>,
     ) -> Result<Updated, ProvisionError> {
+        let c = self.copy_for_steamcmd(from, to, spec, docker, progress).await?;
+        let from_build = steam_build_id(&c.installed, c.app_id);
+        self.run_steamcmd(&c.staging, &c.installed, c.app_id, c.mod_dir.as_deref(), false, c.docker, progress)
+            .await?;
+        let to_build = steam_build_id(&c.installed, c.app_id);
+        if from_build.is_some() && from_build == to_build {
+            let _ = fs::remove_dir_all(&c.staging);
+            return Ok(Updated::UpToDate { build: to_build });
+        }
+        let bytes = dir_size(&c.installed);
+        let dir = c.promote()?;
+        Ok(Updated::NewBuild { dir, bytes, from_build, to_build })
+    }
+
+    /// Check a steamcmd game's installed copy `from` against Valve's files
+    /// (ROADMAP §11 "Verify files"), for a server that crashes on a corrupt
+    /// file. `from` is copied and steamcmd runs **with `validate`** on the
+    /// copy, never on `from`: servers may have it mounted, and `validate`
+    /// puts back every file the operator changed (YaPB's `liblist.gam`).
+    ///
+    /// What steamcmd rewrote is found by comparing the copy before and after:
+    /// a file whose size changed, or whose time changed and whose bytes now
+    /// differ from `from`'s; a file it added is listed too. Its own
+    /// bookkeeping under `steamapps/` is not. Nothing differing discards the
+    /// copy (`Intact`); otherwise it is kept at `to` (`Repaired`), and making
+    /// it the copy servers use is the operator's call, since it may have
+    /// reverted a change they made on purpose. `validate` also brings the copy
+    /// to Steam's newest build, so the builds are reported as well.
+    pub async fn verify(
+        &self,
+        from: &ContentRef,
+        to: &ContentRef,
+        spec: &PackContent,
+        docker: Option<&DockerRuntime>,
+        progress: Option<&InstallProgress>,
+    ) -> Result<Verified, ProvisionError> {
+        let c = self.copy_for_steamcmd(from, to, spec, docker, progress).await?;
+        let from_build = steam_build_id(&c.installed, c.app_id);
+        let before = {
+            let root = c.installed.clone();
+            tokio::task::spawn_blocking(move || file_stamps(&root))
+                .await
+                .map_err(|e| ProvisionError::Io(io::Error::other(e.to_string())))?
+        };
+        self.run_steamcmd(&c.staging, &c.installed, c.app_id, c.mod_dir.as_deref(), true, c.docker, progress)
+            .await?;
+        let to_build = steam_build_id(&c.installed, c.app_id);
+        let changed = {
+            let (root, source) = (c.installed.clone(), c.source.clone());
+            tokio::task::spawn_blocking(move || {
+                let after = file_stamps(&root);
+                changed_files(&before, &after, |rel| same_bytes(&source.join(rel), &root.join(rel)))
+            })
+            .await
+            .map_err(|e| ProvisionError::Io(io::Error::other(e.to_string())))?
+        };
+        if changed.is_empty() && from_build == to_build {
+            let _ = fs::remove_dir_all(&c.staging);
+            return Ok(Verified::Intact { build: to_build });
+        }
+        let dir = c.promote()?;
+        Ok(Verified::Repaired { dir, changed, from_build, to_build })
+    }
+
+    /// What an update and a verify share: the checks, then a plain copy of
+    /// `from` in a fresh staging directory, ready for steamcmd. Never over an
+    /// existing `to`.
+    async fn copy_for_steamcmd<'d>(
+        &self,
+        from: &ContentRef,
+        to: &ContentRef,
+        spec: &PackContent,
+        docker: Option<&'d DockerRuntime>,
+        progress: Option<&InstallProgress>,
+    ) -> Result<SteamcmdCopy<'d>, ProvisionError> {
         spec.validate().map_err(ProvisionError::BadSpec)?;
         let PackContent::Steamcmd { app_id, mod_dir } = spec else {
             return Err(ProvisionError::NotUpdatable { driver: spec.driver_name() });
@@ -490,21 +658,15 @@ impl Provisioner {
         if progress.is_some_and(InstallProgress::is_cancelled) {
             return Err(cancelled(&staging));
         }
-        let from_build = steam_build_id(&installed, *app_id);
-        self.run_steamcmd(&staging, &installed, *app_id, mod_dir.as_deref(), false, docker, progress)
-            .await?;
-        let to_build = steam_build_id(&installed, *app_id);
-        if from_build.is_some() && from_build == to_build {
-            let _ = fs::remove_dir_all(&staging);
-            return Ok(Updated::UpToDate { build: to_build });
-        }
-        let bytes = dir_size(&installed);
-        if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(&installed, &dir)?;
-        let _ = fs::remove_dir_all(&staging);
-        Ok(Updated::NewBuild { dir, bytes, from_build, to_build })
+        Ok(SteamcmdCopy {
+            staging,
+            installed,
+            source,
+            dir,
+            app_id: *app_id,
+            mod_dir: mod_dir.clone(),
+            docker,
+        })
     }
 
     /// One steamcmd run into `installed`, inside `staging`, retried once on
@@ -1121,6 +1283,27 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rewrite with the same bytes is not a change, a new size always is,
+    /// an added file is listed, and steamcmd's own bookkeeping is not.
+    #[test]
+    fn only_files_whose_bytes_changed_are_reported() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = |s| Some(UNIX_EPOCH + Duration::from_secs(s));
+        let stamps = |list: &[(&str, u64, u64)]| -> BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)> {
+            list.iter().map(|(p, len, at)| (PathBuf::from(p), (*len, t(*at)))).collect()
+        };
+        let before = stamps(&[("a.dll", 10, 1), ("b.cfg", 5, 1), ("c.bsp", 7, 1), ("steamapps/x.acf", 3, 1)]);
+        let after = stamps(&[
+            ("a.dll", 10, 9),  // rewritten, same bytes
+            ("b.cfg", 5, 9),   // rewritten, other bytes
+            ("c.bsp", 8, 1),   // new size
+            ("d.wad", 1, 9),   // put back
+            ("steamapps/x.acf", 4, 9),
+        ]);
+        let changed = changed_files(&before, &after, |rel| rel == Path::new("a.dll"));
+        assert_eq!(changed, vec!["b.cfg", "c.bsp", "d.wad"]);
+    }
 
     /// steamcmd's `app_info_print` for app 90 as measured on 2026-10-13,
     /// trimmed: console noise before, `branches` inside `depots` as Steam

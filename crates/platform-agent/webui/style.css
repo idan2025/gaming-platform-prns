@@ -235,6 +235,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .card-reason { font-size: 12px; color: var(--warn); }
 .card-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
 .card-actions .btn { flex: 1; }
+.verify-list { max-height: 200px; overflow: auto; margin: 8px 0; padding: 8px 8px 8px 26px; background: var(--surface-2); border-radius: var(--radius); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
 .game-card { position: relative; }
 .card-remove { position: absolute; top: 8px; right: 8px; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.25); border-radius: var(--radius); background: rgba(0, 0, 0, 0.45); color: #fff; cursor: pointer; }
 .card-remove svg { width: 15px; height: 15px; }
@@ -368,6 +369,17 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .node-usage-value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .node-usage-note { margin-left: auto; font-size: 12px; color: var(--text-3); }
 
+/* Between the phone layout and a wide window the Installed table's columns
+   do not fit: the date goes first. */
+@media (max-width: 1240px) {
+  .copy-head, .copy-row { grid-template-columns: 76px minmax(150px, 2fr) 104px 96px minmax(100px, 1.5fr) 180px; }
+  .copy-head > :nth-child(6), .copy-row > :nth-child(6):not(.update-line) { display: none; }
+}
+@media (max-width: 1000px) {
+  .copy-head { display: none; }
+  .copy-row { grid-template-columns: 76px 1fr auto; row-gap: 6px; }
+  .copy-row > :nth-child(n+3):not(.actions):not(.update-line) { display: none; }
+}
 @media (max-width: 1180px) {
   .list-head, .inst { grid-template-columns: 76px minmax(150px, 2fr) 104px 72px 120px 128px; }
   .list-head > :nth-child(4), .inst > :nth-child(4), .list-head > :nth-child(6), .inst > :nth-child(6), .list-head > :nth-child(8), .inst > :nth-child(8) { display: none; }
@@ -385,9 +397,6 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .toolbar, .content { padding-left: 16px; padding-right: 16px; }
   .list-head { display: none; }
   .inst { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
-  .copy-head { display: none; }
-  .copy-row { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
-  .copy-row > :nth-child(n+3):not(.actions):not(.update-line) { display: none; }
   .inst > :nth-child(n+3):not(.actions):not(.usage) { display: none; }
   .inst > .usage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }

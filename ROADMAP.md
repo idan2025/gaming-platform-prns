@@ -234,7 +234,10 @@ download yet. From step 7, **Update a game** is built too, with a
 "remove the old version when done" option (`CLAUDE.md` has its rules);
 room-before-download and the queue came with item 12, and **remove a pack**
 is built (2026-10-14, `DELETE /packs/:id`, a button on each Games card; the
-node has no built-in pack, so any pack can go). Verify is still open.
+node has no built-in pack, so any pack can go), and so is **verify**
+(`Provisioner::verify`: `validate` on a copy, a list of what differed, and the
+repaired copy kept but used only when the operator says so). Item 11 is
+complete.
 
 **What.** An **Installed** page in Lanthorn Host listing every game whose files
 are on this node, and every download in progress, with the controls to manage

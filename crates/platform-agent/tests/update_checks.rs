@@ -426,3 +426,98 @@ async fn a_game_checks_on_its_own_interval_or_not_at_all() {
         "a game set to never is not checked"
     );
 }
+
+/// Stands in for steamcmd checking files. Without `validate` it refuses (a
+/// check that does not validate checks nothing). With it, it rewrites
+/// `same.txt` with the same bytes, and unless the copy holds `clean`, puts
+/// Valve's `liblist.gam` back over the operator's.
+const VALIDATE_STEAMCMD: &str = "gpp-test-steamcmd-validate:latest";
+const VALIDATE_DOCKERFILE: &str = r#"FROM busybox
+RUN printf '#!/bin/sh\ncase " $* " in *" validate "*) ;; *) exit 9;; esac\nwhile [ "$1" != "+force_install_dir" ]; do shift || exit 3; done\nshift\nd="$1"\nsleep 1\ncat "$d/svencoop/same.txt" > "$d/svencoop/same.tmp" && mv "$d/svencoop/same.tmp" "$d/svencoop/same.txt"\n[ -e "$d/svencoop/clean" ] || printf "valve\\n" > "$d/svencoop/liblist.gam"\n' > /fake && chmod +x /fake
+ENTRYPOINT ["/fake"]
+"#;
+
+fn game_files(dir: &std::path::Path, clean: bool) {
+    let game = dir.join("content/sven-coop/test/svencoop");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::write(game.join("liblist.gam"), "yapb\n").unwrap();
+    std::fs::write(game.join("same.txt"), "unchanged\n").unwrap();
+    if clean {
+        std::fs::write(game.join("clean"), "").unwrap();
+    }
+}
+
+/// A check runs `validate` on a copy, never on the copy servers use; what it
+/// put back is named, a rewrite with the same bytes is not, and the repaired
+/// copy is kept beside the old one without becoming the one servers use until
+/// the operator says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_check_names_what_it_put_back_and_changes_nothing_until_asked() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    game_files(dir.path(), false);
+    let Some(addr) = serve(dir.path(), VALIDATE_STEAMCMD, VALIDATE_DOCKERFILE, Some("100")).await
+    else {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    };
+    let (status, body) =
+        send(reqwest::Method::POST, addr, "/content/sven-coop", json!({ "verify": true })).await;
+    assert_eq!(status, 200, "{body}");
+    let done = wait_install(addr).await;
+    assert_eq!(done["status"]["state"], "done", "{done}");
+    let report = &done["status"]["verify"];
+    assert_eq!(report["changed"], json!(["svencoop/liblist.gam"]), "only what differs: {report}");
+    assert_eq!(report["version"], "test");
+    let repaired =
+        report["repaired_version"].as_str().expect("a repaired copy is kept").to_string();
+    let old = dir.path().join("content/sven-coop/test/svencoop/liblist.gam");
+    assert_eq!(
+        std::fs::read_to_string(&old).unwrap(),
+        "yapb\n",
+        "the copy servers use is never validated"
+    );
+    let kept = dir.path().join(format!("content/sven-coop/{repaired}/svencoop/liblist.gam"));
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "valve\n");
+    assert_eq!(
+        get(addr, "/updates").await["games"][0]["version"],
+        "test",
+        "not made active by itself"
+    );
+
+    let (status, body) =
+        send(reqwest::Method::POST, addr, &format!("/content/sven-coop/{repaired}/use"), json!({}))
+            .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        get(addr, "/updates").await["games"][0]["version"],
+        repaired.as_str(),
+        "the operator chose it"
+    );
+    let (status, _) =
+        send(reqwest::Method::POST, addr, "/content/sven-coop/nothing/use", json!({})).await;
+    assert_eq!(status, 409, "only an installed copy");
+    assert!(staging_is_empty(dir.path()));
+    assert!(task_containers().is_empty());
+}
+
+/// A copy that matches keeps nothing: no identical second copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_check_that_finds_nothing_keeps_nothing() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    game_files(dir.path(), true);
+    let Some(addr) = serve(dir.path(), VALIDATE_STEAMCMD, VALIDATE_DOCKERFILE, Some("100")).await
+    else {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    };
+    send(reqwest::Method::POST, addr, "/content/sven-coop", json!({ "verify": true })).await;
+    let done = wait_install(addr).await;
+    assert_eq!(done["status"]["state"], "done", "{done}");
+    assert_eq!(done["status"]["verify"]["repaired_version"], Value::Null, "{done}");
+    assert_eq!(done["status"]["verify"]["changed_count"], 0);
+    let versions = std::fs::read_dir(dir.path().join("content/sven-coop")).unwrap().count();
+    assert_eq!(versions, 1, "no second copy");
+    assert!(staging_is_empty(dir.path()));
+}

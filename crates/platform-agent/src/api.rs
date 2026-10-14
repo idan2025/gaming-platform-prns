@@ -126,6 +126,7 @@ pub fn router_full(
             post(install_content).get(install_status).delete(cancel_install),
         )
         .route("/content/:game/:version", delete(delete_content))
+        .route("/content/:game/:version/use", post(use_copy))
         .route("/updates", get(updates))
         .route("/updates/settings", axum::routing::put(set_update_settings))
         .route("/updates/:game/check", post(check_update))
@@ -783,11 +784,14 @@ async fn remove(
 /// the same path.
 /// `POST /content/:game` with `{"update": true}` updates an installed game
 /// instead (`Agent::update_content`); `remove_old` also deletes the previous
-/// copy, now or once the servers using it are gone. No body is an install.
+/// copy, now or once the servers using it are gone. `{"verify": true}` checks
+/// the files against Valve's (`Agent::verify_content`). No body is an install.
 #[derive(Deserialize, Default)]
 struct InstallRequest {
     #[serde(default)]
     update: bool,
+    #[serde(default)]
+    verify: bool,
     #[serde(default)]
     remove_old: bool,
 }
@@ -806,7 +810,12 @@ async fn install_content(
             format!("no game pack installed for {game:?}"),
         ));
     }
-    let started = if req.update {
+    if req.update && req.verify {
+        return Err(fail(StatusCode::BAD_REQUEST, "an update or a check of the files, not both"));
+    }
+    let started = if req.verify {
+        crate::install::spawn_verify(state.installs.clone(), state.agent.clone(), game.clone()).await
+    } else if req.update {
         crate::install::spawn_update(state.installs.clone(), state.agent.clone(), game.clone(), req.remove_old)
             .await
     } else {
@@ -894,6 +903,26 @@ async fn cancel_install(
             .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(Json(json!({ "game": game, "cancelled": true })))
+}
+
+/// Make an installed copy the one new servers use, such as the repaired copy
+/// a check of the files kept (`Agent::use_copy`). Held to the game's slot, so
+/// it cannot land in the middle of a download of the same game.
+async fn use_copy(
+    State(state): State<ApiState>,
+    Path((game, version)): Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    if !state.agent.packs().await.contains_key(&game) {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
+    }
+    let agent = state.agent.clone();
+    let outcome = state
+        .installs
+        .exclusive(&game, async { agent.use_copy(&game, &version).await })
+        .await
+        .map_err(|_| fail(StatusCode::CONFLICT, format!("{game} is downloading; wait for it to finish")))?;
+    outcome.map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "game": game, "active": version })))
 }
 
 // ---- Update checks and the disk reserve (`updates.rs`, `ROADMAP.md` §12) ----
