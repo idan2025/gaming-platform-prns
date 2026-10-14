@@ -137,6 +137,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Moving servers onto a new copy (`ROADMAP.md` §12.4): nothing moves
+    // until the operator picks when, per game, on the Installed page.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(platform_agent::agent::MOVE_CHECK_EVERY).await;
+                agent.move_servers_pass().await;
+            }
+        });
+    }
+
     // The Reticulum control uplink is opt-in via `[uplink]` in the config. When
     // present, the agent also announces a `platform-agent.control` destination
     // and answers authenticated create/stop/remove/list requests over a Link, so

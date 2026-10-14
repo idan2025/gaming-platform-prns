@@ -101,12 +101,144 @@ pub enum OnNewBuild {
     Download,
 }
 
+/// When a game's servers move onto the copy new servers use (§12.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveServers {
+    /// They stay on the copy they were created on until the operator acts.
+    #[default]
+    Never,
+    /// As soon as nobody is playing. A server that cannot be asked is never
+    /// empty.
+    WhenEmpty,
+    /// Inside a daily window, once nobody is playing, or with players on if
+    /// the operator allowed a forced move.
+    Window,
+}
+
 /// The operator's choices for one game. Kept apart from [`Settings`] so a
 /// page saving the node-wide settings never resets a game's.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GamePolicy {
     #[serde(default)]
     pub on_new_build: OnNewBuild,
+    #[serde(default)]
+    pub move_servers: MoveServers,
+    /// The window, in whole hours UTC: from `window_start_utc` up to, not
+    /// including, `window_end_utc`; it may run past midnight (22 to 4).
+    #[serde(default)]
+    pub window_start_utc: u8,
+    #[serde(default = "default_window_end")]
+    pub window_end_utc: u8,
+    /// Inside the window, move a server with players on after warning them in
+    /// game. Off unless the operator turns it on (decided 2026-10-13).
+    #[serde(default)]
+    pub force_in_window: bool,
+}
+
+fn default_window_end() -> u8 {
+    6
+}
+
+impl Default for GamePolicy {
+    /// Tell, and never move: nothing happens to a game's servers until the
+    /// operator says so. The window, once chosen, starts as 00:00 to 06:00.
+    fn default() -> Self {
+        Self {
+            on_new_build: OnNewBuild::Notify,
+            move_servers: MoveServers::Never,
+            window_start_utc: 0,
+            window_end_utc: default_window_end(),
+            force_in_window: false,
+        }
+    }
+}
+
+/// A change to a game's choices; what is absent is kept.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PolicyPatch {
+    pub on_new_build: Option<OnNewBuild>,
+    pub move_servers: Option<MoveServers>,
+    pub window_start_utc: Option<u8>,
+    pub window_end_utc: Option<u8>,
+    pub force_in_window: Option<bool>,
+}
+
+impl GamePolicy {
+    pub fn patched(mut self, patch: PolicyPatch) -> Result<Self, String> {
+        if let Some(v) = patch.on_new_build {
+            self.on_new_build = v;
+        }
+        if let Some(v) = patch.move_servers {
+            self.move_servers = v;
+        }
+        if let Some(v) = patch.window_start_utc {
+            self.window_start_utc = v;
+        }
+        if let Some(v) = patch.window_end_utc {
+            self.window_end_utc = v;
+        }
+        if let Some(v) = patch.force_in_window {
+            self.force_in_window = v;
+        }
+        if self.window_start_utc > 23 || self.window_end_utc > 23 {
+            return Err("a window's hours are 0 to 23".into());
+        }
+        if self.window_start_utc == self.window_end_utc {
+            return Err("a window has to be at least an hour long".into());
+        }
+        Ok(self)
+    }
+
+    /// Whether `utc_hour` is inside the window.
+    pub fn in_window(&self, utc_hour: u8) -> bool {
+        let (start, end) = (self.window_start_utc, self.window_end_utc);
+        if start < end {
+            (start..end).contains(&utc_hour)
+        } else {
+            utc_hour >= start || utc_hour < end
+        }
+    }
+
+    /// What to do now with a running server that is not on the copy new
+    /// servers use. `humans` is how many people are on it, bots left out, and
+    /// `None` when the game could not be asked; `can_warn` is whether its game
+    /// has a console to warn them on.
+    pub fn move_decision(&self, humans: Option<u32>, utc_hour: u8, can_warn: bool) -> MoveDecision {
+        let empty = humans == Some(0);
+        let busy = || match humans {
+            Some(n) => format!("{n} playing"),
+            None => "it cannot be asked whether anyone is playing".to_string(),
+        };
+        match self.move_servers {
+            MoveServers::Never => MoveDecision::Stay,
+            MoveServers::WhenEmpty if empty => MoveDecision::Move,
+            MoveServers::WhenEmpty => MoveDecision::Wait(format!("waiting for it to empty: {}", busy())),
+            MoveServers::Window if !self.in_window(utc_hour) => MoveDecision::Wait(format!(
+                "waiting for the window, {:02}:00 to {:02}:00 UTC",
+                self.window_start_utc, self.window_end_utc
+            )),
+            MoveServers::Window if empty => MoveDecision::Move,
+            MoveServers::Window if self.force_in_window && can_warn => MoveDecision::WarnThenMove,
+            MoveServers::Window if self.force_in_window => MoveDecision::Wait(format!(
+                "waiting for it to empty: {}. Its game has no console to warn players on, so it is never moved with them on",
+                busy()
+            )),
+            MoveServers::Window => MoveDecision::Wait(format!("in the window, waiting for it to empty: {}", busy())),
+        }
+    }
+}
+
+/// What [`GamePolicy::move_decision`] says to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveDecision {
+    /// The game's servers stay where they are.
+    Stay,
+    /// Not now, and why.
+    Wait(String),
+    Move,
+    /// Tell the players, wait, then move.
+    WarnThenMove,
 }
 
 /// What is remembered about one game's checks.
@@ -183,6 +315,7 @@ pub struct UpdateNotice {
     pub snooze_until_unix: Option<i64>,
     pub skip_build: Option<String>,
     pub on_new_build: OnNewBuild,
+    pub policy: GamePolicy,
 }
 
 impl UpdateNotice {
@@ -210,6 +343,7 @@ impl UpdateNotice {
             snooze_until_unix: check.snooze_until_unix,
             skip_build: check.skip_build.clone(),
             on_new_build: policy.on_new_build,
+            policy: policy.clone(),
         }
     }
 }
@@ -475,10 +609,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let u = UpdateChecks::load(dir.path());
         assert_eq!(u.policy("g").on_new_build, OnNewBuild::Notify);
-        u.set_policy("g", GamePolicy { on_new_build: OnNewBuild::Download }).unwrap();
+        u.set_policy("g", GamePolicy { on_new_build: OnNewBuild::Download, ..Default::default() })
+            .unwrap();
         u.set_settings(Settings { check_every_hours: Some(6), ..Default::default() }).unwrap();
         let again = UpdateChecks::load(dir.path());
         assert_eq!(again.policy("g").on_new_build, OnNewBuild::Download);
         assert_eq!(again.policy("other").on_new_build, OnNewBuild::Notify);
+    }
+
+    /// "When empty" never moves a server it cannot ask: silence is not zero.
+    #[test]
+    fn a_server_that_cannot_be_asked_is_never_empty() {
+        let p = GamePolicy { move_servers: MoveServers::WhenEmpty, ..Default::default() };
+        assert_eq!(p.move_decision(Some(0), 12, true), MoveDecision::Move);
+        assert!(matches!(p.move_decision(None, 12, true), MoveDecision::Wait(_)));
+        assert!(matches!(p.move_decision(Some(2), 12, true), MoveDecision::Wait(_)));
+        assert_eq!(
+            GamePolicy::default().move_decision(Some(0), 12, true),
+            MoveDecision::Stay,
+            "never is the default"
+        );
+    }
+
+    /// A window waits for empty unless a forced move was allowed, and a forced
+    /// move needs a console to warn the players on.
+    #[test]
+    fn a_window_forces_a_move_only_when_allowed_and_only_with_a_warning() {
+        let p = GamePolicy {
+            move_servers: MoveServers::Window,
+            window_start_utc: 22,
+            window_end_utc: 4,
+            ..Default::default()
+        };
+        assert!(p.in_window(23) && p.in_window(0) && p.in_window(3));
+        assert!(!p.in_window(4) && !p.in_window(12));
+        assert!(
+            matches!(p.move_decision(Some(0), 12, true), MoveDecision::Wait(_)),
+            "outside the window"
+        );
+        assert_eq!(p.move_decision(Some(0), 1, true), MoveDecision::Move);
+        assert!(
+            matches!(p.move_decision(Some(3), 1, true), MoveDecision::Wait(_)),
+            "no force by default"
+        );
+        let forced = GamePolicy { force_in_window: true, ..p.clone() };
+        assert_eq!(forced.move_decision(Some(3), 1, true), MoveDecision::WarnThenMove);
+        assert_eq!(forced.move_decision(None, 1, true), MoveDecision::WarnThenMove);
+        assert!(
+            matches!(forced.move_decision(Some(3), 1, false), MoveDecision::Wait(_)),
+            "no console, no force"
+        );
+    }
+
+    /// A patch changes what it names; a window must be a real one.
+    #[test]
+    fn a_patch_keeps_what_it_does_not_name() {
+        let p = GamePolicy { on_new_build: OnNewBuild::Download, ..Default::default() };
+        let moved = p
+            .clone()
+            .patched(PolicyPatch {
+                move_servers: Some(MoveServers::WhenEmpty),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(moved.on_new_build, OnNewBuild::Download);
+        assert_eq!(moved.move_servers, MoveServers::WhenEmpty);
+        assert!(p
+            .clone()
+            .patched(PolicyPatch { window_end_utc: Some(24), ..Default::default() })
+            .is_err());
+        assert!(p
+            .patched(PolicyPatch {
+                window_start_utc: Some(6),
+                window_end_utc: Some(6),
+                ..Default::default()
+            })
+            .is_err());
     }
 }

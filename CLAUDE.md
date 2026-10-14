@@ -562,6 +562,35 @@ change could quietly break:
   the page share it. Caught by
   `a_found_build_downloads_only_when_the_game_says_so_and_keeps_the_old_copy`.
 
+**Servers move onto a new copy by the operator's rule** (2026-10-14,
+`ROADMAP.md` §12.4, `Agent::move_instance`, `move_servers_pass`). Rules a
+later change could quietly break:
+- **A move recreates the container with the same instance id and never
+  touches the instance folder**, so the same `mesh.identity`, name and
+  address. The spec is read back off the container (`DockerRuntime::spec_of`:
+  `GPP_*` env and labels), because the agent's own `specs` are lost on a
+  restart; every port comes back fixed and stays held in the allocator
+  through the recreate (`create_on(.., ports_held)`), so nothing else can take
+  it in between.
+- **Everything that can refuse does so before anything is stopped**: the plan
+  on the new copy and the port set. A server that is not running after the
+  settle time (30 s) is recreated on the old copy (`RolledBack`) and not tried
+  again until there is a newer copy. Caught by
+  `a_server_that_fails_on_the_new_copy_is_put_back_and_its_copy_is_kept`.
+- **Both copies are pinned while a move runs** (`Agent::moving`), because for
+  a moment no container mounts either. `delete_content` checks the pin *after*
+  listing containers: the move pins before it removes, so a listing without
+  the container was taken after the pin. Caught by the same test.
+- **"When empty" means no humans, and silence is not zero.** Humans are A2S
+  players minus A2S bots; a server that cannot be asked is never empty
+  (`updates::GamePolicy::move_decision`, `when_empty_never_moves_a_server_that_cannot_be_asked`).
+- **Never is the default, and a forced move is the window's opt-in only**,
+  after `say` over the game's console (`ConsoleProtocol::say`, held to the
+  server-name rule). A game with no console is never moved with players on.
+- **One move at a time per node** (`move_lock`), and the crash watch leaves a
+  server alone while its move watches it. A stopped server is not moved; it
+  moves once it runs again.
+
 **The launcher's client identity is not CWD-relative** (2026-09-04):
 `ClientArgs::new` defaults to `./game-bridge-client.identity`, which is right
 for the CLI and wrong for a desktop app whose working directory is `/` or the

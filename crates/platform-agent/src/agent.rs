@@ -142,7 +142,95 @@ pub struct Agent {
     /// the API's state so an automatic download waits in the same queue as
     /// the operator's.
     installs: Arc<crate::install::Installs>,
+    /// Moves of servers onto a new copy (`move_instance`): one at a time, the
+    /// servers and copies in one now, what happened last, and how long a move
+    /// watches and warns.
+    move_lock: Mutex<()>,
+    moving: std::sync::Mutex<HashMap<String, MoveInFlight>>,
+    move_log: std::sync::Mutex<BTreeMap<String, MoveRecord>>,
+    move_timing: std::sync::Mutex<MoveTiming>,
 }
+
+/// A server being moved, and both its copies: neither is deleted while the
+/// move is under way, since for a moment no container mounts either.
+struct MoveInFlight {
+    game_id: String,
+    from: String,
+    to: String,
+}
+
+/// Takes a server out of `Agent::moving` however its move ends.
+struct Unpin<'a> {
+    moving: &'a std::sync::Mutex<HashMap<String, MoveInFlight>>,
+    instance_id: String,
+}
+
+impl Drop for Unpin<'_> {
+    fn drop(&mut self) {
+        self.moving.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.instance_id);
+    }
+}
+
+/// How long a moved server must keep running before the move counts, and how
+/// long players get between the warning and a forced move.
+#[derive(Debug, Clone, Copy)]
+pub struct MoveTiming {
+    pub settle: Duration,
+    pub warn: Duration,
+}
+
+impl Default for MoveTiming {
+    fn default() -> Self {
+        Self { settle: Duration::from_secs(30), warn: Duration::from_secs(60) }
+    }
+}
+
+/// The in-game warning before a forced move. A constant, held to the server
+/// name rule by `ConsoleProtocol::say` all the same.
+pub const MOVE_WARNING: &str = "This server restarts in about a minute for a game update. It keeps its name and address";
+
+/// Where a move of one server has got to, for the Installed page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MoveRecord {
+    pub instance_id: String,
+    pub game_id: String,
+    /// The copy it is on, and the copy new servers use.
+    pub from: String,
+    pub to: String,
+    #[serde(flatten)]
+    pub state: MoveState,
+    pub at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MoveState {
+    /// Not yet, and why.
+    Waiting { why: String },
+    /// Players were told; the move follows.
+    Warned,
+    Moving,
+    Moved,
+    /// The server did not stay up on the new copy and is back on the old one.
+    RolledBack { why: String },
+    /// Nothing was touched, and why; or, if `lost`, the server could be put
+    /// back on neither copy.
+    Failed {
+        why: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        lost: bool,
+    },
+}
+
+/// How a move ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveOutcome {
+    Moved { from: String, to: String },
+    RolledBack { from: String, to: String, why: String },
+}
+
+/// How often the agent looks for servers to move onto a new copy.
+pub const MOVE_CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the agent looks for servers that crashed.
 pub const CRASH_CHECK_EVERY: Duration = Duration::from_secs(10);
@@ -375,6 +463,10 @@ impl Agent {
             updates: crate::updates::UpdateChecks::load(&config_data_root),
             check_lock: Mutex::new(()),
             installs: Arc::new(crate::install::Installs::new()),
+            move_lock: Mutex::new(()),
+            moving: std::sync::Mutex::new(HashMap::new()),
+            move_log: std::sync::Mutex::new(BTreeMap::new()),
+            move_timing: std::sync::Mutex::new(MoveTiming::default()),
         })
     }
 
@@ -535,6 +627,13 @@ impl Agent {
     /// operator nothing. Checking here turns it into the name of the directory
     /// their game install is missing.
     pub async fn plan_and_check(&self, spec: &InstanceSpec) -> Result<InstancePlan> {
+        self.plan_and_check_on(spec, None).await
+    }
+
+    /// [`plan_and_check`](Self::plan_and_check) on a given copy of the game
+    /// rather than the one new servers use. A move plans on the new copy and,
+    /// if it has to roll back, on the old one.
+    async fn plan_and_check_on(&self, spec: &InstanceSpec, version: Option<&str>) -> Result<InstancePlan> {
         spec.validate().map_err(|e| anyhow!("{e}"))?;
 
         let packs = self.packs.read().await;
@@ -551,7 +650,10 @@ impl Agent {
 
         let content = ContentRef {
             game_id: spec.game_id.clone(),
-            version: self.active_version_of(&spec.game_id, &runtime.content_version),
+            version: match version {
+                Some(v) => v.to_string(),
+                None => self.active_version_of(&spec.game_id, &runtime.content_version),
+            },
         };
         let plan = self
             .layout
@@ -750,6 +852,14 @@ impl Agent {
 
     /// Create and start an instance.
     pub async fn create(&self, spec: InstanceSpec) -> Result<InstanceStatus> {
+        self.create_on(spec, None, false).await
+    }
+
+    /// Create on a given copy (`None`: the one new servers use). With
+    /// `ports_held`, every port in the spec is already this instance's in the
+    /// allocator, kept across a move's recreate so nothing else can take it in
+    /// between, and a failure does not give them back.
+    async fn create_on(&self, spec: InstanceSpec, version: Option<&str>, ports_held: bool) -> Result<InstanceStatus> {
         let existing = self.docker.list_managed().await?;
         if existing.iter().any(|c| c.instance_id == spec.instance_id) {
             return Err(anyhow!("instance {:?} already exists", spec.instance_id));
@@ -761,7 +871,7 @@ impl Agent {
             ));
         }
 
-        let plan = self.plan_and_check(&spec).await?;
+        let plan = self.plan_and_check_on(&spec, version).await?;
         for dir in &plan.host_dirs_to_create {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating {}", dir.display()))?;
@@ -792,7 +902,12 @@ impl Agent {
                 }
             })
             .collect();
-        let host_ports = {
+        let host_ports = if ports_held {
+            requested
+                .iter()
+                .map(|p| p.ok_or_else(|| anyhow!("this server has no port for every channel its game now declares")))
+                .collect::<Result<Vec<u16>>>()?
+        } else {
             let mut ports = self.ports.lock().await;
             ports.acquire(&requested).map_err(|e| anyhow!("{e}"))?
         };
@@ -815,8 +930,11 @@ impl Agent {
             Ok(id) => id,
             Err(e) => {
                 // Give the whole set back, or a failed start leaks a port per
-                // channel on every attempt.
-                self.ports.lock().await.release_all(&host_ports);
+                // channel on every attempt. Not a move's: it tries the old
+                // copy on the same ports next.
+                if !ports_held {
+                    self.ports.lock().await.release_all(&host_ports);
+                }
                 return Err(e);
             }
         };
@@ -1500,6 +1618,10 @@ impl Agent {
         {
             let mut watch = self.crashes.lock().await;
             for c in containers.iter().filter(|c| c.state == InstanceState::Stopped) {
+                // A move watches its own server and rolls it back itself.
+                if self.is_moving(&c.instance_id) {
+                    continue;
+                }
                 let Ok(Some(exit)) = self.docker.last_exit(&c.container_id).await else { continue };
                 let key = exit.finished_at.clone().unwrap_or_default();
                 if watch.seen.get(&c.instance_id) == Some(&key) {
@@ -1839,7 +1961,7 @@ impl Agent {
     }
 
     /// What `game_id` does when a check finds a newer build.
-    pub async fn set_update_policy(&self, game_id: &str, policy: crate::updates::GamePolicy) -> Result<(), String> {
+    pub async fn set_update_policy(&self, game_id: &str, patch: crate::updates::PolicyPatch) -> Result<(), String> {
         match self.packs.read().await.get(game_id).map(|p| &p.content) {
             None => return Err(format!("no game pack installed for {game_id:?}")),
             Some(PackContent::Steamcmd { .. }) => {}
@@ -1850,7 +1972,273 @@ impl Agent {
                 ))
             }
         }
+        let policy = self.updates.policy(game_id).patched(patch)?;
         self.updates.set_policy(game_id, policy).map_err(|e| format!("saving the choice: {e}"))
+    }
+
+    // ---- Moving servers onto a new copy (`ROADMAP.md` §12.4) ----
+
+    /// Change how long a move watches the new server and warns players; the
+    /// defaults are 30 s and 60 s. For tests, which cannot wait that long.
+    pub fn set_move_timing(&self, timing: MoveTiming) {
+        *self.move_timing.lock().unwrap_or_else(|e| e.into_inner()) = timing;
+    }
+
+    fn is_moving(&self, instance_id: &str) -> bool {
+        self.moving.lock().unwrap_or_else(|e| e.into_inner()).contains_key(instance_id)
+    }
+
+    /// The servers being moved off or onto this copy right now.
+    fn servers_moving_with(&self, game_id: &str, version: &str) -> Vec<String> {
+        self.moving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, m)| m.game_id == game_id && (m.from == version || m.to == version))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Which copy of its game a container mounts, read off its mounts.
+    fn copy_of(&self, game_id: &str, c: &crate::docker::ManagedContainer) -> Option<String> {
+        let probe = ContentRef { game_id: game_id.to_string(), version: "probe".to_string() };
+        let root = self.layout.content_dir(&probe).ok()?.parent()?.to_path_buf();
+        c.mount_sources.iter().find_map(|m| {
+            let rest = m.strip_prefix(&root).ok()?;
+            rest.components().next()?.as_os_str().to_str().map(str::to_string)
+        })
+    }
+
+    /// People on a server, bots left out, as its game reports them. `None`
+    /// when it could not be asked, which is never "nobody".
+    async fn humans_on(&self, instance: &InstanceStatus) -> Option<u32> {
+        let stats = self.ask_game(instance).await?;
+        Some(u32::from(stats.info.players.saturating_sub(stats.info.bots)))
+    }
+
+    fn log_move(&self, instance_id: &str, game_id: &str, from: &str, to: &str, state: MoveState) {
+        self.move_log.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            instance_id.to_string(),
+            MoveRecord {
+                instance_id: instance_id.to_string(),
+                game_id: game_id.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+                state,
+                at_unix: now_unix(),
+            },
+        );
+    }
+
+    /// What is known about moves: servers waiting for one, and how the last
+    /// one of each server went.
+    pub fn moves(&self) -> Vec<MoveRecord> {
+        self.move_log.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+    }
+
+    /// Move a running server onto the copy new servers use: recreate its
+    /// container there with the **same instance id**, so the same folder,
+    /// name, ports and mesh identity (`mesh::identity_path`), and watch it.
+    /// If it does not stay up for the settle time it is recreated on the old
+    /// copy, and the outcome says why. With `warn`, players are told over the
+    /// game's console first and given the warning time.
+    ///
+    /// One move at a time on a node. Everything that can refuse — the plan on
+    /// the new copy, the port set — does so before anything is stopped, and
+    /// both copies are pinned against deletion until it ends. Nothing is
+    /// deleted here, except through `sweep_old_copies` after a move that
+    /// worked, which deletes only what the operator asked to remove.
+    pub async fn move_instance(&self, instance_id: &str, warn: bool) -> Result<MoveOutcome, String> {
+        let _one = self.move_lock.lock().await;
+        let containers = self.docker.list_managed().await.map_err(|e| format!("{e:#}"))?;
+        let c = containers
+            .iter()
+            .find(|c| c.instance_id == instance_id)
+            .ok_or_else(|| format!("no server {instance_id:?} on this node"))?;
+        if c.state != InstanceState::Running {
+            return Err("only a running server is moved; a stopped one stays on its copy until it runs again".into());
+        }
+        let game_id = c.game_id.clone().ok_or("this server carries no game label")?;
+        let from = self.copy_of(&game_id, c).ok_or("which copy of its game this server uses is not known")?;
+        let to = self
+            .active_version(&game_id)
+            .ok_or_else(|| format!("this node has no runtime configured for {game_id:?}"))?;
+        if from == to {
+            return Err("this server is already on the copy new servers use".into());
+        }
+        let spec = self.docker.spec_of(instance_id).await.map_err(|e| format!("{e:#}"))?;
+        self.plan_and_check_on(&spec, Some(&to)).await.map_err(|e| format!("not moved: {e:#}"))?;
+        let console = {
+            let packs = self.packs.read().await;
+            let pack = packs.get(&game_id).ok_or_else(|| format!("no game pack installed for {game_id:?}"))?;
+            let profile = pack.to_profile().map_err(|e| format!("{e}"))?;
+            let missing = profile.ports().iter().any(|p| {
+                if p.channel == game_bridge::framing::CHANNEL_GAME {
+                    spec.port.is_none()
+                } else {
+                    !spec.extra_ports.contains_key(&p.channel)
+                }
+            });
+            if missing {
+                return Err(
+                    "not moved: its game now declares a port this server never had; remove it and start it again".into(),
+                );
+            }
+            pack.console.map(ConsoleProtocol::from)
+        };
+        let warning = if warn {
+            let console = console.ok_or("not moved: its game has no console to warn players on")?;
+            Some(console.say(MOVE_WARNING).map_err(|e| format!("{e}"))?)
+        } else {
+            None
+        };
+
+        self.moving.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            instance_id.to_string(),
+            MoveInFlight { game_id: game_id.clone(), from: from.clone(), to: to.clone() },
+        );
+        let _unpin = Unpin { moving: &self.moving, instance_id: instance_id.to_string() };
+        let timing = *self.move_timing.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(line) = warning {
+            self.docker
+                .send_console_line(instance_id, &line)
+                .await
+                .map_err(|e| format!("not moved: the players could not be warned: {e:#}"))?;
+            self.log_move(instance_id, &game_id, &from, &to, MoveState::Warned);
+            tokio::time::sleep(timing.warn).await;
+        }
+
+        self.log_move(instance_id, &game_id, &from, &to, MoveState::Moving);
+        tracing::info!(instance = %instance_id, from = %from, to = %to, "moving a server onto the new copy");
+        self.mesh.stop(instance_id).await;
+        let _ = self.docker.stop(instance_id).await;
+        if let Err(e) = self.docker.remove(instance_id).await {
+            // Still there: put it back as it was.
+            let _ = self.restart(instance_id).await;
+            return Err(format!("not moved: its container could not be removed: {e:#}"));
+        }
+
+        let why = match self.create_on(spec.clone(), Some(&to), true).await {
+            Err(e) => Some(format!("it did not start on the new copy: {e:#}")),
+            Ok(_) => self.settled(instance_id, timing.settle).await,
+        };
+        let Some(why) = why else {
+            self.log_move(instance_id, &game_id, &from, &to, MoveState::Moved);
+            tracing::info!(instance = %instance_id, to = %to, "server moved");
+            drop(_unpin);
+            self.sweep_old_copies().await;
+            return Ok(MoveOutcome::Moved { from, to });
+        };
+
+        tracing::warn!(instance = %instance_id, why = %why, "move failed; putting the server back on the old copy");
+        self.mesh.stop(instance_id).await;
+        let _ = self.docker.remove(instance_id).await;
+        match self.create_on(spec.clone(), Some(&from), true).await {
+            Ok(_) => {
+                self.log_move(instance_id, &game_id, &from, &to, MoveState::RolledBack { why: why.clone() });
+                Ok(MoveOutcome::RolledBack { from, to, why })
+            }
+            Err(e) => {
+                let mut held: Vec<u16> = spec.port.into_iter().collect();
+                held.extend(spec.extra_ports.values());
+                self.ports.lock().await.release_all(&held);
+                let why = format!("{why}; putting it back on {from} failed too: {e:#}. Start it again from the Servers page");
+                tracing::error!(instance = %instance_id, why = %why, "a moved server is on neither copy");
+                self.log_move(instance_id, &game_id, &from, &to, MoveState::Failed { why: why.clone(), lost: true });
+                Err(why)
+            }
+        }
+    }
+
+    /// `None` if the server is still running after `settle`, else why not.
+    async fn settled(&self, instance_id: &str, settle: Duration) -> Option<String> {
+        let until = Instant::now() + settle;
+        loop {
+            if self.docker.state_of(instance_id).await.ok() != Some(InstanceState::Running) {
+                let containers = self.docker.list_managed().await.unwrap_or_default();
+                let exit = match containers.iter().find(|c| c.instance_id == instance_id) {
+                    Some(c) => self.docker.last_exit(&c.container_id).await.ok().flatten(),
+                    None => None,
+                };
+                return Some(match exit {
+                    Some(e) => format!("it stopped on the new copy within {} s (exit {})", settle.as_secs(), e.code),
+                    None => format!("it was not running on the new copy within {} s", settle.as_secs()),
+                });
+            }
+            if Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Move what each game's choice says to move now, one server at a time
+    /// (§12.4). A server whose move onto this copy already failed is not
+    /// tried again until there is a newer copy.
+    pub async fn move_servers_pass(&self) {
+        let Ok(containers) = self.docker.list_managed().await else { return };
+        let Ok(instances) = self.list().await else { return };
+        {
+            let mut log = self.move_log.lock().unwrap_or_else(|e| e.into_inner());
+            log.retain(|id, r| {
+                containers.iter().any(|c| &c.instance_id == id) && !matches!(r.state, MoveState::Waiting { .. })
+            });
+        }
+        let hour = (now_unix().rem_euclid(86_400) / 3600) as u8;
+        let games: Vec<(String, bool)> =
+            self.packs.read().await.values().map(|p| (p.id.clone(), p.console.is_some())).collect();
+        for (game_id, can_warn) in games {
+            let policy = self.updates.policy(&game_id);
+            if policy.move_servers == crate::updates::MoveServers::Never {
+                continue;
+            }
+            let Some(to) = self.active_version(&game_id) else { continue };
+            let Ok(dir) = self.layout.content_dir(&ContentRef { game_id: game_id.clone(), version: to.clone() }) else {
+                continue;
+            };
+            if !dir.is_dir() {
+                continue;
+            }
+            for c in containers.iter().filter(|c| c.game_id.as_deref() == Some(game_id.as_str())) {
+                let Some(from) = self.copy_of(&game_id, c) else { continue };
+                if from == to {
+                    continue;
+                }
+                let tried = self.move_log.lock().unwrap_or_else(|e| e.into_inner()).get(&c.instance_id).is_some_and(|r| {
+                    r.to == to && matches!(r.state, MoveState::RolledBack { .. } | MoveState::Failed { .. })
+                });
+                if tried {
+                    continue;
+                }
+                if c.state != InstanceState::Running {
+                    let why = "stopped; it moves once it runs again".to_string();
+                    self.log_move(&c.instance_id, &game_id, &from, &to, MoveState::Waiting { why });
+                    continue;
+                }
+                let humans = match instances.iter().find(|i| i.instance_id == c.instance_id) {
+                    Some(i) => self.humans_on(i).await,
+                    None => None,
+                };
+                let warn = match policy.move_decision(humans, hour, can_warn) {
+                    crate::updates::MoveDecision::Stay => continue,
+                    crate::updates::MoveDecision::Wait(why) => {
+                        self.log_move(&c.instance_id, &game_id, &from, &to, MoveState::Waiting { why });
+                        continue;
+                    }
+                    crate::updates::MoveDecision::Move => false,
+                    crate::updates::MoveDecision::WarnThenMove => true,
+                };
+                if let Err(why) = self.move_instance(&c.instance_id, warn).await {
+                    if !matches!(
+                        self.move_log.lock().unwrap_or_else(|e| e.into_inner()).get(&c.instance_id).map(|r| &r.state),
+                        Some(MoveState::Failed { .. })
+                    ) {
+                        self.log_move(&c.instance_id, &game_id, &from, &to, MoveState::Failed { why, lost: false });
+                    }
+                }
+            }
+        }
     }
 
     /// Hide a game's notice for `hours`, or while `skip_build` is its newest
@@ -2010,6 +2398,13 @@ impl Agent {
             .collect();
         if !used_by.is_empty() {
             return Err(DeleteContentError::InUse(used_by));
+        }
+        // After the listing, not before: a move pins its copies before it
+        // removes the container, so a listing that no longer shows that
+        // container is one taken after the pin.
+        let moving = self.servers_moving_with(game_id, version);
+        if !moving.is_empty() {
+            return Err(DeleteContentError::InUse(moving));
         }
         let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
         let bytes = self.content_size(&dir, modified);

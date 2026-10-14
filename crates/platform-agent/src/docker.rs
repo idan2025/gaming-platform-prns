@@ -892,6 +892,36 @@ impl DockerRuntime {
         Ok(())
     }
 
+    /// The spec a managed container was created from, read back off the
+    /// container: its environment (`GPP_SERVER_NAME`, `GPP_MAX_PLAYERS`,
+    /// `GPP_MAP`, `GPP_BOTS`) and its labels (game, owner, the whole port set).
+    /// The container is the record, as it is for ports and ownership, so a
+    /// server can be recreated the same after the agent restarted and forgot
+    /// the spec it was asked for (`Agent::move_instance`).
+    ///
+    /// Every port comes back fixed, so a recreate keeps the numbers players
+    /// know it by. `restart_on_crash` is not here: it lives beside the
+    /// instance, not on the container, and survives a recreate on its own.
+    pub async fn spec_of(&self, spec_id: &str) -> Result<InstanceSpec> {
+        let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
+        self.assert_managed(&name).await?;
+        let config = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .with_context(|| format!("inspecting container {name}"))?
+            .config
+            .ok_or_else(|| anyhow!("container {name} reports no config"))?;
+        let labels = config.labels.unwrap_or_default();
+        let env: HashMap<String, String> = config
+            .env
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        spec_from_parts(spec_id, &labels, &env)
+    }
+
     pub async fn state_of(&self, spec_id: &str) -> Result<InstanceState> {
         let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
         match self.docker.inspect_container(&name, None).await {
@@ -917,6 +947,50 @@ impl DockerRuntime {
             Err(e) => Err(e).with_context(|| format!("inspecting container {name}")),
         }
     }
+}
+
+/// [`DockerRuntime::spec_of`] without Docker: the labels and environment one
+/// container was created with.
+fn spec_from_parts(
+    spec_id: &str,
+    labels: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+) -> Result<InstanceSpec> {
+    let game_id = labels
+        .get(GAME_LABEL)
+        .cloned()
+        .ok_or_else(|| anyhow!("{spec_id} carries no game label, so it cannot be recreated"))?;
+    let name = env
+        .get("GPP_SERVER_NAME")
+        .cloned()
+        .ok_or_else(|| anyhow!("{spec_id} has no server name in its environment, so it cannot be recreated"))?;
+    let max_players = env
+        .get("GPP_MAX_PLAYERS")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| anyhow!("{spec_id} has no player limit in its environment, so it cannot be recreated"))?;
+    let ports = labels.get(PORTS_LABEL).map(|l| decode_ports_label(l)).unwrap_or_default();
+    let port = ports.iter().find(|p| p.channel == CHANNEL_GAME).map(|p| p.host_port);
+    if port.is_none() {
+        return Err(anyhow!(
+            "{spec_id} predates the port label, so which port is its game is not known; it is not recreated"
+        ));
+    }
+    Ok(InstanceSpec {
+        instance_id: spec_id.to_string(),
+        game_id,
+        name,
+        max_players,
+        port,
+        extra_ports: ports
+            .iter()
+            .filter(|p| p.channel != CHANNEL_GAME)
+            .map(|p| (p.channel, p.host_port))
+            .collect(),
+        bots: env.get("GPP_BOTS").and_then(|v| v.parse().ok()),
+        map: env.get("GPP_MAP").cloned(),
+        restart_on_crash: false,
+        owner: labels.get(OWNER_LABEL).cloned(),
+    })
 }
 
 /// `uid:gid` for a provisioning task: whoever runs the agent.
@@ -995,6 +1069,42 @@ fn usage_from(instance_id: &str, stats: &Stats, sampled_at_ms: u64) -> InstanceU
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server is recreated from what its container carries, every port
+    /// fixed, so a move keeps the numbers players know it by.
+    #[test]
+    fn a_spec_is_read_back_off_its_container_with_every_port_fixed() {
+        let labels: HashMap<String, String> = [
+            (GAME_LABEL, "team-fortress-2"),
+            (PORTS_LABEL, "0:27151/udp,1:27152/tcp"),
+            (OWNER_LABEL, "ab12"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let env: HashMap<String, String> = [
+            ("GPP_SERVER_NAME", "Friday night = fun"),
+            ("GPP_MAX_PLAYERS", "24"),
+            ("GPP_MAP", "ctf_2fort"),
+            ("GPP_BOTS", "4"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let spec = spec_from_parts("tf", &labels, &env).unwrap();
+        assert_eq!(spec.game_id, "team-fortress-2");
+        assert_eq!(spec.name, "Friday night = fun", "only the first = splits");
+        assert_eq!(spec.max_players, 24);
+        assert_eq!(spec.port, Some(27151));
+        assert_eq!(spec.extra_ports.get(&1), Some(&27152));
+        assert_eq!(spec.map.as_deref(), Some("ctf_2fort"));
+        assert_eq!(spec.bots, Some(4));
+        assert_eq!(spec.owner.as_deref(), Some("ab12"));
+
+        let mut old = labels.clone();
+        old.remove(PORTS_LABEL);
+        assert!(spec_from_parts("tf", &old, &env).is_err(), "a container with no port label is not guessed at");
+    }
 
     /// The label is how a restarted agent learns which port is the game and
     /// which is RCON. Docker reports published ports, but not what they mean,
