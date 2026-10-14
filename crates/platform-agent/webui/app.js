@@ -910,7 +910,7 @@ function renderGames() {
   const grid = $("games-grid");
   const n = $("nav-games-count");
   if (n) n.textContent = state.games.length ? String(state.games.length) : "";
-  const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "")).join(";");
+  const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")).join(";");
   if (grid.dataset.sig !== sig) {
     grid.dataset.sig = sig;
     grid.textContent = "";
@@ -931,6 +931,12 @@ function buildGameCard(g) {
   if (g.extra_ports) meta.appendChild(el("span", "chip", "+" + g.extra_ports + (g.extra_ports === 1 ? " port" : " ports")));
   if (g.console) meta.appendChild(el("span", "chip", "Live map change"));
   if (g.bots) meta.appendChild(el("span", "chip", "Bots"));
+  // Whose word the pack is, under this node's [pack_trust] (§11.4's words).
+  if (g.trust && g.trust !== "built in") {
+    const t = el("span", "chip" + (g.signer ? "" : " chip-muted"), g.trust);
+    t.title = g.signer ? "Signed by " + g.signer : "Nobody signed this pack; it is trusted only as far as whoever wrote it.";
+    meta.appendChild(t);
+  }
   body.appendChild(meta);
   if (!g.runnable) body.appendChild(el("p", "card-reason", "Cannot start here: " + (g.reason || "unavailable on this node.")));
   body.appendChild(el("p", "install-status hidden"));

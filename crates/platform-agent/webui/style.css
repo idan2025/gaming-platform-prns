@@ -445,3 +445,4 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .repo-packs { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .repo-pack { display: flex; align-items: center; gap: 10px; }
 .repo-pack-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip.chip-muted { opacity: 0.75; font-style: italic; }
