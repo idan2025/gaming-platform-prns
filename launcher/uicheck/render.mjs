@@ -147,6 +147,11 @@ function makeInvoke(scenario) {
         return typeof scenario.favorites === 'function' ? scenario.favorites() : (scenario.favorites ?? []);
       case 'set_favorite':
         return null;
+      case 'installed_games':
+        return scenario.installed ?? [];
+      case 'pick_game_path':
+        scenario.picked = true;
+        return scenario.pickResult ?? null;
       case 'forget_server':
         return null;
       case 'take_invite': {
@@ -301,6 +306,17 @@ await run('favorites lead the list, and an offline one is shown as offline', {
     check('and the desktop is told too', (scenario.notified || []).includes('Friday night is up'), JSON.stringify(scenario.notified));
   });
 }
+
+await run('a game on this computer is badged Installed', {
+  status: running,
+  rows: () => [row(), legacyRow, row({ destination_hash: '0000aaaa0000aaaa0000aaaa0000aaaa', name: 'Other game', game_id: 'half-life' })],
+  installed: [{ game_id: 'sven-coop', installed: true, launch_ready: true }, { game_id: 'half-life', installed: false, launch_ready: false }],
+}, async (win, doc) => {
+  await settle();
+  const rows = [...doc.querySelectorAll('#list .row')];
+  const badged = rows.filter(r => r.querySelector('.installed-badge')).map(r => r.dataset.hash);
+  check('only the installed game\'s row is badged', badged.length === 1 && badged[0] === 'aabbccddeeff00112233445566778899', JSON.stringify(badged));
+});
 
 await run('detail pane', {
   status: running,

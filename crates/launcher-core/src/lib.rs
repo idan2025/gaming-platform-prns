@@ -420,6 +420,19 @@ pub struct GameLocationView {
     pub detail: String,
 }
 
+/// Whether a game is on this machine, for the list's Installed badge
+/// (`ROADMAP.md` item 4). Read from Steam's own manifests and the player's
+/// saved path only; nothing here comes from a pack but its Steam app id.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledGameView {
+    pub game_id: String,
+    /// Steam has it installed, or the player pointed the launcher at it and
+    /// the file is still there.
+    pub installed: bool,
+    /// Play would start it without asking anything.
+    pub launch_ready: bool,
+}
+
 /// The outcome of a successful [`Launcher::play`], for the UI to confirm what it
 /// started and how.
 #[derive(Debug, Clone, Serialize)]
@@ -1492,6 +1505,22 @@ impl Launcher {
             .and_then(steam::installed_app_dir)
             .is_some();
         build_location_view(game_id, profile, saved.as_deref(), steam_exe.as_deref(), steam_installed)
+    }
+
+    /// Every game this launcher has a pack for, and whether it is on this
+    /// machine. Reads files only; the UI asks at start and after a Locate.
+    pub async fn installed_games(&self) -> Vec<InstalledGameView> {
+        let ids: Vec<String> = self.list_games().into_iter().map(|g| g.id).collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let loc = self.game_location(&id).await;
+            out.push(InstalledGameView {
+                installed: loc.steam_installed || loc.saved_path_valid,
+                launch_ready: loc.launch_ready,
+                game_id: id,
+            });
+        }
+        out
     }
 
     /// Remember the player's own path to a game's executable, after checking it
@@ -2596,6 +2625,30 @@ query = "a2s"
         let fresh: std::collections::HashSet<String> = ["cc".to_string()].into();
         let asked = Launcher::keepalive_targets(&settings, &fresh, now);
         assert_eq!(asked, vec!["never-heard".to_string(), "zz".into(), "bb".into()]);
+    }
+
+    /// A game the player pointed the launcher at reads as installed while
+    /// the file is there, and stops reading so once it is gone.
+    #[tokio::test]
+    async fn a_located_game_is_installed_until_its_file_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Launcher::new(vec![GamePack::sven_coop()]).with_settings_file(dir.path().join("launcher.json"));
+        let exe = dir.path().join("svencoop.exe");
+        std::fs::write(&exe, b"").unwrap();
+        l.set_game_path("sven-coop", &exe).await.unwrap();
+        let view = l.installed_games().await;
+        let sven = view.iter().find(|g| g.game_id == "sven-coop").expect("every pack is listed");
+        assert!(sven.installed);
+        let keys = serde_json::to_value(sven).unwrap();
+        for key in ["game_id", "installed", "launch_ready"] {
+            assert!(keys.get(key).is_some(), "the frontend reads {key}");
+        }
+        std::fs::remove_file(&exe).unwrap();
+        let view = l.installed_games().await;
+        let sven = view.iter().find(|g| g.game_id == "sven-coop").unwrap();
+        // Steam may still have it on a machine running this test; only the
+        // saved path's part is pinned here.
+        assert_eq!(sven.installed, steam::installed_app_dir(225840).is_some());
     }
 
     /// Remembering survives a restart, which is the entire point of writing it

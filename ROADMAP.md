@@ -13,7 +13,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 1 | Auto-update | every player | M | **done** (v0.2.31) |
 | 2 | Invite links | players with friends | S–M | **done** (v0.2.31) |
 | 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
-| 4 | Installed-game detection | every player | M | proposed |
+| 4 | Installed-game detection | every player | M | **built**: Installed badge, Flatpak/Snap Steam, file picker |
 | 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, four notifications |
 | 6 | Chat and player names in rooms | LAN-room players | L | proposed |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
@@ -120,6 +120,14 @@ place of today's text prompt.
 
 **Rules.** The executable still comes from the player's own installation and is
 never guessed from a pack (`PLAN.md` §13.1). Detection reads files only.
+
+**Built (2026-10-14).** `Launcher::installed_games` reports, per pack, whether
+Steam has the game (its own `appmanifest_<id>.acf`, `steam.rs`) or the
+player's saved path still exists; rows and the detail pane say **Installed**.
+Steam is also looked for in Flatpak and Snap installs on Linux, including
+their launchers for Play. Locate opens the system's file dialog
+(`pick_game_path`, run from Rust so the page needs no file permission), with
+the typed path as the fallback.
 
 ## 5. Tray icon and notifications
 

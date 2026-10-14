@@ -594,3 +594,6 @@ details.small > summary { cursor: pointer; color: var(--text-2); }
 .fav-off-name .sub { font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fav-off-row .btn { height: 28px; padding: 0 10px; font-size: 12.5px; }
 .btn-fav.on svg { color: var(--warn); fill: currentColor; }
+.badge.installed-badge { background: var(--ok-soft); color: var(--ok); }
+.pack-detail.have-game { color: var(--ok); }
+.pack-detail.no-game { color: var(--text-3); }
