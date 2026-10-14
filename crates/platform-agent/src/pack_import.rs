@@ -185,17 +185,22 @@ pub async fn import(
 
     std::fs::create_dir_all(dir).map_err(|e| ImportError::Io(e.to_string()))?;
     // A repository pack's signature goes in first, so the pack never sits
-    // beside a signature that is not its own; one from a repository with
-    // none takes a stale one away.
-    if request.repository.is_some() {
-        let sig_path = dir.join(format!("{}.toml{}", pack.id, game_bridge::signing::SIGNATURE_SUFFIX));
-        match &sig {
-            Some(text) => {
-                let staging = dir.join(format!(".{}.toml.sig.partial", pack.id));
-                std::fs::write(&staging, text).map_err(|e| ImportError::Io(e.to_string()))?;
-                std::fs::rename(&staging, &sig_path).map_err(|e| ImportError::Io(e.to_string()))?;
-            }
-            None => {
+    // beside a signature that is not its own. Without one, a signature left
+    // from the pack this replaces goes if it does not hold for the new bytes:
+    // left there, it would make the new pack fail to load as a forgery.
+    let sig_path = dir.join(format!("{}.toml{}", pack.id, game_bridge::signing::SIGNATURE_SUFFIX));
+    match &sig {
+        Some(text) => {
+            let staging = dir.join(format!(".{}.toml.sig.partial", pack.id));
+            std::fs::write(&staging, text).map_err(|e| ImportError::Io(e.to_string()))?;
+            std::fs::rename(&staging, &sig_path).map_err(|e| ImportError::Io(e.to_string()))?;
+        }
+        None => {
+            let holds = std::fs::read_to_string(&sig_path)
+                .ok()
+                .and_then(|t| game_bridge::signing::PackSignature::parse(&t).ok())
+                .is_some_and(|s| s.verify(src.as_bytes(), now).is_ok());
+            if !holds {
                 let _ = std::fs::remove_file(&sig_path);
             }
         }
@@ -617,5 +622,28 @@ query = "a2s"
         assert!(!file.exists() && !dir.path().join("test-game.toml.sig").exists());
         assert!(dir.path().join("notes.txt").exists(), "nothing else is touched");
         assert!(remove(dir.path(), "test-game").unwrap().is_none(), "gone means gone");
+    }
+
+    /// Replacing a signed pack with other bytes takes its old signature away,
+    /// or the new pack would not load; the same bytes keep it.
+    #[tokio::test]
+    async fn a_replaced_pack_never_keeps_a_signature_that_is_not_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        run(&paste(PACK, false), dir.path()).await.unwrap();
+        let key = prns_core::identity::PrivateIdentityMaterial::from_slice(&[5; 64]).unwrap();
+        let sig = game_bridge::signing::PackSignature::sign(
+            PACK.as_bytes(),
+            &key,
+            now() - std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(86_400),
+        )
+        .unwrap();
+        let sig_path = dir.path().join("test-game.toml.sig");
+        std::fs::write(&sig_path, sig.to_toml()).unwrap();
+        assert_eq!(run(&paste(PACK, true), dir.path()).await.unwrap().trust, "signed by an unknown key");
+        assert!(sig_path.exists(), "the same bytes keep their signature");
+        let out = run(&paste(&format!("{PACK}\n# edited\n"), true), dir.path()).await.unwrap();
+        assert_eq!(out.trust, "unsigned local");
+        assert!(!sig_path.exists());
     }
 }
