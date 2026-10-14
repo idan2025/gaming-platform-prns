@@ -262,6 +262,25 @@ fn send_notification(app: &tauri::AppHandle, title: &str, body: &str) -> bool {
 }
 
 #[tauri::command]
+async fn host_server(
+    state: tauri::State<'_, AppState>,
+    request: launcher_core::host::HostRequest,
+) -> Result<launcher_core::host::HostView, String> {
+    state.launcher.host_server(request).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn stop_hosting(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.launcher.stop_hosting().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn hosting(state: tauri::State<'_, AppState>) -> Result<launcher_core::host::HostView, String> {
+    Ok(state.launcher.hosting().await)
+}
+
+#[tauri::command]
 async fn first_run(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.launcher.first_run().await)
 }
@@ -839,6 +858,9 @@ pub fn run() {
             notifications_on,
             first_run,
             finish_first_run,
+            host_server,
+            stop_hosting,
+            hosting,
             set_notifications_on,
             pick_game_path,
             installed_games,

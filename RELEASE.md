@@ -83,6 +83,14 @@ is missing, which makes pushing a tag sufficient on its own.
 - A room whose host runs an older Lanthorn still works; it says chat is
   missing until the host updates.
 
+### Lanthorn: host a server from the launcher
+
+- **Host a server** on the Games page puts a game server you already run on
+  this computer on the mesh — a dedicated server or a game's own "host a
+  game" — with a name, max players and port, and gives you an invite link.
+  Closing the window keeps it up in the tray. Lanthorn never starts the game
+  server itself.
+
 ### Lanthorn: a welcome screen
 
 - A fresh install opens on one screen: your name, and whether to look on
