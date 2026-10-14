@@ -90,6 +90,7 @@ const ICON = {
   trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
   more: '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
   download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+  archive: '<path d="M4 5h16v4H4zM5 9v10h14V9M10 13h4"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/>',
   link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
   log: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
@@ -892,6 +893,8 @@ function openInstanceMenu(id, x, y) {
       title: "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone.",
       action: () => onToggleRestartOnCrash(id, !inst.restart_on_crash) });
   }
+  items.push({ label: "Backups…", icon: "archive", title: "Copies of this server's own files (saves, settings, logs), and putting one back.",
+    action: () => onBackups(id) });
   items.push({ label: "Daily restart…", icon: "restart", title: "Restart this server once a day in a window you pick, when nobody is playing.",
     action: () => onRestartSchedule(id) });
   items.push("sep");
@@ -1390,6 +1393,93 @@ function onShowLog(instanceId) {
     refresh(true);
   });
   back.querySelector(".modal").classList.add("modal-wide");
+}
+
+// ---------- backups (backups.rs) ----------
+
+function onBackups(instanceId) {
+  const inst = instById(instanceId);
+  const name = (inst && inst.name) || instanceId;
+  const path = "/instances/" + encodeURIComponent(instanceId) + "/backups";
+  openModal("backups-dialog", inst && inst.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Backups · " + name));
+    body.appendChild(el("p", "muted small", "A backup holds this server's own files: saves, settings and logs. " +
+      "The game's files are shared and never copied. Putting one back needs the server stopped."));
+    const list = el("div", "backup-list");
+    body.appendChild(list);
+    const note = el("p", "muted small");
+    body.appendChild(note);
+    const actions = el("div", "form-actions");
+    actions.style.marginTop = "8px";
+    const shut = el("button", "btn", "Close");
+    shut.type = "button";
+    shut.onclick = close;
+    const make = el("button", "btn btn-primary", "Back up now");
+    make.type = "button";
+    actions.append(shut, make);
+    body.appendChild(actions);
+
+    async function load() {
+      list.textContent = "";
+      let items;
+      try { items = await api("GET", path); }
+      catch (e) {
+        if (e && e.__auth) { close(); return; }
+        note.textContent = (e && e.error) || "This node's agent cannot make backups. Update the agent.";
+        make.disabled = true;
+        return;
+      }
+      const running = (instById(instanceId) || {}).state === "running";
+      note.textContent = running ? "It is running: a backup now may catch a file mid-write. Stop it first for a clean one." : "";
+      if (!items.length) { list.appendChild(el("div", "muted small", "No backups yet.")); return; }
+      for (const b of items) {
+        const row = el("div", "backup-row");
+        const when = b.created_unix ? new Date(b.created_unix * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : b.name;
+        row.append(el("span", "backup-when", when), el("span", "muted small", formatBytes(b.bytes)));
+        const restore = el("button", "btn btn-small", "Put back");
+        restore.type = "button";
+        restore.disabled = running;
+        restore.title = running ? "Stop the server first." : "Replace this server's files with this backup.";
+        restore.addEventListener("click", async () => {
+          if (!confirm("Put back the backup from " + when + "?\n\nThis server's current files are replaced. Back up first if you may want them.")) return;
+          try {
+            await withInFlight(api("POST", path + "/" + encodeURIComponent(b.name) + "/restore"));
+            toast(name + ": files put back from " + when + ".");
+            clearError();
+          } catch (e) {
+            if (e && e.__auth) { close(); return; }
+            showError((e && e.error) || "The backup was not put back.");
+          }
+        });
+        const del = el("button", "btn btn-small btn-danger-text", "Delete");
+        del.type = "button";
+        del.addEventListener("click", async () => {
+          if (!confirm("Delete the backup from " + when + "?")) return;
+          try { await withInFlight(api("DELETE", path + "/" + encodeURIComponent(b.name))); load(); }
+          catch (e) { if (e && e.__auth) { close(); return; } showError((e && e.error) || "The backup was not deleted."); }
+        });
+        const acts = el("span", "backup-actions");
+        acts.append(restore, del);
+        row.appendChild(acts);
+        list.appendChild(row);
+      }
+    }
+    make.addEventListener("click", async () => {
+      make.disabled = true; make.textContent = "Backing up…";
+      try {
+        const b = await withInFlight(api("POST", path));
+        toast(name + " backed up, " + formatBytes(b.bytes) + ".");
+        clearError();
+        await load();
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "The backup was not made.");
+      } finally {
+        make.disabled = false; make.textContent = "Back up now";
+      }
+    });
+    load();
+  });
 }
 
 // ---------- daily restart (schedule.rs) ----------

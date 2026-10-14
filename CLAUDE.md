@@ -545,6 +545,18 @@ served on its own routes, **not on `InstanceStatus`**, which the uplink
 wire carries to deployed peers. Caught by
 `a_server_restarts_in_its_window_only_when_allowed_and_only_once`.
 
+**A server's own files can be backed up and put back** (2026-10-14,
+`backups.rs`, "Backups…" in a server's menu). Only `instances/<id>/writable`
+(the pack's writable paths), never the shared content. **A backup's name is
+the agent's** (`YYYYMMDD-HHMMSS.tar.gz`) and a name from a request is checked
+against that shape before it becomes a path. **Restore only while the server
+is stopped**, extracted beside with `content::extract` (its path and link
+checks) and swapped in; a directory the backup lacks is made empty so every
+mount keeps a source. A backup is held to the disk reserve and written beside
+and renamed. Backups live in `backups/<id>/`, outside the instance folder, and
+outlive the server. Caught by
+`a_backup_brings_a_servers_files_back_and_only_while_it_is_stopped`.
+
 **A game's files can be updated from the node** (2026-10-13,
 `Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later
 change could quietly break:
