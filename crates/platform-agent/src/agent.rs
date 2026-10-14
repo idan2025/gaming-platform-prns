@@ -149,6 +149,8 @@ pub struct Agent {
     moving: std::sync::Mutex<HashMap<String, MoveInFlight>>,
     move_log: std::sync::Mutex<BTreeMap<String, MoveRecord>>,
     move_timing: std::sync::Mutex<MoveTiming>,
+    /// Why a scheduled restart is waiting, by server (`scheduled_restarts`).
+    restart_waits: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 /// A server being moved, and both its copies: neither is deleted while the
@@ -227,6 +229,21 @@ pub enum MoveState {
 pub enum MoveOutcome {
     Moved { from: String, to: String },
     RolledBack { from: String, to: String, why: String },
+}
+
+/// The in-game warning before a scheduled restart with players on.
+pub const RESTART_WARNING: &str = "This server restarts in about a minute. It keeps its name and address";
+
+/// How often the agent looks at servers' daily restart windows.
+pub const SCHEDULE_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// A server's daily restart, for the page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScheduleStatus {
+    #[serde(flatten)]
+    pub stored: crate::schedule::Stored,
+    /// Why it has not restarted yet in a window that is open now.
+    pub waiting: Option<String>,
 }
 
 /// How often the agent looks for servers to move onto a new copy.
@@ -485,6 +502,7 @@ impl Agent {
             moving: std::sync::Mutex::new(HashMap::new()),
             move_log: std::sync::Mutex::new(BTreeMap::new()),
             move_timing: std::sync::Mutex::new(MoveTiming::default()),
+            restart_waits: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1643,6 +1661,99 @@ impl Agent {
             std::fs::remove_file(&marker)?;
         }
         Ok(())
+    }
+
+    /// Every server's daily restart window, by server (`schedule.rs`).
+    pub async fn restart_schedules(&self) -> Result<BTreeMap<String, ScheduleStatus>> {
+        let waits = self.restart_waits.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut out = BTreeMap::new();
+        for c in self.docker.list_managed().await? {
+            let Ok(dir) = self.layout.instance_dir(&c.instance_id) else { continue };
+            if let Some(stored) = crate::schedule::load(&dir) {
+                let waiting = waits.get(&c.instance_id).cloned();
+                out.insert(c.instance_id, ScheduleStatus { stored, waiting });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Give a server a daily restart window, or take it away with `None`.
+    pub async fn set_restart_schedule(
+        &self,
+        instance_id: &str,
+        schedule: Option<crate::schedule::RestartSchedule>,
+    ) -> Result<()> {
+        if !self.docker.list_managed().await?.iter().any(|c| c.instance_id == instance_id) {
+            return Err(anyhow!("no instance {instance_id:?} on this node"));
+        }
+        let dir = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?;
+        let stored = match schedule {
+            Some(schedule) => {
+                schedule.validate().map_err(|e| anyhow!("{e}"))?;
+                let last_unix = crate::schedule::load(&dir).and_then(|s| s.last_unix);
+                Some(crate::schedule::Stored { schedule, last_unix })
+            }
+            None => None,
+        };
+        crate::schedule::save(&dir, stored.as_ref())?;
+        self.restart_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(instance_id);
+        Ok(())
+    }
+
+    /// Restart the running servers whose daily window is open, once each
+    /// window (`schedule.rs`): when nobody is playing, or after an in-game
+    /// warning where the operator allowed it. A stopped server, and a server
+    /// being moved, are left alone. Through `restart`, so each comes back on
+    /// the mesh.
+    pub async fn scheduled_restarts(&self) {
+        let Ok(containers) = self.docker.list_managed().await else { return };
+        let Ok(instances) = self.list().await else { return };
+        let mut waits = BTreeMap::new();
+        for c in containers.iter().filter(|c| c.state == InstanceState::Running) {
+            let Ok(dir) = self.layout.instance_dir(&c.instance_id) else { continue };
+            let Some(mut stored) = crate::schedule::load(&dir) else { continue };
+            if self.is_moving(&c.instance_id) {
+                continue;
+            }
+            let console = match &c.game_id {
+                Some(game) => self.packs.read().await.get(game).and_then(|p| p.console).map(ConsoleProtocol::from),
+                None => None,
+            };
+            let humans = match instances.iter().find(|i| i.instance_id == c.instance_id) {
+                Some(i) => self.humans_on(i).await,
+                None => None,
+            };
+            let now = now_unix();
+            let warn = match stored.schedule.decision(humans, now, console.is_some(), stored.last_unix) {
+                crate::schedule::RestartDecision::NotNow => continue,
+                crate::schedule::RestartDecision::Wait(why) => {
+                    waits.insert(c.instance_id.clone(), why);
+                    continue;
+                }
+                crate::schedule::RestartDecision::Restart => None,
+                crate::schedule::RestartDecision::WarnThenRestart => console.and_then(|c| c.say(RESTART_WARNING).ok()),
+            };
+            // Recorded first, so a restart that fails is not retried every
+            // minute for the rest of the window.
+            stored.last_unix = Some(now);
+            if let Err(e) = crate::schedule::save(&dir, Some(&stored)) {
+                tracing::warn!(instance = %c.instance_id, error = %e, "not restarting: the schedule could not be saved");
+                continue;
+            }
+            if let Some(line) = warn {
+                if let Err(e) = self.docker.send_console_line(&c.instance_id, &line).await {
+                    tracing::warn!(instance = %c.instance_id, error = %format!("{e:#}"), "not restarting: the players could not be warned");
+                    continue;
+                }
+                let wait = self.move_timing.lock().unwrap_or_else(|e| e.into_inner()).warn;
+                tokio::time::sleep(wait).await;
+            }
+            tracing::info!(instance = %c.instance_id, "scheduled restart");
+            if let Err(e) = self.restart(&c.instance_id).await {
+                tracing::warn!(instance = %c.instance_id, error = %format!("{e:#}"), "the scheduled restart failed");
+            }
+        }
+        *self.restart_waits.lock().unwrap_or_else(|e| e.into_inner()) = waits;
     }
 
     /// Start again every server that asked for it and crashed since the last

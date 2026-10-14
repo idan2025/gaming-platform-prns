@@ -137,6 +137,17 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Daily restart windows (`schedule.rs`): only servers the operator gave one.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(platform_agent::agent::SCHEDULE_CHECK_EVERY).await;
+                agent.scheduled_restarts().await;
+            }
+        });
+    }
+
     // Moving servers onto a new copy (`ROADMAP.md` §12.4): nothing moves
     // until the operator picks when, per game, on the Installed page.
     {

@@ -17,6 +17,7 @@ pub mod mesh;
 pub mod pack_import;
 pub mod packs;
 pub mod ports;
+pub mod schedule;
 pub mod store;
 pub mod uplink;
 pub mod uplink_wire;

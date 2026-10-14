@@ -534,6 +534,17 @@ has the route**: the uplink must never gain one, or an index could type at a
 node's servers. Caught by
 `an_operators_line_reaches_the_console_and_a_second_line_never_does`.
 
+**A server can restart daily in a window** (2026-10-14, `schedule.rs`,
+`Agent::scheduled_restarts`, "Daily restart…" in a server's menu). Once a
+window, only a **running** server (a Stop is never undone), when the game says
+no humans are on it — silence is not empty — or, if the operator allowed it,
+after `say` over a game console; never while the server is being moved. The
+attempt is recorded before the restart, so one that fails is not retried
+every minute. Kept in `restart-schedule.json` in the instance folder and
+served on its own routes, **not on `InstanceStatus`**, which the uplink
+wire carries to deployed peers. Caught by
+`a_server_restarts_in_its_window_only_when_allowed_and_only_once`.
+
 **A game's files can be updated from the node** (2026-10-13,
 `Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later
 change could quietly break:

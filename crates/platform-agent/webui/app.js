@@ -892,6 +892,8 @@ function openInstanceMenu(id, x, y) {
       title: "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone.",
       action: () => onToggleRestartOnCrash(id, !inst.restart_on_crash) });
   }
+  items.push({ label: "Daily restart…", icon: "restart", title: "Restart this server once a day in a window you pick, when nobody is playing.",
+    action: () => onRestartSchedule(id) });
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
   showMenu(x, y, items);
@@ -1388,6 +1390,85 @@ function onShowLog(instanceId) {
     refresh(true);
   });
   back.querySelector(".modal").classList.add("modal-wide");
+}
+
+// ---------- daily restart (schedule.rs) ----------
+
+async function onRestartSchedule(instanceId) {
+  const inst = instById(instanceId);
+  const name = (inst && inst.name) || instanceId;
+  let current = null;
+  try {
+    const all = await api("GET", "/restart-schedules");
+    current = all && all[instanceId] ? all[instanceId] : null;
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "This node's agent cannot schedule restarts. Update the agent.");
+    return;
+  }
+  const game = inst && state.games.find(g => g.id === inst.game_id);
+  const canWarn = !!(game && game.console);
+  const sched = (current && current.schedule) || { start_utc: 4, end_utc: 6, with_players: false };
+  openModal("schedule-dialog", inst && inst.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Daily restart · " + name));
+    body.appendChild(el("p", "muted small", "Once a day, inside the window, when nobody is playing. A server that does not say " +
+      "how many are on is never treated as empty. A stopped server is never started by this."));
+    const onWrap = el("label", "check");
+    const on = el("input");
+    on.type = "checkbox";
+    on.checked = !!current;
+    onWrap.append(on, el("span", null, "Restart this server every day"));
+    body.appendChild(onWrap);
+    const hours = el("div", "ug-hours schedule-hours");
+    const hourSel = value => {
+      const sel = el("select", "field");
+      for (let h = 0; h < 24; h++) { const o = el("option", null, localHour(h)); o.value = String(h); sel.appendChild(o); }
+      sel.value = String(value);
+      return sel;
+    };
+    const start = hourSel(sched.start_utc);
+    const end = hourSel(sched.end_utc);
+    hours.append(el("span", "muted small", "Between"), start, el("span", "muted small", "and"), end, el("span", "muted small", "your time"));
+    body.appendChild(hours);
+    const forceWrap = el("label", "check");
+    const force = el("input");
+    force.type = "checkbox";
+    force.checked = !!sched.with_players;
+    force.disabled = !canWarn;
+    forceWrap.append(force, el("span", null, canWarn ? "Also with players on: they are warned in game a minute before"
+      : "This game has no console to warn players on, so it always waits for empty"));
+    body.appendChild(forceWrap);
+    if (current && current.waiting) body.appendChild(el("p", "muted small", "Now: " + current.waiting + "."));
+    else if (current && current.last_unix) body.appendChild(el("p", "muted small", "Last restarted by this " + ago(current.last_unix) + "."));
+    const sync = () => { start.disabled = end.disabled = !on.checked; force.disabled = !on.checked || !canWarn; };
+    on.addEventListener("change", sync);
+    sync();
+    const actions = el("div", "form-actions");
+    actions.style.marginTop = "8px";
+    const cancel = el("button", "btn", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = close;
+    const save = el("button", "btn btn-primary", "Save");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      if (on.checked && start.value === end.value) { showError("A window has to be at least an hour long."); return; }
+      const schedule = on.checked ? { start_utc: Number(start.value), end_utc: Number(end.value), with_players: force.checked && canWarn } : null;
+      save.disabled = true;
+      try {
+        await withInFlight(api("PUT", "/instances/" + encodeURIComponent(instanceId) + "/restart-schedule", { schedule }));
+        clearError();
+        close();
+        toast(schedule ? name + " restarts daily between " + localHour(schedule.start_utc) + " and " + localHour(schedule.end_utc) + "."
+          : name + " no longer restarts on a schedule.");
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "That did not save.");
+        save.disabled = false;
+      }
+    });
+    actions.append(cancel, save);
+    body.appendChild(actions);
+  });
 }
 
 // ---------- players ----------
