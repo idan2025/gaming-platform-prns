@@ -410,7 +410,10 @@ mod tests {
             Some(true)
         );
         let unchecked = GameCheck::default();
-        assert_eq!(UpdateNotice::new("g", "v", Some("100".into()), &unchecked, &p, 0).available, None);
+        assert_eq!(
+            UpdateNotice::new("g", "v", Some("100".into()), &unchecked, &p, 0).available,
+            None
+        );
     }
 
     /// A failed check keeps the build already seen, and survives a restart.
@@ -430,7 +433,11 @@ mod tests {
     /// reserve waits for the next check rather than restarting every minute.
     #[test]
     fn an_automatic_download_tries_a_build_once_per_check() {
-        let mut c = GameCheck { checked_unix: Some(100), latest_build: Some("200".into()), ..Default::default() };
+        let mut c = GameCheck {
+            checked_unix: Some(100),
+            latest_build: Some("200".into()),
+            ..Default::default()
+        };
         assert!(c.may_auto_download(100));
         c.auto_build = Some("200".into());
         c.auto_unix = Some(110);
