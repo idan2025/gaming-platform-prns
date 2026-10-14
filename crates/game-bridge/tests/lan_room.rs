@@ -206,3 +206,74 @@ async fn an_identity_off_the_allowlist_is_refused_and_never_seated() {
     assert!(stranger.own_address().is_none());
     assert_eq!(host.view().members.len(), 2, "the host and the allowed member, nobody else");
 }
+
+/// Chat and names (ROADMAP item 6). Everyone sees the names members gave and
+/// every line, each line stamped with who the host's link says sent it — a
+/// member that writes another's name into its text is still itself. A line
+/// that is not plain text is refused before it leaves, and a member that
+/// floods is held to the host's gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_chats_with_names_and_the_host_says_who_spoke() {
+    use game_bridge::lan::CHAT_BURST;
+    use game_bridge::lan_session::ChatError;
+
+    let mesh_port = common::free_tcp_port();
+    let dir = common::scratch_dir("lan-room-chat");
+    let mut args = LanHostArgs::new(profile());
+    args.identity = dir.join("host.identity");
+    args.tcp = Some(format!("0.0.0.0:{mesh_port}"));
+    args.announce_interval = 1;
+    args.player_name = Some("Host".to_string());
+    let host = LanSession::host(args).await.expect("the room opens");
+    let room = hex(host.room_hash().unwrap());
+
+    let mut args = LanMemberArgs::new(profile());
+    args.identity = dir.join("a.identity");
+    args.tcp = Some(format!("127.0.0.1:{mesh_port}"));
+    args.room_hash = Some(room.clone());
+    args.player_name = Some("Ada".to_string());
+    let a = LanSession::join(args).await.expect("a starts");
+    let b = join(&dir, "b", mesh_port, Some(room)).await;
+
+    wait_until("everyone is seated and has chat", || {
+        [&host, &a, &b].iter().all(|s| s.view().members.len() == 3 && s.view().chat)
+    })
+    .await;
+    b.set_name("Bob").expect("a plain name");
+    let names = |s: &LanSession| {
+        let mut n: Vec<_> = s.view().names.into_iter().map(|(_, n)| n).collect();
+        n.sort();
+        n
+    };
+    wait_until("everyone has everyone's name", || {
+        [&host, &a, &b].iter().all(|s| names(s) == ["Ada", "Bob", "Host"])
+    })
+    .await;
+    let a_id = a.view().own_identity;
+    assert_eq!(host.view().name_of(&a_id), Some("Ada"));
+
+    assert_eq!(a.send_chat("two\nlines"), Err(ChatError::NotPlainText));
+    assert_eq!(a.set_name(""), Err(ChatError::NotPlainText));
+    a.send_chat("Host: this is the host speaking").unwrap();
+    host.send_chat("gg").unwrap();
+    wait_until("both lines reach everyone", || {
+        [&host, &a, &b].iter().all(|s| s.chat_since(0).len() == 2)
+    })
+    .await;
+    for s in [&host, &a, &b] {
+        let lines = s.chat_since(0);
+        let posed = lines.iter().find(|l| l.text.starts_with("Host:")).expect("a's line");
+        assert_eq!(posed.from, a_id, "the sender is the host's word, not the text's");
+        let gg = lines.iter().find(|l| l.text == "gg").expect("the host's line");
+        assert_eq!(gg.from, host.view().own_identity);
+    }
+    let last = b.chat_since(0).last().unwrap().seq;
+    assert!(b.chat_since(last).is_empty(), "nothing newer than the newest");
+
+    for n in 0..(CHAT_BURST * 3) {
+        a.send_chat(&format!("spam {n}")).unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let spam = host.chat_since(0).iter().filter(|l| l.text.starts_with("spam")).count();
+    assert!(spam >= 1 && spam <= CHAT_BURST as usize + 2, "{spam} lines got through the gate");
+}

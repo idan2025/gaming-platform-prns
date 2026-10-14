@@ -560,6 +560,19 @@ async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, Stri
 }
 
 #[tauri::command]
+async fn room_chat(
+    state: tauri::State<'_, AppState>,
+    since: u64,
+) -> Result<Vec<launcher_core::lan::RoomChatLineView>, String> {
+    Ok(state.launcher.room_chat(since).await)
+}
+
+#[tauri::command]
+async fn send_room_chat(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+    state.launcher.send_room_chat(&text).await.map_err(fmt_err)
+}
+
+#[tauri::command]
 async fn check_room(state: tauri::State<'_, AppState>) -> Result<RoomCheckView, String> {
     state.launcher.check_room().await.map_err(fmt_err)
 }
@@ -785,6 +798,8 @@ pub fn run() {
             remove_interface,
             saved_browse_opts,
             set_player_name,
+            room_chat,
+            send_room_chat,
             lan_helper,
             grant_lan_helper,
             revoke_lan_helper,

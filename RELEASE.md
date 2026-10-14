@@ -74,6 +74,15 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn: chat and names in LAN rooms
+
+- A LAN room has a **chat**, and members are listed by **name** beside their
+  address. Set your name in Settings → You.
+- A room whose host runs an older Lanthorn still works; it says chat is
+  missing until the host updates.
+
 ## v0.2.39
 
 ### Lanthorn: favorites, installed games, a tray, slow-link warnings and big screen

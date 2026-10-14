@@ -849,6 +849,18 @@ Rules a later change could quietly break:
     stand-in game on a second address, both directions: host's game on its
     Wi-Fi, and a member calling out from its own); without the translation
     the join fails with `Connection refused`, as in the field.
+- **Room chat's sender is the host's word, never the line's** (2026-10-15,
+  ROADMAP item 6, `lan.rs` `Name`/`Names`/`Chat`/`ChatFrom`). A member sends
+  text only; the host stamps the identity its link proved, so a line can never
+  be "from" someone else, and a name is data that is never used to tell
+  members apart. Names and lines are refused at decode if they are not one
+  line of plain text within their cap (`valid_name`, `valid_chat`), never
+  stripped, and chat is gated per member at the host (`ChatGate`), like
+  broadcasts. The four types are unknown to older builds and ignored, so a
+  mixed room still runs. Caught by
+  `a_room_chats_with_names_and_the_host_says_who_spoke`, which fails with the
+  gate removed; the UI only ever sets a line as text
+  (`a room chats, by name, and a line is only ever text` in `render.mjs`).
 - **Steam's 27031–27036 are chatter** (`OS_CHATTER`): Proton runs Steam's LAN
   discovery beside every game, and 27036 was offered and allowed as NFSU2's
   missing port.

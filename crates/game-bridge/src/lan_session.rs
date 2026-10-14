@@ -36,7 +36,7 @@ use tracing::{debug, info, warn};
 use crate::announce::{AnnounceFlags, AnnounceInfo, AnnounceRecord};
 use crate::config::BridgeRole;
 use crate::lan::{
-    self, BroadcastGate, LanMessage, Member, MemberTable, Refusal, RoomSubnet, Route, ASPECT_LAN,
+    self, BroadcastGate, ChatGate, LanMessage, Member, MemberTable, Refusal, RoomSubnet, Route, ASPECT_LAN,
     ASPECT_LAN_MEMBER, LAN_MTU, LAN_PROTOCOL_VERSION, TRANSPORT_MODE_LAN,
 };
 use crate::profile::GameProfile;
@@ -57,6 +57,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// How long the host keeps a refused link open, so the `Refused` it just sent
 /// can arrive before the link's teardown does.
 const REFUSED_CLOSE_DELAY: Duration = Duration::from_secs(1);
+/// Chat lines a session keeps for its UI. Older ones fall off.
+const CHAT_KEPT: usize = 200;
+
 /// Packets waiting for the caller to [`recv`](LanSession::recv) them. Past
 /// this, new ones are dropped, the way a full NIC ring drops them.
 const INBOUND_QUEUE: usize = 1024;
@@ -83,6 +86,8 @@ pub struct LanHostArgs {
     pub identify_timeout_secs: u64,
     pub relay_transit: bool,
     pub subnet: RoomSubnet,
+    /// What the host is called in its own room's chat and member list.
+    pub player_name: Option<String>,
 }
 
 impl LanHostArgs {
@@ -99,6 +104,7 @@ impl LanHostArgs {
             identify_timeout_secs: 10,
             relay_transit: true,
             subnet: RoomSubnet::default(),
+            player_name: None,
         }
     }
 }
@@ -115,6 +121,8 @@ pub struct LanMemberArgs {
     pub room_hash: Option<String>,
     /// Off by default, as for a client (`PLAN.md` §4).
     pub relay_transit: bool,
+    /// What this member asks to be called in the room.
+    pub player_name: Option<String>,
 }
 
 impl LanMemberArgs {
@@ -126,6 +134,7 @@ impl LanMemberArgs {
             auto: false,
             room_hash: None,
             relay_transit: false,
+            player_name: None,
         }
     }
 }
@@ -141,7 +150,84 @@ pub struct RoomView {
     pub epoch: u32,
     /// Set when the host refused this member. A refused member stops trying.
     pub refused: Option<Refusal>,
+    /// The names members gave, by identity, as the host last said. Data a
+    /// member chose: never how members are told apart.
+    pub names: Vec<(IdentityHash, String)>,
+    /// Whether the room has chat: always on a host, and on a member once the
+    /// host has sent `Names` (a host older than chat never does).
+    pub chat: bool,
 }
+
+impl RoomView {
+    /// The name `identity` gave, if it gave one.
+    pub fn name_of(&self, identity: &IdentityHash) -> Option<&str> {
+        self.names.iter().find(|(id, _)| id == identity).map(|(_, n)| n.as_str())
+    }
+}
+
+/// One line of room chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLine {
+    /// Counts up from 1 for the session, so a UI asks for what is newer.
+    pub seq: u64,
+    /// Who sent it, as the host's link proved it.
+    pub from: IdentityHash,
+    pub text: String,
+    pub at_unix: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChatLog {
+    lines: std::collections::VecDeque<ChatLine>,
+    next: u64,
+}
+
+impl ChatLog {
+    fn push(&mut self, from: IdentityHash, text: String) {
+        self.next += 1;
+        let at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.lines.push_back(ChatLine { seq: self.next, from, text, at_unix });
+        while self.lines.len() > CHAT_KEPT {
+            self.lines.pop_front();
+        }
+    }
+}
+
+/// What the caller asks of the session's loop.
+enum Control {
+    SetName(String),
+    Chat(String),
+}
+
+/// Why a chat line or name was not sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatError {
+    /// Empty, too long, or not one line of plain text.
+    NotPlainText,
+    /// The host's build has no chat.
+    NoChat,
+    Stopped,
+}
+
+impl core::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotPlainText => write!(
+                f,
+                "one line of text, up to {} characters (a name: up to {})",
+                lan::MAX_CHAT_BYTES,
+                lan::MAX_NAME_BYTES
+            ),
+            Self::NoChat => write!(f, "the room's host runs a Lanthorn without chat"),
+            Self::Stopped => write!(f, "the room session has stopped"),
+        }
+    }
+}
+
+impl std::error::Error for ChatError {}
 
 impl RoomView {
     fn new(own_identity: IdentityHash, subnet: RoomSubnet) -> Self {
@@ -152,6 +238,8 @@ impl RoomView {
             members: Vec::new(),
             epoch: 0,
             refused: None,
+            names: Vec::new(),
+            chat: false,
         }
     }
 
@@ -204,9 +292,41 @@ pub struct LanSession {
     /// Wakes a host's announcer early (`announce_now`). `None` on a member,
     /// which announces nothing anyone browses.
     announce: Option<Arc<tokio::sync::Notify>>,
+    control: mpsc::UnboundedSender<Control>,
+    chat: Arc<Mutex<ChatLog>>,
 }
 
 impl LanSession {
+    /// Say one line in the room's chat. It shows in [`chat_since`] once the
+    /// host sends it back, which is the only receipt there is.
+    ///
+    /// [`chat_since`]: LanSession::chat_since
+    pub fn send_chat(&self, text: &str) -> Result<(), ChatError> {
+        let text = text.trim();
+        if !lan::valid_chat(text) {
+            return Err(ChatError::NotPlainText);
+        }
+        if !self.view.lock().expect("room view lock").chat {
+            return Err(ChatError::NoChat);
+        }
+        self.control.send(Control::Chat(text.to_string())).map_err(|_| ChatError::Stopped)
+    }
+
+    /// Change what this side is called in the room.
+    pub fn set_name(&self, name: &str) -> Result<(), ChatError> {
+        let name = name.trim();
+        if !lan::valid_name(name) {
+            return Err(ChatError::NotPlainText);
+        }
+        self.control.send(Control::SetName(name.to_string())).map_err(|_| ChatError::Stopped)
+    }
+
+    /// Chat lines newer than `seq` (0 for all that are kept), oldest first.
+    pub fn chat_since(&self, seq: u64) -> Vec<ChatLine> {
+        let log = self.chat.lock().expect("chat lock");
+        log.lines.iter().filter(|l| l.seq > seq).cloned().collect()
+    }
+
     /// Hand one IPv4 packet to the room. Returns once it is queued; like a
     /// LAN, delivery is not promised.
     pub fn send(&self, packet: Vec<u8>) -> Result<(), LanSendError> {
@@ -316,6 +436,18 @@ impl LanSession {
         let mut table = MemberTable::new(args.subnet, args.max_members);
         let own_address = table.admit(own_identity).expect("an empty room seats its host");
         let view = Arc::new(Mutex::new(RoomView::new(own_identity, args.subnet)));
+        let own_name = args.player_name.as_deref().map(str::trim).filter(|n| lan::valid_name(n));
+        {
+            let mut v = view.lock().expect("room view lock");
+            v.chat = true;
+            if let Some(n) = own_name {
+                v.names = vec![(own_identity, n.to_string())];
+            }
+        }
+        let own_name = own_name.map(str::to_string);
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
+        let chat = Arc::new(Mutex::new(ChatLog::default()));
+        let thread_chat = chat.clone();
         view.lock().expect("room view lock").apply(
             table.epoch(),
             table.subnet(),
@@ -435,8 +567,11 @@ impl LanSession {
                     inbound: in_tx,
                     event_tx: event_tx.clone(),
                     identify_timeout: Duration::from_secs(args.identify_timeout_secs.max(1)),
+                    names: own_name.into_iter().map(|n| (*own_identity.as_bytes(), n)).collect(),
+                    chat_gate: ChatGate::default(),
+                    chat: thread_chat,
                 };
-                tokio::spawn(host.run(event_rx, out_rx, discovered));
+                tokio::spawn(host.run(event_rx, out_rx, control_rx, discovered));
                 Ok((handle, async move {
                     let _ = node.run().await;
                 }))
@@ -456,6 +591,8 @@ impl LanSession {
             extra_ports: Default::default(),
             rebound: Default::default(),
             announce: Some(announce),
+            control: control_tx,
+            chat,
         })
     }
 
@@ -476,6 +613,15 @@ impl LanSession {
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(INBOUND_QUEUE);
         let thread_view = view.clone();
         let thread_room = room_hash.clone();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
+        let chat = Arc::new(Mutex::new(ChatLog::default()));
+        let thread_chat = chat.clone();
+        let own_name = args
+            .player_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| lan::valid_name(n))
+            .map(str::to_string);
 
         let bridge = spawn_bridge_node(
             BridgeRole::Client,
@@ -514,8 +660,10 @@ impl LanSession {
                     link: None,
                     view: thread_view,
                     inbound: in_tx,
+                    name: own_name,
+                    chat: thread_chat,
                 };
-                tokio::spawn(member.run(event_rx, out_rx, discovered));
+                tokio::spawn(member.run(event_rx, out_rx, control_rx, discovered));
                 Ok((handle, async move {
                     let _ = node.run().await;
                 }))
@@ -535,6 +683,8 @@ impl LanSession {
             extra_ports: Default::default(),
             rebound: Default::default(),
             announce: None,
+            control: control_tx,
+            chat,
         })
     }
 }
@@ -611,6 +761,10 @@ struct Host {
     inbound: mpsc::Sender<Vec<u8>>,
     event_tx: mpsc::UnboundedSender<BridgeEvent>,
     identify_timeout: Duration,
+    /// Names by identity, the host's own included. Only seated members'.
+    names: HashMap<[u8; 16], String>,
+    chat_gate: ChatGate,
+    chat: Arc<Mutex<ChatLog>>,
 }
 
 impl Host {
@@ -618,6 +772,7 @@ impl Host {
         mut self,
         mut events: mpsc::UnboundedReceiver<BridgeEvent>,
         mut outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut control: mpsc::UnboundedReceiver<Control>,
         discovered: Arc<tokio::sync::RwLock<Vec<DiscoveredServer>>>,
     ) {
         let mut refresh = tokio::time::interval(MEMBERS_REFRESH);
@@ -632,6 +787,16 @@ impl Host {
                     let own = self.own_identity;
                     self.forward(own, None, packet);
                 }
+                Some(c) = control.recv() => match c {
+                    Control::SetName(name) => {
+                        self.names.insert(*self.own_identity.as_bytes(), name);
+                        self.publish_names();
+                    }
+                    Control::Chat(text) => {
+                        let own = self.own_identity;
+                        self.say(own, text);
+                    }
+                },
                 _ = refresh.tick() => self.publish_members(),
             }
         }
@@ -668,6 +833,8 @@ impl Host {
                     if self.seated.get(identity.as_bytes()) == Some(&link_id) {
                         self.seated.remove(identity.as_bytes());
                         self.gate.forget(&identity);
+                        self.chat_gate.forget(&identity);
+                        self.names.remove(identity.as_bytes());
                         if self.table.remove(&identity) {
                             info!(identity = ?identity.as_bytes(), "a member left the room");
                             self.publish_members();
@@ -685,8 +852,22 @@ impl Host {
                 match LanMessage::decode(&bytes) {
                     Ok(LanMessage::Hello { .. }) => {
                         send_message(&self.handle, link_id, &self.table.snapshot());
+                        send_message(&self.handle, link_id, &self.names_message());
                     }
                     Ok(LanMessage::Packet(packet)) => self.forward(identity, Some(link_id), packet),
+                    Ok(LanMessage::Name(name)) => {
+                        if self.names.get(identity.as_bytes()) != Some(&name) {
+                            self.names.insert(*identity.as_bytes(), name);
+                            self.publish_names();
+                        }
+                    }
+                    Ok(LanMessage::Chat(text)) => {
+                        if self.chat_gate.allow(identity, Instant::now()) {
+                            self.say(identity, text);
+                        } else {
+                            debug!(sender = ?identity.as_bytes(), "chat over the member's rate; dropped");
+                        }
+                    }
                     // Members and Refused are the host's own words; a member
                     // sending them is ignored like any unknown message.
                     Ok(_) => {}
@@ -717,6 +898,7 @@ impl Host {
                         self.publish_members();
                     } else {
                         send_message(&self.handle, link_id, &self.table.snapshot());
+                        send_message(&self.handle, link_id, &self.names_message());
                     }
                     None
                 }
@@ -774,6 +956,40 @@ impl Host {
             self.table.subnet(),
             self.table.members().to_vec(),
         );
+        self.publish_names();
+    }
+
+    /// The names of members seated now, in table order.
+    fn names_message(&self) -> LanMessage {
+        LanMessage::Names(
+            self.table
+                .members()
+                .iter()
+                .filter_map(|m| {
+                    self.names.get(m.identity.as_bytes()).map(|n| (m.identity, n.clone()))
+                })
+                .collect(),
+        )
+    }
+
+    fn publish_names(&self) {
+        let message = self.names_message();
+        for &link_id in self.seated.values() {
+            send_message(&self.handle, link_id, &message);
+        }
+        if let LanMessage::Names(names) = message {
+            self.view.lock().expect("room view lock").names = names;
+        }
+    }
+
+    /// One chat line from `from` — a seated member, or the host — to everyone,
+    /// the sender included: getting it back is the sender's receipt.
+    fn say(&mut self, from: IdentityHash, text: String) {
+        let message = LanMessage::ChatFrom { from, text: text.clone() };
+        for &link_id in self.seated.values() {
+            send_message(&self.handle, link_id, &message);
+        }
+        self.chat.lock().expect("chat lock").push(from, text);
     }
 }
 
@@ -790,6 +1006,9 @@ struct MemberSide {
     link: Option<LinkId>,
     view: Arc<Mutex<RoomView>>,
     inbound: mpsc::Sender<Vec<u8>>,
+    /// What this member asks to be called.
+    name: Option<String>,
+    chat: Arc<Mutex<ChatLog>>,
 }
 
 /// What the connector tells the member's loop.
@@ -803,6 +1022,7 @@ impl MemberSide {
         mut self,
         mut events: mpsc::UnboundedReceiver<BridgeEvent>,
         mut outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut control: mpsc::UnboundedReceiver<Control>,
         discovered: Arc<tokio::sync::RwLock<Vec<DiscoveredServer>>>,
     ) {
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<Connection>();
@@ -853,6 +1073,17 @@ impl MemberSide {
                     let Some(packet) = packet else { return };
                     self.send(packet);
                 }
+                Some(c) = control.recv() => match c {
+                    Control::SetName(name) => {
+                        self.name = Some(name);
+                        self.send_name();
+                    }
+                    Control::Chat(text) => {
+                        if let Some(link_id) = self.link {
+                            send_message(&self.handle, link_id, &LanMessage::Chat(text));
+                        }
+                    }
+                },
                 _ = hello.tick() => {
                     let seated = self.view.lock().expect("room view lock").own_address.is_some();
                     if let (Some(link_id), false) = (self.link, seated) {
@@ -884,7 +1115,9 @@ impl MemberSide {
             BridgeEvent::LinkClosed { link_id } if self.link == Some(link_id) => {
                 warn!(link = ?link_id, "lost the LAN room; linking again");
                 self.link = None;
-                self.view.lock().expect("room view lock").own_address = None;
+                let mut view = self.view.lock().expect("room view lock");
+                view.own_address = None;
+                view.chat = false;
             }
             BridgeEvent::LinkData { link_id, bytes } if self.link == Some(link_id) => {
                 match LanMessage::decode(&bytes) {
@@ -892,11 +1125,35 @@ impl MemberSide {
                         let mut view = self.view.lock().expect("room view lock");
                         let was = view.own_address;
                         view.apply(epoch, subnet, members);
-                        if was.is_none() {
+                        let seated_now = was.is_none() && view.own_address.is_some();
+                        if seated_now {
                             if let Some(address) = view.own_address {
                                 info!(%address, "seated in the LAN room");
                             }
                         }
+                        drop(view);
+                        if seated_now {
+                            self.send_name();
+                        }
+                    }
+                    Ok(LanMessage::Names(names)) => {
+                        let missing = {
+                            let mut view = self.view.lock().expect("room view lock");
+                            view.chat = true;
+                            view.names = names;
+                            self.name.as_deref().is_some_and(|n| {
+                                view.own_address.is_some()
+                                    && view.name_of(&self.own_identity) != Some(n)
+                            })
+                        };
+                        // Lost, or the host restarted: say it again. The
+                        // host's table is the receipt.
+                        if missing {
+                            self.send_name();
+                        }
+                    }
+                    Ok(LanMessage::ChatFrom { from, text }) => {
+                        self.chat.lock().expect("chat lock").push(from, text);
                     }
                     Ok(LanMessage::Refused(refusal)) => {
                         warn!(%refusal, "the LAN room refused this member");
@@ -908,6 +1165,13 @@ impl MemberSide {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn send_name(&self) {
+        let seated = self.view.lock().expect("room view lock").own_address.is_some();
+        if let (Some(link_id), Some(name), true) = (self.link, &self.name, seated) {
+            send_message(&self.handle, link_id, &LanMessage::Name(name.clone()));
         }
     }
 

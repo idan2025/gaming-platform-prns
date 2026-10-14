@@ -187,6 +187,16 @@ function makeInvoke(scenario) {
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
         if (cmd === 'revoke_lan_helper') scenario.lanHelper = scenario.afterRevoke ?? scenario.lanHelper;
         return scenario.lanHelper;
+      case 'player_name':
+        return scenario.playerName ?? null;
+      case 'set_player_name':
+        (scenario.namesSet ??= []).push(args.name);
+        return null;
+      case 'room_chat':
+        return (scenario.chat ?? []).filter(l => l.seq > args.since);
+      case 'send_room_chat':
+        (scenario.said ??= []).push(args.text);
+        return null;
       case 'room_status':
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
         return scenario.room ?? noRoom;
@@ -905,6 +915,54 @@ const memberRoom = {
   pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
+
+// Room chat (ROADMAP item 6): names beside addresses, lines as text only,
+// a line typed survives the panel's rebuild, and an old host is explained.
+await run('a room chats, by name, and a line is only ever text', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  rows: () => [row()],
+  room: { ...memberRoom, chat: true, members: [{ address: '198.19.1.1', is_self: false, name: 'Ada' }, { address: '198.19.4.2', is_self: true, name: 'Me' }] },
+  playerName: 'Me',
+  chat: [
+    { seq: 1, name: 'Ada', address: '198.19.1.1', is_self: false, text: '<img src=x onerror=alert(1)> gg', at_unix: 0 },
+    { seq: 2, name: 'Me', address: '198.19.4.2', is_self: true, text: 'one more?', at_unix: 0 },
+  ],
+}, async (win, doc, scenario) => {
+  win.setView('rooms');
+  await win.pollRoom();
+  await settle();
+  const members = doc.querySelector('#room-body .member-list')?.textContent || '';
+  check('a member is shown by name beside the address', members.includes('Ada · 198.19.1.1') && members.includes('(you)'), members);
+  const log = doc.querySelector('#chat-log');
+  check('the chat is shown', !!log && !doc.querySelector('#room-chat').hidden);
+  check('lines are listed with who said them', log && log.textContent.includes('Ada') && log.textContent.includes('You'), log && log.textContent);
+  check('a line is text, never markup', log && !log.querySelector('img') && log.textContent.includes('<img'), log && log.innerHTML);
+  const input = doc.querySelector('#chat-input');
+  input.value = 'half typed';
+  await win.pollRoom();
+  await settle();
+  check('a line being typed survives the poll', doc.querySelector('#chat-input')?.value === 'half typed');
+  check('nothing is shown twice', doc.querySelectorAll('#chat-log .chat-line').length === 2, String(doc.querySelectorAll('#chat-log .chat-line').length));
+  doc.querySelector('#chat-send').click();
+  await settle();
+  check('Send says it to the room', (scenario.said || []).includes('half typed'), JSON.stringify(scenario.said));
+});
+
+await run('a room whose host has no chat says so', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  rows: () => [row()],
+  room: { ...memberRoom, chat: false },
+}, async (win, doc) => {
+  win.setView('rooms');
+  await win.pollRoom();
+  await settle();
+  const t = doc.querySelector('#room-chat')?.textContent || '';
+  check('an old host is explained, not a dead box', t.includes('without chat') && doc.querySelector('.chat-form').hidden, t);
+});
 
 // The banner was rebuilt on every 2 s poll, so a press on Leave that spanned
 // a tick went down on one button and up on its replacement: no click.
