@@ -135,6 +135,7 @@ pub fn router_full(
         .route("/games", get(games))
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
+        .route("/packs/:id", delete(remove_pack))
         // Configuring the mesh interfaces binds sockets and joins meshes, so it
         // rides behind the same token gate as every container-creating route
         // (`interfaces.rs` "Authorization is the API's").
@@ -403,6 +404,53 @@ async fn import_pack(
         "imported": imported,
         "loaded": refused.is_none(),
         "refused_reason": refused,
+    })))
+}
+
+/// Take a game pack off this node (`pack_import::remove`). Refused while any
+/// server of the game exists, running or stopped (a stopped one could not be
+/// started again without its pack), or while its files download. The game's
+/// files stay; they show on the Installed page as unused.
+async fn remove_pack(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {
+    let Some(dir) = state.pack_dir.clone() else {
+        return Err(fail(
+            StatusCode::NOT_IMPLEMENTED,
+            "this agent was not told where packs live, so it cannot remove one",
+        ));
+    };
+    let servers: Vec<String> = state
+        .agent
+        .docker()
+        .list_managed()
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .into_iter()
+        .filter(|c| c.game_id.as_deref() == Some(id.as_str()))
+        .map(|c| c.instance_id)
+        .collect();
+    if !servers.is_empty() {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            format!(
+                "{id} still has servers on this node ({}); remove them first. A stopped one counts: it could not be started again without its pack",
+                servers.join(", ")
+            ),
+        ));
+    }
+    if state.installs.is_running(&id).await {
+        return Err(fail(StatusCode::CONFLICT, format!("{id} is downloading; cancel it first")));
+    }
+    let removed = crate::pack_import::remove(&dir, &id)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("removing the pack: {e}")))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("no pack with the id {id:?} in this node's pack directory")))?;
+    state
+        .agent
+        .reload_packs(&dir, std::time::SystemTime::now())
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({
+        "removed": removed,
+        "note": "Its game files are kept; the Installed page lists them as unused.",
     })))
 }
 

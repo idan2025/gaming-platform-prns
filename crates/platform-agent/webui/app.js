@@ -937,10 +937,34 @@ function buildGameCard(g) {
   installBtn.appendChild(icon("download"));
   installBtn.appendChild(el("span", null, "Install"));
   installBtn.addEventListener("click", () => onInstall(g.id));
+  const removeBtn = el("button", "card-remove");
+  removeBtn.type = "button";
+  removeBtn.title = "Remove this game from the node: its pack goes, its files stay on the Installed page";
+  removeBtn.setAttribute("aria-label", "Remove " + g.display_name);
+  removeBtn.appendChild(icon("trash"));
+  removeBtn.addEventListener("click", () => onRemovePack(g));
   actions.append(startBtn, installBtn);
   body.appendChild(actions);
-  card.appendChild(body);
+  card.append(removeBtn, body);
   return card;
+}
+
+// Take a game's pack off the node (DELETE /packs/:id). The node refuses while
+// any server of the game exists and says which.
+async function onRemovePack(g) {
+  if (!confirm("Remove " + g.display_name + " from this node?\n\nIts pack is deleted, so it leaves the Games page and no server of it can start. " +
+    "Its game files stay; delete them on the Installed page if you want the space. It can be added back by importing the pack again.")) return;
+  try {
+    await withInFlight(api("DELETE", "/packs/" + encodeURIComponent(g.id)));
+    const games = await api("GET", "/games");
+    state.games = Array.isArray(games) ? games : [];
+    renderGames();
+    clearError();
+    toast(g.display_name + " removed. Its files are still on the Installed page.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The game was not removed.");
+  }
 }
 
 function refreshCardDynamic(g) {

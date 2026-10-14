@@ -235,6 +235,52 @@ pub fn pack_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.toml"))
 }
 
+/// The files a removal took out of the pack directory.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemovedPack {
+    pub id: String,
+    pub files: Vec<String>,
+}
+
+/// Take a pack out of `dir` (ROADMAP §11 "Remove a pack"), with the signature
+/// beside it. **The file is found by reading the packs there, never by
+/// building a path from `id`**: an id from a URL is a path traversal waiting
+/// to happen, and only a file that parses as the pack with this id is ever
+/// touched. Every file carrying the id goes, or the loader would find it
+/// again. `Ok(None)` when no pack in `dir` has this id.
+///
+/// Whether the pack may go, with servers or a download of its game on the
+/// node, is the caller's to decide first; the game's files are not touched.
+pub fn remove(dir: &Path, id: &str) -> std::io::Result<Option<RemovedPack>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        if GamePack::parse(&src).is_ok_and(|p| p.id == id) {
+            found.push(path);
+        }
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let mut files = Vec::new();
+    for path in found {
+        let mut sig = path.clone().into_os_string();
+        sig.push(game_bridge::signing::SIGNATURE_SUFFIX);
+        let sig = PathBuf::from(sig);
+        if sig.exists() {
+            std::fs::remove_file(&sig)?;
+            files.push(sig.display().to_string());
+        }
+        std::fs::remove_file(&path)?;
+        files.push(path.display().to_string());
+    }
+    Ok(Some(RemovedPack { id: id.to_string(), files }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +402,27 @@ query = "a2s"
         .await
         .unwrap();
         assert!(!out.runnable);
+    }
+
+    /// A removal finds the pack by its contents: a hostile id names no file,
+    /// and the signature goes with the pack.
+    #[tokio::test]
+    async fn a_pack_is_removed_by_what_it_says_never_by_a_path_from_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        run(&paste(PACK, false), dir.path()).await.unwrap();
+        let file = dir.path().join("test-game.toml");
+        std::fs::write(dir.path().join("test-game.toml.sig"), "not checked here").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "keep me").unwrap();
+
+        for hostile in ["../test-game", "test-game.toml", "/etc/passwd", ""] {
+            assert!(remove(dir.path(), hostile).unwrap().is_none(), "{hostile:?} matched something");
+        }
+        assert!(file.exists());
+
+        let removed = remove(dir.path(), "test-game").unwrap().expect("removed");
+        assert_eq!(removed.files.len(), 2, "{removed:?}");
+        assert!(!file.exists() && !dir.path().join("test-game.toml.sig").exists());
+        assert!(dir.path().join("notes.txt").exists(), "nothing else is touched");
+        assert!(remove(dir.path(), "test-game").unwrap().is_none(), "gone means gone");
     }
 }
