@@ -30,6 +30,12 @@ struct AppState {
     pending_invite: std::sync::Mutex<Option<Invite>>,
     /// The update the last check found, kept for `install_update`.
     update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// Whether the tray icon came up. Without one (a Linux desktop with no
+    /// tray, say) closing the window quits as it always did: a hidden window
+    /// with no icon to bring it back would be a launcher nobody can reach.
+    tray: std::sync::atomic::AtomicBool,
+    /// The "still running in the tray" note is shown once a run.
+    told_tray: std::sync::atomic::AtomicBool,
 }
 
 #[tauri::command]
@@ -221,6 +227,84 @@ async fn install_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>
 #[tauri::command]
 async fn set_auto_update(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
     state.launcher.set_auto_check_updates(on).await.map_err(fmt_err)
+}
+
+/// A desktop notification (`ROADMAP.md` item 5), unless the player turned
+/// them off or is looking at the window already, where the page's own toast
+/// says it.
+#[tauri::command]
+async fn notify(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    title: String,
+    body: String,
+) -> Result<bool, String> {
+    if !state.launcher.notifications_on().await {
+        return Ok(false);
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        if w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false) {
+            return Ok(false);
+        }
+    }
+    Ok(send_notification(&app, &title, &body))
+}
+
+fn send_notification(app: &tauri::AppHandle, title: &str, body: &str) -> bool {
+    use tauri_plugin_notification::NotificationExt;
+    // Plain text, short: it comes from server names other people chose.
+    let clip = |s: &str, n: usize| s.chars().filter(|c| !c.is_control()).take(n).collect::<String>();
+    app.notification().builder().title(clip(title, 80)).body(clip(body, 200)).show().is_ok()
+}
+
+#[tauri::command]
+async fn notifications_on(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.launcher.notifications_on().await)
+}
+
+#[tauri::command]
+async fn set_notifications_on(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.launcher.set_notifications_on(on).await.map_err(fmt_err)
+}
+
+/// Bring the window back from the tray, or from behind other windows.
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// The tray icon: click to show the window, and a menu with Show and Quit.
+/// Quit is a real quit, exactly like closing the window used to be, so a
+/// room ends with it (`CLAUDE.md`, Mode 3: nothing a room creates outlives
+/// the launcher).
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let show = MenuItem::with_id(app, "show", "Show Lanthorn", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("Lanthorn")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -521,14 +605,12 @@ pub fn run() {
             for arg in argv.iter().filter(|a| a.starts_with("lanthorn://")) {
                 receive_invite(app, arg);
             }
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
+            show_main(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             let packs = pack_dir(app.handle());
             let launcher = Launcher::from_pack_dir(&packs).with_portable(portable.is_some());
@@ -542,7 +624,18 @@ pub fn run() {
                 launcher,
                 pending_invite: std::sync::Mutex::new(None),
                 update: tokio::sync::Mutex::new(None),
+                tray: std::sync::atomic::AtomicBool::new(false),
+                told_tray: std::sync::atomic::AtomicBool::new(false),
             });
+            // On Linux the tray loads libayatana-appindicator at run time and
+            // panics when the desktop has none; that must cost the tray, not
+            // the launcher.
+            let handle = app.handle().clone();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(&handle))) {
+                Ok(Ok(())) => app.state::<AppState>().tray.store(true, std::sync::atomic::Ordering::Relaxed),
+                Ok(Err(e)) => tracing::info!(error = %e, "no tray icon; closing the window quits"),
+                Err(_) => tracing::info!("no tray library on this desktop; closing the window quits"),
+            }
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 // The OS learns the scheme from the installer (Windows), the
@@ -584,6 +677,39 @@ pub fn run() {
             window.build()?;
             Ok(())
         })
+        // Closing the window while a room is open or a server is joined keeps
+        // the launcher in the tray, because both end with it; otherwise it
+        // quits, as it always did.
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
+            if window.label() != "main" {
+                return;
+            }
+            let app = window.app_handle().clone();
+            let state = app.state::<AppState>();
+            if !state.tray.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            api.prevent_close();
+            let window = window.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                match state.launcher.keeps_running().await {
+                    Some(what) => {
+                        let _ = window.hide();
+                        if !state.told_tray.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            let (title, body) = if what == "room" {
+                                ("Your LAN room is still open", "Lanthorn keeps it open from the tray. Quit from the tray icon to end it.")
+                            } else {
+                                ("Still connected to the server", "Lanthorn keeps the connection from the tray. Quit from the tray icon to end it.")
+                            };
+                            send_notification(&app, title, body);
+                        }
+                    }
+                    None => app.exit(0),
+                }
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             browse_status,
             start_browse,
@@ -618,6 +744,9 @@ pub fn run() {
             game_location,
             set_game_path,
             clear_game_path,
+            notify,
+            notifications_on,
+            set_notifications_on,
             player_name,
             list_interfaces,
             add_interface,

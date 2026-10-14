@@ -451,6 +451,14 @@ has gone. Rules a later change could quietly break:
   about every favorite, however old (`keepalive_targets`), and Remove takes
   the star too, or the row would come straight back. "It's up" is told only
   for a change seen while browsing, never on the first look.
+- **The window closes to the tray only while something would end with it**
+  (2026-10-14, `ROADMAP.md` item 5): a LAN room or a joined server
+  (`Launcher::keeps_running`). Otherwise closing quits, as before. Quit in the
+  tray menu is `app.exit`, the same quit, so a room still ends with the
+  launcher. Without a tray (Linux with no appindicator library, which panics
+  in `libappindicator-sys`; caught) closing always quits: a hidden window with
+  no icon would be unreachable. Notifications are opt-out, plain text, and
+  skipped while the window is in front, where the toast says it.
 - **Never hold the session lock across a network round trip.** A detail probe
   did, for a whole link timeout, and froze the list, the status and Remove
   behind it. Probes and traces clone the handle (`probe_details_via`).

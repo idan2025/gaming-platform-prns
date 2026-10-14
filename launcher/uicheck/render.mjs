@@ -136,6 +136,13 @@ function makeInvoke(scenario) {
         return scenario.known ?? [];
       case 'refresh_known_servers':
         return (scenario.known ?? []).length;
+      case 'notify':
+        (scenario.notified ??= []).push(args.title);
+        return true;
+      case 'notifications_on':
+        return scenario.notificationsOn ?? true;
+      case 'set_notifications_on':
+        return null;
       case 'favorites':
         return typeof scenario.favorites === 'function' ? scenario.favorites() : (scenario.favorites ?? []);
       case 'set_favorite':
@@ -284,13 +291,14 @@ await run('favorites lead the list, and an offline one is shown as offline', {
     status: running,
     rows: () => [row()],
     favorites: () => [{ destination_hash: 'ffffeeeeddddccccbbbbaaaa99998888', name: 'Friday night', game_id: 'sven-coop', last_seen_secs: up ? 1 : 900, online: up }],
-  }, async (win, doc) => {
+  }, async (win, doc, scenario) => {
     const toast = () => doc.querySelector('#toast')?.textContent || '';
     check('nothing is announced on the first look', !toast().includes('Friday night is up'));
     up = true;
     await win.eval('pollAll()');
     await settle();
     check('a favorite coming up is announced', toast().includes('Friday night is up'), toast());
+    check('and the desktop is told too', (scenario.notified || []).includes('Friday night is up'), JSON.stringify(scenario.notified));
   });
 }
 
@@ -825,6 +833,22 @@ await run('the room banner is not rebuilt under the pointer', {
   await win.pollAll();
   check('and lands once the press ends', doc.querySelector('#room-banner').textContent.includes('3 members'),
     doc.querySelector('#room-banner').textContent);
+});
+
+await run('someone joining the room is a desktop notification, once', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  room: memberRoom,
+  rows: () => [row()],
+}, async (win, doc, scenario) => {
+  await win.pollAll();
+  check('nobody is announced on the first look', !(scenario.notified || []).length, JSON.stringify(scenario.notified));
+  scenario.room = { ...memberRoom, members: [...memberRoom.members, { address: '198.19.9.9', is_self: false }] };
+  await win.pollAll();
+  await win.pollAll();
+  const joins = (scenario.notified || []).filter(t => t.includes('joined your LAN room'));
+  check('a newcomer is told once', joins.length === 1, JSON.stringify(scenario.notified));
 });
 
 await run('a LAN room is a room, not a server', {

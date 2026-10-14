@@ -48,6 +48,11 @@ const state = {
   favorites: [],
   favSet: new Set(),
   favOnline: null,
+  // Desktop notifications (ROADMAP item 5): on unless turned off. `roomSeen`
+  // is the member addresses at the last poll, so a join is told once.
+  notifications: true,
+  roomSeen: null,
+  roomCheckTold: null,
   // Mode 3 LAN rooms (PLAN.md §14). `roomsAvailable` is false for an older
   // shell without the room commands, which then shows no room UI at all
   // rather than buttons that throw.
@@ -1672,6 +1677,13 @@ async function pollFavorites() {
 }
 function favoriteCameUp(f) {
   toast((f.name || 'A favorite server') + ' is up.');
+  notify((f.name || 'A favorite server') + ' is up', f.game_id ? gameName(f.game_id) : 'A favorite of yours is online.');
+}
+// A desktop notification. The shell drops it when they are off, or when this
+// window is in front, where the toast says it already.
+function notify(title, body) {
+  if (!state.notifications) return;
+  invoke('notify', { title, body }).catch(() => {});
 }
 function favMenuItem(hash) {
   const on = state.favSet.has(hash);
@@ -2178,6 +2190,22 @@ async function pollRoom() {
   renderRoomBanner();
   renderRoomPanel();
   maybeAutoCheck();
+  noticeRoomJoins();
+}
+// Someone new in the room this launcher hosts or sits in. Never on the first
+// look, and never for this machine itself.
+function noticeRoomJoins() {
+  const r = state.room;
+  if (!r || !r.active) { state.roomSeen = null; return; }
+  const now = new Set(r.members.filter(m => !m.is_self).map(m => m.address));
+  if (state.roomSeen) {
+    const fresh = [...now].filter(a => !state.roomSeen.has(a));
+    if (fresh.length) {
+      notify(fresh.length === 1 ? 'Someone joined your LAN room' : fresh.length + ' people joined your LAN room',
+        (r.name || 'Your room') + ' now has ' + (now.size + 1) + ' members.');
+    }
+  }
+  state.roomSeen = now;
 }
 
 function roomLine(r) {
@@ -2615,6 +2643,16 @@ async function checkRoom() {
   }
   state.roomCheck.busy = false;
   renderRoomPanel(true);
+  const res = state.roomCheck.result;
+  if ((res && !res.ok) || state.roomCheck.error) {
+    // Once per room, until a check passes again.
+    if (state.roomCheckTold !== r.room_hash) {
+      state.roomCheckTold = r.room_hash;
+      notify('The LAN room check failed', 'Open Lanthorn to see what is not reaching the others.');
+    }
+  } else if (res && res.ok) {
+    state.roomCheckTold = null;
+  }
 }
 
 function renderRoomCheck(actions, parent, r) {
@@ -2912,6 +2950,7 @@ function wireInvites() {
 // check at start fails silently and never delays anything.
 
 async function startupUpdateCheck() {
+  try { state.notifications = await invoke('notifications_on'); } catch (_) { /* an older shell */ }
   try {
     state.autoUpdate = await invoke('auto_update');
   } catch (_) { return; } // an older shell
@@ -2933,6 +2972,9 @@ async function checkUpdate(quiet) {
   renderUpdateBanner();
   renderSettings();
   if (!quiet && state.update && !state.update.available) toast('Lanthorn is up to date.');
+  if (quiet && state.update && state.update.available) {
+    notify('A Lanthorn update is ready', 'Version ' + state.update.available + ' — open Lanthorn to update.');
+  }
 }
 
 async function installUpdate() {
@@ -3048,6 +3090,18 @@ function renderSettings() {
   };
   auto.append(box, el('span', '', 'Look for updates when Lanthorn starts'));
   card.appendChild(auto);
+  const notes = el('label', 'toggle-row');
+  const nbox = el('input');
+  nbox.type = 'checkbox';
+  nbox.id = 'notifications-on';
+  nbox.checked = state.notifications;
+  nbox.onchange = async () => {
+    state.notifications = nbox.checked;
+    try { await invoke('set_notifications_on', { on: nbox.checked }); }
+    catch (err) { showError('Could not save that: ' + errText(err)); }
+  };
+  notes.append(nbox, el('span', '', 'Desktop notifications: a favorite comes up, someone joins your room, a room check fails, an update is ready'));
+  card.appendChild(notes);
   card.appendChild(el('p', 'note', 'Updates are checked against GitHub and every download is verified '
     + 'against Lanthorn\u2019s signing key before it is installed. Without internet, nothing is checked '
     + 'and nothing changes.'));

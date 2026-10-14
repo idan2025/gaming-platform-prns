@@ -106,6 +106,10 @@ pub struct LauncherSettings {
     /// asks about every favorite, however long ago it was heard.
     #[serde(default)]
     pub favorites: std::collections::BTreeSet<String>,
+    /// The player turned desktop notifications off (`ROADMAP.md` item 5).
+    /// Stored as "off" so every older settings file means on.
+    #[serde(default)]
+    pub notifications_off: bool,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.
