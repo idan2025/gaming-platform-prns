@@ -649,3 +649,7 @@ body.bigscreen .sidebar-foot { display: none; }
 .welcome input[type="text"] { height: 34px; padding: 0 10px; background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: var(--radius); outline: none; color: var(--text); }
 .welcome input[type="text"]:focus { border-color: var(--accent); }
 .welcome .room-actions { justify-content: flex-end; margin-top: 8px; }
+
+/* ---------- hosting from the launcher (PLAN.md §13.3 step 2) ---------- */
+.host-srv-form { grid-template-columns: 1.4fr 1.6fr 0.7fr 0.9fr auto; }
+@media (max-width: 900px) { .host-srv-form { grid-template-columns: 1fr 1fr; } }

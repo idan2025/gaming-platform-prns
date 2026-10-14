@@ -187,6 +187,15 @@ function makeInvoke(scenario) {
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
         if (cmd === 'revoke_lan_helper') scenario.lanHelper = scenario.afterRevoke ?? scenario.lanHelper;
         return scenario.lanHelper;
+      case 'hosting':
+        return scenario.hostingNow ?? { active: false };
+      case 'host_server':
+        scenario.hostAsked = args.request;
+        scenario.hostingNow = { active: true, game_id: args.request.game_id, name: args.request.name, game_port: args.request.game_port, max_players: args.request.max_players, destination_hash: 'ab'.repeat(16), invite: 'lanthorn://x', clients: 0 };
+        return scenario.hostingNow;
+      case 'stop_hosting':
+        scenario.hostingNow = { active: false };
+        return null;
       case 'first_run':
         return !!scenario.firstRun;
       case 'finish_first_run':
@@ -934,6 +943,34 @@ const memberRoom = {
   pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
+
+// Hosting from the launcher (PLAN.md §13.3 step 2): the form sends what was
+// chosen, the card then says it is on the mesh, and Stop takes it off.
+await run('a server on this computer is put on the mesh and taken off', {
+  status: running,
+  rows: () => [row()],
+  games: [svenGame],
+  playerName: 'Ada',
+}, async (win, doc, scenario) => {
+  win.setView('games');
+  await settle();
+  await settle();
+  check('the name starts as the player\u2019s server', doc.querySelector('#host-srv-name')?.value === 'Ada\u2019s server', doc.querySelector('#host-srv-name')?.value);
+  const port = doc.querySelector('#host-srv-port');
+  port.value = '27016';
+  port.dispatchEvent(new win.Event('input'));
+  doc.querySelector('#host-srv-start').click();
+  await settle();
+  await settle();
+  check('it asks for that game, name and port', scenario.hostAsked && scenario.hostAsked.game_id === 'sven-coop'
+    && scenario.hostAsked.name === 'Ada\u2019s server' && scenario.hostAsked.game_port === 27016, JSON.stringify(scenario.hostAsked));
+  const t = doc.querySelector('#games-body').textContent;
+  check('the card says it is on the mesh', t.includes('On the mesh: Ada\u2019s server'), t);
+  doc.querySelector('#host-stop').click();
+  await settle();
+  await settle();
+  check('Stop takes it off', !!doc.querySelector('#host-srv-start'));
+});
 
 // First run (PLAN.md §13.3 step 4): one screen, then connected with exactly
 // what was chosen; and never shown when the core says it is done.

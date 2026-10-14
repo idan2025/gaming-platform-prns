@@ -19,6 +19,7 @@
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
 pub mod desktop;
+pub mod host;
 pub mod invite;
 pub mod lan;
 pub mod portable;
@@ -487,6 +488,8 @@ struct Inner {
     last_join: Option<JoinState>,
     /// The LAN room this launcher is in, if any (`lan.rs`). One at a time.
     room: Option<lan::RoomState>,
+    /// The server this launcher puts on the mesh, if any (`host.rs`).
+    host: Option<host::HostState>,
     /// Index rows the player removed from the list, for this run. A heard row
     /// is dropped from the browse node itself and a remembered one from
     /// settings; an index would hand the same row straight back on the next
@@ -622,6 +625,7 @@ impl Launcher {
                 client: None,
                 last_join: None,
                 room: None,
+                host: None,
                 hidden: Default::default(),
                 keepalive: None,
             })),
@@ -1692,7 +1696,7 @@ impl Launcher {
         let inner = self.inner.lock().await;
         if inner.room.is_some() {
             Some("room")
-        } else if inner.last_join.is_some() {
+        } else if inner.last_join.is_some() || inner.host.is_some() {
             Some("server")
         } else {
             None

@@ -1004,6 +1004,12 @@ working, and each shortens the distance between installing and playing.
    players, start. Runs the same `BridgeSession` the CLI does — the launcher
    already links `game-bridge` directly, so this is UI, not protocol. Ends at:
    hosting needs no terminal.
+   **Built 2026-10-15** (`launcher-core/src/host.rs`, "Host a server" on the
+   Games page): a game server the player already runs on this computer is put
+   on the mesh with a name, max players and port, on its own
+   `server.identity` and the browse node's interfaces, with an invite link.
+   The launcher never starts the game server itself, and does not volunteer
+   the player's machine as transit.
 3. **Content in the launcher.** Progress, size, and the driver's own errors
    surfaced where a person can see them, plus the `manual` driver saying exactly
    what to put where. Ends at: a player is never left guessing why a game will

@@ -61,6 +61,11 @@ const state = {
   repos: null,
   repoBusy: null,
   repoDraft: '',
+  // The server this launcher puts on the mesh (PLAN.md §13.3 step 2), and the
+  // form's draft, kept across re-renders.
+  hosting: null,
+  hostDraft2: { game_id: '', name: '', max_players: '16', port: '' },
+  hostBusy: false,
   chatSeq: 0,
   chatRoom: null,
   playerName: null,
@@ -839,7 +844,7 @@ function setView(name) {
   // loadInterfaces re-reads the saved-server count, which grows while browsing.
   if (name === 'connections') loadInterfaces();
   if (name === 'settings') renderSettings();
-  if (name === 'games') { renderGames(); loadRepos(); }
+  if (name === 'games') { renderGames(); loadHosting(); loadRepos(); }
 }
 
 // ---------- detail pane ----------
@@ -3638,11 +3643,106 @@ async function repoAction(fn, busy) {
     await loadRepos();
   }
 }
+async function loadHosting() {
+  try { state.hosting = await invoke('hosting'); } catch (_) { state.hosting = null; }
+  renderGames();
+}
+function renderHostCard(body) {
+  const card = el('div', 'card');
+  const head = el('div', 'card-head');
+  head.appendChild(el('h2', '', 'Host a server'));
+  card.appendChild(head);
+  const h = state.hosting;
+  if (h && h.active) {
+    card.appendChild(el('p', 'card-text', 'On the mesh: ' + h.name + ' · ' + gameName(h.game_id)
+      + ' · ' + h.clients + (h.clients === 1 ? ' player linked' : ' players linked') + '.'));
+    card.appendChild(el('p', 'note', 'Keep the game server running on this computer'
+      + (h.game_port ? ', on port ' + h.game_port : '') + '. Stop takes it off the mesh; the game server is yours and keeps running.'));
+    const actions = el('div', 'room-actions');
+    if (h.invite) {
+      const copy = el('button', 'btn', 'Copy invite link');
+      copy.type = 'button';
+      copy.id = 'host-invite';
+      copy.onclick = async () => {
+        try { await navigator.clipboard.writeText(h.invite); toast('Invite link copied.'); }
+        catch (_) { showError('Could not copy. The link is ' + h.invite); }
+      };
+      actions.appendChild(copy);
+    }
+    const stop = el('button', 'btn btn-danger', 'Stop hosting');
+    stop.type = 'button';
+    stop.id = 'host-stop';
+    stop.onclick = async () => {
+      try { await invoke('stop_hosting'); hideError(); } catch (err) { showError(errText(err)); }
+      await loadHosting();
+    };
+    actions.appendChild(stop);
+    card.appendChild(actions);
+    body.appendChild(card);
+    return;
+  }
+  card.appendChild(el('p', 'card-text', 'Running a game server on this computer — a dedicated server, '
+    + 'or the game\u2019s own “host a game”? Put it on the mesh so others find it in their list. '
+    + 'Lanthorn never starts the game server itself.'));
+  const d = state.hostDraft2;
+  if (!d.game_id || !gameById(d.game_id)) d.game_id = (state.games[0] || {}).id || '';
+  if (!d.name && state.playerName) d.name = state.playerName + '\u2019s server';
+  const form = el('form', 'host-form host-srv-form');
+  const sel = el('select');
+  sel.id = 'host-srv-game';
+  sel.setAttribute('aria-label', 'Game');
+  [...state.games].sort((a, b) => (a.display_name || a.id).localeCompare(b.display_name || b.id)).forEach(g => {
+    const o = el('option', '', g.display_name || g.id);
+    o.value = g.id;
+    sel.appendChild(o);
+  });
+  sel.value = d.game_id;
+  sel.onchange = () => { d.game_id = sel.value; };
+  const input = (id, label, key, attrs) => {
+    const i = el('input');
+    i.id = id;
+    Object.assign(i, attrs);
+    i.setAttribute('aria-label', label);
+    i.value = d[key];
+    i.oninput = () => { d[key] = i.value; };
+    return i;
+  };
+  const name = input('host-srv-name', 'Server name', 'name', { type: 'text', maxLength: 48, placeholder: 'Server name' });
+  const max = input('host-srv-max', 'Max players', 'max_players', { type: 'number', min: 1, max: 255, placeholder: 'Max players' });
+  const port = input('host-srv-port', 'Game server port', 'port', { type: 'number', min: 1, max: 65535, placeholder: 'Port (the game\u2019s usual)' });
+  const go = el('button', 'btn btn-primary', state.hostBusy ? 'Starting…' : 'Put it on the mesh');
+  go.type = 'submit';
+  go.id = 'host-srv-start';
+  go.disabled = state.hostBusy || !state.games.length;
+  form.append(sel, name, max, port, go);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    state.hostBusy = true;
+    renderGames();
+    try {
+      state.hosting = await invoke('host_server', { request: {
+        game_id: d.game_id,
+        name: d.name,
+        max_players: parseInt(d.max_players, 10) || 0,
+        game_port: d.port ? parseInt(d.port, 10) : null,
+      } });
+      hideError();
+    } catch (err) {
+      showError('Not hosted: ' + errText(err));
+    } finally {
+      state.hostBusy = false;
+      renderGames();
+    }
+  };
+  card.appendChild(form);
+  body.appendChild(card);
+}
 function renderGames() {
   const body = $('games-body');
   if (!body) return;
   const keep = document.activeElement && document.activeElement.id;
   body.textContent = '';
+  renderHostCard(body);
 
   const mine = el('div', 'card');
   const mh = el('div', 'card-head');
