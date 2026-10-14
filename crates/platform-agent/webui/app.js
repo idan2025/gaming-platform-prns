@@ -73,6 +73,8 @@ const state = {
     defaultReserve: null,
     games: new Map(),    // game_id -> UpdateNotice
     checking: new Set(), // game ids with a check running from this page
+    moves: [],           // MoveRecord: servers waiting for, or done with, a move onto a new copy
+    moving: new Set(),   // instance ids with a Move now running from this page
     timer: null,
   },
 };
@@ -1933,6 +1935,7 @@ function ingestUpdates(body) {
   u.reserve = body.reserve_bytes ?? null;
   u.defaultReserve = body.default_reserve_bytes ?? null;
   u.games = new Map((Array.isArray(body.games) ? body.games : []).map(g => [g.game_id, g]));
+  u.moves = Array.isArray(body.moves) ? body.moves : [];
   renderUpdatesBar();
   renderInstalled();
   renderInstalledBadge();
@@ -2127,7 +2130,154 @@ function buildCopyRow(c, downloading, artEl) {
     el("div", "cell", formatDate(c.modified_unix)), actions);
   const notice = state.updates.games.get(c.game_id);
   if (c.updatable && notice && notice.version === c.version) row.appendChild(buildUpdateLine(notice, downloading));
+  for (const m of state.updates.moves) {
+    if (m.game_id === c.game_id && m.from === c.version) row.appendChild(buildMoveLine(m));
+  }
   return row;
+}
+
+// One server on this copy and its move onto the copy new servers use (Agent::move_instance).
+function buildMoveLine(m) {
+  const line = el("div", "update-line");
+  const who = el("strong", null, instanceName(m.instance_id));
+  const text = el("span");
+  const moving = state.updates.moving.has(m.instance_id);
+  if (moving || m.state === "moving") text.append(who, " is moving to version " + m.to + "…");
+  else if (m.state === "waiting") text.append(who, " stays on this copy for now, " + m.why + ".");
+  else if (m.state === "warned") text.append(who, ": players were told it restarts in a minute for the update.");
+  else if (m.state === "moved") text.append(who, " moved to version " + m.to + " " + ago(m.at_unix) + ".");
+  else if (m.state === "rolled_back") {
+    text.append(who, " did not stay up on version " + m.to + " and is back on this copy: " + m.why + ". It is not tried again until there is a newer copy.");
+  } else if (m.state === "failed") {
+    text.className = "bad-text";
+    text.append(who, (m.lost ? " is on neither copy: " : " was not moved: ") + m.why);
+  }
+  line.appendChild(text);
+  if (m.state === "waiting" && !moving && !/^stopped/.test(m.why || "")) {
+    const b = el("button", "link-btn", "Move now");
+    b.type = "button";
+    b.title = "Restart it on version " + m.to + " now, whoever is playing. It keeps its name, port and address.";
+    b.addEventListener("click", () => onMoveNow(m));
+    line.appendChild(b);
+  }
+  return line;
+}
+
+async function onMoveNow(m) {
+  const name = instanceName(m.instance_id);
+  if (!confirm("Move " + name + " to version " + m.to + " now?\n\nIt restarts, so anyone playing is dropped without a warning. " +
+    "It keeps its name, port and address, and goes back to version " + m.from + " if it does not stay up.")) return;
+  const u = state.updates;
+  u.moving.add(m.instance_id);
+  renderInstalled();
+  try {
+    const r = await api("POST", "/instances/" + encodeURIComponent(m.instance_id) + "/move");
+    clearError();
+    if (r.state === "moved") toast(name + " moved to version " + r.to + ".");
+    else showError(name + " did not stay up on version " + r.to + " and is back on version " + r.from + ": " + r.why);
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The move did not run.");
+  } finally {
+    u.moving.delete(m.instance_id);
+    loadUpdates();
+    pollInstalled();
+  }
+}
+
+// A UTC hour as this browser's clock reads it.
+function localHour(utcHour) {
+  return new Date(Date.UTC(2000, 0, 1, utcHour)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function moveSummary(p) {
+  if (!p || p.move_servers === "never") return "Servers stay on their copy";
+  if (p.move_servers === "when_empty") return "Servers move when empty";
+  return "Servers move " + localHour(p.window_start_utc) + "–" + localHour(p.window_end_utc) +
+    (p.force_in_window ? ", players warned" : ", when empty");
+}
+
+// When this game's servers move onto the copy new servers use (updates.rs MoveServers).
+function onMovePolicy(n) {
+  const p = n.policy || { move_servers: "never", window_start_utc: 0, window_end_utc: 6, force_in_window: false };
+  openModal("move-dialog", n.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Moving " + gameName(n.game_id) + " servers to a new copy"));
+    body.appendChild(el("p", "muted small",
+      "After an update, servers keep the copy they started on. Moving one restarts it on the new copy with the same name, " +
+      "port and address. One server at a time; if it does not stay up, it goes back to its old copy."));
+    const choice = (value, text, sub) => {
+      const wrap = el("label", "check move-choice");
+      const r = el("input");
+      r.type = "radio";
+      r.name = "move-servers";
+      r.value = value;
+      r.checked = p.move_servers === value;
+      const t = el("span");
+      t.append(el("strong", null, text), el("span", "muted small", " " + sub));
+      wrap.append(r, t);
+      body.appendChild(wrap);
+      return r;
+    };
+    choice("never", "Never", "— they stay until you restart them on the new copy yourself.");
+    choice("when_empty", "When empty", "— as soon as nobody is playing. A server that does not answer is never treated as empty.");
+    const windowed = choice("window", "In a window", "— every day between these hours, once nobody is playing.");
+    const hours = el("div", "move-hours");
+    const hourSelect = (value) => {
+      const sel = el("select");
+      for (let h = 0; h < 24; h++) {
+        const o = el("option", null, localHour(h));
+        o.value = String(h);
+        sel.appendChild(o);
+      }
+      sel.value = String(value);
+      return sel;
+    };
+    const start = hourSelect(p.window_start_utc);
+    const end = hourSelect(p.window_end_utc);
+    hours.append(el("span", "muted small", "From "), start, el("span", "muted small", " to "), end,
+      el("span", "muted small", " your time"));
+    body.appendChild(hours);
+    const forceWrap = el("label", "check move-choice move-force");
+    const force = el("input");
+    force.type = "checkbox";
+    force.checked = !!p.force_in_window;
+    forceWrap.append(force, el("span", null, "In the window, move it with players on: they are warned in game a minute before"));
+    body.appendChild(forceWrap);
+    const sync = () => {
+      const on = windowed.checked;
+      start.disabled = end.disabled = force.disabled = !on;
+    };
+    body.querySelectorAll('input[name="move-servers"]').forEach(r => r.addEventListener("change", sync));
+    sync();
+    const actions = el("div", "form-actions");
+    actions.style.marginTop = "8px";
+    const cancel = el("button", "btn", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = close;
+    const save = el("button", "btn btn-primary", "Save");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      const picked = body.querySelector('input[name="move-servers"]:checked');
+      const patch = { move_servers: picked ? picked.value : "never" };
+      if (patch.move_servers === "window") {
+        if (start.value === end.value) { showError("A window has to be at least an hour long."); return; }
+        Object.assign(patch, { window_start_utc: Number(start.value), window_end_utc: Number(end.value), force_in_window: force.checked });
+      }
+      save.disabled = true;
+      try {
+        ingestUpdates(await withInFlight(api("PUT", "/updates/" + encodeURIComponent(n.game_id) + "/policy", patch)));
+        clearError();
+        close();
+        toast(gameName(n.game_id) + ": " + moveSummary(state.updates.games.get(n.game_id)?.policy).toLowerCase() + ".");
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "That did not save.");
+        save.disabled = false;
+      }
+    });
+    actions.append(cancel, save);
+    body.appendChild(actions);
+  });
 }
 
 function ago(unix) {
@@ -2187,6 +2337,7 @@ function buildUpdateLine(n, downloading) {
     line.appendChild(el("span", null, n.checked_unix ? "No answer from Steam yet." : "Not checked for new builds yet."));
     line.appendChild(checkNow);
   }
+  line.appendChild(btn(moveSummary(n.policy) + " · change", "Choose when servers move to a new copy after an update.", () => onMovePolicy(n)));
   line.appendChild(auto
     ? btn("Downloads new builds automatically · turn off", "Go back to being told about a new build and pressing Update yourself.",
       () => onUpdatePolicy(n.game_id, "notify"))
@@ -2263,7 +2414,8 @@ function onUpdateGame(c) {
     body.appendChild(el("h3", null, "Update " + name));
     body.appendChild(el("p", "muted small",
       "Downloads the newest build into a new copy beside version " + c.version + ". Only what changed is downloaded, " +
-      "and anything added to this copy, such as bots, comes along. New servers use the new copy; servers that exist now keep theirs."));
+      "and anything added to this copy, such as bots, comes along. New servers use the new copy; servers that exist now keep theirs " +
+      "until they move, as chosen under the game's row (" + moveSummary(state.updates.games.get(c.game_id)?.policy).toLowerCase() + ")."));
     const wrap = el("label", "check");
     const removeOld = el("input");
     removeOld.type = "checkbox";

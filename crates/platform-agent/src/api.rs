@@ -131,6 +131,7 @@ pub fn router_full(
         .route("/updates/:game/check", post(check_update))
         .route("/updates/:game/snooze", post(snooze_update).delete(unsnooze_update))
         .route("/updates/:game/policy", axum::routing::put(set_update_policy))
+        .route("/instances/:id/move", post(move_instance))
         .route("/games", get(games))
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
@@ -865,6 +866,7 @@ async fn updates(State(state): State<ApiState>) -> Json<serde_json::Value> {
         "default_reserve_bytes": storage.as_ref().map(|s| crate::updates::default_reserve(s.total_bytes)),
         "storage": storage,
         "games": state.agent.update_notices().await,
+        "moves": state.agent.moves(),
     }))
 }
 
@@ -888,12 +890,15 @@ async fn check_update(State(state): State<ApiState>, Path(game): Path<String>) -
     Ok(Json(json!(notice)))
 }
 
-/// `{"on_new_build": "download"}` or `"notify"`: what a found build does for
-/// this game (§12.3). Answers like `GET /updates`.
+/// A game's choices (`updates::PolicyPatch`; what is absent is kept): what a
+/// found build does (§12.3), `{"on_new_build": "download"}` or `"notify"`,
+/// and when its servers move onto the new copy (§12.4), `move_servers`
+/// `never`, `when_empty` or `window`, with `window_start_utc`,
+/// `window_end_utc` and `force_in_window`. Answers like `GET /updates`.
 async fn set_update_policy(
     State(state): State<ApiState>,
     Path(game): Path<String>,
-    Json(policy): Json<crate::updates::GamePolicy>,
+    Json(policy): Json<crate::updates::PolicyPatch>,
 ) -> ApiResult<serde_json::Value> {
     if !state.agent.packs().await.contains_key(&game) {
         return Err(fail(StatusCode::NOT_FOUND, format!("no game pack installed for {game:?}")));
@@ -901,6 +906,21 @@ async fn set_update_policy(
     state.agent.set_update_policy(&game, policy).await.map_err(|e| fail(StatusCode::CONFLICT, e))?;
     state.agent.start_automatic_downloads().await;
     Ok(updates(State(state)).await)
+}
+
+/// Move a running server onto the copy new servers use now, whoever is on
+/// it (`Agent::move_instance`). Holds the request for the move and the
+/// watch after it, about half a minute.
+async fn move_instance(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {
+    match state.agent.move_instance(&id, false).await {
+        Ok(crate::agent::MoveOutcome::Moved { from, to }) => {
+            Ok(Json(json!({ "instance_id": id, "state": "moved", "from": from, "to": to })))
+        }
+        Ok(crate::agent::MoveOutcome::RolledBack { from, to, why }) => {
+            Ok(Json(json!({ "instance_id": id, "state": "rolled_back", "from": from, "to": to, "why": why })))
+        }
+        Err(e) => Err(fail(StatusCode::CONFLICT, e)),
+    }
 }
 
 /// `{"hours": 24}` hides a notice for a day; `{"skip_build": true}` hides it

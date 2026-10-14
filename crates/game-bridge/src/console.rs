@@ -62,6 +62,19 @@ impl ConsoleProtocol {
             Self::Goldsrc | Self::Source => format!("changelevel {map}"),
         })
     }
+
+    /// The console line that shows `message` to everyone on the server. Its
+    /// text is held to the same rule as a server name, the free text that
+    /// already reaches a console: no `;`, `"`, `+` or control character can
+    /// make it a second command.
+    pub fn say(&self, message: &str) -> Result<String, ServerNameError> {
+        validate_server_name(message)?;
+        Ok(match self {
+            // A server console's `say` reaches every player's chat on both
+            // engines.
+            Self::Goldsrc | Self::Source => format!("say {message}"),
+        })
+    }
 }
 
 /// Most bots a caller may ask for. A GoldSrc server holds 32 slots including
@@ -257,6 +270,15 @@ pub fn validate_server_name(name: &str) -> Result<(), ServerNameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_to_players_can_never_become_a_second_command() {
+        let c = ConsoleProtocol::Goldsrc;
+        assert_eq!(c.say("Restarting in 60 seconds").unwrap(), "say Restarting in 60 seconds");
+        for bad in ["hi; quit", "hi\nquit", "a\"b", "a+quit"] {
+            assert!(c.say(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
 
     /// Each of these was measured running a console command or an engine
     /// option on a real GoldSrc or Source server when passed as its name.

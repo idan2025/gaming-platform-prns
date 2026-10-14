@@ -21,7 +21,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36) |
-| 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **started**: checks, snooze, reserve, queue (v0.2.37); automatic download |
+| 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **started**: checks, snooze, reserve, queue (v0.2.37); automatic download, moving servers |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 Recommended first: **1 and 2.** They remove the most friction for a new player:
@@ -401,14 +401,18 @@ unused and can be deleted from the page.
 
 ## 12. Node: update checks, storage-safe downloads, moving servers
 
-**Status (2026-10-14): steps 1–3 are built** — checks, the notice,
-snooze, the reserve, the queue (`updates.rs`, `CLAUDE.md` has the rules), and
-per game "download it" (`OnNewBuild`, a link on the Installed row; the full
-settings section is still step 5).
+**Status (2026-10-14): steps 1–4 are built** — checks, the notice,
+snooze, the reserve, the queue (`updates.rs`, `CLAUDE.md` has the rules), per
+game "download it" (`OnNewBuild`), and moving servers (`move_instance`: when
+empty, a daily window with an opt-in forced move after an in-game warning, one
+at a time, rollback, and **Move now** on the page). Not built from 12.4: the
+one-off date. A stopped server is not moved until it runs again. The choices
+are set from links and a dialog on the Installed row; the settings section is
+step 5.
 Where it departs from the text below, the code is right: the routes are their
 own resource, `/updates` (a static segment under `/content/:game` would shadow
 a version of that name for `DELETE`); and steamcmd nests `branches` inside
-`depots`, measured. Steps 4–5 are open.
+`depots`, measured. Step 5 is open.
 
 Builds on item 11's **Update** button
 (`Provisioner::update`, `Agent::update_content`, `active.rs`), which already
