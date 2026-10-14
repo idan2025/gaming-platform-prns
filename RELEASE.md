@@ -74,6 +74,19 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host: backups on a schedule, as files, and after a server is gone
+
+- **Back up automatically** in a server's Backups: every 6 or 12 hours, daily
+  or weekly, keeping the newest few. Only while the server runs, and only the
+  backups the schedule made are ever deleted; ones made with Back up now stay.
+- **Download** saves a backup as a file; **Import a file…** brings one in, from
+  this node or another, to restore like any other. A file that is not a
+  server backup is refused.
+- The Servers page says when removed servers left backups behind, and lists
+  them to download or delete.
+
 ## v0.2.38
 
 ### Lanthorn Host: new builds that install themselves, and servers that move onto them

@@ -13,10 +13,22 @@
 //!   interrupted restore never leaves half a tree. Extraction is `content.rs`'s
 //!   `extract`: its path and link checks hold here too.
 //! * **Written beside and renamed**, so an interrupted backup is never listed.
+//! * **A schedule prunes only what it made.** It remembers the names it wrote
+//!   and deletes the oldest of those beyond `keep`; a backup the operator made
+//!   by hand is never deleted by anything automatic. A schedule file that is
+//!   lost turns its backups into hand-made ones, which is the safe direction.
+//! * **An imported backup is checked before it is kept**: it is extracted
+//!   into staging with `content.rs`'s `extract` (its path and link checks) and
+//!   must hold a `writable` directory and nothing beside it, then it is given
+//!   an agent-made name. A file from outside never names itself, and restore
+//!   checks it all again.
+//! * **A removed server's backups stay** until the operator deletes them, and
+//!   only a server that no longer exists can have all of its backups deleted
+//!   in one go.
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Where backups live, under the data root: `backups/<instance id>/`.
 pub const BACKUPS_DIR: &str = "backups";
@@ -155,6 +167,101 @@ pub fn restore(archive: &Path, writable: &Path, staging: &Path) -> Result<(), St
     done
 }
 
+/// The file in an instance's folder that holds its backup schedule.
+pub const SCHEDULE_FILE: &str = "backup-schedule.json";
+
+/// Back a server up every `every_hours`, keeping the newest `keep` of the
+/// backups the schedule made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSchedule {
+    pub every_hours: u32,
+    pub keep: u32,
+}
+
+impl BackupSchedule {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=24 * 30).contains(&self.every_hours) {
+            return Err("a backup schedule runs every 1 hour to 30 days".into());
+        }
+        if !(1..=100).contains(&self.keep) {
+            return Err("a backup schedule keeps 1 to 100 backups".into());
+        }
+        Ok(())
+    }
+
+    /// Whether a backup is due at `now`, the last one having been made at
+    /// `last`.
+    pub fn due(&self, now: i64, last: Option<i64>) -> bool {
+        last.is_none_or(|at| now - at >= i64::from(self.every_hours) * 3600)
+    }
+}
+
+/// A backup schedule as stored: when it last ran, and the backups it made,
+/// oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSchedule {
+    pub schedule: BackupSchedule,
+    #[serde(default)]
+    pub last_unix: Option<i64>,
+    #[serde(default)]
+    pub made: Vec<String>,
+}
+
+impl StoredSchedule {
+    /// Record a backup the schedule made, and return the ones to delete: the
+    /// oldest it made beyond `keep`.
+    pub fn record(&mut self, name: String) -> Vec<String> {
+        self.made.push(name);
+        let extra = self.made.len().saturating_sub(self.schedule.keep as usize);
+        self.made.drain(..extra).collect()
+    }
+}
+
+/// Read the backup schedule in an instance folder. Missing or unreadable is
+/// none.
+pub fn load_schedule(instance_dir: &Path) -> Option<StoredSchedule> {
+    let bytes = std::fs::read(instance_dir.join(SCHEDULE_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write it beside and rename over; `None` removes it.
+pub fn save_schedule(instance_dir: &Path, stored: Option<&StoredSchedule>) -> std::io::Result<()> {
+    let path = instance_dir.join(SCHEDULE_FILE);
+    match stored {
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+        Some(stored) => {
+            std::fs::create_dir_all(instance_dir)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(stored).map_err(std::io::Error::other)?)?;
+            std::fs::rename(&tmp, &path)
+        }
+    }
+}
+
+/// Whether `archive` is a backup this module could restore: a tar.gz that
+/// extracts cleanly under `content.rs`'s checks into `writable/` and nothing
+/// else. `staging` is used and removed.
+pub fn check_archive(archive: &Path, staging: &Path) -> Result<(), String> {
+    let done = (|| {
+        std::fs::create_dir_all(staging).map_err(|e| format!("{e}"))?;
+        crate::content::extract(archive, staging, 0)
+            .map_err(|e| format!("this is not a backup the node can read: {e}"))?;
+        let mut names = Vec::new();
+        for e in std::fs::read_dir(staging).map_err(|e| format!("{e}"))?.flatten() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        if names != ["writable"] || !staging.join("writable").is_dir() {
+            return Err("this is not a server backup: it must hold one writable folder and nothing else".into());
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(staging);
+    done
+}
+
 /// The path of a named backup in `dir`, or `None` for a name this module
 /// would not have made.
 pub fn path_of(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -188,6 +295,57 @@ mod tests {
         std::fs::write(dir.path().join(&first), b"").unwrap();
         let second = new_name(dir.path(), 1_791_000_000);
         assert!(valid_name(&second) && second != first, "{second}");
+    }
+
+    #[test]
+    fn only_an_archive_shaped_like_a_backup_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let writable = root.path().join("writable");
+        std::fs::create_dir_all(writable.join("save")).unwrap();
+        std::fs::write(writable.join("save/a"), b"x").unwrap();
+        let dir = root.path().join("b");
+        let made = create(&writable, &dir, "20261014-000000.tar.gz").unwrap();
+        check_archive(&dir.join(&made.name), &root.path().join("s1")).expect("its own backups pass");
+        assert!(!root.path().join("s1").exists(), "staging removed");
+
+        // Something else beside `writable`.
+        let other = dir.join("other.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                std::fs::File::create(&other).unwrap(),
+                flate2::Compression::default(),
+            );
+            let mut tar = tar::Builder::new(gz);
+            tar.append_dir_all("writable", &writable).unwrap();
+            tar.append_dir_all("extra", &writable).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        assert!(check_archive(&other, &root.path().join("s2")).is_err());
+        std::fs::write(&other, b"not an archive").unwrap();
+        assert!(check_archive(&other, &root.path().join("s3")).is_err());
+        assert!(!root.path().join("s3").exists());
+    }
+
+    #[test]
+    fn a_schedule_is_due_by_its_interval_and_prunes_only_what_it_made() {
+        let s = BackupSchedule { every_hours: 6, keep: 2 };
+        assert!(s.due(100, None));
+        assert!(!s.due(6 * 3600 - 1, Some(0)));
+        assert!(s.due(6 * 3600, Some(0)));
+        let mut stored = StoredSchedule { schedule: s, last_unix: None, made: Vec::new() };
+        assert!(stored.record("a".into()).is_empty());
+        assert!(stored.record("b".into()).is_empty());
+        assert_eq!(stored.record("c".into()), vec!["a".to_string()]);
+        assert_eq!(stored.made, vec!["b".to_string(), "c".to_string()]);
+        assert!(BackupSchedule { every_hours: 0, keep: 2 }.validate().is_err());
+        assert!(BackupSchedule { every_hours: 6, keep: 0 }.validate().is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_schedule(dir.path()), None);
+        save_schedule(dir.path(), Some(&stored)).unwrap();
+        assert_eq!(load_schedule(dir.path()), Some(stored));
+        save_schedule(dir.path(), None).unwrap();
+        assert_eq!(load_schedule(dir.path()), None);
     }
 
     /// A backup comes back exactly, a directory the backup lacks is made

@@ -54,6 +54,7 @@ const state = {
   playersTimer: null,
   orphans: null,         // {count, bytes, skipped_recent} from /orphans/summary
   orphansCheckedAt: 0,
+  removedBackups: null,  // [{instance_id, backups}] of removed servers, from /backups
   installed: {
     timer: null,
     busy: false,
@@ -339,6 +340,7 @@ async function poll() {
     recordPlayers();
     renderStatusPill();
     renderStorage();
+    if (Date.now() - state.orphansCheckedAt >= ORPHANS_EVERY_MS) refreshRemovedBackups();
     refreshOrphans(false);
     renderInstances();
   } catch (e) {
@@ -893,7 +895,7 @@ function openInstanceMenu(id, x, y) {
       title: "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone.",
       action: () => onToggleRestartOnCrash(id, !inst.restart_on_crash) });
   }
-  items.push({ label: "Backups…", icon: "archive", title: "Copies of this server's own files (saves, settings, logs), and putting one back.",
+  items.push({ label: "Backups…", icon: "archive", title: "Copies of this server's own files (saves, settings, logs), and restoring one.",
     action: () => onBackups(id) });
   items.push({ label: "Daily restart…", icon: "restart", title: "Restart this server once a day in a window you pick, when nobody is playing.",
     action: () => onRestartSchedule(id) });
@@ -1397,6 +1399,30 @@ function onShowLog(instanceId) {
 
 // ---------- backups (backups.rs) ----------
 
+// A backup's file, saved by the browser. Fetched with the token like every
+// other request, so a link cannot do it.
+async function downloadBackup(instanceId, name) {
+  const path = "/instances/" + encodeURIComponent(instanceId) + "/backups/" + encodeURIComponent(name) + "/file";
+  let resp;
+  try { resp = await withInFlight(fetch(path, { headers: { "Authorization": "Bearer " + (state.token || "") } })); }
+  catch (e) { showError("Could not reach the node."); return; }
+  if (resp.status === 401) { setToken(null); showTokenScreen(); return; }
+  if (!resp.ok) {
+    let msg = "The backup could not be downloaded.";
+    try { const d = await resp.json(); if (d && d.error) msg = d.error; } catch (_) {}
+    showError(msg);
+    return;
+  }
+  const url = URL.createObjectURL(await resp.blob());
+  const a = el("a");
+  a.href = url;
+  a.download = instanceId + "-" + name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
 function onBackups(instanceId) {
   const inst = instById(instanceId);
   const name = (inst && inst.name) || instanceId;
@@ -1404,11 +1430,64 @@ function onBackups(instanceId) {
   openModal("backups-dialog", inst && inst.game_id, (body, close) => {
     body.appendChild(el("h3", null, "Backups · " + name));
     body.appendChild(el("p", "muted small", "A backup holds this server's own files: saves, settings and logs. " +
-      "The game's files are shared and never copied. Putting one back needs the server stopped."));
+      "The game's files are shared and never copied. Restoring one needs the server stopped."));
     const list = el("div", "backup-list");
     body.appendChild(list);
     const note = el("p", "muted small");
     body.appendChild(note);
+
+    // On a schedule (backups.rs): only while the server runs, and it deletes
+    // only the backups it made itself.
+    const sched = el("div", "backup-schedule");
+    const every = el("select", "field");
+    for (const [v, t] of [["0", "Off"], ["6", "Every 6 hours"], ["12", "Every 12 hours"], ["24", "Every day"], ["168", "Every week"]]) {
+      const o = el("option", null, t); o.value = v; every.appendChild(o);
+    }
+    const keep = el("input", "field");
+    keep.type = "number"; keep.min = "1"; keep.max = "100"; keep.value = "7";
+    const keepLabel = el("label", "muted small", "keep the newest ");
+    keepLabel.appendChild(keep);
+    const saveSched = el("button", "btn btn-small", "Save");
+    saveSched.type = "button";
+    const schedNote = el("div", "muted small");
+    const schedLabel = el("label", null, "Back up automatically ");
+    schedLabel.appendChild(every);
+    sched.append(schedLabel, keepLabel, saveSched);
+    body.append(sched, schedNote);
+    function schedText() {
+      keepLabel.classList.toggle("hidden", every.value === "0");
+      schedNote.textContent = every.value === "0" ? "" :
+        "While it runs. Only backups made on this schedule are deleted to keep " + (keep.value || "?") + "; ones made with Back up now stay.";
+    }
+    every.addEventListener("change", schedText);
+    keep.addEventListener("input", schedText);
+    const schedPath = "/instances/" + encodeURIComponent(instanceId) + "/backup-schedule";
+    api("GET", schedPath).then((st) => {
+      if (st && st.schedule) {
+        const h = String(st.schedule.every_hours);
+        if (![...every.options].some((o) => o.value === h)) { const o = el("option", null, "Every " + h + " hours"); o.value = h; every.appendChild(o); }
+        every.value = h;
+        keep.value = String(st.schedule.keep);
+      }
+      schedText();
+    }).catch((e) => {
+      if (e && e.__auth) { close(); return; }
+      sched.classList.add("hidden"); // an older agent
+    });
+    saveSched.addEventListener("click", async () => {
+      const hours = Number(every.value);
+      const k = Number(keep.value);
+      if (hours && !(k >= 1 && k <= 100)) { showError("Keep 1 to 100 backups."); return; }
+      try {
+        await withInFlight(api("PUT", schedPath, { schedule: hours ? { every_hours: hours, keep: k } : null }));
+        clearError();
+        toast(hours ? name + " is backed up " + every.options[every.selectedIndex].text.toLowerCase() + "." : name + " is no longer backed up automatically.");
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "The schedule was not saved.");
+      }
+    });
+
     const actions = el("div", "form-actions");
     actions.style.marginTop = "8px";
     const shut = el("button", "btn", "Close");
@@ -1416,7 +1495,39 @@ function onBackups(instanceId) {
     shut.onclick = close;
     const make = el("button", "btn btn-primary", "Back up now");
     make.type = "button";
-    actions.append(shut, make);
+    const picker = el("input");
+    picker.type = "file";
+    picker.accept = ".gz,.tar.gz,application/gzip";
+    picker.className = "hidden";
+    const importBtn = el("button", "btn", "Import a file…");
+    importBtn.type = "button";
+    importBtn.title = "Add a backup file saved with Download, from this node or another. Restore it once it is listed.";
+    importBtn.addEventListener("click", () => picker.click());
+    picker.addEventListener("change", async () => {
+      const f = picker.files && picker.files[0];
+      picker.value = "";
+      if (!f) return;
+      importBtn.disabled = true; importBtn.textContent = "Importing…";
+      try {
+        const resp = await withInFlight(fetch(path + "/import", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + (state.token || ""), "Content-Type": "application/gzip" },
+          body: f,
+        }));
+        if (resp.status === 401) { setToken(null); showTokenScreen(); close(); return; }
+        let data = null;
+        try { data = await resp.json(); } catch (_) {}
+        if (!resp.ok) { showError((data && data.error) || "The file was not imported."); return; }
+        clearError();
+        toast(f.name + " imported. Restore it from the list when the server is stopped.");
+        await load();
+      } catch (e) {
+        showError("Could not reach the node.");
+      } finally {
+        importBtn.disabled = false; importBtn.textContent = "Import a file…";
+      }
+    });
+    actions.append(picker, shut, importBtn, make);
     body.appendChild(actions);
 
     async function load() {
@@ -1436,19 +1547,19 @@ function onBackups(instanceId) {
         const row = el("div", "backup-row");
         const when = b.created_unix ? new Date(b.created_unix * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : b.name;
         row.append(el("span", "backup-when", when), el("span", "muted small", formatBytes(b.bytes)));
-        const restore = el("button", "btn btn-small", "Put back");
+        const restore = el("button", "btn btn-small", "Restore");
         restore.type = "button";
         restore.disabled = running;
         restore.title = running ? "Stop the server first." : "Replace this server's files with this backup.";
         restore.addEventListener("click", async () => {
-          if (!confirm("Put back the backup from " + when + "?\n\nThis server's current files are replaced. Back up first if you may want them.")) return;
+          if (!confirm("Restore the backup from " + when + "?\n\nThis server's current files are replaced. Back up first if you may want them.")) return;
           try {
             await withInFlight(api("POST", path + "/" + encodeURIComponent(b.name) + "/restore"));
-            toast(name + ": files put back from " + when + ".");
+            toast(name + ": files restored from " + when + ".");
             clearError();
           } catch (e) {
             if (e && e.__auth) { close(); return; }
-            showError((e && e.error) || "The backup was not put back.");
+            showError((e && e.error) || "The backup was not restored.");
           }
         });
         const del = el("button", "btn btn-small btn-danger-text", "Delete");
@@ -1458,8 +1569,12 @@ function onBackups(instanceId) {
           try { await withInFlight(api("DELETE", path + "/" + encodeURIComponent(b.name))); load(); }
           catch (e) { if (e && e.__auth) { close(); return; } showError((e && e.error) || "The backup was not deleted."); }
         });
+        const down = el("button", "btn btn-small", "Download");
+        down.type = "button";
+        down.title = "Save this backup as a file, to keep elsewhere or bring back later with Import.";
+        down.addEventListener("click", () => downloadBackup(instanceId, b.name));
         const acts = el("span", "backup-actions");
-        acts.append(restore, del);
+        acts.append(down, restore, del);
         row.appendChild(acts);
         list.appendChild(row);
       }
@@ -1673,6 +1788,86 @@ async function onCleanOrphans() {
     showError((e && e.error) || "Could not clean up.");
   }
   refreshOrphans(true);
+}
+
+// Backups of servers that were removed: they stay until the operator deletes
+// them (backups.rs). Read with the leftover folders, once a minute.
+async function refreshRemovedBackups() {
+  try {
+    const sets = await api("GET", "/backups");
+    state.removedBackups = sets.filter((s) => !s.server_exists);
+  } catch (e) {
+    state.removedBackups = null; // an older agent: no notice
+  }
+  renderRemovedBackups();
+}
+function renderRemovedBackups() {
+  const bar = $("removed-backups-bar");
+  if (!bar) return;
+  const sets = state.removedBackups || [];
+  bar.classList.toggle("hidden", !sets.length);
+  if (!sets.length) return;
+  const count = sets.reduce((n, s) => n + s.backups.length, 0);
+  const bytes = sets.reduce((n, s) => n + s.backups.reduce((m, b) => m + b.bytes, 0), 0);
+  $("removed-backups-text").textContent = count + " backup" + (count === 1 ? "" : "s") + " of " + sets.length +
+    " removed server" + (sets.length === 1 ? "" : "s") + ", " + formatBytes(bytes) + ".";
+}
+function onRemovedBackups() {
+  openModal("removed-backups-dialog", null, (body, close) => {
+    body.appendChild(el("h3", null, "Backups of removed servers"));
+    body.appendChild(el("p", "muted small", "These servers no longer exist; their backups stayed. " +
+      "Download one to keep it, or to bring it into another server with Import in that server's Backups."));
+    const list = el("div", "backup-list");
+    body.appendChild(list);
+    const actions = el("div", "form-actions");
+    const shut = el("button", "btn", "Close");
+    shut.type = "button";
+    shut.onclick = close;
+    actions.appendChild(shut);
+    body.appendChild(actions);
+    async function del(path, what) {
+      try { await withInFlight(api("DELETE", path)); clearError(); }
+      catch (e) { if (e && e.__auth) { close(); return; } showError((e && e.error) || what + " was not deleted."); }
+      await refreshRemovedBackups();
+      render();
+    }
+    function render() {
+      list.textContent = "";
+      const sets = state.removedBackups || [];
+      if (!sets.length) { list.appendChild(el("div", "muted small", "None left.")); return; }
+      for (const set of sets) {
+        const head = el("div", "backup-row");
+        head.appendChild(el("span", "backup-when", set.instance_id));
+        const all = el("button", "btn btn-small btn-danger-text", "Delete all");
+        all.type = "button";
+        all.addEventListener("click", () => {
+          if (!confirm("Delete all " + set.backups.length + " backups of " + set.instance_id + "?\n\nThis cannot be undone.")) return;
+          del("/backups/" + encodeURIComponent(set.instance_id), "The backups");
+        });
+        head.appendChild(all);
+        list.appendChild(head);
+        for (const b of set.backups) {
+          const row = el("div", "backup-row backup-sub");
+          const when = b.created_unix ? new Date(b.created_unix * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : b.name;
+          row.append(el("span", "backup-when", when), el("span", "muted small", formatBytes(b.bytes)));
+          const d = el("button", "btn btn-small btn-danger-text", "Delete");
+          d.type = "button";
+          d.addEventListener("click", () => {
+            if (!confirm("Delete the backup from " + when + "?")) return;
+            del("/instances/" + encodeURIComponent(set.instance_id) + "/backups/" + encodeURIComponent(b.name), "The backup");
+          });
+          const down = el("button", "btn btn-small", "Download");
+          down.type = "button";
+          down.addEventListener("click", () => downloadBackup(set.instance_id, b.name));
+          const acts = el("span", "backup-actions");
+          acts.append(down, d);
+          row.appendChild(acts);
+          list.appendChild(row);
+        }
+      }
+    }
+    render();
+  });
 }
 
 // ---------- server actions ----------
@@ -2969,6 +3164,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));
   $("announce-btn").addEventListener("click", () => onAnnounce(null));
   $("orphans-clean").addEventListener("click", onCleanOrphans);
+  $("removed-backups-show").addEventListener("click", onRemovedBackups);
   $("installed-unused-btn").addEventListener("click", onDeleteUnused);
   $("updates-every").addEventListener("change", saveUpdateSettings);
   $("updates-reserve").addEventListener("change", saveUpdateSettings);

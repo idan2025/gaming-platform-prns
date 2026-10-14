@@ -237,6 +237,18 @@ pub const RESTART_WARNING: &str = "This server restarts in about a minute. It ke
 /// How often the agent looks at servers' daily restart windows.
 pub const SCHEDULE_CHECK_EVERY: Duration = Duration::from_secs(60);
 
+/// One server's backups, for the page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupSet {
+    pub instance_id: String,
+    /// False for a server that was removed; its backups stayed.
+    pub server_exists: bool,
+    pub backups: Vec<crate::backups::Backup>,
+}
+
+/// How often the agent looks for backups that are due.
+pub const BACKUP_CHECK_EVERY: Duration = Duration::from_secs(60);
+
 /// A server's daily restart, for the page.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScheduleStatus {
@@ -1726,13 +1738,189 @@ impl Agent {
         Ok(())
     }
 
+    /// Delete one backup. The server need not exist any more: a removed
+    /// server's backups stay until deleted. The id is still checked as an
+    /// instance id and the name against the agent's own shape.
     pub async fn delete_backup(&self, instance_id: &str, name: &str) -> Result<()> {
-        self.ensure_instance(instance_id).await?;
-        let path = crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+        let dir = self.backups_dir(instance_id)?;
+        let path = crate::backups::path_of(&dir, name)
             .filter(|p| p.is_file())
             .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))?;
         std::fs::remove_file(path)?;
+        // An empty folder of a removed server is not worth listing.
+        if crate::backups::list(&dir).is_empty() && !self.server_exists(instance_id).await? {
+            let _ = std::fs::remove_dir(&dir);
+        }
         Ok(())
+    }
+
+    /// Where a named backup is, for download. Like delete, the server need
+    /// not exist any more.
+    pub async fn backup_file(&self, instance_id: &str, name: &str) -> Result<std::path::PathBuf> {
+        crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))
+    }
+
+    /// Where an upload for `instance_id` is written while it arrives: a
+    /// hidden partial file in its backups folder, which `list` never shows.
+    /// Refused for a server that does not exist, or when `bytes` (if the
+    /// sender said) would go below the disk reserve.
+    pub async fn backup_upload_path(&self, instance_id: &str, bytes: Option<u64>) -> Result<std::path::PathBuf> {
+        self.ensure_instance(instance_id).await?;
+        if let Some(bytes) = bytes {
+            self.room_for(bytes).await.map_err(|e| anyhow!("{e}"))?;
+        }
+        let dir = self.backups_dir(instance_id)?;
+        std::fs::create_dir_all(&dir)?;
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for an upload name: {e}"))?;
+        Ok(dir.join(format!(".upload-{}.partial", hex::encode(seed))))
+    }
+
+    /// Keep an uploaded backup if it is one (`backups::check_archive`), under
+    /// a name the agent makes. The upload is removed either way.
+    pub async fn import_backup(&self, instance_id: &str, upload: &std::path::Path) -> Result<crate::backups::Backup> {
+        let dir = self.backups_dir(instance_id)?;
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for a staging name: {e}"))?;
+        let staging = self.config.data_root.join("staging").join(format!("import-{}", hex::encode(seed)));
+        let archive = upload.to_path_buf();
+        let checked = tokio::task::spawn_blocking(move || crate::backups::check_archive(&archive, &staging)).await?;
+        if let Err(e) = checked {
+            let _ = std::fs::remove_file(upload);
+            return Err(anyhow!("{e}"));
+        }
+        let name = crate::backups::new_name(&dir, now_unix());
+        if let Err(e) = std::fs::rename(upload, dir.join(&name)) {
+            let _ = std::fs::remove_file(upload);
+            return Err(e.into());
+        }
+        let bytes = std::fs::metadata(dir.join(&name))?.len();
+        tracing::info!(instance = %instance_id, backup = %name, bytes, "imported a backup");
+        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()) })
+    }
+
+    async fn server_exists(&self, instance_id: &str) -> Result<bool> {
+        Ok(self.docker.list_managed().await?.iter().any(|c| c.instance_id == instance_id))
+    }
+
+    /// Every server's backups on this node, removed servers' included, by
+    /// server id.
+    pub async fn all_backups(&self) -> Result<Vec<BackupSet>> {
+        let existing: std::collections::BTreeSet<String> =
+            self.docker.list_managed().await?.into_iter().map(|c| c.instance_id).collect();
+        let root = self.config.data_root.join(crate::backups::BACKUPS_DIR);
+        let Ok(entries) = std::fs::read_dir(&root) else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let Ok(id) = e.file_name().into_string() else { continue };
+            // A folder whose name is not an instance id is not the agent's.
+            if self.layout.instance_dir(&id).is_err() || !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let backups = crate::backups::list(&e.path());
+            if backups.is_empty() {
+                continue;
+            }
+            out.push(BackupSet { server_exists: existing.contains(&id), instance_id: id, backups });
+        }
+        out.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+        Ok(out)
+    }
+
+    /// Delete every backup of a server that no longer exists. Refused for a
+    /// server that does: its backups go one at a time.
+    pub async fn delete_removed_backups(&self, instance_id: &str) -> Result<usize> {
+        let dir = self.backups_dir(instance_id)?;
+        if self.server_exists(instance_id).await? {
+            return Err(anyhow!("{instance_id} still exists; delete its backups one at a time"));
+        }
+        let backups = crate::backups::list(&dir);
+        if backups.is_empty() {
+            return Err(anyhow!("{instance_id} has no backups"));
+        }
+        for b in &backups {
+            std::fs::remove_file(dir.join(&b.name))?;
+        }
+        let _ = std::fs::remove_dir(&dir);
+        tracing::info!(instance = %instance_id, count = backups.len(), "deleted a removed server's backups");
+        Ok(backups.len())
+    }
+
+    /// A server's backup schedule, if it has one.
+    pub async fn backup_schedule(&self, instance_id: &str) -> Result<Option<crate::backups::StoredSchedule>> {
+        self.ensure_instance(instance_id).await?;
+        let dir = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?;
+        Ok(crate::backups::load_schedule(&dir))
+    }
+
+    /// Back a server up on a schedule, or stop with `None`. Changing the
+    /// interval keeps what the schedule made, so it still prunes those.
+    pub async fn set_backup_schedule(
+        &self,
+        instance_id: &str,
+        schedule: Option<crate::backups::BackupSchedule>,
+    ) -> Result<()> {
+        self.ensure_instance(instance_id).await?;
+        let dir = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?;
+        let stored = match schedule {
+            Some(schedule) => {
+                schedule.validate().map_err(|e| anyhow!("{e}"))?;
+                let old = crate::backups::load_schedule(&dir);
+                Some(crate::backups::StoredSchedule {
+                    schedule,
+                    last_unix: old.as_ref().and_then(|o| o.last_unix),
+                    made: old.map(|o| o.made).unwrap_or_default(),
+                })
+            }
+            None => None,
+        };
+        crate::backups::save_schedule(&dir, stored.as_ref())?;
+        Ok(())
+    }
+
+    /// Back up the running servers whose schedule is due, and delete the
+    /// oldest backups each schedule made beyond its `keep`. A stopped server's
+    /// files do not change, so it is not backed up again. The attempt is
+    /// recorded first, so one that fails (the disk reserve, say) waits for the
+    /// next interval rather than retrying every minute.
+    pub async fn scheduled_backups(&self) {
+        let Ok(containers) = self.docker.list_managed().await else { return };
+        for c in containers.iter().filter(|c| c.state == InstanceState::Running) {
+            let Ok(dir) = self.layout.instance_dir(&c.instance_id) else { continue };
+            let Some(mut stored) = crate::backups::load_schedule(&dir) else { continue };
+            let now = now_unix();
+            if !stored.schedule.due(now, stored.last_unix) {
+                continue;
+            }
+            stored.last_unix = Some(now);
+            if let Err(e) = crate::backups::save_schedule(&dir, Some(&stored)) {
+                tracing::warn!(instance = %c.instance_id, error = %e, "not backing up: the schedule could not be saved");
+                continue;
+            }
+            let made = match self.create_backup(&c.instance_id).await {
+                Ok(made) => made,
+                Err(e) => {
+                    tracing::warn!(instance = %c.instance_id, error = %format!("{e:#}"), "the scheduled backup failed");
+                    continue;
+                }
+            };
+            let prune = stored.record(made.name);
+            if let Err(e) = crate::backups::save_schedule(&dir, Some(&stored)) {
+                // Not pruning: a name the file does not remember would never
+                // be pruned again, but one it forgot to drop could be deleted
+                // twice. Neither is worth deleting on a guess.
+                tracing::warn!(instance = %c.instance_id, error = %e, "the backup schedule could not be saved");
+                continue;
+            }
+            let Ok(bdir) = self.backups_dir(&c.instance_id) else { continue };
+            for name in prune {
+                if let Some(path) = crate::backups::path_of(&bdir, &name) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 
     /// Every server's daily restart window, by server (`schedule.rs`).

@@ -123,6 +123,14 @@ pub fn router_full(
         .route("/instances/:id/backups", get(list_backups).post(create_backup))
         .route("/instances/:id/backups/:name", delete(delete_backup))
         .route("/instances/:id/backups/:name/restore", post(restore_backup))
+        .route("/instances/:id/backup-schedule", get(backup_schedule).put(set_backup_schedule))
+        .route("/instances/:id/backups/:name/file", get(download_backup))
+        .route(
+            "/instances/:id/backups/import",
+            post(import_backup).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/backups", get(all_backups))
+        .route("/backups/:id", delete(delete_removed_backups))
         .route("/instances/:id/bots", post(set_bots))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
@@ -786,6 +794,139 @@ async fn delete_backup(
         .await
         .map(|()| Json(json!({ "instance_id": id, "deleted": name })))
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+/// The largest backup the node takes in. A server's own files (saves,
+/// settings, logs) are megabytes; this is a bound on a mistake, not a quota.
+const MAX_BACKUP_UPLOAD: u64 = 4 * 1024 * 1024 * 1024;
+
+/// A backup's file, for the operator to keep elsewhere. Streamed, never read
+/// whole into memory.
+async fn download_backup(
+    State(state): State<ApiState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let path = state.agent.backup_file(&id, &name).await.map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let file = tokio::fs::File::open(&path).await.map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let len = file.metadata().await.map(|m| m.len()).ok();
+    let stream = futures_util::stream::unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(buf)), file))
+            }
+            Err(e) => Some((Err(e), file)),
+        }
+    });
+    let mut resp = Response::new(axum::body::Body::from_stream(stream));
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/gzip"));
+    // The name is the agent's own shape (`backups::valid_name`): digits, `-`
+    // and `.tar.gz`, so it is safe in a header as is.
+    let file_name = format!("{id}-{name}");
+    if let Ok(v) = header::HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if let Some(len) = len {
+        headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(len));
+    }
+    Ok(resp)
+}
+
+/// Take in a backup file for a server, as the request body. It needs a
+/// `Content-Length`, is held to the disk reserve and `MAX_BACKUP_UPLOAD`,
+/// and is kept only if it is a backup (`Agent::import_backup`).
+async fn import_backup(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<crate::backups::Backup> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| fail(StatusCode::LENGTH_REQUIRED, anyhow::anyhow!("send the file with its length")))?;
+    if declared > MAX_BACKUP_UPLOAD {
+        return Err(fail(StatusCode::PAYLOAD_TOO_LARGE, anyhow::anyhow!("a backup is at most 4 GB")));
+    }
+    let upload = state
+        .agent
+        .backup_upload_path(&id, Some(declared))
+        .await
+        .map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    let written = async {
+        let mut file = tokio::fs::File::create(&upload).await?;
+        let mut stream = body.into_data_stream();
+        let mut total = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            total += chunk.len() as u64;
+            if total > declared {
+                return Err(std::io::Error::other("the upload is longer than it said"));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok::<_, std::io::Error>(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&upload);
+        return Err(fail(StatusCode::BAD_REQUEST, anyhow::anyhow!("the upload did not arrive: {e}")));
+    }
+    state.agent.import_backup(&id, &upload).await.map(Json).map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// A server's backup schedule, or `null`.
+async fn backup_schedule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<Option<crate::backups::StoredSchedule>> {
+    state.agent.backup_schedule(&id).await.map(Json).map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+/// `{"schedule": {"every_hours": 24, "keep": 7}}` backs a server up on a
+/// schedule; `{"schedule": null}` stops it.
+#[derive(Deserialize)]
+struct BackupScheduleReq {
+    schedule: Option<crate::backups::BackupSchedule>,
+}
+
+async fn set_backup_schedule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<BackupScheduleReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .set_backup_schedule(&id, req.schedule)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "schedule": req.schedule })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// Every server's backups, removed servers' included.
+async fn all_backups(State(state): State<ApiState>) -> ApiResult<Vec<crate::agent::BackupSet>> {
+    state.agent.all_backups().await.map(Json).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Delete every backup of a server that was removed.
+async fn delete_removed_backups(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .delete_removed_backups(&id)
+        .await
+        .map(|n| Json(json!({ "instance_id": id, "deleted": n })))
+        .map_err(|e| fail(StatusCode::CONFLICT, e))
 }
 
 /// Every server's daily restart window, by id (`schedule.rs`).
