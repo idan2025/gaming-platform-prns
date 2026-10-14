@@ -597,3 +597,4 @@ details.small > summary { cursor: pointer; color: var(--text-2); }
 .badge.installed-badge { background: var(--ok-soft); color: var(--ok); }
 .pack-detail.have-game { color: var(--ok); }
 .pack-detail.no-game { color: var(--text-3); }
+.badge.slow-badge { background: var(--warn-soft); color: var(--warn); }
