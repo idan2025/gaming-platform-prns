@@ -209,6 +209,53 @@ pub fn validate_map_name(map: &str) -> Result<(), MapNameError> {
     Ok(())
 }
 
+/// Longest console line an operator may send. A real command is a few words;
+/// this keeps a paste accident from becoming a wall of input to a game.
+pub const MAX_CONSOLE_LINE_LEN: usize = 256;
+
+/// Why an operator's console line was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleLineError {
+    Empty,
+    TooLong(usize),
+    /// A control character, a newline above all: a console reads one command
+    /// per line, so a second line is a second command nobody saw typed.
+    Control(char),
+}
+
+impl core::fmt::Display for ConsoleLineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "the console line is empty"),
+            Self::TooLong(n) => {
+                write!(f, "the console line is {n} bytes, over the {MAX_CONSOLE_LINE_LEN}-byte limit")
+            }
+            Self::Control(c) => write!(f, "the console line contains {c:?}; send one line, with no control characters"),
+        }
+    }
+}
+
+impl std::error::Error for ConsoleLineError {}
+
+/// Judge a line the **operator** types at their own server's console
+/// (`ROADMAP.md` item 7). Free text is allowed — `;` included, since chaining
+/// commands on your own server is your business — but it is exactly one line:
+/// a newline, a carriage return or any other control character is refused,
+/// never stripped. Only the node's own API accepts one; a pack names a
+/// protocol and never a command, and an index can never send one.
+pub fn validate_console_line(line: &str) -> Result<(), ConsoleLineError> {
+    if line.trim().is_empty() {
+        return Err(ConsoleLineError::Empty);
+    }
+    if line.len() > MAX_CONSOLE_LINE_LEN {
+        return Err(ConsoleLineError::TooLong(line.len()));
+    }
+    if let Some(c) = line.chars().find(|c| c.is_control()) {
+        return Err(ConsoleLineError::Control(c));
+    }
+    Ok(())
+}
+
 /// Why a server name was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerNameError {
@@ -270,6 +317,16 @@ pub fn validate_server_name(name: &str) -> Result<(), ServerNameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_operators_console_line_is_one_line_and_nothing_more() {
+        assert!(validate_console_line("status").is_ok());
+        assert!(validate_console_line("mp_timelimit 30; sv_restart 1").is_ok(), "chaining is the operator's call");
+        for bad in ["status\nquit", "status\rquit", "a\u{0}b", "", "   "] {
+            assert!(validate_console_line(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(validate_console_line(&"x".repeat(MAX_CONSOLE_LINE_LEN + 1)).is_err());
+    }
 
     #[test]
     fn a_message_to_players_can_never_become_a_second_command() {

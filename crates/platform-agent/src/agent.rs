@@ -1206,6 +1206,31 @@ impl Agent {
         Ok(line)
     }
 
+    /// Send a line the operator typed to a running server's console
+    /// (`ROADMAP.md` item 7). Only for a game whose pack declares a console,
+    /// so the line reaches something that reads it; held to one line by
+    /// `validate_console_line`. Logged, since it is someone typing at a game
+    /// server. The uplink has no way to call this: an index never types at a
+    /// node's servers.
+    pub async fn send_console(&self, instance_id: &str, line: &str) -> Result<()> {
+        game_bridge::console::validate_console_line(line).map_err(|e| anyhow!("{e}"))?;
+        let instances = self.list().await?;
+        let instance = instances
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
+        let has_console = self.packs.read().await.get(&instance.game_id).is_some_and(|p| p.console.is_some());
+        if !has_console {
+            return Err(anyhow!(
+                "the {:?} pack declares no console, so this node does not know that its server reads one",
+                instance.game_id
+            ));
+        }
+        self.docker.send_console_line(instance_id, line).await?;
+        tracing::info!(instance = %instance_id, line = %line, "console line sent by the operator");
+        Ok(())
+    }
+
     /// Which bot implementation this node can drive for a game, if any.
     ///
     /// The node's config wins over the pack. A pack may only name bots the game

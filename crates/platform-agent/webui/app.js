@@ -882,7 +882,8 @@ function openInstanceMenu(id, x, y) {
       : "Only a server on the mesh has an invite link.",
     action: () => copyValue(inviteLink(inst)) });
   items.push({ label: "Copy mesh address", icon: "copy", disabled: !inst.mesh_destination, action: () => copyValue(inst.mesh_destination) });
-  items.push({ label: "Show log", icon: "log", action: () => onShowLog(id) });
+  const hasConsole = state.games.some(g => g.id === inst.game_id && g.console);
+  items.push({ label: hasConsole ? "Log and console" : "Show log", icon: "log", action: () => onShowLog(id) });
   items.push({ label: "Players…", icon: "users", disabled: !cap.running,
     title: cap.running ? "Who is on this server, as the game reports it." : "The server has to be running.",
     action: () => onShowPlayers(id) });
@@ -1321,8 +1322,46 @@ function onShowLog(instanceId) {
     head.append(spacer, pick, copy, shut);
     const pre = el("pre", "log-text", "Reading the log…");
     pre.tabIndex = 0;
-    const foot = el("div", "muted small log-foot", "Updates every 2 s while open. Read-only.");
-    body.append(head, pre, foot);
+    const game = inst && state.games.find(g => g.id === inst.game_id);
+    const canType = !!(game && game.console && inst.state === "running");
+    const footText = canType ? "Updates every 2 s while open. A line you send shows here with the game's answer."
+      : "Updates every 2 s while open. Read-only.";
+    const foot = el("div", "muted small log-foot", footText);
+    body.append(head, pre);
+    if (canType) {
+      // One line at a time, typed by the operator (Agent::send_console).
+      const form = el("form", "console-form");
+      const input = el("input", "field console-input");
+      input.type = "text";
+      input.maxLength = 256;
+      input.placeholder = "Type a console command, such as status";
+      input.setAttribute("aria-label", "Console command");
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      const send = el("button", "btn btn-primary", "Send");
+      send.type = "submit";
+      form.append(input, send);
+      form.addEventListener("submit", async ev => {
+        ev.preventDefault();
+        const line = input.value.trim();
+        if (!line) return;
+        send.disabled = true;
+        try {
+          await api("POST", "/instances/" + encodeURIComponent(instanceId) + "/console", { line });
+          input.value = "";
+          foot.textContent = "Sent: " + line;
+          setTimeout(() => refresh(true), 600);
+        } catch (e) {
+          if (e && e.__auth) { close(); return; }
+          foot.textContent = (e && e.error) || "The line was not sent.";
+        } finally {
+          send.disabled = false;
+          input.focus();
+        }
+      });
+      body.appendChild(form);
+    }
+    body.appendChild(foot);
 
     let first = true;
     async function refresh(jump) {
@@ -1339,7 +1378,7 @@ function onShowLog(instanceId) {
           if (first || jump || atEnd) pre.scrollTop = pre.scrollHeight;
         }
         first = false;
-        foot.textContent = "Updates every 2 s while open. Read-only.";
+        if (!foot.textContent.startsWith("Sent: ")) foot.textContent = footText;
       } catch (e) {
         if (e && e.__auth) { close(); return; }
         foot.textContent = (e && e.error) || "Could not read the log.";
