@@ -1613,6 +1613,31 @@ impl Launcher {
         self.persist(&settings)
     }
 
+    pub async fn notifications_on(&self) -> bool {
+        !self.settings.lock().await.notifications_off
+    }
+
+    pub async fn set_notifications_on(&self, on: bool) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        settings.notifications_off = !on;
+        self.persist(&settings)
+    }
+
+    /// What closing the window would cut off, if anything: `"room"` while a
+    /// LAN room is open here, `"server"` while a join's bridge is running.
+    /// The shell keeps running in the tray for either (`ROADMAP.md` item 5),
+    /// because both end when the launcher does.
+    pub async fn keeps_running(&self) -> Option<&'static str> {
+        let inner = self.inner.lock().await;
+        if inner.room.is_some() {
+            Some("room")
+        } else if inner.last_join.is_some() {
+            Some("server")
+        } else {
+            None
+        }
+    }
+
     pub async fn set_player_name(&self, name: &str) -> Result<()> {
         let trimmed = name.trim();
         let mut settings = self.settings.lock().await;
@@ -2537,6 +2562,20 @@ query = "a2s"
 
         l.forget_server(Some(hash)).await.unwrap();
         assert!(l.favorites().await.is_empty(), "Remove takes the star too");
+    }
+
+    /// Nothing is open on a fresh launcher, so closing it just quits; and
+    /// notifications are on unless turned off, and stay off.
+    #[tokio::test]
+    async fn closing_an_idle_launcher_quits_and_notifications_remember_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("launcher.json");
+        let l = Launcher::new(Vec::new()).with_settings_file(file.clone());
+        assert_eq!(l.keeps_running().await, None);
+        assert!(l.notifications_on().await);
+        l.set_notifications_on(false).await.unwrap();
+        let l = Launcher::new(Vec::new()).with_settings_file(file);
+        assert!(!l.notifications_on().await);
     }
 
     /// The keep-alive asks about a favorite however long ago it was heard,

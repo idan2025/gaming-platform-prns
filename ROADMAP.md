@@ -14,7 +14,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 2 | Invite links | players with friends | S–M | **done** (v0.2.31) |
 | 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
 | 4 | Installed-game detection | every player | M | proposed |
-| 5 | Tray icon and notifications | hosts, regulars | M | proposed |
+| 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, four notifications |
 | 6 | Chat and player names in rooms | LAN-room players | L | proposed |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
@@ -134,6 +134,15 @@ that means a window in the way the whole evening.
 now — nothing a room creates may outlive the launcher (`CLAUDE.md`, Mode 3).
 Notifications are opt-out, and none fires while a game is fullscreen if the OS
 can tell.
+
+**Built (2026-10-14).** A tray icon (click or Show to bring the window back,
+Quit to quit). Closing the window hides it to the tray only while a room is
+open or a server is joined, with a one-time note saying so; otherwise it
+quits. Desktop notifications for a favorite coming up, someone joining your
+room, a failed room check and an update found at start, with a switch in
+Settings; skipped while the window is in front. **Not yet:** holding them
+back while a game is fullscreen — none of the three OSes says so in a way
+this build reads.
 
 ## 6. Chat and player names in rooms
 
