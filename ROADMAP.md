@@ -19,7 +19,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
-| 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
+| 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
@@ -250,6 +250,15 @@ join, play, leave. Good on a Steam Deck in Game Mode and on a TV.
 
 **How.** The Gamepad API in the webview, a second stylesheet, and focus that is
 always visible. The AppImage already runs on SteamOS.
+
+**Built (2026-10-14).** **Big screen mode** (Settings, or a controller's
+Start): large rows and buttons, an icon-only sidebar and a thick focus ring,
+remembered per screen. A controller drives the same actions as the keyboard:
+up/down (d-pad or left stick, with repeat) through the list, A or right opens
+a server with focus on Join, X joins, Y opens the row's menu, B goes back,
+LB/RB switch sections; elsewhere up/down move between buttons and A presses.
+A controller plugging in offers big screen once. **Not yet:** tried on a real
+Steam Deck — WebKitGTK reads gamepads only when built with libmanette.
 
 ## 11. Node: installed games and downloads
 
