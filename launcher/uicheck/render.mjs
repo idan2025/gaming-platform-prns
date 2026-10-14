@@ -484,6 +484,51 @@ await run('many hops and no round trip yet is said', {
   check('seven hops is a hint', !!hint && /7 hops away/.test(hint.textContent), hint && hint.textContent);
 });
 
+// A controller drives the list: down moves, A opens the detail on Join, B
+// goes back, Start switches big screen. The pad is a stub read by the page's
+// own loop, frame by frame.
+{
+  const pad = { buttons: Array.from({ length: 17 }, () => ({ pressed: false })), axes: [0, 0, 0, 0] };
+  let frames = [];
+  await run('a controller drives the list', {
+    status: running,
+    rows: () => [row(), row({ destination_hash: '0202'.repeat(8), name: 'Second', hops: 2 })],
+    beforeApp(w) {
+      Object.defineProperty(w.navigator, 'getGamepads', { value: () => [pad] });
+      w.requestAnimationFrame = cb => { frames.push(cb); return frames.length; };
+      w.performance.now = () => Date.now();
+      w.Element.prototype.scrollIntoView ??= () => {};
+      w.CSS ??= { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+    },
+  }, async (win, doc) => {
+    await settle();
+    const frame = () => { const f = frames; frames = []; f.forEach(cb => cb()); };
+    const press = async (i) => {
+      pad.buttons[i].pressed = true; frame();
+      pad.buttons[i].pressed = false; frame();
+      await settle();
+    };
+    await win.pollAll();
+    check('the list is there to drive', doc.querySelectorAll('#list .row').length === 2, String(doc.querySelectorAll('#list .row').length));
+    win.dispatchEvent(new win.Event('gamepadconnected'));
+    frame();
+    await press(13); // down
+    await press(13);
+    const active = () => doc.querySelector('#list .row[tabindex="0"]')?.dataset.hash;
+    check('down moves through the list', active() === '0202'.repeat(8), active());
+    await press(0); // A
+    check('A opens the detail pane', !doc.querySelector('#detail').hidden);
+    await new Promise(r => setTimeout(r, 5));
+    check('and lands on Join', doc.activeElement && doc.activeElement.id === 'detail-join', doc.activeElement && doc.activeElement.id);
+    await press(1); // B
+    check('B closes it', doc.querySelector('#detail').hidden);
+    await press(9); // Start
+    check('Start turns big screen on', doc.body.classList.contains('bigscreen'));
+    await press(9);
+    check('and off', !doc.body.classList.contains('bigscreen'));
+  });
+}
+
 await run('no round trip, no playability hint', {
   status: running,
   rows: () => [row()],

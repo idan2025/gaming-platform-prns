@@ -598,3 +598,21 @@ details.small > summary { cursor: pointer; color: var(--text-2); }
 .pack-detail.have-game { color: var(--ok); }
 .pack-detail.no-game { color: var(--text-3); }
 .badge.slow-badge { background: var(--warn-soft); color: var(--warn); }
+/* ---------- big screen (ROADMAP item 10) ---------- */
+/* Large rows and a focus that can be seen from a sofa. The layout is the same
+   page; only sizes change, so nothing behaves differently. */
+body.bigscreen { font-size: 17px; --row-h: 84px; }
+body.bigscreen .sidebar { width: 88px; padding-left: 10px; padding-right: 10px; }
+body.bigscreen .sidebar .brand-text, body.bigscreen .nav-item span, body.bigscreen .sidebar-foot .node-sub { display: none; }
+body.bigscreen .nav-item { justify-content: center; height: 52px; }
+body.bigscreen .nav-item svg { width: 26px; height: 26px; }
+body.bigscreen .art-thumb { width: 136px; height: 64px; }
+body.bigscreen .list-head, body.bigscreen .row { grid-template-columns: 136px minmax(220px, 2.4fr) minmax(130px, 1.2fr) minmax(110px, 1fr) 120px 110px 96px; }
+body.bigscreen .row .col-name .v { font-size: 19px; }
+body.bigscreen .row .sub, body.bigscreen .row .v { font-size: 15px; }
+body.bigscreen .detail { width: min(560px, 46vw); }
+body.bigscreen .btn { height: 48px; padding: 0 20px; font-size: 16px; }
+body.bigscreen .btn-join, body.bigscreen .btn-play { height: 56px; font-size: 18px; }
+body.bigscreen :focus { outline: 4px solid var(--accent); outline-offset: 2px; }
+body.bigscreen .row:focus { outline-offset: -4px; }
+body.bigscreen .sidebar-foot { display: none; }

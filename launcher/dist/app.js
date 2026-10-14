@@ -2206,6 +2206,9 @@ async function init() {
   });
   await loadGames();
   await loadInstalled();
+  // After an await: the controller code is at the end of this file, and its
+  // constants do not exist until the whole file has run.
+  initBigScreen();
   await loadVersion();
   // The saved interfaces, so Connect uses what was configured rather than
   // asking the player to retype a relay address they were given once.
@@ -3189,6 +3192,14 @@ function renderSettings() {
   };
   notes.append(nbox, el('span', '', 'Desktop notifications: a favorite comes up, someone joins your room, a room check fails, an update is ready'));
   card.appendChild(notes);
+  const big = el('label', 'toggle-row');
+  const bbox = el('input');
+  bbox.type = 'checkbox';
+  bbox.id = 'bigscreen-on';
+  bbox.checked = !!state.bigScreen;
+  bbox.onchange = () => setBigScreen(bbox.checked);
+  big.append(bbox, el('span', '', 'Big screen mode: large rows for a TV or a Steam Deck. A controller’s Start button switches it too'));
+  card.appendChild(big);
   card.appendChild(el('p', 'note', 'Updates are checked against GitHub and every download is verified '
     + 'against Lanthorn\u2019s signing key before it is installed. Without internet, nothing is checked '
     + 'and nothing changes.'));
@@ -3206,4 +3217,150 @@ function renderSettings() {
   about.appendChild(page);
   body.appendChild(about);
   if (keep) document.getElementById(keep)?.focus({ preventScroll: true });
+}
+
+
+// ---------- controller and big screen (ROADMAP item 10) ----------
+//
+// A layout with large rows and a focus you can see across a room, and a
+// gamepad that drives the same actions the keyboard does: up and down through
+// the list, A to open or press, B to go back, X to join, Start for big screen,
+// LB/RB between sections. Nothing here is new behaviour, only a new way in.
+// The mode is a per-screen preference, so it lives in this webview's storage.
+const BIG_KEY = 'lanthorn.bigscreen';
+function setBigScreen(on) {
+  document.body.classList.toggle('bigscreen', !!on);
+  state.bigScreen = !!on;
+  try { localStorage.setItem(BIG_KEY, on ? '1' : '0'); } catch (_) { /* private storage: this run only */ }
+  const box = $('bigscreen-on');
+  if (box) box.checked = !!on;
+}
+function initBigScreen() {
+  let saved = false;
+  try { saved = localStorage.getItem(BIG_KEY) === '1'; } catch (_) { /* none */ }
+  setBigScreen(saved);
+  window.addEventListener('gamepadconnected', () => {
+    if (!state.bigScreen) toast('Controller found. Press Start for big screen mode.');
+    startPadLoop();
+  });
+  // A pad already connected before the page loaded shows up on first poll.
+  if (navigator.getGamepads && [...navigator.getGamepads()].some(Boolean)) startPadLoop();
+}
+
+// Standard mapping (https://w3c.github.io/gamepad/#remapping).
+const PAD = { A: 0, B: 1, X: 2, Y: 3, LB: 4, RB: 5, BACK: 8, START: 9, UP: 12, DOWN: 13, LEFT: 14, RIGHT: 15 };
+const PAD_REPEAT_FIRST_MS = 380;
+const PAD_REPEAT_MS = 110;
+let padLoop = null;
+const padHeld = new Map(); // logical button -> { since, last }
+function startPadLoop() {
+  if (padLoop || !navigator.getGamepads) return;
+  const tick = () => {
+    const pads = [...navigator.getGamepads()].filter(Boolean);
+    if (!pads.length) { padLoop = null; padHeld.clear(); return; }
+    const now = performance.now();
+    const pressed = new Set();
+    for (const p of pads) {
+      const b = i => !!(p.buttons[i] && p.buttons[i].pressed);
+      for (const [name, i] of Object.entries(PAD)) if (b(i)) pressed.add(name);
+      // The left stick counts as the d-pad.
+      const [x, y] = [p.axes[0] || 0, p.axes[1] || 0];
+      if (y < -0.6) pressed.add('UP');
+      if (y > 0.6) pressed.add('DOWN');
+      if (x < -0.6) pressed.add('LEFT');
+      if (x > 0.6) pressed.add('RIGHT');
+    }
+    for (const name of [...padHeld.keys()]) if (!pressed.has(name)) padHeld.delete(name);
+    for (const name of pressed) {
+      const h = padHeld.get(name);
+      const repeats = name === 'UP' || name === 'DOWN';
+      if (!h) {
+        padHeld.set(name, { since: now, last: now });
+        padPress(name);
+      } else if (repeats && now - h.since > PAD_REPEAT_FIRST_MS && now - h.last > PAD_REPEAT_MS) {
+        h.last = now;
+        padPress(name);
+      }
+    }
+    padLoop = requestAnimationFrame(tick);
+  };
+  padLoop = requestAnimationFrame(tick);
+}
+
+// What each button does, written over the page's own actions.
+function padPress(name) {
+  const active = document.activeElement;
+  const inDetail = !!(active && active.closest && active.closest('.detail'));
+  const inMenu = !!document.querySelector('#ctx-menu:not([hidden])');
+  if (name === 'START') { setBigScreen(!state.bigScreen); return; }
+  if (name === 'LB' || name === 'RB') {
+    const visible = VIEWS.filter(v => { const n = $('nav-' + v); return n && !n.hidden; });
+    const i = visible.indexOf(state.view);
+    const next = visible[(i + (name === 'RB' ? 1 : visible.length - 1)) % visible.length];
+    setView(next);
+    return;
+  }
+  if (name === 'B') {
+    if (inMenu) { closeMenu(); return; }
+    if (state.detail) { closeDetail(); focusList(); return; }
+    if (state.view !== 'servers') { setView('servers'); focusList(); }
+    return;
+  }
+  if (state.view === 'servers' && !inDetail && !inMenu) {
+    if (name === 'UP' || name === 'DOWN') { listKey(name === 'UP' ? 'ArrowUp' : 'ArrowDown'); return; }
+    if (name === 'A' || name === 'RIGHT') {
+      if (!state.activeHash) { listKey('ArrowDown'); return; }
+      openDetail(state.activeHash);
+      focusDetail();
+      return;
+    }
+    if (name === 'X' && state.activeHash) { openDetail(state.activeHash); primaryAction(state.activeHash); return; }
+    if (name === 'Y' && state.activeHash) {
+      const r = $('list').querySelector('.row[data-hash="' + CSS.escape(state.activeHash) + '"]');
+      if (r) {
+        const b = r.getBoundingClientRect();
+        openRowMenu(state.activeHash, b.left + 120, b.top + b.height / 2);
+        const first = $('ctx-menu').querySelector('.menu-item:not([disabled])');
+        if (first) first.focus();
+      }
+      return;
+    }
+    return;
+  }
+  // Anywhere else: move between the things that can be pressed, and press.
+  if (name === 'LEFT' && inDetail) { focusList(); return; }
+  if (name === 'UP' || name === 'LEFT') { moveFocus(-1); return; }
+  if (name === 'DOWN' || name === 'RIGHT') { moveFocus(1); return; }
+  if (name === 'A' && active && active !== document.body) { active.click(); return; }
+  if (name === 'X' && state.detail) { primaryAction(state.detail.hash); }
+}
+function listKey(key) {
+  const list = $('list');
+  if (document.activeElement === document.body) list.focus();
+  onListKey({ key, preventDefault() {}, shiftKey: false });
+}
+function focusList() {
+  const list = $('list');
+  const row = state.activeHash && list.querySelector('.row[data-hash="' + CSS.escape(state.activeHash) + '"]');
+  (row || list).focus();
+}
+function focusDetail() {
+  // After the pane is built: the first thing to press, Join.
+  setTimeout(() => {
+    const target = $('detail-join') || $('detail').querySelector('button:not([disabled])');
+    if (target) target.focus();
+  }, 0);
+}
+// The next or previous pressable thing in the open menu, the detail pane or
+// the current section, in page order.
+function moveFocus(dir) {
+  const menu = document.querySelector('#ctx-menu:not([hidden])');
+  const scope = menu || (state.detail && document.activeElement && document.activeElement.closest('.detail') ? $('detail') : $('view-' + state.view)) || document.body;
+  const items = [...scope.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+    .filter(e => !e.disabled && !e.hidden && e.offsetParent !== null);
+  if (!items.length) return;
+  const i = items.indexOf(document.activeElement);
+  const next = items[i < 0 ? 0 : Math.max(0, Math.min(items.length - 1, i + dir))];
+  next.focus();
+  next.scrollIntoView({ block: 'nearest' });
 }
