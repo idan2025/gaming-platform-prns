@@ -288,6 +288,9 @@ query = "a2s"
         .expect("the imported pack is live without a restart");
     assert_eq!(found["runnable"], serde_json::json!(false));
     assert!(found["reason"].as_str().unwrap().contains("games.imported-game"));
+    // Its tier is read from its file, so an operator sees what they added.
+    assert_eq!(found["trust"], "unsigned local");
+    assert!(found["signer"].is_null());
 
     // A second import of the same id is refused rather than replacing a pack
     // whose game may be running.

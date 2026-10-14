@@ -278,6 +278,12 @@ struct GameOption {
     steam_app_id: Option<u32>,
     /// The picture to show (`GamePack::art_url`), or none for a lettered tile.
     art_url: Option<String>,
+    /// The pack's tier under this node's `[pack_trust]` (§11.4's words), read
+    /// from its file and signature now. `None` when there is no pack directory
+    /// to read it from.
+    trust: Option<String>,
+    /// Who signed it, hex identity hash, when someone did.
+    signer: Option<String>,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -514,6 +520,14 @@ async fn remove_pack(State(state): State<ApiState>, Path(id): Path<String>) -> A
 async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
     let config = state.agent.config();
     let packs = state.agent.packs().await;
+    let policy = config.pack_trust_policy();
+    let now = std::time::SystemTime::now();
+    let tier = |id: &str| {
+        let dir = state.pack_dir.as_ref()?;
+        let path = crate::pack_import::pack_path(dir, id);
+        // A pack loaded from a file named otherwise is not guessed at.
+        game_bridge::GamePack::load_verified(&path, &policy, now).ok().map(|p| p.trust)
+    };
     let mut out: Vec<GameOption> = packs
         .values()
         .map(|pack| {
@@ -522,6 +536,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
             // control appear for Counter-Strike 1.6 on a node that installed
             // YaPB and stay absent on one that did not.
             let bots = runtime.and_then(|r| r.bots).is_some() || pack.bots.is_some();
+            let trust = tier(&pack.id);
             GameOption {
                 runnable: runtime.is_some(),
                 reason: runtime.is_none().then(|| {
@@ -541,6 +556,8 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 bots: bots && pack.console.is_some(),
                 steam_app_id: pack.launch.as_ref().and_then(|l| l.steam_app_id),
                 art_url: pack.art_url(),
+                signer: trust.as_ref().and_then(|t| t.signer()).map(|s| hex::encode(s.as_bytes())),
+                trust: trust.map(|t| t.label().to_string()),
             }
         })
         .collect();

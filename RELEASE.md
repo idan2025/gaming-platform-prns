@@ -74,6 +74,14 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Lanthorn Host: each game says whose word its pack is
+
+- A game card on the Games page shows its pack's tier under this node's
+  trust settings (signed, signed by an unknown key, unsigned local), with the
+  signer on hover.
+
 ## v0.2.40
 
 ### Lanthorn: chat and names in LAN rooms

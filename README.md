@@ -278,6 +278,25 @@ Throughput is the real ceiling, and it varies by two orders of magnitude across
 games. `GAMES.md` labels every game with a minimum link class; the numbers are an
 ordering until phase 0 measures them.
 
+## Sharing game packs
+
+A game is added to Lanthorn by its **pack**: a small TOML file in `packs/`
+that says which ports and files a game needs, never which program runs.
+To share packs, publish a **pack repository**, a plain folder that any web
+host can serve:
+
+```
+game-bridge sign  my-game.toml --identity author.identity   # optional, per pack
+game-bridge repo build ./my-packs --name "My packs" \
+    --identity author.identity                               # writes index.json (+ .sig)
+```
+
+Players add the folder's https address on the launcher's **Games** page, and
+node operators add it under **Add a game…** in Lanthorn Host. A pack is
+installed only if its bytes are the ones the list names and its signature,
+if it has one, holds. A signed list is held to the key it was first added
+with. Lanthorn ships with no repository configured.
+
 ## Relationship to Svencoop-Prns
 
 [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns) **stays a
