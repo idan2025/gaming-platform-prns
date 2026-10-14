@@ -324,6 +324,24 @@ pub struct UpdateReport {
     pub old_used_by: Vec<String>,
 }
 
+/// How a check of a copy's files against Valve's ended (`verify_content`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerifyReport {
+    /// The copy that was checked: the one new servers use.
+    pub version: String,
+    /// Where the repaired copy was kept, when anything differed. Not made the
+    /// copy servers use: that is `use_copy`, the operator's call.
+    pub repaired_version: Option<String>,
+    /// The files that differed, at most [`VERIFY_REPORT_FILES`] of them.
+    pub changed: Vec<String>,
+    pub changed_count: usize,
+    pub from_build: Option<String>,
+    pub to_build: Option<String>,
+}
+
+/// How many differing files a verify report names; the count is always whole.
+pub const VERIFY_REPORT_FILES: usize = 50;
+
 /// Why a copy was not deleted.
 #[derive(Debug)]
 pub enum DeleteContentError {
@@ -1748,6 +1766,78 @@ impl Agent {
             report.old = if report.old_used_by.is_empty() { "removed" } else { "waiting" }.into();
         }
         Ok(report)
+    }
+
+    /// Check the copy new servers use against Valve's files
+    /// (`Provisioner::verify`). Nothing that differed means nothing is kept;
+    /// otherwise the repaired copy is kept beside it under a new version name
+    /// and is **not** made active: `validate` also puts back files the
+    /// operator changed on purpose, such as YaPB's `liblist.gam`, so the
+    /// report names every file and `use_copy` is a separate step.
+    pub async fn verify_content(
+        &self,
+        game_id: &str,
+        progress: Option<&crate::content::InstallProgress>,
+    ) -> Result<VerifyReport, ProvisionError> {
+        let io = |m: String| ProvisionError::Io(std::io::Error::other(m));
+        let spec = {
+            let packs = self.packs.read().await;
+            packs
+                .get(game_id)
+                .ok_or_else(|| io(format!("no game pack installed for {game_id:?}")))?
+                .content
+                .clone()
+        };
+        let runtime = self
+            .config
+            .runtime_for(game_id)
+            .ok_or_else(|| io(format!("this node has no runtime configured for {game_id:?}")))?;
+        let base = runtime.content_version.clone();
+        let current = self.active_version_of(game_id, &base);
+        let from = ContentRef { game_id: game_id.to_string(), version: current.clone() };
+        let to_version = self.next_version_name(game_id, &base).map_err(io)?;
+        let to = ContentRef { game_id: game_id.to_string(), version: to_version.clone() };
+        match self.content.verify(&from, &to, &spec, Some(&self.docker), progress).await? {
+            crate::content::Verified::Intact { build } => Ok(VerifyReport {
+                version: current,
+                repaired_version: None,
+                changed: Vec::new(),
+                changed_count: 0,
+                from_build: build.clone(),
+                to_build: build,
+            }),
+            crate::content::Verified::Repaired { changed, from_build, to_build, .. } => Ok(VerifyReport {
+                version: current,
+                repaired_version: Some(to_version),
+                changed_count: changed.len(),
+                changed: changed.into_iter().take(VERIFY_REPORT_FILES).collect(),
+                from_build,
+                to_build,
+            }),
+        }
+    }
+
+    /// Make an installed copy the one new servers use, such as a repaired
+    /// copy a verify kept. `agent.toml` is not rewritten (`active.rs`), and
+    /// servers that exist move by the game's rule, as after an update.
+    pub async fn use_copy(&self, game_id: &str, version: &str) -> Result<(), String> {
+        let runtime = self
+            .config
+            .runtime_for(game_id)
+            .ok_or_else(|| format!("this node has no runtime configured for {game_id:?}"))?;
+        let content = ContentRef { game_id: game_id.to_string(), version: version.to_string() };
+        let dir = self.layout.content_dir(&content).map_err(|e| format!("{e}"))?;
+        if !dir.is_dir() {
+            return Err(format!("{game_id} has no installed copy {version:?}"));
+        }
+        let pack = self.packs.read().await.get(game_id).cloned();
+        if let Some(pack) = pack {
+            self.create_writable_mountpoints(&content, &self.writable_paths_for(game_id, &pack))
+                .map_err(|e| format!("{e}"))?;
+        }
+        self.active
+            .set_active(game_id, &runtime.content_version, version)
+            .map_err(|e| format!("recording the copy new servers use: {e}"))
     }
 
     /// The operator's update-check and reserve settings (`updates.rs`).

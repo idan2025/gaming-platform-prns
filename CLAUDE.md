@@ -512,6 +512,17 @@ change could quietly break:
   stay. The node has no built-in pack: every pack it runs is a file. Caught by
   `a_pack_is_removed_by_what_it_says_never_by_a_path_from_outside` and
   `a_pack_is_removed_only_when_no_server_of_its_game_exists`.
+- **Verify runs `validate` on a copy, never on the copy servers use**
+  (`Provisioner::verify`, `POST /content/:game {"verify": true}`), and a
+  repaired copy is **never made active by itself**: `validate` also puts back
+  files the operator changed on purpose (YaPB's `liblist.gam`), so the report
+  names every file that differed and `POST /content/:game/:version/use` is a
+  separate step. What differed is a size change, or a time change whose bytes
+  now differ from the original's, so a rewrite with the same bytes is not
+  reported; steamcmd's `steamapps/` bookkeeping never is. Nothing differing
+  keeps nothing. Update and verify share `copy_for_steamcmd`. Caught by
+  `a_file_check_names_what_it_put_back_and_changes_nothing_until_asked`, which
+  fails if the same-bytes test or the `validate` flag is dropped.
 
 **A game's files can be updated from the node** (2026-10-13,
 `Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later

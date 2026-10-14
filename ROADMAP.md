@@ -20,7 +20,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **started**: the round trip in words |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | proposed |
-| 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36) |
+| 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
@@ -234,7 +234,10 @@ download yet. From step 7, **Update a game** is built too, with a
 "remove the old version when done" option (`CLAUDE.md` has its rules);
 room-before-download and the queue came with item 12, and **remove a pack**
 is built (2026-10-14, `DELETE /packs/:id`, a button on each Games card; the
-node has no built-in pack, so any pack can go). Verify is still open.
+node has no built-in pack, so any pack can go), and so is **verify**
+(`Provisioner::verify`: `validate` on a copy, a list of what differed, and the
+repaired copy kept but used only when the operator says so). Item 11 is
+complete.
 
 **What.** An **Installed** page in Lanthorn Host listing every game whose files
 are on this node, and every download in progress, with the controls to manage

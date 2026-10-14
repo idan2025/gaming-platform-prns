@@ -2261,7 +2261,7 @@ function buildCopyRow(c, downloading, artEl) {
   row.append(artCell, nameCell, stateCell, el("div", "cell", formatBytes(c.bytes)), usedBy,
     el("div", "cell", formatDate(c.modified_unix)), actions);
   const notice = state.updates.games.get(c.game_id);
-  if (c.updatable && notice && notice.version === c.version) row.appendChild(buildUpdateLine(notice, downloading));
+  if (c.updatable && notice && notice.version === c.version) row.appendChild(buildUpdateLine(notice, downloading, c));
   for (const m of state.updates.moves) {
     if (m.game_id === c.game_id && m.from === c.version) row.appendChild(buildMoveLine(m));
   }
@@ -2353,7 +2353,7 @@ function ago(unix) {
 
 // What is known about this copy's newest build, and what can be done about it.
 // Built from the last GET /updates; the copies poll never changes it.
-function buildUpdateLine(n, downloading) {
+function buildUpdateLine(n, downloading, copy) {
   const line = el("div", "update-line");
   const checking = state.updates.checking.has(n.game_id);
   const btn = (text, title, fn) => {
@@ -2398,6 +2398,10 @@ function buildUpdateLine(n, downloading) {
   } else {
     line.appendChild(el("span", null, n.checked_unix ? "No answer from Steam yet." : "Not checked for new builds yet."));
     line.appendChild(checkNow);
+  }
+  if (copy && !downloading) {
+    line.appendChild(btn("Verify files", "Check these files against Valve's, for a server that crashes on a damaged file. " +
+      "A copy is checked; servers keep running on this one.", () => onVerifyGame(copy)));
   }
   line.appendChild(btn(moveSummary(n.policy) + " · change", "Choose when servers move to a new copy after an update.", () => onMovePolicy(n)));
   line.appendChild(auto
@@ -2523,6 +2527,67 @@ function onUpdateGame(c) {
 }
 
 // Say how an update ended, once. The Installed list shows the rest.
+async function onVerifyGame(c) {
+  const name = gameName(c.game_id);
+  if (!confirm("Check " + name + " version " + c.version + " against Valve's files?\n\n" +
+    "A copy is made and checked; servers keep running on this one. Needs about " + formatBytes(Math.round(c.bytes * 1.1)) +
+    " free while it runs. If anything differs, the repaired copy is kept beside this one and you choose whether servers use it.")) return;
+  try {
+    await withInFlight(api("POST", "/content/" + encodeURIComponent(c.game_id), { verify: true }));
+    clearError();
+    toast("Checking " + name + "'s files.");
+    watchUpdate(c.game_id);
+    pollInstalled();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The check did not start.");
+  }
+}
+
+// What a check of the files found (Agent::verify_content), and the choice it leaves.
+function showVerifyResult(gameId, v) {
+  const name = gameName(gameId);
+  if (!v.repaired_version) {
+    toast(name + ": every file matches Valve's" + (v.to_build ? " (build " + v.to_build + ")" : "") + ". Nothing was kept.");
+    return;
+  }
+  openModal("verify-dialog", gameId, (body, close) => {
+    body.appendChild(el("h3", null, name + ": " + v.changed_count + " file" + (v.changed_count === 1 ? "" : "s") + " differed"));
+    body.appendChild(el("p", "muted small", "These files in version " + v.version + " were not Valve's. The repaired copy is version " +
+      v.repaired_version + ", beside it. Files you changed on purpose are in this list too and were put back, such as liblist.gam " +
+      "for bots: if so, keep the current copy." + (v.from_build !== v.to_build && v.to_build ? " The check also brought it to build " + v.to_build + "." : "")));
+    const list = el("ul", "verify-list");
+    for (const f of v.changed) list.appendChild(el("li", null, f));
+    if (v.changed_count > v.changed.length) list.appendChild(el("li", "muted", "and " + (v.changed_count - v.changed.length) + " more"));
+    body.appendChild(list);
+    const actions = el("div", "form-actions");
+    actions.style.marginTop = "8px";
+    const keep = el("button", "btn", "Keep the current copy");
+    keep.type = "button";
+    keep.title = "The repaired copy stays on the Installed page as unused; delete it there.";
+    keep.onclick = close;
+    const use = el("button", "btn btn-primary", "Use the repaired copy");
+    use.type = "button";
+    use.addEventListener("click", async () => {
+      use.disabled = true;
+      try {
+        await withInFlight(api("POST", "/content/" + encodeURIComponent(gameId) + "/" + encodeURIComponent(v.repaired_version) + "/use"));
+        clearError();
+        close();
+        toast("New " + name + " servers use version " + v.repaired_version + ". Existing ones move by the game's rule.");
+        loadUpdates();
+        pollInstalled();
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "That did not change.");
+        use.disabled = false;
+      }
+    });
+    actions.append(keep, use);
+    body.appendChild(actions);
+  });
+}
+
 async function watchUpdate(gameId) {
   for (;;) {
     await new Promise(r => setTimeout(r, 3000));
@@ -2532,7 +2597,12 @@ async function watchUpdate(gameId) {
     const st = (body && body.status) || {};
     if (st.state === "running" || st.state === "queued") continue;
     if (st.state === "failed") {
-      if (st.error !== "cancelled") showError(gameName(gameId) + " was not updated: " + st.error);
+      if (st.error !== "cancelled") showError(gameName(gameId) + ": that did not finish. " + st.error);
+      return;
+    }
+    if (st.state === "done" && st.verify) {
+      showVerifyResult(gameId, st.verify);
+      pollInstalled();
       return;
     }
     const u = st.update;
