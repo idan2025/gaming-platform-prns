@@ -16,6 +16,12 @@
 //!   disk and 5 GB unless the operator set one (decided 2026-10-13). An
 //!   update starts only if it fits above it, and a download crossing it is
 //!   stopped (`install.rs`).
+//! * **What a found build does is per game, and "tell me" is the default**
+//!   (§12.3). "Download it" runs the same update the button does, through the
+//!   same queue and reserve gate, never removing the old copy: nothing
+//!   automatic deletes. A snooze or a skipped build holds it back too, and a
+//!   build it tried once is not tried again until the next check, so a
+//!   download stopped at the reserve does not restart every minute.
 //! * **Stored beside `content-active.json`, never in `agent.toml`**, which
 //!   stays the operator's file and is never rewritten.
 
@@ -84,6 +90,25 @@ impl Settings {
     }
 }
 
+/// What a game does when a check finds a newer build (§12.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnNewBuild {
+    /// Show the notice; the operator presses Update.
+    #[default]
+    Notify,
+    /// Download it in the background. Servers keep running on the old copy.
+    Download,
+}
+
+/// The operator's choices for one game. Kept apart from [`Settings`] so a
+/// page saving the node-wide settings never resets a game's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamePolicy {
+    #[serde(default)]
+    pub on_new_build: OnNewBuild,
+}
+
 /// What is remembered about one game's checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameCheck {
@@ -102,6 +127,11 @@ pub struct GameCheck {
     /// The notice is hidden while this is the newest build.
     #[serde(default)]
     pub skip_build: Option<String>,
+    /// The build an automatic download last started for, and when.
+    #[serde(default)]
+    pub auto_build: Option<String>,
+    #[serde(default)]
+    pub auto_unix: Option<i64>,
 }
 
 impl GameCheck {
@@ -117,6 +147,20 @@ impl GameCheck {
     pub fn snoozed(&self, now: i64) -> bool {
         self.snooze_until_unix.is_some_and(|until| until > now)
             || (self.skip_build.is_some() && self.skip_build == self.latest_build)
+    }
+
+    /// Whether an automatic download of the newest build may start at `now`:
+    /// not hidden, and not already tried for this build since the last check.
+    pub fn may_auto_download(&self, now: i64) -> bool {
+        let Some(latest) = &self.latest_build else { return false };
+        if self.snoozed(now) {
+            return false;
+        }
+        match (&self.auto_build, self.auto_unix, self.checked_unix) {
+            (Some(tried), Some(at), Some(checked)) if tried == latest => checked > at,
+            (Some(tried), _, _) if tried == latest => false,
+            _ => true,
+        }
     }
 }
 
@@ -138,6 +182,7 @@ pub struct UpdateNotice {
     pub error: Option<String>,
     pub snooze_until_unix: Option<i64>,
     pub skip_build: Option<String>,
+    pub on_new_build: OnNewBuild,
 }
 
 impl UpdateNotice {
@@ -146,6 +191,7 @@ impl UpdateNotice {
         version: &str,
         installed_build: Option<String>,
         check: &GameCheck,
+        policy: &GamePolicy,
         now: i64,
     ) -> Self {
         let available = match (&installed_build, &check.latest_build) {
@@ -163,6 +209,7 @@ impl UpdateNotice {
             error: check.error.clone(),
             snooze_until_unix: check.snooze_until_unix,
             skip_build: check.skip_build.clone(),
+            on_new_build: policy.on_new_build,
         }
     }
 }
@@ -173,6 +220,8 @@ struct State {
     settings: Settings,
     #[serde(default)]
     games: BTreeMap<String, GameCheck>,
+    #[serde(default)]
+    policies: BTreeMap<String, GamePolicy>,
 }
 
 pub struct UpdateChecks {
@@ -234,6 +283,29 @@ impl UpdateChecks {
             }
             Err(e) => entry.error = Some(e),
         }
+        self.save(&state)
+    }
+
+    pub fn policy(&self, game_id: &str) -> GamePolicy {
+        self.lock().policies.get(game_id).cloned().unwrap_or_default()
+    }
+
+    pub fn set_policy(&self, game_id: &str, policy: GamePolicy) -> std::io::Result<()> {
+        let mut state = self.lock();
+        if policy == GamePolicy::default() {
+            state.policies.remove(game_id);
+        } else {
+            state.policies.insert(game_id.to_string(), policy);
+        }
+        self.save(&state)
+    }
+
+    /// Remember that an automatic download of `build` started at `now`.
+    pub fn record_auto(&self, game_id: &str, build: &str, now: i64) -> std::io::Result<()> {
+        let mut state = self.lock();
+        let entry = state.games.entry(game_id.to_string()).or_default();
+        entry.auto_build = Some(build.to_string());
+        entry.auto_unix = Some(now);
         self.save(&state)
     }
 
@@ -327,17 +399,21 @@ mod tests {
     #[test]
     fn a_copy_without_a_manifest_is_unknown_never_up_to_date() {
         let check = GameCheck { latest_build: Some("200".into()), ..Default::default() };
-        assert_eq!(UpdateNotice::new("g", "v", None, &check, 0).available, None);
+        let p = GamePolicy::default();
+        assert_eq!(UpdateNotice::new("g", "v", None, &check, &p, 0).available, None);
         assert_eq!(
-            UpdateNotice::new("g", "v", Some("200".into()), &check, 0).available,
+            UpdateNotice::new("g", "v", Some("200".into()), &check, &p, 0).available,
             Some(false)
         );
         assert_eq!(
-            UpdateNotice::new("g", "v", Some("100".into()), &check, 0).available,
+            UpdateNotice::new("g", "v", Some("100".into()), &check, &p, 0).available,
             Some(true)
         );
         let unchecked = GameCheck::default();
-        assert_eq!(UpdateNotice::new("g", "v", Some("100".into()), &unchecked, 0).available, None);
+        assert_eq!(
+            UpdateNotice::new("g", "v", Some("100".into()), &unchecked, &p, 0).available,
+            None
+        );
     }
 
     /// A failed check keeps the build already seen, and survives a restart.
@@ -351,5 +427,58 @@ mod tests {
         assert_eq!(again.latest_build.as_deref(), Some("200"));
         assert_eq!(again.error.as_deref(), Some("Steam did not answer"));
         assert_eq!(again.checked_unix, Some(20));
+    }
+
+    /// An automatic download tries a build once per check: one stopped at the
+    /// reserve waits for the next check rather than restarting every minute.
+    #[test]
+    fn an_automatic_download_tries_a_build_once_per_check() {
+        let mut c = GameCheck {
+            checked_unix: Some(100),
+            latest_build: Some("200".into()),
+            ..Default::default()
+        };
+        assert!(c.may_auto_download(100));
+        c.auto_build = Some("200".into());
+        c.auto_unix = Some(110);
+        assert!(!c.may_auto_download(120), "tried since the last check");
+        c.checked_unix = Some(200);
+        assert!(c.may_auto_download(200), "a later check allows another try");
+        c.latest_build = Some("300".into());
+        c.checked_unix = Some(100);
+        assert!(c.may_auto_download(200), "a newer build is a new try");
+        assert!(!GameCheck::default().may_auto_download(0), "nothing checked, nothing to fetch");
+    }
+
+    /// "Remind me later" and "skip this build" hold the download back too.
+    #[test]
+    fn a_snoozed_or_skipped_build_is_not_downloaded() {
+        let skipped = GameCheck {
+            latest_build: Some("200".into()),
+            skip_build: Some("200".into()),
+            ..Default::default()
+        };
+        assert!(!skipped.may_auto_download(0));
+        let later = GameCheck {
+            latest_build: Some("200".into()),
+            snooze_until_unix: Some(50),
+            ..Default::default()
+        };
+        assert!(!later.may_auto_download(10));
+        assert!(later.may_auto_download(50));
+    }
+
+    /// The node-wide settings and a game's choice are saved apart, and the
+    /// default ("tell me") is what a node had before.
+    #[test]
+    fn a_games_choice_survives_a_restart_and_defaults_to_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let u = UpdateChecks::load(dir.path());
+        assert_eq!(u.policy("g").on_new_build, OnNewBuild::Notify);
+        u.set_policy("g", GamePolicy { on_new_build: OnNewBuild::Download }).unwrap();
+        u.set_settings(Settings { check_every_hours: Some(6), ..Default::default() }).unwrap();
+        let again = UpdateChecks::load(dir.path());
+        assert_eq!(again.policy("g").on_new_build, OnNewBuild::Download);
+        assert_eq!(again.policy("other").on_new_build, OnNewBuild::Notify);
     }
 }
