@@ -560,6 +560,40 @@ async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, Stri
 }
 
 #[tauri::command]
+async fn pack_repos(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<launcher_core::repo::PackRepoView>, String> {
+    Ok(state.launcher.browse_pack_repos().await)
+}
+
+#[tauri::command]
+async fn add_pack_repo(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<launcher_core::repo::PackRepoView, String> {
+    state.launcher.add_pack_repo(&url).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn remove_pack_repo(state: tauri::State<'_, AppState>, url: String) -> Result<(), String> {
+    state.launcher.remove_pack_repo(&url).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn install_repo_pack(
+    state: tauri::State<'_, AppState>,
+    url: String,
+    id: String,
+) -> Result<launcher_core::repo::InstalledPackView, String> {
+    state.launcher.install_repo_pack(&url, &id).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn remove_installed_pack(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    state.launcher.remove_installed_pack(&id).await.map_err(fmt_err)
+}
+
+#[tauri::command]
 async fn room_chat(
     state: tauri::State<'_, AppState>,
     since: u64,
@@ -800,6 +834,11 @@ pub fn run() {
             set_player_name,
             room_chat,
             send_room_chat,
+            pack_repos,
+            add_pack_repo,
+            remove_pack_repo,
+            install_repo_pack,
+            remove_installed_pack,
             lan_helper,
             grant_lan_helper,
             revoke_lan_helper,

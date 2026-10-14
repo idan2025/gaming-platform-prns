@@ -187,6 +187,20 @@ function makeInvoke(scenario) {
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
         if (cmd === 'revoke_lan_helper') scenario.lanHelper = scenario.afterRevoke ?? scenario.lanHelper;
         return scenario.lanHelper;
+      case 'pack_repos':
+        return scenario.repos ?? [];
+      case 'add_pack_repo':
+        (scenario.repoCalls ??= []).push(['add', args.url]);
+        return { url: args.url, name: 'Added', error: null, packs: [] };
+      case 'remove_pack_repo':
+        (scenario.repoCalls ??= []).push(['drop', args.url]);
+        return null;
+      case 'install_repo_pack':
+        (scenario.repoCalls ??= []).push(['install', args.url, args.id]);
+        return { id: args.id, display_name: 'OpenTTD', trust: 'signed by an unknown key', trust_detail: 'x', replaced: false };
+      case 'remove_installed_pack':
+        (scenario.repoCalls ??= []).push(['remove', args.id]);
+        return null;
       case 'player_name':
         return scenario.playerName ?? null;
       case 'set_player_name':
@@ -915,6 +929,44 @@ const memberRoom = {
   pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
+
+// Games and pack repositories (ROADMAP item 8): installed games with their
+// tier, a pack from a repository installs by its repository and id, a shipped
+// game offers no install, and only a repository pack can be removed.
+await run('the Games page lists games and installs from a repository', {
+  status: running,
+  rows: () => [row()],
+  games: [svenGame, { ...lanGame(), removable: true, trust: 'signed by an unknown key' }],
+  repos: [{
+    url: 'https://packs.example/index.json', name: 'Example packs', error: null,
+    packs: [
+      { id: 'sven-coop', display_name: 'Sven Co-op', art_url: null, lan: false, signed: false, state: 'shipped' },
+      { id: 'quake', display_name: 'Quake <b>1</b>', art_url: null, lan: false, signed: true, state: 'available' },
+    ],
+  }, { url: 'https://down.example/index.json', name: null, error: 'connection refused', packs: [] }],
+}, async (win, doc, scenario) => {
+  win.setView('games');
+  await settle();
+  const t = doc.querySelector('#games-body')?.textContent || '';
+  check('installed games are listed with their tier', t.includes('Sven Co-op') && t.includes('signed by an unknown key'), t);
+  check('a repository is listed by name', t.includes('Example packs'), t);
+  check('a repository that failed says why', t.includes('connection refused'), t);
+  check('a pack name is text, never markup', !doc.querySelector('#games-body b') && t.includes('Quake <b>1</b>'));
+  const shipped = doc.querySelector('[data-pack="sven-coop"]');
+  check('a shipped game offers no install', shipped && shipped.disabled && shipped.textContent.includes('Ships with'));
+  const removes = [...doc.querySelectorAll('#games-body .game-list .btn')].map(b => b.textContent);
+  check('only a repository pack can be removed', removes.length === 1, JSON.stringify(removes));
+  const input = doc.querySelector('#repo-url');
+  input.value = 'https://typed.example';
+  input.dispatchEvent(new win.Event('input'));
+  doc.querySelector('[data-pack="quake"]').click();
+  await settle();
+  await settle();
+  check('Install asks for that pack from that repository',
+    (scenario.repoCalls || []).some(c => c[0] === 'install' && c[1] === 'https://packs.example/index.json' && c[2] === 'quake'),
+    JSON.stringify(scenario.repoCalls));
+  check('a repository address being typed survives a re-render', doc.querySelector('#repo-url')?.value === 'https://typed.example');
+});
 
 // Room chat (ROADMAP item 6): names beside addresses, lines as text only,
 // a line typed survives the panel's rebuild, and an old host is explained.

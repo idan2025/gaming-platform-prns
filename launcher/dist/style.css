@@ -625,4 +625,18 @@ body.bigscreen .sidebar-foot { display: none; }
 .chat-line.self .chat-who { color: var(--accent); }
 .chat-text { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .chat-form { display: flex; gap: 8px; margin-top: 8px; }
-.chat-form input { flex: 1; min-width: 0; }
+.chat-form input { flex: 1; min-width: 0; height: 32px; padding: 0 10px; background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: var(--radius); outline: none; color: var(--text); }
+.chat-form input:focus { border-color: var(--accent); }
+
+/* ---------- games and pack repositories (ROADMAP item 8) ---------- */
+.game-item .item-text { flex: 1; min-width: 0; }
+.item-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-sub { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-sub.mono { font-family: var(--mono); }
+.game-item .btn { flex: none; }
+.repo { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.repo-head { display: flex; align-items: center; gap: 10px; }
+.repo-head .item-text { flex: 1; min-width: 0; }
+@media (max-width: 520px) {
+  .game-item .art-thumb { display: none; }
+}

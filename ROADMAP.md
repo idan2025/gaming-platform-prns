@@ -17,7 +17,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, four notifications |
 | 6 | Chat and player names in rooms | LAN-room players | L | **built** for rooms: chat, names, rate limit; server chat not started |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
-| 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
+| 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; no project repository yet |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
@@ -230,6 +230,18 @@ community pack from inside the launcher, with its art (the `art` field now
 exists), its trust tier shown, and an update when the author signs a new
 version. The rule that keeps it safe is the format, not a scanner (`PLAN.md`
 §13.2).
+
+**Built.** A repository is a static folder any web host serves:
+
+```
+game-bridge sign  mygame.toml --identity author.identity   # optional, per pack
+game-bridge repo build ./my-packs --name "My packs"        # writes index.json
+```
+
+The player adds its address on the Games page (none ships) and installs from
+there; an installed pack is a file in `packs/` beside the settings and loads
+like a shipped one, with its tier shown. Still to decide: whether the project
+runs a reviewed repository (§13.2), and whether the index is signed too.
 
 ## 9. Playability check before joining
 

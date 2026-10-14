@@ -18,6 +18,8 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# A pack repository's digests (`src/repo.rs`).
+sha2 = "0.10"
 # The one-time token a LAN helper proves itself with (`lan_relay.rs`).
 getrandom = "0.2"
 # For the `game-bridge` binary's logging only. The library never installs a
@@ -49,6 +51,7 @@ default = ["serde"]
 serde = []
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 
 [[bin]]

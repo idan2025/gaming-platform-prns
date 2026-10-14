@@ -36,6 +36,7 @@ usage: game-bridge server <game-id> [options]
        game-bridge lan-join <game-id> [options]
        game-bridge sign   <pack.toml> [options]
        game-bridge verify <pack.toml> [options]
+       game-bridge repo build <dir> [--name NAME]
        game-bridge --help | --version
 
 roles (PLAN.md §1)
@@ -51,6 +52,9 @@ roles (PLAN.md §1)
   lan-join join a LAN room and put it on this machine's adapter
   sign     write a detached signature beside a pack (PLAN.md §11.3)
   verify   check the signature beside a pack, and say which tier it earns
+  repo     write the index.json that makes a directory of packs a repository
+           a launcher can add (PLAN.md §13.3 step 6); serve the directory
+           from any web host
 
 common options
   --packs DIR        where to read game packs from (default: ./packs)
@@ -141,6 +145,7 @@ fn main() -> Result<()> {
         "lan-host" | "lan-join" => return run_lan(role, &args[1..]),
         "sign" => return sign_pack(&args[1..]),
         "verify" => return verify_pack_cli(&args[1..]),
+        "repo" => return repo_cli(&args[1..]),
         other => bail!("unknown role {other:?}\n\n{USAGE}"),
     };
 
@@ -553,6 +558,47 @@ fn sign_pack(rest: &[String]) -> Result<()> {
         "\nThe window is inside the signed material, so editing it invalidates the signature.\n\
          Re-sign before it closes: a node that has not refreshed refuses the pack rather than\n\
          trusting it forever (PLAN.md §11.3)."
+    );
+    Ok(())
+}
+
+/// `game-bridge repo build <dir> [--name NAME]`: list every pack in `dir` in
+/// its `index.json`, written beside and renamed so a web host never serves a
+/// half-written one.
+fn repo_cli(rest: &[String]) -> Result<()> {
+    let mut it = rest.iter();
+    match it.next().map(String::as_str) {
+        Some("build") => {}
+        _ => bail!("game-bridge repo takes `build <dir>`\n\n{USAGE}"),
+    }
+    let mut dir: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--name" => name = Some(value(&mut it, "--name")?),
+            other if other.starts_with('-') => {
+                bail!("unknown option {other:?} for game-bridge repo build\n\n{USAGE}")
+            }
+            other if dir.is_none() => dir = Some(PathBuf::from(other)),
+            other => bail!("game-bridge repo build takes one directory, not also {other:?}"),
+        }
+    }
+    let dir = dir.ok_or_else(|| anyhow!("game-bridge repo build needs a directory\n\n{USAGE}"))?;
+    let name = name.unwrap_or_else(|| {
+        dir.file_name().and_then(|n| n.to_str()).unwrap_or("Game packs").to_string()
+    });
+    let index = game_bridge::repo::RepoIndex::build(&dir, &name)?;
+    let json = serde_json::to_vec_pretty(&index)?;
+    let path = dir.join(game_bridge::repo::INDEX_FILE);
+    let staging = dir.join(".index.json.partial");
+    std::fs::write(&staging, &json).with_context(|| format!("writing {}", staging.display()))?;
+    std::fs::rename(&staging, &path).with_context(|| format!("writing {}", path.display()))?;
+    let signed = index.packs.iter().filter(|p| p.signed).count();
+    println!(
+        "{}: {} pack(s), {signed} signed, in {}",
+        index.name,
+        index.packs.len(),
+        path.display()
     );
     Ok(())
 }

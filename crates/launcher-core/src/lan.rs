@@ -813,7 +813,7 @@ impl Launcher {
             }
         };
         let pack = self
-            .packs
+            .packs()
             .iter()
             .find(|p| p.pack.id == game_id)
             .map(|p| p.pack.clone())

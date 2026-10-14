@@ -21,6 +21,7 @@
 pub mod invite;
 pub mod lan;
 pub mod portable;
+pub mod repo;
 pub mod settings;
 pub mod steam;
 pub mod update;
@@ -276,6 +277,9 @@ pub struct GameSummary {
     /// The picture to show for this game (`GamePack::art_url`): the pack's
     /// `art`, else the Steam header. `None` means a lettered tile.
     pub art_url: Option<String>,
+    /// Installed from a pack repository (`repo.rs`), so the player can
+    /// remove it. A shipped pack cannot be.
+    pub removable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -446,7 +450,10 @@ pub struct PlayResult {
 /// The launcher's whole state.
 pub struct Launcher {
     inner: Arc<Mutex<Inner>>,
-    packs: Vec<TrustedPack>,
+    /// Every game this launcher knows: the shipped packs, then the ones the
+    /// player installed from a repository (`repo.rs`), which can be added
+    /// while it runs. Never held across an await.
+    packs: Arc<std::sync::RwLock<Vec<TrustedPack>>>,
     /// The player's persisted choices — where their games live, and the name
     /// they join under. Behind its own lock so a settings write does not block
     /// browsing, and so [`Launcher::play`] can read it without taking the
@@ -617,7 +624,7 @@ impl Launcher {
                 hidden: Default::default(),
                 keepalive: None,
             })),
-            packs,
+            packs: Arc::new(std::sync::RwLock::new(packs)),
             settings: Arc::new(Mutex::new(settings)),
             settings_path,
             portable: false,
@@ -679,6 +686,7 @@ impl Launcher {
             settings_path: Some(path),
             ..self
         }
+        .load_user_packs()
     }
 
     /// The platform version this launcher was built from.
@@ -692,8 +700,13 @@ impl Launcher {
         env!("CARGO_PKG_VERSION")
     }
 
+    /// The packs as they are now.
+    pub(crate) fn packs(&self) -> std::sync::RwLockReadGuard<'_, Vec<TrustedPack>> {
+        self.packs.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn list_games(&self) -> Vec<GameSummary> {
-        self.packs
+        self.packs()
             .iter()
             .map(|p| GameSummary {
                 id: p.pack.id.clone(),
@@ -705,12 +718,13 @@ impl Launcher {
                 lan: lan::lan_support(&p.pack),
                 steam_app_id: p.pack.launch.as_ref().and_then(|l| l.steam_app_id),
                 art_url: p.pack.art_url(),
+                removable: self.is_user_pack(p),
             })
             .collect()
     }
 
     fn profile_for(&self, game_id: &str) -> Option<GameProfile> {
-        self.packs
+        self.packs()
             .iter()
             .find(|p| p.pack.id == game_id)
             .and_then(|p| p.pack.to_profile().ok())
@@ -1357,7 +1371,9 @@ impl Launcher {
             // With no game named, fall back to the only pack, if there is only
             // one. Guessing among several would be picking a wire protocol for
             // the user.
-            None if self.packs.len() == 1 => self.packs[0].pack.id.clone(),
+            None if self.packs().len() == 1 => {
+                self.packs().first().map(|p| p.pack.id.clone()).unwrap_or_default()
+            }
             None => {
                 return Err(anyhow!(
                     "this server did not say which game it runs, so a game must be chosen"
@@ -1443,8 +1459,8 @@ impl Launcher {
         Ok(JoinResult { listen_addr, can_launch, launch_ready, reachable, game_id: Some(game_id) })
     }
 
-    fn launch_profile(&self, game_id: &str) -> Option<&LaunchProfile> {
-        self.packs.iter().find(|p| p.pack.id == game_id)?.pack.launch.as_ref()
+    fn launch_profile(&self, game_id: &str) -> Option<LaunchProfile> {
+        self.packs().iter().find(|p| p.pack.id == game_id)?.pack.launch.clone()
     }
 
     /// Start the player's own copy of the game, pointed at the port `join_server`
@@ -1497,6 +1513,7 @@ impl Launcher {
             settings.game_paths.get(game_id).cloned()
         };
         let profile = self.launch_profile(game_id);
+        let profile = profile.as_ref();
         let steam_exe = steam::steam_executable();
         // Only consult Steam for an install when the pack actually names an app
         // id; a pack without one is not a Steam-locatable game.
@@ -1712,8 +1729,7 @@ impl Launcher {
         };
         let profile = self
             .launch_profile(&join.game_id)
-            .ok_or_else(|| anyhow!("no launch profile for {:?}", join.game_id))?
-            .clone();
+            .ok_or_else(|| anyhow!("no launch profile for {:?}", join.game_id))?;
 
         let (saved, name) = {
             let settings = self.settings.lock().await;
@@ -2266,6 +2282,7 @@ mod tests {
             "lan",
             "steam_app_id",
             "art_url",
+            "removable",
         ]
         {
             assert!(v.get(key).is_some(), "the UI reads `{key}` and it is missing");

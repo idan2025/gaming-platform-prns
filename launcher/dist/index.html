@@ -35,6 +35,10 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="13" rx="2"/><path d="M8 21h8M12 18v3"/><path d="M7 12h3M14 12h3"/></svg>
         <span>LAN rooms</span><span class="nav-dot" id="nav-rooms-dot" hidden></span>
       </button>
+      <button class="nav-item" id="nav-games" data-view="games" role="tab" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="7" width="20" height="11" rx="4"/><path d="M7 11v3M5.5 12.5h3"/><circle cx="16" cy="11.5" r=".9"/><circle cx="18" cy="13.5" r=".9"/></svg>
+        <span>Games</span>
+      </button>
       <button class="nav-item" id="nav-connections" data-view="connections" role="tab" type="button">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
         <span>Connections</span>
@@ -153,6 +157,17 @@
         </div>
       </section>
 
+      <!-- Games and pack repositories (ROADMAP item 8, PLAN.md §13.3 step 5).
+           A repository is opt-in: none ships, and adding one is a player
+           choosing to read somebody's list of packs. -->
+      <section class="view view-page" id="view-games" hidden>
+        <div class="page">
+          <header class="page-head">
+            <h1>Games</h1>
+          </header>
+          <div id="games-body"></div>
+        </div>
+      </section>
       <section class="view view-page" id="view-connections" hidden>
         <div class="page">
           <header class="page-head">

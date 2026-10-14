@@ -55,6 +55,12 @@ const state = {
   roomCheckTold: null,
   // Room chat (ROADMAP item 6): the newest line shown, for which room, and the
   // player's own name from settings.
+  // Pack repositories (ROADMAP item 8): what each listed when last read,
+  // and which install is running. Read when the Games view opens, never on a
+  // timer: each read is a fetch from somebody's web host.
+  repos: null,
+  repoBusy: null,
+  repoDraft: '',
   chatSeq: 0,
   chatRoom: null,
   playerName: null,
@@ -817,7 +823,7 @@ function updateFilterBadge() {
 }
 
 // ---------- views ----------
-const VIEWS = ['servers', 'rooms', 'connections', 'indexes', 'settings'];
+const VIEWS = ['servers', 'rooms', 'games', 'connections', 'indexes', 'settings'];
 function setView(name) {
   if (!VIEWS.includes(name)) name = 'servers';
   state.view = name;
@@ -833,6 +839,7 @@ function setView(name) {
   // loadInterfaces re-reads the saved-server count, which grows while browsing.
   if (name === 'connections') loadInterfaces();
   if (name === 'settings') renderSettings();
+  if (name === 'games') { renderGames(); loadRepos(); }
 }
 
 // ---------- detail pane ----------
@@ -3506,4 +3513,153 @@ function moveFocus(dir) {
   const next = items[i < 0 ? 0 : Math.max(0, Math.min(items.length - 1, i + dir))];
   next.focus();
   next.scrollIntoView({ block: 'nearest' });
+}
+
+
+// ---------- games and pack repositories (ROADMAP item 8) ----------
+//
+// The games this launcher knows, and the repositories the player added. A
+// pack from a repository is checked against the repository's digest and its
+// own signature before it is written (launcher-core `repo.rs`); this page
+// only shows the tier that earned, as the detail pane does. Rendered on
+// open and after an action, never on a timer, so a URL being typed stays.
+const REPO_STATE = {
+  available: 'Install',
+  update: 'Update',
+  installed: 'Installed',
+  shipped: 'Ships with Lanthorn',
+};
+async function loadRepos() {
+  try {
+    state.repos = await invoke('pack_repos');
+  } catch (err) {
+    state.repos = [];
+    showError('Could not read the pack repositories: ' + errText(err));
+  }
+  renderGames();
+}
+async function repoAction(fn, busy) {
+  state.repoBusy = busy;
+  renderGames();
+  try {
+    await fn();
+    hideError();
+  } catch (err) {
+    showError(errText(err));
+  } finally {
+    state.repoBusy = null;
+    await loadGames();
+    await loadInstalled();
+    await loadRepos();
+  }
+}
+function renderGames() {
+  const body = $('games-body');
+  if (!body) return;
+  const keep = document.activeElement && document.activeElement.id;
+  body.textContent = '';
+
+  const mine = el('div', 'card');
+  const mh = el('div', 'card-head');
+  mh.appendChild(el('h2', '', 'Your games'));
+  mine.appendChild(mh);
+  const list = el('div', 'item-list game-list');
+  [...state.games].sort((a, b) => (a.display_name || a.id).localeCompare(b.display_name || b.id)).forEach(g => {
+    const item = el('div', 'item game-item');
+    item.appendChild(art(g.id, 'art-thumb', {}));
+    const text = el('div', 'item-text');
+    text.appendChild(el('div', 'item-title', g.display_name || g.id));
+    const have = state.installed.get(g.id);
+    const bits = [g.trust];
+    if (have && have.installed) bits.push('on this computer');
+    if (g.lan) bits.push('LAN rooms');
+    const sub = el('div', 'item-sub', bits.join(' · '));
+    sub.title = g.trust_detail || '';
+    text.appendChild(sub);
+    item.appendChild(text);
+    if (g.removable) {
+      const rm = el('button', 'btn', 'Remove');
+      rm.type = 'button';
+      rm.disabled = !!state.repoBusy;
+      rm.onclick = () => repoAction(() => invoke('remove_installed_pack', { id: g.id }), 'remove:' + g.id);
+      item.appendChild(rm);
+    }
+    list.appendChild(item);
+  });
+  mine.appendChild(list);
+  body.appendChild(mine);
+
+  const repos = el('div', 'card');
+  const rh = el('div', 'card-head');
+  rh.appendChild(el('h2', '', 'Pack repositories'));
+  repos.appendChild(rh);
+  repos.appendChild(el('p', 'card-text', 'A repository is somebody\u2019s list of game packs, and it is '
+    + 'optional: Lanthorn ships with none. A pack tells Lanthorn how to find and join a game and never '
+    + 'runs anything here; each one shows whether its author signed it.'));
+  const form = el('form', 'inline-form');
+  const input = el('input');
+  input.id = 'repo-url';
+  input.type = 'text';
+  input.placeholder = 'https://… address of a pack repository';
+  input.setAttribute('aria-label', 'Pack repository address');
+  input.spellcheck = false;
+  input.value = state.repoDraft;
+  input.oninput = () => { state.repoDraft = input.value; };
+  const add = el('button', 'btn', state.repoBusy === 'add' ? 'Adding…' : 'Add repository');
+  add.type = 'submit';
+  add.id = 'repo-add';
+  add.disabled = !!state.repoBusy;
+  form.append(input, add);
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const url = input.value.trim();
+    if (!url) return;
+    repoAction(async () => {
+      await invoke('add_pack_repo', { url });
+      state.repoDraft = '';
+    }, 'add');
+  };
+  repos.appendChild(form);
+  if (state.repos === null) repos.appendChild(el('p', 'note', 'Reading…'));
+  (state.repos || []).forEach(r => {
+    const box = el('div', 'repo');
+    const head = el('div', 'repo-head');
+    const title = el('div', 'item-text');
+    title.appendChild(el('div', 'item-title', r.name || 'Repository'));
+    title.appendChild(el('div', 'item-sub mono', r.url));
+    head.appendChild(title);
+    const rm = el('button', 'btn', 'Remove');
+    rm.type = 'button';
+    rm.disabled = !!state.repoBusy;
+    rm.title = 'Stop reading this list. Packs installed from it stay.';
+    rm.onclick = () => repoAction(() => invoke('remove_pack_repo', { url: r.url }), 'drop');
+    head.appendChild(rm);
+    box.appendChild(head);
+    if (r.error) box.appendChild(el('p', 'room-err small', 'Could not read it: ' + r.error));
+    if (!r.error && !r.packs.length) box.appendChild(el('p', 'note', 'It lists no packs.'));
+    r.packs.forEach(p => {
+      const item = el('div', 'item game-item');
+      item.appendChild(art(p.id, 'art-thumb', { fallbackName: p.display_name }));
+      const text = el('div', 'item-text');
+      text.appendChild(el('div', 'item-title', p.display_name));
+      const bits = [p.signed ? 'signed' : 'unsigned'];
+      if (p.lan) bits.push('LAN rooms');
+      text.appendChild(el('div', 'item-sub', bits.join(' · ')));
+      item.appendChild(text);
+      const busy = state.repoBusy === 'install:' + p.id;
+      const act = el('button', p.state === 'available' || p.state === 'update' ? 'btn btn-primary' : 'btn', busy ? 'Installing…' : (REPO_STATE[p.state] || p.state));
+      act.type = 'button';
+      act.dataset.pack = p.id;
+      act.disabled = !!state.repoBusy || !(p.state === 'available' || p.state === 'update');
+      act.onclick = () => repoAction(async () => {
+        const done = await invoke('install_repo_pack', { url: r.url, id: p.id });
+        toast(done.display_name + (done.replaced ? ' updated' : ' installed') + ' — ' + done.trust + '.');
+      }, 'install:' + p.id);
+      item.appendChild(act);
+      box.appendChild(item);
+    });
+    repos.appendChild(box);
+  });
+  body.appendChild(repos);
+  if (keep) document.getElementById(keep)?.focus({ preventScroll: true });
 }
