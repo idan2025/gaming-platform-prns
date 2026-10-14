@@ -53,6 +53,11 @@ const state = {
   notifications: true,
   roomSeen: null,
   roomCheckTold: null,
+  // Room chat (ROADMAP item 6): the newest line shown, for which room, and the
+  // player's own name from settings.
+  chatSeq: 0,
+  chatRoom: null,
+  playerName: null,
   // Which games are on this machine (ROADMAP item 4), by game id, from
   // `installed_games`. Read at start and after a Locate: it reads files.
   installed: new Map(),
@@ -2210,6 +2215,7 @@ async function init() {
   // constants do not exist until the whole file has run.
   initBigScreen();
   await loadVersion();
+  try { state.playerName = await invoke('player_name'); } catch (_) {}
   // The saved interfaces, so Connect uses what was configured rather than
   // asking the player to retype a relay address they were given once.
   try {
@@ -2281,6 +2287,109 @@ async function pollRoom() {
   renderRoomPanel();
   maybeAutoCheck();
   noticeRoomJoins();
+  await pollChat();
+}
+
+// ---------- room chat (ROADMAP item 6) ----------
+//
+// Built once and only appended to: the room panel above it is rebuilt on
+// every change, and a chat box rebuilt under someone typing loses their line.
+// Every name and line is another player's text, so it only ever goes in as
+// textContent.
+function memberLabel(m) {
+  const who = m.name ? m.name + ' · ' + m.address : m.address;
+  return who + (m.is_self ? ' (you)' : '');
+}
+function ensureChat() {
+  let box = $('room-chat');
+  if (box) return box;
+  const panel = $('room-panel');
+  if (!panel) return null;
+  box = el('div', 'card room-chat');
+  box.id = 'room-chat';
+  box.hidden = true;
+  const head = el('div', 'card-head');
+  head.appendChild(el('h2', '', 'Room chat'));
+  box.appendChild(head);
+  const log = el('div', 'chat-log');
+  log.id = 'chat-log';
+  log.setAttribute('role', 'log');
+  log.setAttribute('aria-live', 'polite');
+  box.appendChild(log);
+  const note = el('p', 'note');
+  note.id = 'chat-note';
+  note.hidden = true;
+  box.appendChild(note);
+  const form = el('form', 'chat-form');
+  const input = el('input');
+  input.id = 'chat-input';
+  input.type = 'text';
+  input.maxLength = 280;
+  input.autocomplete = 'off';
+  input.placeholder = 'Say something to the room';
+  input.setAttribute('aria-label', 'Chat message');
+  const send = el('button', 'btn btn-primary', 'Send');
+  send.type = 'submit';
+  send.id = 'chat-send';
+  form.append(input, send);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    try {
+      await invoke('send_room_chat', { text });
+      input.value = '';
+      hideError();
+      setTimeout(pollChat, 400);
+    } catch (err) {
+      showError('Not sent: ' + errText(err));
+    }
+  };
+  box.appendChild(form);
+  panel.appendChild(box);
+  return box;
+}
+async function pollChat() {
+  const r = state.room;
+  const box = ensureChat();
+  if (!box) return;
+  const live = !!(r && r.active && r.address);
+  box.hidden = !live;
+  if (!live) { state.chatRoom = null; return; }
+  const log = $('chat-log');
+  if (state.chatRoom !== r.room_hash) {
+    state.chatRoom = r.room_hash;
+    state.chatSeq = 0;
+    log.textContent = '';
+  }
+  const note = $('chat-note');
+  const form = box.querySelector('.chat-form');
+  form.hidden = !r.chat;
+  note.hidden = !!r.chat && !!state.playerName;
+  note.textContent = !r.chat
+    ? 'This room’s host runs a Lanthorn without chat. The room works; only chat is missing until they update.'
+    : 'Others see you as ' + r.address + '. Set a name in Settings to be known by it.';
+  if (!r.chat) return;
+  let lines;
+  try { lines = await invoke('room_chat', { since: state.chatSeq }); } catch (_) { return; }
+  if (!lines || !lines.length) return;
+  const atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+  const first = state.chatSeq === 0;
+  lines.forEach(l => {
+    state.chatSeq = Math.max(state.chatSeq, l.seq);
+    const row = el('div', 'chat-line' + (l.is_self ? ' self' : ''));
+    const who = el('span', 'chat-who', l.is_self ? 'You' : (l.name || l.address || 'Someone who left'));
+    if (!l.is_self && l.address) who.title = l.address;
+    row.append(who, el('span', 'chat-text', l.text));
+    log.appendChild(row);
+  });
+  while (log.children.length > 200) log.removeChild(log.firstChild);
+  if (atEnd || first) log.scrollTop = log.scrollHeight;
+  const heard = lines.filter(l => !l.is_self);
+  if (!first && heard.length) {
+    const l = heard[heard.length - 1];
+    notify((l.name || l.address || 'Someone') + ' in your LAN room', l.text);
+  }
 }
 // Someone new in the room this launcher hosts or sits in. Never on the first
 // look, and never for this machine itself.
@@ -2837,7 +2946,7 @@ function renderRoomPanel(force) {
     renderRoomVerdict(card, r);
     const ul = el('ul', 'member-list player-list');
     r.members.forEach(m => {
-      const li = el('li', m.is_self ? 'self' : '', m.address + (m.is_self ? ' (you)' : ''));
+      const li = el('li', m.is_self ? 'self' : '', memberLabel(m));
       ul.appendChild(li);
     });
     card.appendChild(ul);
@@ -3129,6 +3238,40 @@ function renderSettings() {
   body.textContent = '';
   const u = state.update;
 
+  const you = el('div', 'card');
+  const yh = el('div', 'card-head');
+  yh.appendChild(el('h2', '', 'You'));
+  you.appendChild(yh);
+  const nameForm = el('form', 'chat-form');
+  const nameInput = el('input');
+  nameInput.id = 'player-name';
+  nameInput.type = 'text';
+  nameInput.maxLength = 32;
+  nameInput.placeholder = 'Your name';
+  nameInput.setAttribute('aria-label', 'Your name');
+  nameInput.value = state.nameDraft ?? state.playerName ?? '';
+  nameInput.oninput = () => { state.nameDraft = nameInput.value; };
+  const save = el('button', 'btn', 'Save');
+  save.type = 'submit';
+  save.id = 'player-name-save';
+  nameForm.append(nameInput, save);
+  nameForm.onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await invoke('set_player_name', { name: nameInput.value });
+      state.playerName = nameInput.value.trim() || null;
+      state.nameDraft = null;
+      hideError();
+      toast(state.playerName ? 'Saved. You are ' + state.playerName + '.' : 'Name cleared.');
+    } catch (err) {
+      showError('Could not save that: ' + errText(err));
+    }
+  };
+  you.appendChild(nameForm);
+  you.appendChild(el('p', 'note', 'What LAN rooms show beside your address, and what a game started '
+    + 'with Play calls you if its pack passes a name.'));
+  body.appendChild(you);
+
   const card = el('div', 'card');
   const head = el('div', 'card-head');
   head.appendChild(el('h2', '', 'Updates'));
@@ -3190,7 +3333,7 @@ function renderSettings() {
     try { await invoke('set_notifications_on', { on: nbox.checked }); }
     catch (err) { showError('Could not save that: ' + errText(err)); }
   };
-  notes.append(nbox, el('span', '', 'Desktop notifications: a favorite comes up, someone joins your room, a room check fails, an update is ready'));
+  notes.append(nbox, el('span', '', 'Desktop notifications: a favorite comes up, someone joins or writes in your room, a room check fails, an update is ready'));
   card.appendChild(notes);
   const big = el('label', 'toggle-row');
   const bbox = el('input');

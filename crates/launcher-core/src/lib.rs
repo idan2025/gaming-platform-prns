@@ -1670,8 +1670,18 @@ impl Launcher {
     pub async fn set_player_name(&self, name: &str) -> Result<()> {
         let trimmed = name.trim();
         let mut settings = self.settings.lock().await;
+        if !trimmed.is_empty() && !game_bridge::lan::valid_name(trimmed) {
+            return Err(anyhow!(
+                "a name is one line of up to {} characters",
+                game_bridge::lan::MAX_NAME_BYTES
+            ));
+        }
         settings.player_name = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
         self.persist(&settings)?;
+        drop(settings);
+        if !trimmed.is_empty() {
+            self.rename_in_room(trimmed).await;
+        }
         Ok(())
     }
 

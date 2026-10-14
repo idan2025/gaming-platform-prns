@@ -33,6 +33,13 @@
 //!   member cannot claim somebody else's address by asking.
 //! - **Unknown message types are ignored, never an error**, so a newer peer's
 //!   message is not a reason to drop an older peer's room.
+//! - **A chat line's sender is the host's word, never the line's.** A member
+//!   sends only text; the host stamps the identity its link proved
+//!   ([`LanMessage::ChatFrom`]). A name is data a member chose and is never
+//!   used to tell members apart.
+//! - **Names and chat are text, and refused rather than repaired**: no control
+//!   character (a newline above all), length-capped, checked at decode and
+//!   again by whoever sends ([`valid_name`], [`valid_chat`]).
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -330,6 +337,43 @@ const MSG_HELLO: u8 = 0x01;
 const MSG_MEMBERS: u8 = 0x02;
 const MSG_REFUSED: u8 = 0x03;
 const MSG_PACKET: u8 = 0x04;
+// Chat and names (ROADMAP item 6). A host or member older than these reads
+// each as `Unknown` and ignores it, so a room of mixed builds still runs; only
+// the chat is missing.
+const MSG_NAME: u8 = 0x05;
+const MSG_NAMES: u8 = 0x06;
+const MSG_CHAT: u8 = 0x07;
+const MSG_CHAT_FROM: u8 = 0x08;
+
+/// Longest player name, in bytes. 32 members at this length still fit one
+/// `Names` in a link packet.
+pub const MAX_NAME_BYTES: usize = 32;
+
+/// Longest chat line, in bytes.
+pub const MAX_CHAT_BYTES: usize = 280;
+
+/// Chat lines a member may send in a burst, and per second after it.
+pub const CHAT_BURST: u32 = 5;
+pub const CHAT_RATE_PER_SEC: f64 = 0.5;
+
+fn plain_text(text: &str, max: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max
+        && text.trim() == text
+        && !text.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+/// Whether `name` may stand for a member: trimmed, non-empty, at most
+/// [`MAX_NAME_BYTES`], no control characters. Refused, never repaired.
+pub fn valid_name(name: &str) -> bool {
+    plain_text(name, MAX_NAME_BYTES)
+}
+
+/// Whether `text` may be a chat line: as [`valid_name`], at most
+/// [`MAX_CHAT_BYTES`]. One line, so a newline is refused.
+pub fn valid_chat(text: &str) -> bool {
+    plain_text(text, MAX_CHAT_BYTES)
+}
 
 /// One message on a member's link to its host. One per link packet.
 ///
@@ -348,6 +392,17 @@ pub enum LanMessage {
     /// Either way: one IPv4 packet. Its own header says where it is from and
     /// where it goes, so the message adds nothing that could disagree with it.
     Packet(Vec<u8>),
+    /// Member → host: what to call me. Repeated until the host's `Names`
+    /// carries it.
+    Name(String),
+    /// Host → member: the names members gave, by identity. Its arrival is also
+    /// how a member learns the host has chat at all.
+    Names(Vec<(IdentityHash, String)>),
+    /// Member → host: one chat line. No sender: the host knows who it is.
+    Chat(String),
+    /// Host → member: one chat line, and who sent it, as the host's link
+    /// proved it. The sender gets its own line back, which is its receipt.
+    ChatFrom { from: IdentityHash, text: String },
     /// A type this build does not know. Ignored, never an error.
     Unknown(u8),
 }
@@ -359,6 +414,8 @@ pub enum LanDecodeError {
     TooManyMembers(usize),
     BadSubnet,
     PacketTooLarge(usize),
+    /// A name or chat line that is not plain text within its cap.
+    BadText,
 }
 
 impl core::fmt::Display for LanDecodeError {
@@ -373,11 +430,26 @@ impl core::fmt::Display for LanDecodeError {
             Self::PacketTooLarge(n) => {
                 write!(f, "packet of {n} bytes is over the {LAN_MTU}-byte MTU")
             }
+            Self::BadText => write!(f, "a name or chat line that is not plain text"),
         }
     }
 }
 
 impl std::error::Error for LanDecodeError {}
+
+fn text_of(bytes: &[u8], valid: fn(&str) -> bool) -> Result<String, LanDecodeError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| LanDecodeError::BadText)?;
+    if !valid(text) {
+        return Err(LanDecodeError::BadText);
+    }
+    Ok(text.to_string())
+}
+
+fn identity_of(bytes: &[u8]) -> IdentityHash {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&bytes[..16]);
+    IdentityHash::new(id)
+}
 
 const MEMBER_ENTRY_LEN: usize = 16 + 4;
 
@@ -404,6 +476,36 @@ impl LanMessage {
                 let mut buf = Vec::with_capacity(1 + p.len());
                 buf.push(MSG_PACKET);
                 buf.extend_from_slice(p);
+                buf
+            }
+            Self::Name(name) => {
+                let mut buf = vec![MSG_NAME];
+                buf.extend_from_slice(name.as_bytes());
+                buf
+            }
+            Self::Names(names) => {
+                let names: Vec<_> = names
+                    .iter()
+                    .filter(|(_, n)| valid_name(n))
+                    .take(MAX_MEMBERS)
+                    .collect();
+                let mut buf = vec![MSG_NAMES, names.len() as u8];
+                for (id, name) in names {
+                    buf.extend_from_slice(id.as_bytes());
+                    buf.push(name.len() as u8);
+                    buf.extend_from_slice(name.as_bytes());
+                }
+                buf
+            }
+            Self::Chat(text) => {
+                let mut buf = vec![MSG_CHAT];
+                buf.extend_from_slice(text.as_bytes());
+                buf
+            }
+            Self::ChatFrom { from, text } => {
+                let mut buf = vec![MSG_CHAT_FROM];
+                buf.extend_from_slice(from.as_bytes());
+                buf.extend_from_slice(text.as_bytes());
                 buf
             }
             Self::Unknown(t) => vec![*t],
@@ -455,6 +557,34 @@ impl LanMessage {
                     return Err(LanDecodeError::PacketTooLarge(rest.len()));
                 }
                 Ok(Self::Packet(rest.to_vec()))
+            }
+            MSG_NAME => Ok(Self::Name(text_of(rest, valid_name)?)),
+            MSG_NAMES => {
+                let (&count, mut entries) = rest.split_first().ok_or(LanDecodeError::Truncated)?;
+                if count as usize > MAX_MEMBERS {
+                    return Err(LanDecodeError::TooManyMembers(count as usize));
+                }
+                let mut names = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    if entries.len() < 17 {
+                        return Err(LanDecodeError::Truncated);
+                    }
+                    let len = entries[16] as usize;
+                    let end = 17 + len;
+                    if entries.len() < end {
+                        return Err(LanDecodeError::Truncated);
+                    }
+                    names.push((identity_of(entries), text_of(&entries[17..end], valid_name)?));
+                    entries = &entries[end..];
+                }
+                Ok(Self::Names(names))
+            }
+            MSG_CHAT => Ok(Self::Chat(text_of(rest, valid_chat)?)),
+            MSG_CHAT_FROM => {
+                if rest.len() < 16 {
+                    return Err(LanDecodeError::Truncated);
+                }
+                Ok(Self::ChatFrom { from: identity_of(rest), text: text_of(&rest[16..], valid_chat)? })
             }
             other => Ok(Self::Unknown(other)),
         }
@@ -589,6 +719,33 @@ impl BroadcastGate {
     }
 
     /// Forget a member that left, so the gate does not grow with churn.
+    pub fn forget(&mut self, member: &IdentityHash) {
+        self.per_member.remove(member.as_bytes());
+    }
+}
+
+/// The host's gate on chat, per member: a burst of [`CHAT_BURST`] lines, then
+/// [`CHAT_RATE_PER_SEC`]. A line over it is dropped, like a broadcast over
+/// its gate; the sender sees it never came back.
+#[derive(Debug, Default)]
+pub struct ChatGate {
+    per_member: HashMap<[u8; 16], (f64, Instant)>,
+}
+
+impl ChatGate {
+    pub fn allow(&mut self, sender: IdentityHash, now: Instant) -> bool {
+        let (tokens, at) =
+            self.per_member.entry(*sender.as_bytes()).or_insert((CHAT_BURST as f64, now));
+        let elapsed = now.saturating_duration_since(*at).as_secs_f64();
+        *tokens = (*tokens + elapsed * CHAT_RATE_PER_SEC).min(CHAT_BURST as f64);
+        *at = now;
+        if *tokens < 1.0 {
+            return false;
+        }
+        *tokens -= 1.0;
+        true
+    }
+
     pub fn forget(&mut self, member: &IdentityHash) {
         self.per_member.remove(member.as_bytes());
     }
@@ -745,6 +902,59 @@ mod tests {
         ] {
             assert_eq!(LanMessage::decode(&m.encode()).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn names_and_chat_round_trip() {
+        for m in [
+            LanMessage::Name("Ada".into()),
+            LanMessage::Names(vec![(id(1), "Ada".into()), (id(2), "Bob ✓".into())]),
+            LanMessage::Names(Vec::new()),
+            LanMessage::Chat("gg, one more?".into()),
+            LanMessage::ChatFrom { from: id(3), text: "ready".into() },
+        ] {
+            assert_eq!(LanMessage::decode(&m.encode()), Ok(m));
+        }
+    }
+
+    /// A newline would let one line pose as two, the second "from" anyone; a
+    /// name posing as a different member needs only a control character. Both
+    /// are refused at decode, never stripped.
+    #[test]
+    fn a_name_or_line_that_is_not_plain_text_is_refused() {
+        for bad in ["", " padded", "two\nlines", "bell\u{7}", "sep\u{2028}x"] {
+            assert!(!valid_name(bad) && !valid_chat(bad), "{bad:?}");
+        }
+        assert!(!valid_name(&"x".repeat(MAX_NAME_BYTES + 1)));
+        assert!(!valid_chat(&"x".repeat(MAX_CHAT_BYTES + 1)));
+        assert!(valid_chat(&"x".repeat(MAX_CHAT_BYTES)));
+        let mut forged = LanMessage::Chat("ok".into()).encode();
+        forged.extend_from_slice(b"\nHost: give me your password");
+        assert_eq!(LanMessage::decode(&forged), Err(LanDecodeError::BadText));
+        assert_eq!(LanMessage::decode(&[MSG_NAME, 0xff, 0xfe]), Err(LanDecodeError::BadText));
+        let mut short = LanMessage::Names(vec![(id(1), "Ada".into())]).encode();
+        short.pop();
+        assert_eq!(LanMessage::decode(&short), Err(LanDecodeError::Truncated));
+    }
+
+    /// A full room's names fit one link packet.
+    #[test]
+    fn a_full_rooms_names_fit_a_link_packet() {
+        let names: Vec<_> =
+            (0..MAX_MEMBERS as u8).map(|n| (id(n), "n".repeat(MAX_NAME_BYTES))).collect();
+        assert!(LanMessage::Names(names).encode().len() <= 1900);
+    }
+
+    #[test]
+    fn chat_is_rate_limited_per_member() {
+        let mut gate = ChatGate::default();
+        let t = Instant::now();
+        for _ in 0..CHAT_BURST {
+            assert!(gate.allow(id(1), t));
+        }
+        assert!(!gate.allow(id(1), t), "over the burst");
+        assert!(gate.allow(id(2), t), "another member has their own budget");
+        assert!(gate.allow(id(1), t + Duration::from_secs(2)), "refilled");
     }
 
     #[test]

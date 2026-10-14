@@ -15,7 +15,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
 | 4 | Installed-game detection | every player | M | **built**: Installed badge, Flatpak/Snap Steam, file picker |
 | 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, four notifications |
-| 6 | Chat and player names in rooms | LAN-room players | L | proposed |
+| 6 | Chat and player names in rooms | LAN-room players | L | **built** for rooms: chat, names, rate limit; server chat not started |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | planned (`PLAN.md` §13) |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
@@ -171,6 +171,20 @@ exists in settings (`player_name`).
   like broadcasts (`lan::BroadcastGate`).
 - A name is data from another member: never trusted for identity, which stays
   the Reticulum identity.
+
+**Built (rooms).** Over the member↔host links, not LXMF: four new message
+types (`lan.rs`, `Name`, `Names`, `Chat`, `ChatFrom`) that a room of older
+builds reads as unknown and ignores, so a mixed room still runs and a member
+whose host has no chat is told so. The host stamps every line with the
+identity its link proved; a member sends text only. Names and lines are one
+line of plain text, capped (32 and 280 bytes), refused at decode, never
+stripped; chat is held to a per-member gate at the host (burst 5, then one
+every two seconds). The player's name is set in Settings → You, which also
+finally gives the launch template's `{name}` a way in.
+
+**Not started:** chat on a server for its bridged players. A server's link is
+the game's own, so a chat there needs its own message channel; LXMF is still
+worth measuring for it.
 
 ## 7. Node: console, resources, schedules, backups
 

@@ -98,6 +98,23 @@ pub struct LanHelperView {
 pub struct RoomMemberView {
     pub address: String,
     pub is_self: bool,
+    /// The name the member gave, if it gave one. Data from another player:
+    /// shown, never used to tell members apart.
+    pub name: Option<String>,
+}
+
+/// One line of room chat, as the UI shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomChatLineView {
+    /// Ask for lines newer than the last one seen with this.
+    pub seq: u64,
+    /// The sender's name, or `None` for one that gave none.
+    pub name: Option<String>,
+    /// The sender's room address, while it is still in the room.
+    pub address: Option<String>,
+    pub is_self: bool,
+    pub text: String,
+    pub at_unix: u64,
 }
 
 /// The room this launcher is in, if any.
@@ -114,6 +131,9 @@ pub struct RoomView {
     /// The room's subnet, `198.19.0.0/16`.
     pub subnet: Option<String>,
     pub members: Vec<RoomMemberView>,
+    /// Whether the room has chat. False while joining, and for a room whose
+    /// host runs a Lanthorn older than chat.
+    pub chat: bool,
     /// `"none"`, `"waiting"` (for a seat), `"starting"` (the adapter — on
     /// Windows, the elevation prompt), `"up"`, `"stopped"` or `"failed"`.
     pub adapter: String,
@@ -281,6 +301,7 @@ impl RoomView {
             address: None,
             subnet: None,
             members: Vec::new(),
+            chat: false,
             adapter: "none".to_string(),
             error: None,
             refused: None,
@@ -813,6 +834,7 @@ impl Launcher {
         let helper_path = helper_path().ok_or_else(|| anyhow!("cannot locate lan-helper"))?;
 
         let saved_opts = self.saved_browse_opts().await;
+        let player_name = self.player_name().await;
         let identity = self.lan_identity_path();
         if let Some(parent) = identity.parent() {
             std::fs::create_dir_all(parent)
@@ -837,6 +859,7 @@ impl Launcher {
                 args.tcp = opts.tcp.clone();
                 args.auto = opts.auto;
                 args.name = name.clone();
+                args.player_name = player_name.clone();
                 ("host", name, LanSession::host(args).await?)
             }
             RoomRequest::Join { hash, .. } => {
@@ -845,6 +868,7 @@ impl Launcher {
                 args.tcp = opts.tcp.clone();
                 args.auto = opts.auto;
                 args.room_hash = Some(hash);
+                args.player_name = player_name.clone();
                 ("member", None, LanSession::join(args).await?)
             }
         };
@@ -976,8 +1000,10 @@ impl Launcher {
                 .map(|m| RoomMemberView {
                     address: m.address.to_string(),
                     is_self: m.identity == view.own_identity,
+                    name: view.name_of(&m.identity).map(str::to_string),
                 })
                 .collect(),
+            chat: view.chat,
             adapter: adapter.to_string(),
             error,
             refused: view.refused.map(|r| r.to_string()),
@@ -989,6 +1015,44 @@ impl Launcher {
                     &room.session.extra_ports().ports(),
                 )
             },
+        }
+    }
+
+    /// Room chat newer than `since` (0 for all this session kept).
+    pub async fn room_chat(&self, since: u64) -> Vec<RoomChatLineView> {
+        let inner = self.inner.lock().await;
+        let Some(room) = &inner.room else { return Vec::new() };
+        let view = room.session.view();
+        room.session
+            .chat_since(since)
+            .into_iter()
+            .map(|l| RoomChatLineView {
+                seq: l.seq,
+                name: view.name_of(&l.from).map(str::to_string),
+                address: view
+                    .members
+                    .iter()
+                    .find(|m| m.identity == l.from)
+                    .map(|m| m.address.to_string()),
+                is_self: l.from == view.own_identity,
+                text: l.text,
+                at_unix: l.at_unix,
+            })
+            .collect()
+    }
+
+    /// Say one line in the room's chat.
+    pub async fn send_room_chat(&self, text: &str) -> Result<()> {
+        let inner = self.inner.lock().await;
+        let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
+        room.session.send_chat(text).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Tell the room this player's new name, if there is a room.
+    pub(crate) async fn rename_in_room(&self, name: &str) {
+        let inner = self.inner.lock().await;
+        if let Some(room) = &inner.room {
+            let _ = room.session.set_name(name);
         }
     }
 
@@ -1136,6 +1200,7 @@ mod tests {
                 "active",
                 "adapter",
                 "address",
+                "chat",
                 "error",
                 "firewall",
                 "game_id",
@@ -1149,10 +1214,23 @@ mod tests {
             ]
         );
         assert_eq!(v["adapter"], "none");
-        let m =
-            serde_json::to_value(RoomMemberView { address: "198.19.0.1".into(), is_self: true })
-                .unwrap();
-        assert_eq!(keys(&m), ["address", "is_self"]);
+        let m = serde_json::to_value(RoomMemberView {
+            address: "198.19.0.1".into(),
+            is_self: true,
+            name: Some("Ada".into()),
+        })
+        .unwrap();
+        assert_eq!(keys(&m), ["address", "is_self", "name"]);
+        let c = serde_json::to_value(RoomChatLineView {
+            seq: 1,
+            name: None,
+            address: None,
+            is_self: false,
+            text: "gg".into(),
+            at_unix: 0,
+        })
+        .unwrap();
+        assert_eq!(keys(&c), ["address", "at_unix", "is_self", "name", "seq", "text"]);
         let f = serde_json::to_value(RoomFirewallView {
             dropped: vec![RoomDroppedView { port: 9900, transport: "tcp", from: "198.19.0.2".into() }],
             advice: Some("ufw is refusing incoming connections here.".into()),
