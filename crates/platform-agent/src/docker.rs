@@ -41,6 +41,9 @@ use crate::store::Mount;
 /// A game server flushes config and logs on shutdown; killing it immediately
 /// loses that. Ten seconds is generous for a shutdown that should take one.
 const STOP_TIMEOUT_SECS: i64 = 10;
+/// How long a stop waits for Docker's container list to agree that it
+/// stopped (`DockerRuntime::wait_listed_stopped`).
+const LIST_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Label marking a short-lived provisioning container, so one is never mistaken
 /// for an instance. It carries `MANAGED_LABEL` too — the agent's guard applies
@@ -754,7 +757,41 @@ impl DockerRuntime {
             .stop_container(&name, Some(StopContainerOptions { t: STOP_TIMEOUT_SECS }))
             .await
             .with_context(|| format!("stopping container {name}"))?;
+        self.wait_listed_stopped(&name).await;
         Ok(())
+    }
+
+    /// Wait until the container *list* says `name` is not running.
+    ///
+    /// Docker answers a stop once the process is gone, but its list (which
+    /// `list_managed`, and so every page and the uplink, reads) can say
+    /// "running" for a moment longer: seen on CI runners, where a list right
+    /// after a stop that returned showed the server still up — an uplink
+    /// stop that "did not stop it", a restore refused as "running". A stop
+    /// returns only once the agent's own reading agrees, bounded so a daemon
+    /// that never catches up costs seconds, not a hang.
+    async fn wait_listed_stopped(&self, name: &str) {
+        let deadline = tokio::time::Instant::now() + LIST_CATCH_UP;
+        loop {
+            let mut filters = HashMap::new();
+            filters.insert("name".to_string(), vec![format!("^/{name}$")]);
+            let listed = self
+                .docker
+                .list_containers(Some(ListContainersOptions { all: true, filters, ..Default::default() }))
+                .await;
+            let running = match listed {
+                Ok(cs) => cs.iter().any(|c| c.state.as_deref() == Some("running")),
+                Err(_) => false,
+            };
+            if !running {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(container = %name, "Docker still lists a stopped container as running");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Restart the container in place.
