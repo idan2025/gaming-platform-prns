@@ -83,6 +83,14 @@ is missing, which makes pushing a tag sufficient on its own.
 - A room whose host runs an older Lanthorn still works; it says chat is
   missing until the host updates.
 
+### Lanthorn Host: add a game from a repository
+
+- **Add a game…** on the Games page adds a pack from a pack repository (the
+  same kind the launcher reads) or from a pack's own address. The node
+  fetches it, refuses bytes the repository did not list or a signature that
+  does not hold, and then applies its own `[pack_trust]` policy as before.
+- A pack's id may no longer contain a path: it names the pack's file.
+
 ### Lanthorn: quiet over a fullscreen game
 
 - On Windows, desktop notifications wait while a game or presentation is

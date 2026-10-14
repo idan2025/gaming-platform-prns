@@ -149,6 +149,7 @@ async fn without_the_token_every_route_is_refused() {
         (reqwest::Method::PUT, "/updates/sven-coop/policy"),
         (reqwest::Method::POST, "/instances/anything/move"),
         (reqwest::Method::DELETE, "/packs/sven-coop"),
+        (reqwest::Method::GET, "/packs/repository?url=https://example.org/"),
         (reqwest::Method::POST, "/content/sven-coop/test/use"),
         (reqwest::Method::POST, "/instances/anything/console"),
         (reqwest::Method::PUT, "/instances/anything/restart-schedule"),

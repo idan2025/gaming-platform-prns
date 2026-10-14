@@ -698,6 +698,13 @@ later change could quietly break:
 - **The index decides what is listed, never what is trusted.** Trust is each
   pack's own `.sig`, and the launcher shows a tier without gating on it, as
   at load. Repository art is not fetched for a pack not installed.
+- **The node takes a repository pack through the same import**
+  (`pack_import::fetch_from_repository`, `GET /packs/repository`, "Add a
+  game…"): digest, then signature (refused, never unsigned), then the usual
+  parse, write and `[pack_trust]` reload. `a_repository_pack_installs_only_as_listed_and_signed`.
+- **A pack id names a file, so it cannot name a path** (`pack::id_is_file_safe`,
+  checked in `GamePack::parse`). Before this an id was only ASCII, and the
+  node's import wrote `<id>.toml` from it. `a_pack_id_that_could_name_a_path_is_refused`.
 - **One HTTP stack.** `launcher-core` uses the same reqwest 0.13 and rustls
   with ring the Tauri updater brings; do not add a second TLS stack.
 

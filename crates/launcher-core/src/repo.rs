@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use game_bridge::pack::TrustedPack;
-use game_bridge::repo::{self, RepoIndex, MAX_INDEX_BYTES, MAX_PACK_BYTES};
+use game_bridge::repo::{self, beside, check_repo_url, RepoIndex, MAX_INDEX_BYTES, MAX_PACK_BYTES};
 use game_bridge::signing::{verify_pack, PackSignature, TrustPolicy, SIGNATURE_SUFFIX};
 use game_bridge::GamePack;
 use serde::Serialize;
@@ -74,33 +74,6 @@ pub struct InstalledPackView {
     pub trust_detail: String,
     /// True when this replaced an earlier install of the same pack.
     pub replaced: bool,
-}
-
-/// A repository URL the launcher will fetch: `https`, or `http` to this
-/// machine only (a repository being tested). No query or fragment, so the
-/// packs beside the index are found by plain path.
-pub fn check_repo_url(url: &str) -> Result<String> {
-    let url = url.trim();
-    let local =
-        ["http://localhost:", "http://localhost/", "http://127.0.0.1:", "http://127.0.0.1/"];
-    if !(url.starts_with("https://") || local.iter().any(|p| url.starts_with(p))) {
-        bail!("a pack repository is an https:// address (http:// only for this computer)");
-    }
-    if url.contains(['?', '#', ' ', '\\']) || url.len() > 512 {
-        bail!("a pack repository address has no query, fragment or spaces");
-    }
-    let url = if url.ends_with(repo::INDEX_FILE) {
-        url.to_string()
-    } else {
-        format!("{}/{}", url.trim_end_matches('/'), repo::INDEX_FILE)
-    };
-    Ok(url)
-}
-
-/// The address of `file` beside the index at `index_url`.
-fn beside(index_url: &str, file: &str) -> String {
-    let base = &index_url[..=index_url.rfind('/').unwrap_or(index_url.len() - 1)];
-    format!("{base}{file}")
 }
 
 async fn fetch(url: &str, max: usize) -> Result<Vec<u8>> {
