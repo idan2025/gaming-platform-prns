@@ -273,13 +273,27 @@ async fn an_index_creates_lists_stops_and_removes_on_a_remote_agent() {
         );
 
         // Stop over the uplink, then list confirms it stopped.
+        let stopping = std::time::Instant::now();
         tn.client.stop(tn.agent_dest, &id).await?;
+        let took = stopping.elapsed();
         let listed: Vec<InstanceStatus> = tn.client.list(tn.agent_dest).await?;
         let row = listed
             .iter()
             .find(|r| r.instance_id == id)
             .ok_or_else(|| anyhow!("the instance vanished after stop"))?;
-        assert_eq!(row.state, InstanceState::Stopped, "stop over the uplink did not stop it");
+        // What Docker itself says, so a failure on a CI runner names its cause:
+        // a stop that returned early, or a container started again after it.
+        let docker_state = std::process::Command::new("docker")
+            .args(["inspect", "-f", "{{json .State}} restarts={{.RestartCount}}", &name])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        assert_eq!(
+            row.state,
+            InstanceState::Stopped,
+            "stop over the uplink did not stop it (the stop took {took:?}; docker: {docker_state}; {} rows)",
+            listed.len()
+        );
 
         // Remove over the uplink, then list confirms it is gone.
         tn.client.remove(tn.agent_dest, &id).await?;
