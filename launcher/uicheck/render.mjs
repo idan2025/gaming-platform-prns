@@ -187,6 +187,11 @@ function makeInvoke(scenario) {
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
         if (cmd === 'revoke_lan_helper') scenario.lanHelper = scenario.afterRevoke ?? scenario.lanHelper;
         return scenario.lanHelper;
+      case 'first_run':
+        return !!scenario.firstRun;
+      case 'finish_first_run':
+        scenario.firstRunFinished = true;
+        return null;
       case 'pack_repos':
         return scenario.repos ?? [];
       case 'add_pack_repo':
@@ -929,6 +934,34 @@ const memberRoom = {
   pack_gaps: { ports: [], seen: [], report: null, can_allow: [], allowed: [], wide_open: false },
 };
 const fw = (over) => ({ ...memberRoom.firewall, ...over });
+
+// First run (PLAN.md §13.3 step 4): one screen, then connected with exactly
+// what was chosen; and never shown when the core says it is done.
+await run('a fresh install gets one welcome screen and connects', {
+  status: { ...running, running: false },
+  rows: () => [],
+  firstRun: true,
+}, async (win, doc, scenario) => {
+  await settle();
+  check('the welcome screen shows', !!doc.querySelector('#welcome'));
+  doc.querySelector('#welcome-name').value = 'Ada';
+  doc.querySelector('#welcome-hub').value = 'hub.example:4242';
+  doc.querySelector('#welcome-start').click();
+  await settle();
+  await settle();
+  check('the name is saved', (scenario.namesSet || []).includes('Ada'), JSON.stringify(scenario.namesSet));
+  check('it is marked done', scenario.firstRunFinished === true);
+  check('and it is gone', !doc.querySelector('#welcome'));
+  check('it connects with the hub it was given', calls.includes('start_browse'), JSON.stringify(calls.slice(-6)));
+});
+
+await run('a launcher past its first run never shows it', {
+  status: running,
+  rows: () => [row()],
+}, async (win, doc) => {
+  await settle();
+  check('no welcome screen', !doc.querySelector('#welcome'));
+});
 
 // Games and pack repositories (ROADMAP item 8): installed games with their
 // tier, a pack from a repository installs by its repository and id, a shipped

@@ -262,6 +262,16 @@ fn send_notification(app: &tauri::AppHandle, title: &str, body: &str) -> bool {
 }
 
 #[tauri::command]
+async fn first_run(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.launcher.first_run().await)
+}
+
+#[tauri::command]
+async fn finish_first_run(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.launcher.finish_first_run().await.map_err(fmt_err)
+}
+
+#[tauri::command]
 async fn notifications_on(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.launcher.notifications_on().await)
 }
@@ -827,6 +837,8 @@ pub fn run() {
             clear_game_path,
             notify,
             notifications_on,
+            first_run,
+            finish_first_run,
             set_notifications_on,
             pick_game_path,
             installed_games,

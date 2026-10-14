@@ -83,6 +83,12 @@ is missing, which makes pushing a tag sufficient on its own.
 - A room whose host runs an older Lanthorn still works; it says chat is
   missing until the host updates.
 
+### Lanthorn: a welcome screen
+
+- A fresh install opens on one screen: your name, and whether to look on
+  this network, use a hub address, or both. Start connects with that; Skip
+  leaves it for the Connections page. Shown once.
+
 ### Lanthorn Host: add a game from a repository
 
 - **Add a game…** on the Games page adds a pack from a pack repository (the

@@ -2242,6 +2242,91 @@ async function init() {
   state.pollTimer = setInterval(pollAll, 2000);
   await takeInvite();
   startupUpdateCheck();
+  try { if (await invoke('first_run')) openWelcome(); } catch (_) {}
+}
+
+// ---------- first run (PLAN.md §13.3 step 4) ----------
+//
+// One screen on a fresh install: a name, and how to reach anyone — this
+// network, a hub address, or both. Start connects with exactly that; Skip
+// leaves everything as it was. Shown once, and never on a launcher that
+// already has a connection saved. The identity needs no step: it is made the
+// first time one is needed.
+function openWelcome() {
+  if ($('welcome')) return;
+  const back = el('div', 'welcome-back');
+  back.id = 'welcome';
+  const box = el('form', 'card welcome');
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  box.setAttribute('aria-labelledby', 'welcome-title');
+  const h = el('h2', '', 'Welcome to Lanthorn');
+  h.id = 'welcome-title';
+  box.appendChild(h);
+  box.appendChild(el('p', 'card-text', 'Lanthorn finds game servers over a mesh network: no account, '
+    + 'no central server. Two things and you are in.'));
+  box.appendChild(el('label', 'welcome-label', 'Your name'));
+  const name = el('input');
+  name.id = 'welcome-name';
+  name.type = 'text';
+  name.maxLength = 32;
+  name.placeholder = 'What friends see in LAN rooms (optional)';
+  name.value = state.playerName || '';
+  box.appendChild(name);
+  box.appendChild(el('label', 'welcome-label', 'How to find servers'));
+  const autoRow = el('label', 'toggle-row');
+  const auto = el('input');
+  auto.type = 'checkbox';
+  auto.id = 'welcome-auto';
+  auto.checked = true;
+  autoRow.append(auto, el('span', '', 'Look on this network (Wi-Fi or cable)'));
+  box.appendChild(autoRow);
+  const hub = el('input');
+  hub.id = 'welcome-hub';
+  hub.type = 'text';
+  hub.spellcheck = false;
+  hub.placeholder = 'A hub address someone gave you, like host:4242 (optional)';
+  box.appendChild(hub);
+  box.appendChild(el('p', 'note', 'A hub is how you reach servers beyond this network. Both can be changed later under Connections.'));
+  const actions = el('div', 'room-actions');
+  const skip = el('button', 'btn', 'Skip');
+  skip.type = 'button';
+  skip.id = 'welcome-skip';
+  const go = el('button', 'btn btn-primary', 'Start');
+  go.type = 'submit';
+  go.id = 'welcome-start';
+  actions.append(skip, go);
+  box.appendChild(actions);
+  const done = async () => {
+    try { await invoke('finish_first_run'); } catch (_) {}
+    back.remove();
+  };
+  skip.onclick = done;
+  box.onsubmit = async (e) => {
+    e.preventDefault();
+    if (!auto.checked && !hub.value.trim()) {
+      showError('Pick at least one way to find servers: this network, or a hub address.');
+      return;
+    }
+    go.disabled = true;
+    try {
+      if (name.value.trim()) {
+        await invoke('set_player_name', { name: name.value });
+        state.playerName = name.value.trim();
+      }
+    } catch (err) {
+      showError('Could not save that name: ' + errText(err));
+      go.disabled = false;
+      return;
+    }
+    state.autoDiscover = auto.checked;
+    state.tcpPeer = hub.value.trim();
+    await done();
+    await startBrowse();
+  };
+  back.appendChild(box);
+  document.body.appendChild(back);
+  name.focus();
 }
 init().catch(err => showError('The launcher could not start: ' + errText(err)));
 

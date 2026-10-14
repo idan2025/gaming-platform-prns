@@ -113,6 +113,8 @@ pub struct LauncherSettings {
     /// Pack repositories the player added (`repo.rs`), as index URLs. None
     /// ships: a repository is opt-in.
     pub pack_repos: Vec<String>,
+    /// The first-run screen was finished or skipped (`PLAN.md` §13.3 step 4).
+    pub first_run_done: bool,
 }
 
 /// A server this launcher has seen, remembered so it can be found again.
