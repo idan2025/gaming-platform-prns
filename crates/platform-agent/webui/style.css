@@ -397,7 +397,10 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .sidebar { width: auto; height: auto; position: static; flex-direction: row; align-items: center; gap: 8px; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   .brand { padding: 0 8px 0 0; }
   .brand-sub, .sidebar-foot .capacity { display: none; }
-  .nav { flex-direction: row; }
+  /* The tabs get a row of their own and share it; scrolling is only the
+     fallback for a screen narrower than any phone. */
+  .nav { flex-direction: row; order: 3; width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .nav-item { flex: 1 0 auto; justify-content: center; }
   .nav-item span:first-of-type { flex: none; }
   .sidebar-foot { margin: 0 0 0 auto; }
   .node-card { padding: 6px 8px; display: flex; gap: 10px; align-items: center; border: 0; background: none; }
@@ -405,9 +408,23 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .toolbar, .content { padding-left: 16px; padding-right: 16px; }
   .list-head { display: none; }
   .inst { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
+  .inst .art-thumb { width: 64px; height: 30px; }
   .inst > :nth-child(n+3):not(.actions):not(.usage) { display: none; }
   .inst > .usage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 480px) {
+  .nav-item { gap: 6px; padding: 0 8px; }
+  .nav-item svg, .nav-count { display: none; }
+  /* Announce keeps its icon and its tooltip; the words go. */
+  #announce-btn { font-size: 0; gap: 0; padding: 0 10px; }
+  .node-card .disk-line { display: none; }
+  .node-line { white-space: nowrap; }
+  /* A server's buttons take their own line, so its name is readable. */
+  .inst { grid-template-columns: 56px 1fr; }
+  .inst .art-thumb { width: 56px; height: 26px; }
+  .inst > .actions { grid-column: 1 / -1; justify-content: flex-end; }
+  .inst > .usage { grid-column: 1 / -1; }
 }
 
 /* Art: the picture whole (object-fit: contain) over a blurred, zoomed copy of
