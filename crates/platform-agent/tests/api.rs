@@ -148,6 +148,7 @@ async fn without_the_token_every_route_is_refused() {
         (reqwest::Method::PUT, "/updates/settings"),
         (reqwest::Method::PUT, "/updates/sven-coop/policy"),
         (reqwest::Method::POST, "/instances/anything/move"),
+        (reqwest::Method::DELETE, "/packs/sven-coop"),
     ] {
         let status = client
             .request(method.clone(), format!("http://{addr}{path}"))
@@ -574,4 +575,57 @@ async fn restart_on_crash_for_an_unknown_server_is_refused() {
         .unwrap()
         .status();
     assert_eq!(status, 404);
+}
+
+/// A pack goes, with its file, and comes off `/games` without a restart. A
+/// server of its game, even a stopped one, holds it: it could not be started
+/// again without the pack.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pack_is_removed_only_when_no_server_of_its_game_exists() {
+    let Some((addr, dir, _tmp)) = serve_with_packs().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let pack = r#"
+schema_version = 1
+id = "removable-game"
+display_name = "Removable Game"
+app_name = "removable-game"
+default_port = 27015
+transport = "udp"
+min_link_class = 1
+query = "a2s"
+"#;
+    let resp = client.post(format!("http://{addr}/packs")).json(&serde_json::json!({ "toml": pack })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A stopped server of that game, as the agent would label one.
+    let name = format!("gpp-removable{}", std::process::id());
+    let created = std::process::Command::new("docker")
+        .args(["create", "--name", &name])
+        .args(["--label", &format!("{}=1", platform_agent::config::MANAGED_LABEL)])
+        .args(["--label", &format!("{}=removable{}", platform_agent::config::INSTANCE_LABEL, std::process::id())])
+        .args(["--label", &format!("{}=removable-game", platform_agent::config::GAME_LABEL)])
+        .args(["busybox", "true"])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let held = client.delete(format!("http://{addr}/packs/removable-game")).send().await.unwrap();
+    let status = held.status();
+    let _ = std::process::Command::new("docker").args(["rm", "-f", &name]).output();
+    assert_eq!(status, 409, "{}", held.text().await.unwrap());
+    assert!(dir.join("removable-game.toml").exists(), "a refused removal removes nothing");
+
+    let resp = client.delete(format!("http://{addr}/packs/removable-game")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    assert!(!dir.join("removable-game.toml").exists());
+    let games: Vec<serde_json::Value> =
+        client.get(format!("http://{addr}/games")).send().await.unwrap().json().await.unwrap();
+    assert!(!games.iter().any(|g| g["id"] == "removable-game"), "gone without a restart");
+
+    let again = client.delete(format!("http://{addr}/packs/removable-game")).send().await.unwrap();
+    assert_eq!(again.status(), 404);
+    let hostile = client.delete(format!("http://{addr}/packs/..%2Fagent")).send().await.unwrap();
+    assert_eq!(hostile.status(), 404, "an id names no path");
 }

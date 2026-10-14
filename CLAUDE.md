@@ -504,6 +504,14 @@ change could quietly break:
   staging directory and ends `Failed { error: "cancelled" }`. A cancel that
   lands while the container is being created is caught by the flag check in
   `run_to_completion`. Pinned by `a_download_shows_growing_bytes_and_a_cancel_leaves_nothing`.
+- **A pack is removed by what it says, never by a path from the URL**
+  (`pack_import::remove`, `DELETE /packs/:id`): every `.toml` in the pack
+  directory is parsed and only one whose `id` matches goes, with its `.sig`.
+  Refused while any server of the game exists, running or stopped (it could
+  not start again without its pack), or while it downloads; the game's files
+  stay. The node has no built-in pack: every pack it runs is a file. Caught by
+  `a_pack_is_removed_by_what_it_says_never_by_a_path_from_outside` and
+  `a_pack_is_removed_only_when_no_server_of_its_game_exists`.
 
 **A game's files can be updated from the node** (2026-10-13,
 `Provisioner::update`, `Agent::update_content`, `active.rs`). Rules a later

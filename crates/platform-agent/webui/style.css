@@ -235,6 +235,10 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .card-reason { font-size: 12px; color: var(--warn); }
 .card-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
 .card-actions .btn { flex: 1; }
+.game-card { position: relative; }
+.card-remove { position: absolute; top: 8px; right: 8px; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.25); border-radius: var(--radius); background: rgba(0, 0, 0, 0.45); color: #fff; cursor: pointer; }
+.card-remove svg { width: 15px; height: 15px; }
+.card-remove:hover { background: var(--bad); border-color: var(--bad); }
 .game-card.unrunnable .art { filter: grayscale(0.85) brightness(0.7); }
 .install-status { font-size: 12px; color: var(--text-2); }
 .install-status.ok { color: var(--ok); }

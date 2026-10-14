@@ -232,7 +232,9 @@ one per game. Both open decisions took the safe option: Delete only lists the
 servers using a copy (409 with their ids), and no total is shown for any
 download yet. From step 7, **Update a game** is built too, with a
 "remove the old version when done" option (`CLAUDE.md` has its rules);
-verify, room-before-download, remove a pack and a queue are still open.
+room-before-download and the queue came with item 12, and **remove a pack**
+is built (2026-10-14, `DELETE /packs/:id`, a button on each Games card; the
+node has no built-in pack, so any pack can go). Verify is still open.
 
 **What.** An **Installed** page in Lanthorn Host listing every game whose files
 are on this node, and every download in progress, with the controls to manage
