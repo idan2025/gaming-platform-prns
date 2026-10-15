@@ -74,6 +74,15 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### Controllers on Linux
+
+- Big screen mode now works with a gamepad on Linux even where the system's
+  web view cannot see one (WebKitGTK without libmanette, as on some Steam
+  Deck and distribution builds): Lanthorn reads the controller itself. It
+  only reads it; games and Steam still get every press.
+
 ## v0.2.41
 
 ### Quiet over a fullscreen game on Linux

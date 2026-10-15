@@ -19,7 +19,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; the official repository, mirrors, seeding over Reticulum |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
-| 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation |
+| 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation, Linux gamepads read by the launcher itself |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
@@ -389,8 +389,12 @@ remembered per screen. A controller drives the same actions as the keyboard:
 up/down (d-pad or left stick, with repeat) through the list, A or right opens
 a server with focus on Join, X joins, Y opens the row's menu, B goes back,
 LB/RB switch sections; elsewhere up/down move between buttons and A presses.
-A controller plugging in offers big screen once. **Not yet:** tried on a real
-Steam Deck — WebKitGTK reads gamepads only when built with libmanette.
+A controller plugging in offers big screen once. **On Linux the launcher reads
+gamepads itself** (2026-10-15, `launcher-core/src/gamepad.rs`), because
+WebKitGTK reads them only when built with libmanette: `/dev/input` through
+`evdev`, read and never grabbed, merged in the page with the Gamepad API so a
+pad seen both ways is one pad. Measured against a kernel uinput pad
+(`tests/gamepad_uinput.rs`). **Still to check:** a real Steam Deck in Game Mode.
 
 ## 11. Node: installed games and downloads
 
