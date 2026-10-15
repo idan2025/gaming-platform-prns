@@ -110,9 +110,13 @@ pub struct LauncherSettings {
     /// Stored as "off" so every older settings file means on.
     #[serde(default)]
     pub notifications_off: bool,
-    /// Pack repositories the player added (`repo.rs`), as index URLs. None
-    /// ships: a repository is opt-in.
+    /// Pack repositories the player added (`repo.rs`), as index URLs. The
+    /// official one is not kept here: it is on unless
+    /// [`official_packs_off`](Self::official_packs_off).
     pub pack_repos: Vec<String>,
+    /// The player turned the official pack repository off (`repo.rs`). Off
+    /// means no fetch from it at all, and nothing new from it.
+    pub official_packs_off: bool,
     /// The key each repository's index was signed with when it was added,
     /// hex identity hash by index URL. Once pinned, a list signed by another
     /// key, or no longer signed, is refused (`repo.rs`).

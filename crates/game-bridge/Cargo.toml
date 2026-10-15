@@ -20,6 +20,12 @@ serde_json = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 # A pack repository's digests (`src/repo.rs`).
 sha2 = "0.10"
+# Fetching a pack repository and mirroring it (`src/repo.rs`): the same
+# reqwest and rustls-with-ring the launcher's updater brings, so there is one
+# HTTP stack (`CLAUDE.md`). `url` turns a local folder into a `file://` source.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+url = "2"
 # The one-time token a LAN helper proves itself with (`lan_relay.rs`).
 getrandom = "0.2"
 # For the `game-bridge` binary's logging only. The library never installs a

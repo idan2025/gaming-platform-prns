@@ -470,6 +470,12 @@ pub struct Launcher {
     /// nothing — on Linux the helper is asked for per room, on Windows the
     /// Wintun driver is removed again when a room ends.
     portable: bool,
+    /// The official pack repository's index URL and the key its list must be
+    /// signed by (`repo.rs`). Constants in a release; a test points it at a
+    /// folder it signed itself.
+    official: Arc<(String, String)>,
+    /// What the last look at the official repository did.
+    official_sync: Arc<std::sync::Mutex<repo::OfficialSyncView>>,
 }
 
 struct Inner {
@@ -637,6 +643,11 @@ impl Launcher {
             settings: Arc::new(Mutex::new(settings)),
             settings_path,
             portable: false,
+            official: Arc::new((
+                game_bridge::repo::OFFICIAL_REPOSITORY.to_string(),
+                game_bridge::signing::PROJECT_KEY_HEX.to_string(),
+            )),
+            official_sync: Default::default(),
         }
     }
 
@@ -663,7 +674,7 @@ impl Launcher {
     /// signature is an error and never a demotion to unsigned; that rule holds
     /// wherever packs are read.
     pub fn from_pack_dir(dir: &std::path::Path) -> Self {
-        let policy = TrustPolicy::allowing_unsigned();
+        let policy = trust_policy();
         let launcher = match GamePack::load_dir_verified(dir, &policy, std::time::SystemTime::now()) {
             Ok(loaded) => {
                 for (path, e) in &loaded.errors {
@@ -1816,6 +1827,13 @@ fn unreachable_view(hash: &str, error: String) -> ServerDetailsView {
         stats_age_secs: None,
         error: Some(error),
     }
+}
+
+/// What the launcher classifies packs by: it shows a tier and gates on none
+/// (`from_pack_dir`), and the project key is first-party, so the official
+/// repository's packs say so.
+pub(crate) fn trust_policy() -> TrustPolicy {
+    TrustPolicy::allowing_unsigned().with_first_party(game_bridge::signing::project_key())
 }
 
 fn parse_hash(hex_str: &str) -> Result<DestinationHash> {

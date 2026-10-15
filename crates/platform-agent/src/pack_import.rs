@@ -262,9 +262,21 @@ async fn fetch_from_repository(
     now: SystemTime,
 ) -> Result<(String, Option<String>), ImportError> {
     use game_bridge::repo::{beside, sha256_hex};
-    let index = read_repository(repository).await?;
     let url = game_bridge::repo::check_repo_url(repository)
         .map_err(|e| ImportError::Repository(e.to_string()))?;
+    let read = game_bridge::repo::read_index(&url)
+        .await
+        .map_err(|e| ImportError::Repository(format!("{e:#}")))?;
+    // The official list is held to the project key, whoever serves it.
+    if game_bridge::repo::check_repo_url(game_bridge::repo::OFFICIAL_REPOSITORY).ok().as_deref()
+        == Some(url.as_str())
+        && read.signature.as_ref().map(|(who, _)| *who) != Some(game_bridge::signing::project_key())
+    {
+        return Err(ImportError::Repository(
+            "the official list is not signed by the project key".into(),
+        ));
+    }
+    let index = read.index;
     let entry = index
         .entry(id)
         .ok_or_else(|| ImportError::Repository(format!("the repository does not list {id:?}")))?;
@@ -301,27 +313,10 @@ pub async fn read_repository(repository: &str) -> Result<game_bridge::repo::Repo
     game_bridge::repo::RepoIndex::parse(&bytes).map_err(|e| ImportError::Repository(e.to_string()))
 }
 
+/// A repository's files, `https` or a folder on this machine
+/// (`game_bridge::repo::fetch`, the one fetch the launcher uses too).
 async fn fetch_bytes(url: &str, max: usize) -> Result<Vec<u8>, ImportError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| ImportError::Fetch(e.to_string()))?;
-    let mut response =
-        client.get(url).send().await.map_err(|e| ImportError::Fetch(e.to_string()))?;
-    if !response.status().is_success() {
-        return Err(ImportError::Fetch(format!("{} said {}", url, response.status())));
-    }
-    if response.content_length().is_some_and(|n| n as usize > max) {
-        return Err(ImportError::TooLarge { bytes: response.content_length().unwrap_or(0) as usize });
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| ImportError::Fetch(e.to_string()))? {
-        body.extend_from_slice(&chunk);
-        if body.len() > max {
-            return Err(ImportError::TooLarge { bytes: body.len() });
-        }
-    }
-    Ok(body)
+    game_bridge::repo::fetch(url, max).await.map_err(|e| ImportError::Fetch(format!("{e:#}")))
 }
 
 async fn fetch_pack(url: &str) -> Result<String, ImportError> {

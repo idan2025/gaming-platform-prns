@@ -24,6 +24,8 @@ futures-util = { version = "0.3", default-features = false }
 axum = "0.7"
 serde_json = "1"
 hex = "0.4"
+# A folder repository's path, checked to lie under the data root (`api.rs`).
+url = "2"
 getrandom = "0.2"
 libc = "0.2"
 sha2 = "0.10"

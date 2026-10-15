@@ -23,27 +23,26 @@
 //!   `PLAN.md` §13.1, whatever repository it came from.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use game_bridge::pack::TrustedPack;
-use game_bridge::repo::{self, beside, check_repo_url, RepoIndex, MAX_INDEX_BYTES, MAX_PACK_BYTES};
-use game_bridge::signing::{verify_pack, PackSignature, TrustPolicy, SIGNATURE_SUFFIX};
+use game_bridge::repo::{self, beside, check_repo_url, RepoIndex, MAX_PACK_BYTES};
+use game_bridge::signing::{verify_pack, PackSignature, PackTrust, SIGNATURE_SUFFIX};
 use game_bridge::GamePack;
 use serde::Serialize;
 
 use crate::Launcher;
 
-/// How long one fetch may take.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Largest signature file fetched. One is a few hundred bytes.
-const MAX_SIG_BYTES: usize = 16 * 1024;
+use game_bridge::repo::MAX_SIG_BYTES;
 
 /// One repository, as the Packs view shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct PackRepoView {
     pub url: String,
+    /// The official repository: held to the project key, on unless the
+    /// player turned it off, and the one that may update a shipped game.
+    pub official: bool,
     /// Who signed its list, hex identity hash, when it is signed. Pinned when
     /// the repository was added.
     pub signer: Option<String>,
@@ -80,60 +79,15 @@ pub struct InstalledPackView {
 }
 
 async fn fetch(url: &str, max: usize) -> Result<Vec<u8>> {
-    // The shell's updater also uses rustls with ring; whichever installs the
-    // provider first wins, and the other's attempt is a harmless error.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-    let mut response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
-    if !response.status().is_success() {
-        bail!("{url} answered {}", response.status());
-    }
-    if response.content_length().is_some_and(|n| n as usize > max) {
-        bail!("{url} is over {max} bytes");
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.with_context(|| format!("reading {url}"))? {
-        body.extend_from_slice(&chunk);
-        if body.len() > max {
-            bail!("{url} is over {max} bytes");
-        }
-    }
-    Ok(body)
+    repo::fetch(url, max).await
 }
 
 /// The index at `url` and who signed it, if anyone: `index.json.sig` beside
 /// it, under the index domain. A signature that is there and does not verify
-/// is an error, never an unsigned list.
+/// is an error, never an unsigned list (`repo::read_index`).
 async fn fetch_index(url: &str) -> Result<(RepoIndex, Option<String>)> {
-    let bytes = fetch(url, MAX_INDEX_BYTES).await?;
-    let index = RepoIndex::parse(&bytes)?;
-    let sig_url = format!("{url}{SIGNATURE_SUFFIX}");
-    let signer = match fetch_optional(&sig_url, MAX_SIG_BYTES).await? {
-        None => None,
-        Some(sig) => {
-            let text =
-                String::from_utf8(sig).map_err(|_| anyhow!("the list's signature is not text"))?;
-            let sig = PackSignature::parse(&text)
-                .map_err(|e| anyhow!("the list's signature is unreadable: {e}"))?;
-            let who = sig.verify_index(&bytes, SystemTime::now()).map_err(|e| {
-                anyhow!("the repository's list has a signature that does not hold: {e}")
-            })?;
-            Some(hex::encode(who.as_bytes()))
-        }
-    };
-    Ok((index, signer))
-}
-
-/// As [`fetch`], with a 404 meaning "not there".
-async fn fetch_optional(url: &str, max: usize) -> Result<Option<Vec<u8>>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-    let response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    drop(response);
-    fetch(url, max).await.map(Some)
+    let read = repo::read_index(url).await?;
+    Ok((read.index, read.signature.map(|(who, _)| hex::encode(who.as_bytes()))))
 }
 
 impl Launcher {
@@ -151,7 +105,7 @@ impl Launcher {
         if !dir.is_dir() {
             return self;
         }
-        let policy = TrustPolicy::allowing_unsigned();
+        let policy = crate::trust_policy();
         match GamePack::load_dir_verified(&dir, &policy, SystemTime::now()) {
             Ok(loaded) => {
                 for (path, e) in &loaded.errors {
@@ -159,10 +113,15 @@ impl Launcher {
                 }
                 let mut packs = self.packs.write().unwrap_or_else(|e| e.into_inner());
                 for p in loaded.packs {
-                    if packs.iter().any(|have| have.pack.id == p.pack.id) {
-                        tracing::warn!(id = %p.pack.id, "an installed pack has a shipped game's id; the shipped one stays");
-                    } else {
-                        packs.push(p);
+                    let official = matches!(p.trust, PackTrust::FirstParty { .. });
+                    match packs.iter().position(|have| have.pack.id == p.pack.id) {
+                        // The official repository's newer copy of a shipped
+                        // game: the same project, signed by its key.
+                        Some(i) if official => packs[i] = p,
+                        Some(_) => {
+                            tracing::warn!(id = %p.pack.id, "an installed pack has a shipped game's id; the shipped one stays")
+                        }
+                        None => packs.push(p),
                     }
                 }
             }
@@ -176,14 +135,34 @@ impl Launcher {
             .is_some_and(|dir| std::path::Path::new(&p.file).parent() == Some(dir.as_path()))
     }
 
+    /// The repositories this launcher reads: the official one first, unless
+    /// the player turned it off, then the ones they added.
     pub async fn pack_repos(&self) -> Vec<String> {
-        self.settings.lock().await.pack_repos.clone()
+        let settings = self.settings.lock().await;
+        let mut out = Vec::new();
+        if !settings.official_packs_off {
+            out.push(self.official.0.clone());
+        }
+        out.extend(settings.pack_repos.iter().filter(|u| **u != self.official.0).cloned());
+        out
+    }
+
+    pub(crate) fn is_official(&self, url: &str) -> bool {
+        url == self.official.0
     }
 
     /// Add a repository, after reading its index once: an address that is not
     /// a repository is refused now rather than listed as broken forever.
     pub async fn add_pack_repo(&self, url: &str) -> Result<PackRepoView> {
         let url = check_repo_url(url)?;
+        if self.is_official(&url) {
+            let index = self.pinned_index(&url).await?;
+            let mut settings = self.settings.lock().await;
+            settings.official_packs_off = false;
+            self.persist(&settings)?;
+            drop(settings);
+            return Ok(self.repo_view(url, Ok(index)));
+        }
         let (index, signer) = fetch_index(&url).await?;
         {
             let mut settings = self.settings.lock().await;
@@ -202,7 +181,13 @@ impl Launcher {
 
     /// The index at `url`, held to the key pinned for it, if one was.
     async fn pinned_index(&self, url: &str) -> Result<(RepoIndex, Option<String>)> {
-        let pinned = self.settings.lock().await.pack_repo_keys.get(url).cloned();
+        // The official list is held to the project key, never to whatever
+        // key it was first seen with.
+        let pinned = if self.is_official(url) {
+            Some(self.official.1.clone())
+        } else {
+            self.settings.lock().await.pack_repo_keys.get(url).cloned()
+        };
         let (index, signer) = fetch_index(url).await?;
         if let Some(pin) = pinned {
             if signer.as_deref() != Some(pin.as_str()) {
@@ -219,6 +204,10 @@ impl Launcher {
 
     pub async fn remove_pack_repo(&self, url: &str) -> Result<()> {
         let mut settings = self.settings.lock().await;
+        if self.is_official(url) {
+            settings.official_packs_off = true;
+            return self.persist(&settings);
+        }
         settings.pack_repos.retain(|u| u != url);
         settings.pack_repo_keys.remove(url);
         self.persist(&settings)?;
@@ -240,6 +229,7 @@ impl Launcher {
             Ok(i) => i,
             Err(e) => {
                 return PackRepoView {
+                    official: self.is_official(&url),
                     url,
                     signer: None,
                     name: None,
@@ -249,14 +239,33 @@ impl Launcher {
             }
         };
         let packs = self.packs();
+        let official = self.is_official(&url);
         let rows = index
             .packs
             .iter()
             .map(|e| {
                 let have = packs.iter().find(|p| p.pack.id == e.id);
+                let differs = |p: &TrustedPack| {
+                    std::fs::read(&p.file).map(|b| repo::sha256_hex(&b) != e.sha256).unwrap_or(true)
+                };
+                let first_party = |p: &TrustedPack| matches!(p.trust, PackTrust::FirstParty { .. });
                 let state = match have {
                     None => "available",
+                    // Only the official repository updates a shipped game:
+                    // when its bytes moved on, or to take the signed copy.
+                    Some(p) if !self.is_user_pack(p) && official && (differs(p) || !first_party(p)) => {
+                        "update"
+                    }
                     Some(p) if !self.is_user_pack(p) => "shipped",
+                    // An official copy whose signature runs out within the
+                    // refresh window is taken again before it can hide the game.
+                    Some(p)
+                        if official
+                            && first_party(p)
+                            && repo::signature_due(p.expires_at, SystemTime::now()) =>
+                    {
+                        "update"
+                    }
                     Some(p) => match std::fs::read(&p.file) {
                         Ok(bytes) if repo::sha256_hex(&bytes) == e.sha256 => "installed",
                         _ => "update",
@@ -272,7 +281,7 @@ impl Launcher {
                 }
             })
             .collect();
-        PackRepoView { url, signer, name: Some(index.name), error: None, packs: rows }
+        PackRepoView { official, url, signer, name: Some(index.name), error: None, packs: rows }
     }
 
     /// Install (or update) pack `id` from the repository at `url`.
@@ -282,7 +291,7 @@ impl Launcher {
             .user_pack_dir()
             .ok_or_else(|| anyhow!("this launcher has no settings folder to keep packs in"))?;
         if let Some(p) = self.packs().iter().find(|p| p.pack.id == id) {
-            if !self.is_user_pack(p) {
+            if !self.is_user_pack(p) && !self.is_official(&url) {
                 bail!(
                     "{} ships with Lanthorn; a repository cannot replace it",
                     p.pack.display_name
@@ -311,7 +320,7 @@ impl Launcher {
             bail!("{why}; nothing was installed");
         }
 
-        let policy = TrustPolicy::allowing_unsigned();
+        let policy = crate::trust_policy();
         let now = SystemTime::now();
         let sig = if entry.signed {
             let sig_bytes =
@@ -362,12 +371,20 @@ impl Launcher {
 
     /// Remove a pack installed from a repository. A shipped pack is refused.
     pub async fn remove_installed_pack(&self, id: &str) -> Result<()> {
+        let official_off = self.settings.lock().await.official_packs_off;
         let file = {
             let packs = self.packs();
             let p =
                 packs.iter().find(|p| p.pack.id == id).ok_or_else(|| anyhow!("no pack {id:?}"))?;
             if !self.is_user_pack(p) {
                 bail!("{} ships with Lanthorn and cannot be removed", p.pack.display_name);
+            }
+            if matches!(p.trust, PackTrust::FirstParty { .. }) && !official_off {
+                bail!(
+                    "{} comes from the official repository and would come straight back. \
+                     Turn the official repository off first to stop taking its packs",
+                    p.pack.display_name
+                );
             }
             PathBuf::from(&p.file)
         };
@@ -377,6 +394,85 @@ impl Launcher {
         let _ = std::fs::remove_file(PathBuf::from(sig));
         self.packs.write().unwrap_or_else(|e| e.into_inner()).retain(|p| p.pack.id != id);
         Ok(())
+    }
+}
+
+/// What the last look at the official repository did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OfficialSyncView {
+    /// Whether the official repository is on.
+    pub on: bool,
+    /// When it was last read, unix seconds; `None` before the first time.
+    pub checked_unix: Option<u64>,
+    /// Games that arrived, and games whose pack was updated, that time.
+    pub added: Vec<String>,
+    pub updated: Vec<String>,
+    /// Why it could not be read, or a pack not taken: offline is normal.
+    pub error: Option<String>,
+}
+
+impl Launcher {
+    /// Take every pack the official repository lists that this launcher does
+    /// not have, or has other bytes of, through the same install as a click
+    /// (`install_repo_pack`: digest, review, signature). A launcher with the
+    /// official repository off reads nothing. Never fails loudly: offline is
+    /// a normal state, and the view says what happened.
+    pub async fn sync_official_packs(&self) -> OfficialSyncView {
+        let on = !self.settings.lock().await.official_packs_off;
+        let mut view = OfficialSyncView { on, ..Default::default() };
+        if !on {
+            *self.official_sync.lock().unwrap_or_else(|e| e.into_inner()) = view.clone();
+            return view;
+        }
+        view.checked_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let url = self.official.0.clone();
+        match self.pinned_index(&url).await {
+            Err(e) => view.error = Some(crate::error_text(e)),
+            Ok((index, _)) => {
+                let repo = self.repo_view(url.clone(), Ok((index, None)));
+                for p in repo.packs.iter().filter(|p| p.state == "available" || p.state == "update") {
+                    match self.install_repo_pack(&url, &p.id).await {
+                        Ok(done) if done.replaced || p.state == "update" => view.updated.push(p.id.clone()),
+                        Ok(_) => view.added.push(p.id.clone()),
+                        Err(e) => {
+                            view.error.get_or_insert_with(|| format!("{}: {}", p.id, crate::error_text(e)));
+                        }
+                    }
+                }
+            }
+        }
+        *self.official_sync.lock().unwrap_or_else(|e| e.into_inner()) = view.clone();
+        view
+    }
+
+    pub async fn official_packs_on(&self) -> bool {
+        !self.settings.lock().await.official_packs_off
+    }
+
+    /// Turn the official repository on or off. Off reads nothing from it;
+    /// what it installed stays.
+    pub async fn set_official_packs(&self, on: bool) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        settings.official_packs_off = !on;
+        self.persist(&settings)?;
+        drop(settings);
+        self.official_sync.lock().unwrap_or_else(|e| e.into_inner()).on = on;
+        Ok(())
+    }
+
+    /// What the last [`sync_official_packs`](Self::sync_official_packs) did.
+    pub fn official_sync(&self) -> OfficialSyncView {
+        self.official_sync.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Point the official repository somewhere else, for a test that signed
+    /// its own: a release always reads the constants.
+    #[doc(hidden)]
+    pub fn with_official_repo(self, index_url: &str, key_hex: &str) -> Self {
+        Self { official: std::sync::Arc::new((index_url.to_string(), key_hex.to_string())), ..self }
     }
 }
 
@@ -393,6 +489,7 @@ fn write_beside(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn a_repository_address_is_https_or_this_machine_and_names_its_index() {
@@ -405,9 +502,11 @@ mod tests {
             "https://example.org/p/index.json"
         );
         assert!(check_repo_url("http://127.0.0.1:8000").is_ok());
+        // A folder on this machine is one too: a mirror kept locally.
+        #[cfg(unix)]
+        assert!(check_repo_url("file:///srv/packs/").unwrap().ends_with("/srv/packs/index.json"));
         for bad in [
             "http://example.org/packs",
-            "file:///etc",
             "ftp://x/y",
             "https://x/y?a=b",
             "https://x/y#z",
@@ -497,6 +596,9 @@ mod tests {
         let port = serve(served.path().to_path_buf());
         let url = format!("http://127.0.0.1:{port}/");
         let settings = home.path().join("launcher.json");
+        // These are about repositories a player adds; the official one is
+        // its own test.
+        std::fs::write(&settings, r#"{"official_packs_off":true}"#).unwrap();
         let launcher =
             || Launcher::new(vec![GamePack::sven_coop()]).with_settings_file(settings.clone());
         let l = launcher();
@@ -572,6 +674,63 @@ mod tests {
         assert!(l.pack_repos().await.is_empty());
     }
 
+    /// The official repository: listed first unless turned off, held to its
+    /// key whatever key it was first seen with, and synced — new games
+    /// arrive, a shipped game takes the signed copy, and a list signed by
+    /// anyone else changes nothing. An official game cannot be removed while
+    /// the repository would only send it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_official_repository_is_on_by_default_held_to_its_key_and_synced() {
+        let packs_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let served = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for f in ["half-life.toml", "sven-coop.toml"] {
+            std::fs::copy(packs_src.join(f), served.path().join(f)).unwrap();
+            let bytes = std::fs::read(served.path().join(f)).unwrap();
+            let sig = PackSignature::sign(
+                &bytes,
+                &prns_core::identity::PrivateIdentityMaterial::from_slice(&[9; 64]).unwrap(),
+                SystemTime::now() - Duration::from_secs(60),
+                Duration::from_secs(game_bridge::repo::PACK_SIGNATURE_DAYS * 86_400),
+            )
+            .unwrap();
+            std::fs::write(served.path().join(format!("{f}{SIGNATURE_SUFFIX}")), sig.to_toml()).unwrap();
+        }
+        build(served.path());
+        sign_index(served.path(), 9);
+        let key = hex::encode(
+            prns_core::identity::PrivateIdentityMaterial::from_slice(&[9; 64])
+                .unwrap()
+                .public()
+                .identity_hash()
+                .as_bytes(),
+        );
+        let url = check_repo_url(&served.path().to_string_lossy()).unwrap();
+        let l = Launcher::new(vec![GamePack::sven_coop()])
+            .with_settings_file(home.path().join("launcher.json"))
+            .with_official_repo(&url, &key);
+        // The key is first-party only for the real project key; a test key
+        // reads as signed community at most, which is enough to see it held.
+        assert_eq!(l.pack_repos().await, vec![url.clone()], "on by default, first");
+
+        let first = l.sync_official_packs().await;
+        assert!(first.error.is_none(), "{first:?}");
+        assert_eq!(first.added, vec!["half-life".to_string()]);
+        assert_eq!(first.updated, vec!["sven-coop".to_string()], "the shipped game takes the signed copy");
+        assert!(l.list_games().iter().any(|g| g.id == "half-life"));
+        let again = l.sync_official_packs().await;
+        assert!(again.added.is_empty() && again.updated.is_empty(), "{again:?}");
+
+        // Re-signed by someone else: refused, nothing touched.
+        sign_index(served.path(), 4);
+        let refused = l.sync_official_packs().await;
+        assert!(refused.error.is_some(), "{refused:?}");
+
+        l.remove_pack_repo(&url).await.unwrap();
+        assert!(l.pack_repos().await.is_empty());
+        assert!(!l.sync_official_packs().await.on);
+    }
+
     fn sign_index(dir: &std::path::Path, seed: u8) {
         let key = prns_core::identity::PrivateIdentityMaterial::from_slice(&[seed; 64]).unwrap();
         let bytes = std::fs::read(dir.join(repo::INDEX_FILE)).unwrap();
@@ -599,6 +758,7 @@ mod tests {
         build(served.path());
         sign_index(served.path(), 3);
         let url = format!("http://127.0.0.1:{}/", serve(served.path().to_path_buf()));
+        std::fs::write(home.path().join("launcher.json"), r#"{"official_packs_off":true}"#).unwrap();
         let l = Launcher::new(vec![GamePack::sven_coop()])
             .with_settings_file(home.path().join("launcher.json"));
         let view = l.add_pack_repo(&url).await.unwrap();

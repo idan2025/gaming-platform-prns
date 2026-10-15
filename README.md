@@ -291,6 +291,24 @@ game-bridge repo build ./my-packs --name "My packs" \
     --identity author.identity                               # writes index.json (+ .sig)
 ```
 
+**The official repository** is `packs/` in this repository, published to
+<https://idan2025.github.io/gaming-platform-prns/> after review, with every
+pack and the list signed by the project key
+(`7a656c1da3347bfcfe6b3981f71099c8`). To add a game to it, open a pull
+request that adds a pack to `packs/`.
+
+To keep a copy — on a LAN with no internet, or to serve it from your own
+host — mirror it. A mirror is an exact, one-way copy: it carries the
+project's signatures unchanged, so it cannot add to or change the list, and
+running it again takes what was published since:
+
+```
+game-bridge repo mirror ./lanthorn-packs          # the official repository
+game-bridge repo mirror <url-or-folder> <dir> --key <signer>   # any signed one
+```
+
+A folder is a repository too: add its path in Lanthorn or Lanthorn Host.
+
 Players add the folder's https address on the launcher's **Games** page, and
 node operators add it under **Add a game…** in Lanthorn Host. A pack is
 installed only if its bytes are the ones the list names and its signature,

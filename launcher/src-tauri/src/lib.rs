@@ -593,6 +593,27 @@ async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, Stri
 }
 
 #[tauri::command]
+async fn sync_official_packs(
+    state: tauri::State<'_, AppState>,
+) -> Result<launcher_core::repo::OfficialSyncView, String> {
+    Ok(state.launcher.sync_official_packs().await)
+}
+
+#[tauri::command]
+async fn set_official_packs(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.launcher.set_official_packs(on).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn official_packs(
+    state: tauri::State<'_, AppState>,
+) -> Result<launcher_core::repo::OfficialSyncView, String> {
+    let mut view = state.launcher.official_sync();
+    view.on = state.launcher.official_packs_on().await;
+    Ok(view)
+}
+
+#[tauri::command]
 async fn pack_repos(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<launcher_core::repo::PackRepoView>, String> {
@@ -930,6 +951,9 @@ pub fn run() {
             set_hosted_chat,
             mute_in_hosted_chat,
             pack_repos,
+            sync_official_packs,
+            set_official_packs,
+            official_packs,
             add_pack_repo,
             remove_pack_repo,
             install_repo_pack,

@@ -162,3 +162,36 @@ fn an_existing_signature_is_not_replaced_without_force() {
     forced.push("--force");
     assert!(run(&forced).status.success());
 }
+
+/// The publish job's path, through the real binary: sign every pack, build a
+/// signed list, and mirror it held to the signing key. `repo build` once
+/// left its list in a hidden partial file and never renamed it into place —
+/// every in-process test passed, and no repository it built could be read.
+#[test]
+fn a_repository_built_and_signed_by_the_cli_mirrors_exactly() {
+    let dir = scratch("repo");
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::rename(dir.join("pack.toml"), repo.join("sven-coop.toml")).unwrap();
+    let key = dir.join("key");
+    let k = key.to_str().unwrap();
+    let signed = run(&["sign", repo.join("sven-coop.toml").to_str().unwrap(), "--identity", k]);
+    assert!(signed.status.success(), "{}", stderr(&signed));
+    let built = run(&["repo", "build", repo.to_str().unwrap(), "--identity", k]);
+    assert!(built.status.success(), "{}", stderr(&built));
+    assert!(repo.join("index.json").is_file(), "the list is where a reader looks");
+    let signer = stdout(&built)
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|w| w.len() == 32 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("repo build names its signer")
+        .to_string();
+
+    let out = dir.join("mirror");
+    let m = run(&["repo", "mirror", repo.to_str().unwrap(), out.to_str().unwrap(), "--key", &signer]);
+    assert!(m.status.success(), "{}", stderr(&m));
+    for f in ["index.json", "index.json.sig", "sven-coop.toml", "sven-coop.toml.sig"] {
+        assert_eq!(std::fs::read(out.join(f)).unwrap(), std::fs::read(repo.join(f)).unwrap(), "{f}");
+    }
+    let wrong = run(&["repo", "mirror", repo.to_str().unwrap(), dir.join("other").to_str().unwrap(), "--key", &"0".repeat(32)]);
+    assert!(!wrong.status.success(), "a list held to another key is refused");
+}

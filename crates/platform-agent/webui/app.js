@@ -987,6 +987,65 @@ async function afterImport(res) {
   else if (!p.runnable) msg += " It needs a runtime in agent.toml before a server can start.";
   toast(msg);
 }
+// ---------- the official pack repository (official.rs) ----------
+//
+// On unless the operator turns it off: new games arrive by themselves, and a
+// pack is never replaced while a server of its game exists.
+async function loadOfficial() {
+  try { state.official = await api("GET", "/packs/official"); } catch (_) { state.official = null; }
+  renderOfficial();
+}
+function renderOfficial() {
+  const row = $("official-row");
+  if (!row) return;
+  const o = state.official;
+  row.classList.toggle("hidden", !o);
+  if (!o) return;
+  row.textContent = "";
+  const text = el("div", "official-text");
+  text.appendChild(el("strong", null, o.on ? "Official packs: on" : "Official packs: off"));
+  const bits = [];
+  if (!o.on) bits.push("new games from the Lanthorn project do not arrive");
+  else {
+    bits.push(o.checked_unix ? "checked " + ago(o.checked_unix) : "not checked yet");
+    if ((o.added || []).length) bits.push("new: " + o.added.join(", "));
+    if ((o.updated || []).length) bits.push("updated: " + o.updated.join(", "));
+    if ((o.waiting || []).length) bits.push("waiting for their servers to go: " + o.waiting.join(", "));
+    if (o.error) bits.push("could not read it: " + o.error);
+  }
+  text.appendChild(el("span", "muted small", " · " + bits.join(" · ")));
+  row.appendChild(text);
+  const actions = el("div", "official-actions");
+  if (o.on) {
+    const now = el("button", "btn btn-small", "Check now");
+    now.type = "button";
+    now.addEventListener("click", async () => {
+      now.disabled = true; now.textContent = "Checking…";
+      try {
+        state.official = await withInFlight(api("POST", "/packs/official/sync"));
+        const games = await api("GET", "/games");
+        state.games = Array.isArray(games) ? games : [];
+        renderGames();
+        clearError();
+        const n = (state.official.added || []).length + (state.official.updated || []).length;
+        toast(n ? n + " pack(s) taken from the official repository." : "The official packs are up to date.");
+      } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Could not check."); }
+      renderOfficial();
+    });
+    actions.appendChild(now);
+  }
+  const flip = el("button", "btn btn-small", o.on ? "Turn off" : "Turn on");
+  flip.type = "button";
+  flip.title = o.on ? "Stop taking packs from the Lanthorn project. What is here stays." : "Take new and updated packs from the Lanthorn project.";
+  flip.addEventListener("click", async () => {
+    try { state.official = await withInFlight(api("PUT", "/packs/official", { on: !o.on })); clearError(); }
+    catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not change."); }
+    renderOfficial();
+  });
+  actions.appendChild(flip);
+  row.appendChild(actions);
+}
+
 function openAddGameDialog() {
   openModal("add-game-dialog", null, (body, close) => {
     body.appendChild(el("h3", null, "Add a game"));
@@ -3330,7 +3389,7 @@ function setActiveTab(name) {
   // Fetched on entry rather than polled: rare to change, never stale when
   // the operator is looking.
   if (name === "interfaces") loadInterfaces();
-  if (name === "games") renderGames();
+  if (name === "games") { renderGames(); loadOfficial(); }
   if (name === "servers") pollUsage();
   if (name === "installed") pollInstalled();
 }

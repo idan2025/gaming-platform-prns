@@ -455,3 +455,8 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .chat-line { font-size: 13.5px; line-height: 1.4; }
 .chat-form { display: flex; gap: 8px; }
 .chat-form .field { flex: 1; min-width: 0; }
+
+/* ---------- official pack repository ---------- */
+.official-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 10px 14px; margin: 0 0 14px; border: 1px solid var(--line); border-radius: 10px; }
+.official-row.hidden { display: none; }
+.official-actions { display: flex; gap: 8px; }

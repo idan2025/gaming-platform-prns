@@ -505,12 +505,22 @@ impl AgentConfig {
     /// docs for why the permissive reading is the one a missing section gets.
     /// Keys are already known to be well-formed hex by `validate`, so a
     /// key that fails to parse here cannot come from a successful `load`.
+    ///
+    /// The project key (`signing::PROJECT_KEY_HEX`) is always first-party:
+    /// it signs the official repository, which a node reads by default, and
+    /// the release that runs here comes from the same project.
     pub fn pack_trust_policy(&self) -> TrustPolicy {
+        let project = game_bridge::signing::project_key();
         let Some(cfg) = &self.pack_trust else {
-            return TrustPolicy::allowing_unsigned();
+            return TrustPolicy::allowing_unsigned().with_first_party(project);
         };
+        let mut first_party: Vec<_> =
+            cfg.first_party_keys.iter().filter_map(|k| identity_hash(k)).collect();
+        if !first_party.contains(&project) {
+            first_party.push(project);
+        }
         TrustPolicy {
-            first_party_keys: cfg.first_party_keys.iter().filter_map(|k| identity_hash(k)).collect(),
+            first_party_keys: first_party,
             trusted_keys: cfg.trusted_keys.iter().filter_map(|k| identity_hash(k)).collect(),
             allow_unsigned: cfg.allow_unsigned,
         }
@@ -728,7 +738,8 @@ cpus = 1.5
         let policy = cfg.pack_trust_policy();
         assert!(!policy.allow_unsigned);
         assert_eq!(policy.trusted_keys.len(), 1);
-        assert!(policy.first_party_keys.is_empty());
+        // The project key is the one first-party key a section need not name.
+        assert_eq!(policy.first_party_keys, vec![game_bridge::signing::project_key()]);
     }
 
     #[test]

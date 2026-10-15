@@ -60,6 +60,23 @@ pub const SIGNATURE_SCHEMA_VERSION: u32 = 1;
 /// Suffix appended to a pack's file name to find its signature.
 pub const SIGNATURE_SUFFIX: &str = ".sig";
 
+/// The project's key: what signs the official pack repository's list and
+/// every pack in it (`.github/workflows/packs.yml`). A launcher and a node
+/// hold the official repository to it, and a mirror is an exact copy only
+/// because it carries this key's signatures unchanged (`repo::mirror`).
+///
+/// **Changing it strands every installed launcher's official repository**
+/// until they update, as the updater key does (`RELEASE.md`). The secret is
+/// the `PACK_SIGNING_IDENTITY` repository secret, with an offline copy.
+pub const PROJECT_KEY_HEX: &str = "7a656c1da3347bfcfe6b3981f71099c8";
+
+/// [`PROJECT_KEY_HEX`] as an identity hash.
+pub fn project_key() -> IdentityHash {
+    let mut b = [0u8; 16];
+    hex::decode_to_slice(PROJECT_KEY_HEX, &mut b).expect("PROJECT_KEY_HEX is 32 hex digits");
+    IdentityHash::new(b)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignatureError {
     Parse(String),

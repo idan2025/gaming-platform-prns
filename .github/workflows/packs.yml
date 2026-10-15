@@ -1,0 +1,84 @@
+name: packs
+
+# Publishes the official pack repository to GitHub Pages: every pack in
+# `packs/`, signed with the project key (`signing::PROJECT_KEY_HEX`), its
+# signed `index.json`, and the website in `site/`. Runs when a pack, the site
+# or the tool that builds them changes on main, and weekly, so signatures are
+# always renewed long before they close: each pack's for 400 days (checked at
+# every load, offline too — `repo::PACK_SIGNATURE_DAYS`), the list's for 60
+# (checked only when it is read online).
+#
+# The key is the `PACK_SIGNING_IDENTITY` secret (base64 of the identity file).
+# The last step mirrors what is about to be published and holds it to the
+# project key, so a wrong secret or a broken list never goes out.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packs/**"
+      - "site/**"
+      - "crates/game-bridge/**"
+      - ".github/workflows/packs.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build game-bridge
+        run: cargo build --quiet -p game-bridge --bin game-bridge
+
+      - name: review, sign and list the packs
+        env:
+          PACK_SIGNING_IDENTITY: ${{ secrets.PACK_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          gb=./target/debug/game-bridge
+          key="$RUNNER_TEMP/pack-signing.identity"
+          printf '%s' "$PACK_SIGNING_IDENTITY" | base64 -d > "$key"
+          trap 'rm -f "$key"' EXIT
+          mkdir -p _site/packs
+          cp packs/*.toml _site/packs/
+          # The same review a pull request had; a refusal stops the publish.
+          "$gb" review --against _site/packs _site/packs/*.toml
+          for f in _site/packs/*.toml; do
+            "$gb" sign "$f" --identity "$key" --days 400 --force
+          done
+          "$gb" repo build _site/packs --name "Lanthorn official packs" --identity "$key" --days 60
+          cp site/* _site/
+          chmod -R a+rX _site
+
+      - name: check it is what a launcher will accept
+        run: ./target/debug/game-bridge repo mirror "$PWD/_site/packs" "$RUNNER_TEMP/check"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

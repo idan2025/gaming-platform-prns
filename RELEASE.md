@@ -76,6 +76,23 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### The official pack repository
+
+- `packs/` is published to <https://idan2025.github.io/gaming-platform-prns/>
+  with a website, every pack and the list signed by the project key, after
+  the same review a pull request gets; weekly, so signatures never lapse.
+- Lanthorn and Lanthorn Host read it by default and take new and updated
+  packs by themselves, every six hours and with **Check now**; either can
+  turn it off. A node never changes a pack while a server of that game
+  exists.
+- `game-bridge repo mirror` makes an exact, one-way copy of a signed
+  repository (the official one by default), and a folder can be added as a
+  repository in Lanthorn and Lanthorn Host.
+- Fixed: `game-bridge repo build` left its list in a hidden partial file.
+- **The project key (`7a656c1da3347bfcfe6b3981f71099c8`) is a release
+  secret like the updater key**: `PACK_SIGNING_IDENTITY` in the repository
+  secrets, and an offline copy. Losing it means re-keying every launcher.
+
 ### Chat on servers
 
 - Players who join a server through Lanthorn can talk to each other and to
