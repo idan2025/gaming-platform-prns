@@ -1823,18 +1823,44 @@ impl ChatOpener {
         let (mut reader, writer) = self.handle.byte_stream(link_id, to_client, to_server).await;
         let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(server_chat::pump_writes(writer, rx));
-        let _ = tx.send(hello);
-        let welcomed = tokio::time::timeout(server_chat::WELCOME_TIMEOUT, async {
-            loop {
-                match server_chat::read_message(&mut reader).await {
-                    Ok(Some(b)) if ChatMessage::decode(&b) == Some(ChatMessage::Welcome) => return true,
-                    Ok(Some(_)) => continue,
-                    _ => return false,
+        // One reader for the link's life: it hands `Welcome` over and applies
+        // everything else, so nothing the server says early is lost.
+        let state = Arc::new(std::sync::Mutex::new(server_chat::ClientChatState {
+            open: true,
+            ..Default::default()
+        }));
+        let (welcome_tx, mut welcome_rx) = mpsc::unbounded_channel::<()>();
+        let reader_state = state.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(b)) = server_chat::read_message(&mut reader).await {
+                match ChatMessage::decode(&b) {
+                    Some(ChatMessage::Welcome) => {
+                        let _ = welcome_tx.send(());
+                    }
+                    Some(msg) => server_chat::client_apply(&reader_state, msg),
+                    None => {}
                 }
             }
-        })
-        .await
-        .unwrap_or(false);
+            reader_state.lock().unwrap_or_else(|e| e.into_inner()).open = false;
+        });
+        // **`Hello` is sent again until it is answered.** The server registers
+        // its chat reader when the link comes up, and stream data that beats
+        // the registration is acknowledged and dropped. Unanswered, the link
+        // would sit unidentified until an open server's identify timeout
+        // (10 s by default) and then be given a game connection — so the
+        // client tries for well under that and closes the link if nothing
+        // answers. Measured on CI: a single Hello lost the race on Linux.
+        let deadline = Instant::now() + server_chat::HELLO_WINDOW;
+        let mut welcomed = false;
+        while Instant::now() < deadline {
+            let _ = tx.send(hello.clone());
+            if let Ok(Some(())) =
+                tokio::time::timeout(server_chat::HELLO_RESEND, welcome_rx.recv()).await
+            {
+                welcomed = true;
+                break;
+            }
+        }
         if !welcomed {
             let _ = self.handle.close_link(link_id);
             anyhow::bail!("the server did not answer chat");
@@ -1843,19 +1869,6 @@ impl ChatOpener {
             let _ = self.handle.close_link(link_id);
             anyhow::bail!("could not identify for chat: {e:?}");
         }
-        let state = Arc::new(std::sync::Mutex::new(server_chat::ClientChatState {
-            open: true,
-            ..Default::default()
-        }));
-        let reader_state = state.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(b)) = server_chat::read_message(&mut reader).await {
-                if let Some(msg) = ChatMessage::decode(&b) {
-                    server_chat::client_apply(&reader_state, msg);
-                }
-            }
-            reader_state.lock().unwrap_or_else(|e| e.into_inner()).open = false;
-        });
         Ok(ChatClient { link_id, handle: self.handle.clone(), tx, state })
     }
 

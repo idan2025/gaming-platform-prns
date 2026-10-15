@@ -71,8 +71,16 @@ pub const MAX_NAMES: usize = 64;
 /// Longest message either side accepts: a full roster, with room.
 pub const MAX_MESSAGE: usize = 8 * 1024;
 
-/// How long a client waits for `Welcome` before giving up on the server.
+/// How long a client waits to hear a server's announce before asking it.
 pub const WELCOME_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a client keeps saying `Hello` before closing the link: well
+/// under a server's default identify timeout (10 s), after which an open
+/// server would start the game for a link that never said what it was.
+pub const HELLO_WINDOW: Duration = Duration::from_secs(5);
+
+/// How often `Hello` is said again while unanswered.
+pub const HELLO_RESEND: Duration = Duration::from_millis(500);
 
 const HELLO: u8 = 0x01;
 const SAY: u8 = 0x02;

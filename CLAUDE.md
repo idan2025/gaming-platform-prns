@@ -910,7 +910,11 @@ Rules a later change could quietly break:
   started (a UDP relay is detached, not closed — `spawn_server_link_relay`
   closes the link only if it still owns it). The server writes chat only to
   links that said `Hello`, stamps lines with the identity the link proved,
-  and gates them per identity. A node's chat is off until the operator turns
+  and **the client repeats `Hello` every 0.5 s for at most 5 s**: a `Hello`
+  that beats the server's reader registration is dropped (CI, Linux), and
+  an unanswered link must close before the 10 s identify timeout hands it a
+  game. The server ignores every `Hello` after the first. It gates lines
+  per identity. A node's chat is off until the operator turns
   it on per server (`chat.json`), loopback API only. Caught by
   `a_chat_link_never_starts_a_game_connection` and
   `a_link_that_never_said_hello_never_receives_chat`.
