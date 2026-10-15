@@ -262,6 +262,7 @@ Pick one, or several:
 | [DESIGN.md](DESIGN.md) | Architecture, components, hard problems and positions on them. |
 | [GAMES.md](GAMES.md) | Nine axes of per-game variation, viability tiers, the game ladder. |
 | [MODES.md](MODES.md) | Dedicated, listen-server, virtual-LAN, and the unsupported case. |
+| [MONETIZATION.md](MONETIZATION.md) | Hosted servers, tiers, and why it is not yet time to charge. |
 | [ENGINE.md](ENGINE.md) | The pinned Prns fork: what it patches, why, and how to move the pin. |
 | [CLAUDE.md](CLAUDE.md) | Instructions for agents working in this repo. |
 

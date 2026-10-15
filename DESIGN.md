@@ -237,17 +237,18 @@ gaming-platform-prns/
 
 ## 7. Open questions
 
-- Node supply: platform-owned hosts only, or user-contributed nodes? Given the
-  decentralized-first rule, user-contributed is the default and platform-owned is
-  the convenience — but that means untrusted agents, which shapes pack signing
-  (`GAMES.md` §6) and any billing model.
+- ~~Node supply: platform-owned hosts only, or user-contributed nodes?~~
+  Decided 2026-10-15: both — free self-hosting, plus project-hosted tiers.
+  `PLAN.md` §10, `MONETIZATION.md`.
 - ~~Does Mode 3 (virtual LAN, `MODES.md`) justify shipping a privileged
   installer?~~ Decided 2026-09-24: yes, as an opt-in separate helper; the
   launcher stays unprivileged. `PLAN.md` §14.
-- Do central-deployed servers get a platform-run Reticulum uplink by default, or
-  must the operator supply one?
-- Monetization — free/open, paid instances, or bring-your-own-node with a paid
-  directory? Affects whether quotas are cosmetic or load-bearing.
+- ~~Do central-deployed servers get a platform-run Reticulum uplink by default,
+  or must the operator supply one?~~ Decided 2026-10-15: the project runs hubs
+  for its hosted servers; self-hosters supply their own. `PLAN.md` §10.
+- ~~Monetization — free/open, paid instances, or bring-your-own-node with a
+  paid directory?~~ Direction decided 2026-10-15: paid hosted servers plus
+  add-ons; quotas become load-bearing per tier. `MONETIZATION.md`.
 - Which games can central actually host? Only anonymous-steamcmd titles are
   legally hostable by the platform; everything else is bring-your-own-node with
   operator-supplied credentials (`GAMES.md` §5). Decide before phase 3.

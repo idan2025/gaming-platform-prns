@@ -674,11 +674,23 @@ not pre-emptively switch; wait for WebView2 to actually bite in testing.
 
 ## 10. Decisions this plan does not make
 
-Carried from `DESIGN.md` §7, still open, listed here so they are not lost:
-node supply (user-contributed is the default under the decentralization rule, so
-agents are untrusted), and monetization.
+Carried from `DESIGN.md` §7. None is fully open any more; what is left is
+numbers and timing, in `MONETIZATION.md`.
 
-Four have since been decided:
+Seven have been decided:
+
+- **Node supply** — decided 2026-10-15: **both.** Self-hosting on one's own
+  hardware is free forever, with whatever hub the operator chooses; the
+  project also runs hosted servers as a monetized platform with tiers,
+  a free one among them. Self-hosting must never get worse for it.
+- **Uplink for hosted servers** — decided 2026-10-15: **the project runs hubs
+  for its hosted servers**, never required by anything else; self-hosters
+  bring their own.
+- **Monetization** — direction decided 2026-10-15: **paid hosted servers plus
+  add-ons**, software free and open, nothing in the protocol. Tiers, the free
+  tier's cleanup and the never-for-sale list are proposals in
+  `MONETIZATION.md`, and so is the assessment that the product is **not yet
+  ready to charge** (§6 there: players first, then a free beta).
 
 - **Whether Mode 3 justifies a privileged installer** — decided 2026-09-24:
   **yes, as an opt-in separate helper**, never by elevating the launcher. §14
