@@ -46,7 +46,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use game_bridge::content::PackContent;
+use game_bridge::content::{PackContent, SteamPlatform};
 use sha2::{Digest, Sha256};
 
 use crate::docker::DockerRuntime;
@@ -93,6 +93,7 @@ struct SteamcmdCopy<'d> {
     dir: PathBuf,
     app_id: u32,
     mod_dir: Option<String>,
+    platform: SteamPlatform,
     docker: &'d DockerRuntime,
 }
 
@@ -163,6 +164,56 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
         Some(hasher.finalize().to_vec())
     };
     matches!((hash(a), hash(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Every argument of one steamcmd run, built here and nowhere else.
+///
+/// The pack supplied a number, perhaps a mod name and a platform word, and
+/// `+login anonymous` is not negotiable: an app that needs credentials is a
+/// `manual` pack (GAMES.md §5). The platform becomes steamcmd's own
+/// `@sSteamCmdForcePlatformType` setting, written here from a fixed list.
+pub fn steamcmd_args(
+    app_id: u32,
+    mod_dir: Option<&str>,
+    platform: SteamPlatform,
+    validate: bool,
+) -> Result<Vec<String>, game_bridge::content::ContentError> {
+    let mut cmd: Vec<String> =
+        vec!["+force_install_dir".into(), TASK_INSTALL_DIR.into(), "+login".into(), "anonymous".into()];
+    // Which depots of a multi-mod app to fetch. Steam app 90 is the case: by
+    // default it installs Half-Life and Counter-Strike, and only `mod czero`
+    // brings Condition Zero as well. The name was validated as an identifier
+    // when the pack loaded and is re-checked here, because "it was validated
+    // elsewhere" is how a shell-shaped string reaches a command line.
+    if let Some(name) = mod_dir {
+        game_bridge::content::validate_mod_name(name)?;
+        cmd.extend(["+app_set_config".into(), app_id.to_string(), "mod".into(), name.into()]);
+    }
+    let force = |cmd: &mut Vec<String>, os: &str| {
+        cmd.push("+@sSteamCmdForcePlatformType".into());
+        cmd.push(os.into());
+    };
+    let update = |cmd: &mut Vec<String>, validate: bool| {
+        cmd.extend(["+app_update".into(), app_id.to_string()]);
+        if validate {
+            cmd.push("validate".into());
+        }
+    };
+    match platform {
+        SteamPlatform::Linux => update(&mut cmd, validate),
+        SteamPlatform::Windows => {
+            force(&mut cmd, "windows");
+            update(&mut cmd, validate);
+        }
+        SteamPlatform::WindowsFirst => {
+            force(&mut cmd, "windows");
+            update(&mut cmd, false);
+            force(&mut cmd, "linux");
+            update(&mut cmd, validate);
+        }
+    }
+    cmd.push("+quit".into());
+    Ok(cmd)
 }
 
 /// What `ensure` did.
@@ -485,7 +536,7 @@ impl Provisioner {
                 let _ = fs::remove_dir_all(&staging);
                 Ok(Provisioned::Installed { dir, bytes: written })
             }
-            PackContent::Steamcmd { app_id, mod_dir } => {
+            PackContent::Steamcmd { app_id, mod_dir, platform } => {
                 if !self.allow_fetch {
                     return Err(ProvisionError::FetchNotPermitted {
                         url: format!("steam app {app_id}"),
@@ -504,7 +555,7 @@ impl Provisioner {
                 }
                 let installed = staging.join("unpacked");
                 fs::create_dir_all(&installed)?;
-                self.run_steamcmd(&staging, &installed, *app_id, mod_dir.as_deref(), true, docker, progress)
+                self.run_steamcmd(&staging, &installed, *app_id, mod_dir.as_deref(), *platform, true, docker, progress)
                     .await?;
                 let bytes = dir_size(&installed);
                 if let Some(parent) = dir.parent() {
@@ -536,7 +587,7 @@ impl Provisioner {
     ) -> Result<Updated, ProvisionError> {
         let c = self.copy_for_steamcmd(from, to, spec, docker, progress).await?;
         let from_build = steam_build_id(&c.installed, c.app_id);
-        self.run_steamcmd(&c.staging, &c.installed, c.app_id, c.mod_dir.as_deref(), false, c.docker, progress)
+        self.run_steamcmd(&c.staging, &c.installed, c.app_id, c.mod_dir.as_deref(), c.platform, false, c.docker, progress)
             .await?;
         let to_build = steam_build_id(&c.installed, c.app_id);
         if from_build.is_some() && from_build == to_build {
@@ -578,7 +629,7 @@ impl Provisioner {
                 .await
                 .map_err(|e| ProvisionError::Io(io::Error::other(e.to_string())))?
         };
-        self.run_steamcmd(&c.staging, &c.installed, c.app_id, c.mod_dir.as_deref(), true, c.docker, progress)
+        self.run_steamcmd(&c.staging, &c.installed, c.app_id, c.mod_dir.as_deref(), c.platform, true, c.docker, progress)
             .await?;
         let to_build = steam_build_id(&c.installed, c.app_id);
         let changed = {
@@ -610,7 +661,7 @@ impl Provisioner {
         progress: Option<&InstallProgress>,
     ) -> Result<SteamcmdCopy<'d>, ProvisionError> {
         spec.validate().map_err(ProvisionError::BadSpec)?;
-        let PackContent::Steamcmd { app_id, mod_dir } = spec else {
+        let PackContent::Steamcmd { app_id, mod_dir, platform } = spec else {
             return Err(ProvisionError::NotUpdatable { driver: spec.driver_name() });
         };
         if !self.allow_fetch {
@@ -665,6 +716,7 @@ impl Provisioner {
             dir,
             app_id: *app_id,
             mod_dir: mod_dir.clone(),
+            platform: *platform,
             docker,
         })
     }
@@ -685,6 +737,7 @@ impl Provisioner {
         installed: &Path,
         app_id: u32,
         mod_dir: Option<&str>,
+        platform: SteamPlatform,
         validate: bool,
         docker: &DockerRuntime,
         progress: Option<&InstallProgress>,
@@ -721,36 +774,7 @@ impl Provisioner {
                 read_only: false,
             },
         ];
-        // Every argument here is built by this code. The pack supplied
-        // one number, and `+login anonymous` is not negotiable: an app
-        // that needs credentials is a `manual` pack (GAMES.md §5).
-        let mut cmd = vec![
-            "+force_install_dir".to_string(),
-            TASK_INSTALL_DIR.to_string(),
-            "+login".to_string(),
-            "anonymous".to_string(),
-        ];
-        // Which depots of a multi-mod app to fetch. Steam app 90 is the
-        // case: by default it installs Half-Life and Counter-Strike,
-        // and only `mod czero` brings Condition Zero as well. The name
-        // was validated as an identifier when the pack loaded
-        // (`content::validate_mod_name`) and is re-checked here,
-        // because "it was validated elsewhere" is how a shell-shaped
-        // string reaches a command line.
-        if let Some(name) = mod_dir {
-            game_bridge::content::validate_mod_name(name)
-                .map_err(ProvisionError::BadSpec)?;
-            cmd.push("+app_set_config".to_string());
-            cmd.push(app_id.to_string());
-            cmd.push("mod".to_string());
-            cmd.push(name.to_string());
-        }
-        cmd.push("+app_update".to_string());
-        cmd.push(app_id.to_string());
-        if validate {
-            cmd.push("validate".to_string());
-        }
-        cmd.push("+quit".to_string());
+        let cmd = steamcmd_args(app_id, mod_dir, platform, validate).map_err(ProvisionError::BadSpec)?;
         let task = staging.file_name().and_then(|n| n.to_str()).unwrap_or("task").to_string();
         // steamcmd fails a fresh install now and then with `ERROR!
         // Failed to install app '<id>' (Missing configuration)`, before
@@ -1549,6 +1573,21 @@ Unloading Steam API...OK
         ContentRef { game_id: "sven-coop".to_string(), version: "5.26".to_string() }
     }
 
+    #[test]
+    fn a_platform_word_becomes_steamcmds_own_setting_and_nothing_else() {
+        let args = |platform, validate| steamcmd_args(222860, None, platform, validate).unwrap().join(" ");
+        assert_eq!(args(SteamPlatform::Linux, true), "+force_install_dir /install +login anonymous +app_update 222860 validate +quit".replace("/install", TASK_INSTALL_DIR));
+        assert!(args(SteamPlatform::Windows, false).ends_with("+@sSteamCmdForcePlatformType windows +app_update 222860 +quit"));
+        // Left 4 Dead 2: the Windows depots first, then the Linux build, and
+        // only the Linux run may validate (never on an update).
+        assert!(args(SteamPlatform::WindowsFirst, true).ends_with(
+            "+@sSteamCmdForcePlatformType windows +app_update 222860 +@sSteamCmdForcePlatformType linux +app_update 222860 validate +quit"
+        ));
+        assert!(!args(SteamPlatform::WindowsFirst, false).contains("validate"));
+        // The mod name is still checked where the line is built.
+        assert!(steamcmd_args(90, Some("czero;quit"), SteamPlatform::Linux, true).is_err());
+    }
+
     #[tokio::test]
     async fn a_manual_pack_names_the_directory_a_human_has_to_fill() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1598,7 +1637,7 @@ Unloading Steam API...OK
         let provisioner = Provisioner::new(layout(&tmp), true, None);
         assert!(matches!(
             provisioner
-                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None }, None)
+                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None, platform: SteamPlatform::Linux }, None)
                 .await,
             Err(ProvisionError::NoSteamcmdImage { app_id: 276060 })
         ));
@@ -1613,7 +1652,7 @@ Unloading Steam API...OK
             Provisioner::new(layout(&tmp), false, Some("example/steamcmd".to_string()));
         assert!(matches!(
             provisioner
-                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None }, None)
+                .ensure(&sven(), &PackContent::Steamcmd { app_id: 276060, mod_dir: None, platform: SteamPlatform::Linux }, None)
                 .await,
             Err(ProvisionError::FetchNotPermitted { .. })
         ));

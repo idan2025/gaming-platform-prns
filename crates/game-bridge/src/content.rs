@@ -105,7 +105,38 @@ pub enum PackContent {
         /// program.
         #[serde(default, rename = "mod")]
         mod_dir: Option<String>,
+        /// Which of the app's builds to fetch (`SteamPlatform`). A word from
+        /// a fixed list that the node turns into steamcmd's own setting; the
+        /// pack never writes the setting.
+        #[serde(default, skip_serializing_if = "SteamPlatform::is_linux")]
+        platform: SteamPlatform,
     },
+}
+
+/// Which build of a Steam app a node fetches.
+///
+/// A dedicated server's Windows build runs under Wine in an image the
+/// operator chose, never one a pack names: this only says which depots to
+/// download (`CLAUDE.md`, "a pack cannot name what runs").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SteamPlatform {
+    /// The Linux build. What every pack fetched before this existed.
+    #[default]
+    Linux,
+    /// The Windows build, for a server with no working Linux one.
+    Windows,
+    /// The Linux build, reached through the Windows one: Left 4 Dead 2's
+    /// server (app 222860) refuses a Linux install with `Invalid platform`
+    /// until the Windows depots are there, then validates as Linux
+    /// (measured 2026-09-30 and again 2026-10-15).
+    WindowsFirst,
+}
+
+impl SteamPlatform {
+    pub fn is_linux(&self) -> bool {
+        *self == Self::Linux
+    }
 }
 
 /// Longest mod name accepted. Every real one is a short directory name
@@ -200,7 +231,7 @@ impl PackContent {
                 }
                 Ok(())
             }
-            Self::Steamcmd { app_id, mod_dir } => {
+            Self::Steamcmd { app_id, mod_dir, .. } => {
                 if *app_id == 0 {
                     return Err(ContentError::BadAppId(*app_id));
                 }
@@ -253,9 +284,9 @@ mod tests {
     /// pack loads rather than when a download starts.
     #[test]
     fn a_steamcmd_mod_is_validated_with_the_rest_of_the_spec() {
-        let ok = PackContent::Steamcmd { app_id: 90, mod_dir: Some("czero".to_string()) };
+        let ok = PackContent::Steamcmd { app_id: 90, mod_dir: Some("czero".to_string()), platform: SteamPlatform::Linux };
         assert!(ok.validate().is_ok());
-        let bad = PackContent::Steamcmd { app_id: 90, mod_dir: Some("../czero".to_string()) };
+        let bad = PackContent::Steamcmd { app_id: 90, mod_dir: Some("../czero".to_string()), platform: SteamPlatform::Linux };
         assert!(matches!(bad.validate(), Err(ContentError::BadModName(_))));
     }
 
@@ -344,9 +375,25 @@ mod tests {
             app_id = 276060
         "#;
         let content: PackContent = toml::from_str(src).unwrap();
-        assert_eq!(content, PackContent::Steamcmd { app_id: 276060, mod_dir: None });
+        assert_eq!(content, PackContent::Steamcmd { app_id: 276060, mod_dir: None, platform: SteamPlatform::Linux });
         content.validate().unwrap();
         assert!(content.is_automatic());
+    }
+
+    #[test]
+    fn a_steamcmd_platform_is_a_word_from_a_fixed_list() {
+        let parse = |p: &str| toml::from_str::<PackContent>(&format!("driver = \"steamcmd\"\napp_id = 222860\nplatform = \"{p}\"\n"));
+        assert_eq!(
+            parse("windows-first").unwrap(),
+            PackContent::Steamcmd { app_id: 222860, mod_dir: None, platform: SteamPlatform::WindowsFirst }
+        );
+        assert!(matches!(parse("windows").unwrap(), PackContent::Steamcmd { platform: SteamPlatform::Windows, .. }));
+        // Never steamcmd's own words, and never anything to pass through.
+        assert!(parse("macos").is_err());
+        assert!(parse("windows +quit").is_err());
+        // A Linux pack writes no platform, so older builds still read it.
+        let linux = PackContent::Steamcmd { app_id: 90, mod_dir: None, platform: SteamPlatform::Linux };
+        assert!(!serde_json::to_string(&linux).unwrap().contains("platform"));
     }
 
     /// There is no `login` field, and adding one would make every shared pack a
@@ -365,7 +412,7 @@ mod tests {
     #[test]
     fn app_id_zero_is_refused() {
         assert!(matches!(
-            PackContent::Steamcmd { app_id: 0, mod_dir: None }.validate(),
+            PackContent::Steamcmd { app_id: 0, mod_dir: None, platform: SteamPlatform::Linux }.validate(),
             Err(ContentError::BadAppId(0))
         ));
     }
