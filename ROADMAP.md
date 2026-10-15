@@ -24,6 +24,19 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
+## Not working — check needed
+
+Nothing here ships until every part of it works (the user's rule,
+2026-10-15): a game whose console, install or join fails is parked here,
+not shipped with the failing part left out.
+
+| What | Status | What is missing |
+| --- | --- | --- |
+| Zombie Panic! Source (Windows server under Wine) | **not working** | Boots, Steam and VAC, A2S all work; a live map change never reaches the Windows console. Work kept on branch `wip/source-wine` (`images/source-wine/NOTES.md`). |
+| Synergy | **not working** | Its server needs Half-Life 2's paid files, which an anonymous steamcmd cannot fetch (`GAMES.md` §5, licensing). |
+| Nuclear Dawn | **not tried** | Linux depot is empty; the Windows route above, once it works. |
+| Controller and big-screen mode on a Steam Deck (item 10) | **check needed** | Not tried on a real device; to discuss after the other features. |
+
 Recommended first: **1 and 2.** They remove the most friction for a new player:
 nobody stays stuck on an old build, and nobody has to be talked through finding
 a server.
