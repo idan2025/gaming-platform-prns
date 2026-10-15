@@ -76,6 +76,12 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### Quiet over a fullscreen game on Linux
+
+- Lanthorn's desktop notifications now wait while a fullscreen game has
+  the screen on Linux too (X11, and games under XWayland such as Proton's),
+  as they already did on Windows.
+
 ### Getting a game
 
 - A game that is not on this computer has **Install with Steam** in its
