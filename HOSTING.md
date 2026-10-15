@@ -350,7 +350,22 @@ Vikings, and Knights II `pvkii`. Two need care:
 - **Fistful of Frags** maps have their own slot limits; a server with more
   slots than a map allows skips that map. 16 slots was measured to work.
 
-Other Source games can run in this image too, but only these eleven are measured.
+**Left 4 Dead 2** runs in it as `SRCDS_GAME = "left4dead2"`. Its pack
+fetches the Linux server through the Windows one (steamcmd refuses a direct
+Linux install), 9.3 GB:
+
+```toml
+[games.left-4-dead-2]
+image = "gpp/source:1"
+content_root = "/game"
+content_version = "app222860"
+env = { SRCDS_GAME = "left4dead2" }
+```
+
+The image turns off its lobby-only joins so players can connect by address,
+and the game fixes its own slots (4 for a co-op campaign).
+
+Other Source games can run in this image too, but only these twelve are measured.
 Set `SRCDS_GAME` to the game directory, `SRCDS_APP_ID` to the `appID` line of
 its `steam.inf`, and pick a starting map — the image refuses to guess.
 

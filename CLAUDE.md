@@ -314,8 +314,8 @@ in the same shape as `images/goldsrc`, measured against TF2 build 10828683,
 Counter-Strike: Source, Garry's Mod, HL2: Deathmatch, DoD: Source, and six
 non-Valve Source games (`GAMES.md` §9 lists them and the three still blocked). Their
 packs after TF2 were drafted by glm-5.3-flash from a verified fact sheet,
-checked by script and reviewed. Left 4 Dead 2 is deliberately absent:
-`GAMES.md` §9 says why.
+checked by script and reviewed. Left 4 Dead 2 followed on 2026-10-15
+(`GAMES.md` §9 says what it needed).
 Rules a later change could quietly break:
 - **`SteamAppId` must be set, to the app players own** (440 for TF2, the
   `appID` in `tf/steam.inf`). Unset, srcds logs `Unable to load Steam support
@@ -345,6 +345,13 @@ Rules a later change could quietly break:
   load: replay_srv.so`, a file that is there, failing on its dependency.
 - **`tf/cfg` must never be writable** — it ships ~70 files, the map cycle among
   them. The TF2 pack shipped with it and booted fine, never rotating maps.
+- **A pack picks a Steam build by a word, never steamcmd's setting**
+  (`[content] platform`: `linux`, `windows`, `windows-first`). The agent
+  writes `+@sSteamCmdForcePlatformType` itself (`content::steamcmd_args`),
+  and `windows-first` (Left 4 Dead 2) validates only on its Linux pass and
+  never on an update. A Windows server runs under Wine only in an image the
+  operator chose. A pack carrying `platform` does not parse on an older
+  build (`deny_unknown_fields`), which is the safe failure.
 - **steamcmd is retried once on `Missing configuration`**, and on nothing else
   (`content.rs`). Two fresh TF2 installs in three hit it before downloading a
   byte; the same command then succeeded. Caught by

@@ -476,7 +476,7 @@ impl GamePack {
             // anonymously, which is what `steamcmd` requires. Kept in step with
             // `packs/sven-coop.toml`, which
             // `shipped_sven_pack_matches_the_builtin` enforces.
-            content: PackContent::Steamcmd { app_id: 276060, mod_dir: None },
+            content: PackContent::Steamcmd { app_id: 276060, mod_dir: None, platform: Default::default() },
             extra_ports: Vec::new(),
             // Where the 108 shipped maps are, so a node can offer them as a
             // list instead of asking someone to remember a name.
@@ -836,7 +836,7 @@ query = "a2s"
         };
         let hl = get("half-life");
         let cs = get("counter-strike-16");
-        assert_eq!(hl.content, PackContent::Steamcmd { app_id: 90, mod_dir: None });
+        assert_eq!(hl.content, PackContent::Steamcmd { app_id: 90, mod_dir: None, platform: Default::default() });
         assert_eq!(cs.content, hl.content);
         assert_eq!(hl.writable_paths, ["valve/logs"]);
         assert_eq!(cs.writable_paths, ["cstrike/logs"]);
@@ -886,7 +886,7 @@ query = "a2s"
             if pack.bots == Some(PackBots::Zbot) {
                 assert_eq!(
                     pack.content,
-                    PackContent::Steamcmd { app_id: 90, mod_dir: Some("czero".to_string()) },
+                    PackContent::Steamcmd { app_id: 90, mod_dir: Some("czero".to_string()), platform: Default::default() },
                     "{} claims Z-Bot without being the Condition Zero mod",
                     pack.id
                 );

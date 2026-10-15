@@ -1,0 +1,48 @@
+# Left 4 Dead 2 — GAMES.md §9, "Left 4 Dead 2: what it needs". Measured on a
+# node 2026-09-30 and again 2026-10-15; the four needs listed there are what
+# this pack and images/source now carry.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "left-4-dead-2"
+display_name = "Left 4 Dead 2"
+app_name = "left-4-dead-2"
+default_port = 27015
+transport = "udp"
+min_link_class = 2
+query = "a2s"
+
+# 45 maps ship and there is no map cycle: a campaign moves from map to map by
+# itself, and the first campaign's first map is where a server starts.
+maps_dir = "left4dead2/maps"
+
+console = "source"
+
+# Nothing is writable: the server was measured to boot, connect to Steam with
+# VAC on and answer A2S from a read-only copy.
+writable_paths = []
+
+notes = "Source engine (Left 4 Dead branch). Game on UDP 27015 with A2S on the same port, RCON on TCP 27015 beside it. Co-op campaign: A2S reports 4 slots (versus needs 8) whatever the node asks for; the game decides. The operator runs it from images/source with SRCDS_GAME = \"left4dead2\", which turns off lobby-only joins (sv_allow_lobby_connect_only 0) so a player can connect by address, as a bridged player does. Not yet played through the mesh."
+
+[[extra_ports]]
+channel = 1
+name = "rcon"
+port = 27015
+transport = "tcp"
+
+# The dedicated server is app 222860, and steamcmd refuses a Linux install of
+# it with `Invalid platform` until the Windows depots are there.
+# `windows-first` is the node fetching the Windows build and then the Linux
+# one; the server that runs is the Linux srcds (9.3 GB).
+[content]
+driver = "steamcmd"
+app_id = 222860
+platform = "windows-first"
+
+[launch]
+kind = "source"
+steam_app_id = 550
+args = ["+connect {address}", "+password {password}"]

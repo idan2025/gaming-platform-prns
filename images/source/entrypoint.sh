@@ -54,6 +54,7 @@ case "$GAME" in
     bms)       GAME_APP_ID=362890 ;;
     zps)       GAME_APP_ID=17500 ;;
     pvkii)     GAME_APP_ID=17570 ;;
+    left4dead2) GAME_APP_ID=550 ;;
     *)         GAME_APP_ID="" ;;
 esac
 SteamAppId="${SRCDS_APP_ID:-$GAME_APP_ID}"
@@ -79,6 +80,7 @@ if [ -z "$MAP" ]; then
         bms)       MAP="dm_bounce" ;;
         zps)       MAP="zph_pithole" ;;
         pvkii)     MAP="bt_glacier" ;;
+        left4dead2) MAP="c1m1_hotel" ;;
         *)
             echo "No default map for game '$GAME'; the instance must name one." >&2
             exit 1
@@ -120,6 +122,19 @@ case "$GAME" in
 esac
 export BIN
 
+# Settings a game needs before a bridged player can join it, set here from
+# fixed words and never from the environment. Left 4 Dead 2 boots lobby-only
+# (`sv_allow_lobby_connect_only 1`), which refuses a player who connects by
+# address, and an address is exactly how a bridged player arrives
+# (127.0.0.1). The command line takes 0 and the server stays secure
+# (measured 2026-09-30). Expanded unquoted below, so each word stays one
+# argument; nothing here may ever come from outside this file.
+EXTRA=""
+case "$GAME" in
+    left4dead2) EXTRA="+sv_allow_lobby_connect_only 0" ;;
+esac
+export EXTRA
+
 cd "$CONTENT"
 # `$GAME/bin` is what every Source mod's own `srcds_run` puts on the path.
 LD_LIBRARY_PATH="$CONTENT:$CONTENT/bin:$CONTENT/$GAME/bin:${LD_LIBRARY_PATH:-}"
@@ -152,4 +167,4 @@ echo "Starting Source: game=$GAME port=$PORT maxplayers=$MAXPLAYERS map=$MAP app
 # next one, which the node would then publish nothing for. `-e` makes `script`
 # exit with srcds's status, and it passes the SIGTERM of `docker stop` through.
 export PORT MAXPLAYERS GAME MAP NAME
-exec script -qfec 'exec ./"$BIN" -game "$GAME" -port "$PORT" -strictportbind +maxplayers "$MAXPLAYERS" +map "$MAP" +hostname "\"$NAME\""' /dev/null
+exec script -qfec 'exec ./"$BIN" -game "$GAME" -port "$PORT" -strictportbind +maxplayers "$MAXPLAYERS" $EXTRA +map "$MAP" +hostname "\"$NAME\""' /dev/null

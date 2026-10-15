@@ -248,8 +248,9 @@ Every one of these is a `.toml` and, for Source, an operator image. `query =
   each booted in `images/source` secure and answering as its own app (240,
   4000). ~~HL2 Deathmatch, Day of Defeat: Source~~ shipped the same day
   (`packs/half-life-2-deathmatch.toml`, `packs/day-of-defeat-source.toml`;
-  apps 320, 300). **Left 4 Dead 2 is not data** — see "Left 4 Dead 2: what it
-  needs" below.
+  apps 320, 300). ~~Left 4 Dead 2~~ **shipped 2026-10-15**
+  (`packs/left-4-dead-2.toml`) once needs 1–3 below were built — see "Left 4
+  Dead 2: what it needs".
 - **Non-Valve games on Source** — the cheapest non-Valve wins in the whole
   list, because they inherit A2S, the `source` console and the Source launch
   kind. **All of them are Mode 1** (`MODES.md`): a dedicated server players join
@@ -279,6 +280,16 @@ needs its `SRCDS_APP_ID` (the `appID` in its `steam.inf`) and a starting map
 until it is measured and given defaults.
 
 ### Left 4 Dead 2: what it needs
+
+**Built 2026-10-15** (needs 1–3; need 4 is still nobody's to have checked).
+The steamcmd driver has a typed `platform` (`linux`, `windows`,
+`windows-first`; `game_bridge::content::SteamPlatform`), and the pack says
+`windows-first`, which the node turns into the command below
+(`content::steamcmd_args`). Measured again: `Invalid platform` on a plain
+Linux install, then `Success! App '222860' fully installed.` both ways, 9.3
+GB. `images/source` knows `left4dead2` (app 550, `c1m1_hotel`) and passes
+`+sv_allow_lobby_connect_only 0`; it boots secure from a read-only copy and
+answers A2S as `Left 4 Dead 2`, app 550, 0/4.
 
 Measured 2026-09-30 on a node, and deliberately not shipped. Everything below
 was seen, not assumed; the last item is the one nobody here could check.

@@ -25,7 +25,7 @@
 //!
 //! Every check finds its subject by property, never by a game's id.
 
-use crate::content::PackContent;
+use crate::content::{PackContent, SteamPlatform};
 use crate::lan_filter;
 use crate::pack::{GamePack, PackLanInbound};
 
@@ -284,6 +284,13 @@ pub fn review(pack: &GamePack, others: &[GamePack]) -> Vec<Finding> {
         ),
         _ => {}
     }
+    if let PackContent::Steamcmd { platform: SteamPlatform::Windows, .. } = &pack.content {
+        add(
+            Review,
+            "content.platform",
+            "fetches the Windows server, which runs under Wine on a node that chose a Wine image: check the Linux build really does not work, and that it was run under Wine".into(),
+        );
+    }
 
     // Ports.
     if let Some(lan) = &pack.lan {
@@ -463,7 +470,7 @@ mod tests {
         assert!(refused(&p, &[]).is_empty());
 
         let (_, mut p) = base();
-        p.content = PackContent::Steamcmd { app_id: 4_000_000, mod_dir: None };
+        p.content = PackContent::Steamcmd { app_id: 4_000_000, mod_dir: None, platform: Default::default() };
         assert!(review(&p, &all).iter().any(|f| f.field == "content.app_id"));
     }
 }
