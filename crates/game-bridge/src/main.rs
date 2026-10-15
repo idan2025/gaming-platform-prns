@@ -37,6 +37,7 @@ usage: game-bridge server <game-id> [options]
        game-bridge sign   <pack.toml> [options]
        game-bridge verify <pack.toml> [options]
        game-bridge repo build <dir> [--name NAME] [--identity PATH [--days N]]
+       game-bridge repo mirror [<source>] <dir> [--key HEX]
        game-bridge review <pack.toml>... [--against DIR] [--markdown]
        game-bridge --help | --version
 
@@ -55,7 +56,10 @@ roles (PLAN.md §1)
   verify   check the signature beside a pack, and say which tier it earns
   repo     write the index.json that makes a directory of packs a repository
            a launcher can add (PLAN.md §13.3 step 6); serve the directory
-           from any web host
+           from any web host. `repo mirror` copies a signed repository
+           (the official one when no source is given) into a folder, exactly
+           and one way: run it again to take what was added since. Serve the
+           folder from any web host, or add it in a launcher or node as is
   review   name what a person must read in a pack before sharing or merging
            it, and refuse what no honest pack needs; exits 1 on a refusal.
            --against DIR compares with the packs it would sit beside. A pack
@@ -668,7 +672,8 @@ fn repo_cli(rest: &[String]) -> Result<()> {
     let mut it = rest.iter();
     match it.next().map(String::as_str) {
         Some("build") => {}
-        _ => bail!("game-bridge repo takes `build <dir>`\n\n{USAGE}"),
+        Some("mirror") => return repo_mirror_cli(&rest[1..]),
+        _ => bail!("game-bridge repo takes `build <dir>` or `mirror [<source>] <dir>`\n\n{USAGE}"),
     }
     let mut dir: Option<PathBuf> = None;
     let mut name: Option<String> = None;
@@ -695,6 +700,7 @@ fn repo_cli(rest: &[String]) -> Result<()> {
     let path = dir.join(game_bridge::repo::INDEX_FILE);
     let staging = dir.join(".index.json.partial");
     std::fs::write(&staging, &json).with_context(|| format!("writing {}", staging.display()))?;
+    std::fs::rename(&staging, &path).with_context(|| format!("writing {}", path.display()))?;
     // A signed index lets a launcher notice the list changing hands: it pins
     // the key it first saw. Written after the index, and removed when this
     // build is unsigned, so a signature never sits beside another list.
@@ -728,6 +734,49 @@ fn repo_cli(rest: &[String]) -> Result<()> {
         index.name,
         index.packs.len(),
         path.display()
+    );
+    Ok(())
+}
+
+/// `game-bridge repo mirror [<source>] <dir> [--key HEX]`: an exact, one-way
+/// copy of a signed repository (`repo::mirror`). With one path, the source is
+/// the official repository and the key the project's.
+fn repo_mirror_cli(rest: &[String]) -> Result<()> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut key: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--key" => key = Some(value(&mut it, "--key")?),
+            other if other.starts_with('-') => {
+                bail!("unknown option {other:?} for game-bridge repo mirror\n\n{USAGE}")
+            }
+            other => paths.push(other.to_string()),
+        }
+    }
+    let (source, dir) = match paths.as_slice() {
+        [dir] => (game_bridge::repo::OFFICIAL_REPOSITORY.to_string(), PathBuf::from(dir)),
+        [source, dir] => (source.clone(), PathBuf::from(dir)),
+        _ => bail!("game-bridge repo mirror takes [<source>] <dir>\n\n{USAGE}"),
+    };
+    let key = match key {
+        None => game_bridge::signing::project_key(),
+        Some(hex_key) => {
+            let mut b = [0u8; 16];
+            hex::decode_to_slice(hex_key.trim(), &mut b)
+                .map_err(|_| anyhow!("--key is an identity hash, 32 hex digits"))?;
+            prns_core::identity::IdentityHash::new(b)
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let report = runtime.block_on(game_bridge::repo::mirror(&source, &dir, key))?;
+    println!(
+        "{}: {} pack(s) in {}, {} new or changed{}",
+        report.name,
+        report.packs,
+        dir.display(),
+        report.changed.len(),
+        if report.changed.is_empty() { String::new() } else { format!(" ({})", report.changed.join(", ")) }
     );
     Ok(())
 }

@@ -899,6 +899,8 @@ dependencies = [
  "libc",
  "personal-rns",
  "prns-core",
+ "reqwest 0.13.5",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -907,6 +909,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "windows-sys 0.61.2",
 ]
 

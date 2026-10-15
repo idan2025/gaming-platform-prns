@@ -23,22 +23,18 @@
 //!   `PLAN.md` §13.1, whatever repository it came from.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use game_bridge::pack::TrustedPack;
-use game_bridge::repo::{self, beside, check_repo_url, RepoIndex, MAX_INDEX_BYTES, MAX_PACK_BYTES};
+use game_bridge::repo::{self, beside, check_repo_url, RepoIndex, MAX_PACK_BYTES};
 use game_bridge::signing::{verify_pack, PackSignature, TrustPolicy, SIGNATURE_SUFFIX};
 use game_bridge::GamePack;
 use serde::Serialize;
 
 use crate::Launcher;
 
-/// How long one fetch may take.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Largest signature file fetched. One is a few hundred bytes.
-const MAX_SIG_BYTES: usize = 16 * 1024;
+use game_bridge::repo::MAX_SIG_BYTES;
 
 /// One repository, as the Packs view shows it.
 #[derive(Debug, Clone, Serialize)]
@@ -80,60 +76,15 @@ pub struct InstalledPackView {
 }
 
 async fn fetch(url: &str, max: usize) -> Result<Vec<u8>> {
-    // The shell's updater also uses rustls with ring; whichever installs the
-    // provider first wins, and the other's attempt is a harmless error.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-    let mut response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
-    if !response.status().is_success() {
-        bail!("{url} answered {}", response.status());
-    }
-    if response.content_length().is_some_and(|n| n as usize > max) {
-        bail!("{url} is over {max} bytes");
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.with_context(|| format!("reading {url}"))? {
-        body.extend_from_slice(&chunk);
-        if body.len() > max {
-            bail!("{url} is over {max} bytes");
-        }
-    }
-    Ok(body)
+    repo::fetch(url, max).await
 }
 
 /// The index at `url` and who signed it, if anyone: `index.json.sig` beside
 /// it, under the index domain. A signature that is there and does not verify
-/// is an error, never an unsigned list.
+/// is an error, never an unsigned list (`repo::read_index`).
 async fn fetch_index(url: &str) -> Result<(RepoIndex, Option<String>)> {
-    let bytes = fetch(url, MAX_INDEX_BYTES).await?;
-    let index = RepoIndex::parse(&bytes)?;
-    let sig_url = format!("{url}{SIGNATURE_SUFFIX}");
-    let signer = match fetch_optional(&sig_url, MAX_SIG_BYTES).await? {
-        None => None,
-        Some(sig) => {
-            let text =
-                String::from_utf8(sig).map_err(|_| anyhow!("the list's signature is not text"))?;
-            let sig = PackSignature::parse(&text)
-                .map_err(|e| anyhow!("the list's signature is unreadable: {e}"))?;
-            let who = sig.verify_index(&bytes, SystemTime::now()).map_err(|e| {
-                anyhow!("the repository's list has a signature that does not hold: {e}")
-            })?;
-            Some(hex::encode(who.as_bytes()))
-        }
-    };
-    Ok((index, signer))
-}
-
-/// As [`fetch`], with a 404 meaning "not there".
-async fn fetch_optional(url: &str, max: usize) -> Result<Option<Vec<u8>>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-    let response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    drop(response);
-    fetch(url, max).await.map(Some)
+    let read = repo::read_index(url).await?;
+    Ok((read.index, read.signature.map(|(who, _)| hex::encode(who.as_bytes()))))
 }
 
 impl Launcher {
@@ -393,6 +344,7 @@ fn write_beside(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn a_repository_address_is_https_or_this_machine_and_names_its_index() {
@@ -405,9 +357,11 @@ mod tests {
             "https://example.org/p/index.json"
         );
         assert!(check_repo_url("http://127.0.0.1:8000").is_ok());
+        // A folder on this machine is one too: a mirror kept locally.
+        #[cfg(unix)]
+        assert!(check_repo_url("file:///srv/packs/").unwrap().ends_with("/srv/packs/index.json"));
         for bad in [
             "http://example.org/packs",
-            "file:///etc",
             "ftp://x/y",
             "https://x/y?a=b",
             "https://x/y#z",

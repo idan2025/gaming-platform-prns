@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lanthorn game packs</title>
+<meta name="description" content="The official, reviewed game packs for Lanthorn, signed with the project key. Add them, mirror them, or keep them offline.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Lanthorn</p>
+    <h1>Game packs</h1>
+    <p class="lede">A pack tells Lanthorn how a game talks: its ports, its query, where its files come from. It never names a program to run.
+      These are the official packs, reviewed before they are merged and signed with the project key.</p>
+    <p class="meta"><span id="count">Loading…</span> · <a href="packs/index.json">index.json</a> · <a href="https://github.com/idan2025/gaming-platform-prns/tree/main/packs">source</a></p>
+  </div>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>Packs</h2>
+    <div id="packs" class="grid" aria-live="polite"></div>
+    <p id="error" class="error" hidden></p>
+  </section>
+
+  <section class="cols">
+    <article>
+      <h2>Use them</h2>
+      <p>Lanthorn and Lanthorn Host read this repository by default, and pick up a pack the day it is published. Its address is:</p>
+      <pre><code id="repo-url">https://idan2025.github.io/gaming-platform-prns/packs/</code></pre>
+      <p>Every list and pack is signed by the project key, and Lanthorn refuses a list this key did not sign:</p>
+      <pre><code>7a656c1da3347bfcfe6b3981f71099c8</code></pre>
+    </article>
+    <article>
+      <h2>Mirror them</h2>
+      <p>A mirror is an exact, one-way copy. It cannot add to or change the official list: the signatures it carries are the project's, so an edited file fails them everywhere.</p>
+      <pre><code>game-bridge repo mirror ./lanthorn-packs</code></pre>
+      <p>Run it again to take what was published since. Serve the folder from any web host, or add the folder itself in Lanthorn or Lanthorn Host to work with no internet at all.</p>
+    </article>
+    <article>
+      <h2>Add a game</h2>
+      <p>Open a pull request that adds a <code>.toml</code> to <code>packs/</code>. CI runs <code>game-bridge review</code> on it, which refuses what no honest pack needs, and a maintainer reads the rest. Once merged it is signed and published here.</p>
+      <p>Passing review does not make a pack safe; the format does: a pack cannot name a program, and its launch arguments start the player's own game without a shell.</p>
+    </article>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <p>Lanthorn is a decentralized server browser over Reticulum. <a href="https://github.com/idan2025/gaming-platform-prns">GitHub</a></p>
+</footer>
+<script src="site.js"></script>
+</body>
+</html>

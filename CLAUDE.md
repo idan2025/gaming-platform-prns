@@ -718,6 +718,23 @@ later change could quietly break:
   flagged for a person. Never describe a passing pack as safe or let a
   refusal stand in for the format's own limits. `no_shipped_pack_is_refused`
   keeps it honest: a check that refuses a shipped pack is a wrong check.
+- **The official repository is `packs/`, published by `packs.yml` and
+  signed by the project key** (`signing::PROJECT_KEY_HEX`, secret
+  `PACK_SIGNING_IDENTITY`, offline copy with the maintainer). The job reviews
+  the packs again, signs each and the list for 60 days, and refuses to
+  publish anything `repo mirror` would not accept under that key; it runs
+  weekly so signatures never lapse. Changing the key strands every
+  launcher's official repository, like the updater key.
+- **A mirror is exact and one way** (`repo::mirror`): only a list signed by
+  the key it is held to, every pack's digest and signature checked, and the
+  same bytes written — list and signature unchanged — and nothing else, so a
+  reader checks a mirror against the same key as the source. Built beside and
+  swapped in. `a_mirror_is_an_exact_one_way_copy_held_to_one_key` and the
+  CLI's `a_repository_built_and_signed_by_the_cli_mirrors_exactly` (which
+  caught `repo build` never renaming its list into place).
+- **A folder is a repository** (`file://` or an absolute path,
+  `repo::check_repo_url`), read through the same `repo::fetch` and the same
+  checks as https.
 - **One HTTP stack.** `launcher-core` uses the same reqwest 0.13 and rustls
   with ring the Tauri updater brings; do not add a second TLS stack.
 
