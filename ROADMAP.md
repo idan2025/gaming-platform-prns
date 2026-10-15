@@ -149,7 +149,9 @@ open or a server is joined, with a one-time note saying so; otherwise it
 quits. Desktop notifications for a favorite coming up, someone joining your
 room, a failed room check and an update found at start, with a switch in
 Settings; skipped while the window is in front, and held back while a game
-is fullscreen on Windows (`desktop.rs`); Linux desktops and macOS do it themselves.
+is fullscreen: on Windows from the shell, on Linux from the window manager's
+`_NET_WM_STATE_FULLSCREEN` on the active window (X11 and XWayland, `desktop.rs`);
+macOS decides itself.
 
 ## 6. Chat and player names in rooms
 

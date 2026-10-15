@@ -461,7 +461,10 @@ has gone. Rules a later change could quietly break:
   launcher. Without a tray (Linux with no appindicator library, which panics
   in `libappindicator-sys`; caught) closing always quits: a hidden window with
   no icon would be unreachable. Notifications are opt-out, plain text, and
-  skipped while the window is in front, where the toast says it.
+  skipped while the window is in front, where the toast says it, and while
+  a fullscreen game has the screen (`desktop.rs`: Windows' shell state; on
+  Linux `xprop` in **its own process**, never Xlib in the launcher's, whose
+  error handler GTK owns; `tests/fullscreen_x11.rs` under Xvfb).
 - **Never hold the session lock across a network round trip.** A detail probe
   did, for a whole link timeout, and froze the list, the status and Remove
   behind it. Probes and traces clone the handle (`probe_details_via`).
