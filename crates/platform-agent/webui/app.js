@@ -960,8 +960,8 @@ function buildGameCard(g) {
     // Nothing here can download a manual game: the button looks again.
     installBtn.textContent = "";
     installBtn.title = "Look for the files again once they are in place";
-    installBtn.dataset.label = "Check again";
-    installBtn.appendChild(el("span", null, "Check again"));
+    installBtn.dataset.label = "Recheck";
+    installBtn.appendChild(el("span", null, "Recheck"));
     installBtn.addEventListener("click", recheckGames);
   } else {
     installBtn.addEventListener("click", () => onInstall(g.id));
@@ -1070,8 +1070,38 @@ function renderOfficial() {
     if (o.error) bits.push("could not read it: " + o.error);
   }
   text.appendChild(el("span", "muted small", " · " + bits.join(" · ")));
+  // Seeding (official.rs): an exact mirror, served on the mesh through this
+  // node's hub, so launchers and nodes with no internet still get the packs.
+  const sd = o.seed || {};
+  const seedBits = [];
+  if (!sd.on) seedBits.push("not shared on the mesh");
+  else {
+    seedBits.push(sd.address ? "shared on the mesh" + (sd.packs != null ? " (" + sd.packs + " packs)" : "") : "sharing on the mesh starts with the next check");
+    if (sd.mirrored_unix) seedBits.push("copied " + ago(sd.mirrored_unix));
+    if (sd.error) seedBits.push(sd.error);
+  }
+  const seedLine = el("div", "muted small", seedBits.join(" · "));
+  if (sd.address) seedLine.title = "Its address: " + sd.address;
+  text.appendChild(seedLine);
   row.appendChild(text);
   const actions = el("div", "official-actions");
+  const share = el("button", "btn btn-small", sd.on ? "Stop sharing" : "Share on the mesh");
+  share.type = "button";
+  share.title = sd.on
+    ? "Stop serving the official packs on the mesh. The copy stays in mirrors/official."
+    : "Keep an exact copy of the official packs and serve it on the mesh, so launchers and nodes without internet still get them. Only the project's signed files are served.";
+  share.addEventListener("click", async () => {
+    share.disabled = true; share.textContent = sd.on ? "Stopping…" : "Copying…";
+    try {
+      await withInFlight(api("PUT", "/packs/official", { seed: !sd.on }));
+      state.official = await withInFlight(api("POST", "/packs/official/sync"));
+      clearError();
+      const now = state.official.seed || {};
+      if (now.on && now.error) showError("Sharing on the mesh: " + now.error);
+    } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not change."); }
+    renderOfficial();
+  });
+  actions.appendChild(share);
   if (o.on) {
     const now = el("button", "btn btn-small", "Check now");
     now.type = "button";

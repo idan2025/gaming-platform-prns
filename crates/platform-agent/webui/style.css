@@ -235,10 +235,10 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .card-reason { font-size: 12px; color: var(--warn); }
 .content-help { font-size: 12px; display: grid; gap: 6px; }
 .content-help p { margin: 0; }
-.content-path { display: flex; gap: 6px; align-items: center; min-width: 0; }
-.content-path code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; padding: 4px 6px; border-radius: 6px; background: var(--surface-2, rgba(127,127,127,.12)); }
+.content-path { display: grid; gap: 6px; justify-items: start; min-width: 0; }
+.content-path code { width: 100%; overflow-wrap: anywhere; font-size: 12px; padding: 4px 6px; border-radius: 6px; background: var(--surface-2, rgba(127,127,127,.12)); }
 .card-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
-.card-actions .btn { flex: 1; }
+.card-actions .btn { flex: 1 1 0; min-width: 0; padding-left: 8px; padding-right: 8px; white-space: nowrap; }
 .backup-list { display: grid; gap: 6px; max-height: 260px; overflow: auto; margin: 8px 0; }
 .backup-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px; background: var(--surface-2); border-radius: var(--radius); }
 .backup-when { font-weight: 600; flex: 1 0 auto; white-space: nowrap; }

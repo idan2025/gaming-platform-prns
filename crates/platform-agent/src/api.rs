@@ -443,21 +443,29 @@ async fn official_status(State(state): State<ApiState>) -> Json<crate::official:
     Json(state.agent.official().status())
 }
 
+/// Either switch, or both: taking the official packs, and seeding them on
+/// the mesh. A seeding change takes effect at the next pass, which the page
+/// asks for right after.
 #[derive(Deserialize)]
 struct OfficialReq {
-    on: bool,
+    #[serde(default)]
+    on: Option<bool>,
+    #[serde(default)]
+    seed: Option<bool>,
 }
 
 async fn set_official(
     State(state): State<ApiState>,
     Json(req): Json<OfficialReq>,
 ) -> ApiResult<crate::official::OfficialStatus> {
-    state
-        .agent
-        .official()
-        .set_on(req.on)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(state.agent.official().status()))
+    let official = state.agent.official();
+    if let Some(on) = req.on {
+        official.set_on(on).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    if let Some(seed) = req.seed {
+        official.set_seeding(seed).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    Ok(Json(official.status()))
 }
 
 /// Read the official list now, as the timer would.
