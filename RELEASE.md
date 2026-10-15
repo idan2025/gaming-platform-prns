@@ -92,6 +92,9 @@ is missing, which makes pushing a tag sufficient on its own.
   current. Lanthorn lists repositories it hears on the mesh, and both the
   launcher and Lanthorn Host take the official packs from a seed by
   themselves when GitHub cannot be reached, held to the project key.
+- Adding a game: `CONTRIBUTING.md` walks through a pack pull request, the
+  review posts its result on the pull request, and there is a form to
+  request a game.
 - Fixed: `game-bridge repo build` left its list in a hidden partial file.
 - **The project key (`7a656c1da3347bfcfe6b3981f71099c8`) is a release
   secret like the updater key**: `PACK_SIGNING_IDENTITY` in the repository

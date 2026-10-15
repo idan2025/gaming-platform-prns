@@ -1,0 +1,74 @@
+name: pack review comment
+
+# Posts the game pack review (ci.yml's `pack-review` job) on the pull request
+# that changed a pack, so a contributor sees what was refused or flagged
+# without opening the run. Kept apart from ci.yml on purpose: a pull request
+# from a fork gets no write token, and this workflow, which has one, never
+# checks out or runs anything from the pull request. It reads one text file,
+# and finds the pull request from the run's head commit, never from the file.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - name: fetch the review
+        id: fetch
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pack-review
+          path: pack-review
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: post it
+        if: steps.fetch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --repo "$REPO" --state open --search "$HEAD_SHA" --json number,headRefOid \
+            --jq ".[] | select(.headRefOid == \"$HEAD_SHA\") | .number" | head -n1)
+          if [ -z "$pr" ]; then
+            echo "No open pull request has head $HEAD_SHA."
+            exit 0
+          fi
+          status=$(head -c 8 pack-review/status | tr -cd '0-9')
+          marker='<!-- lanthorn-pack-review -->'
+          {
+            echo "$marker"
+            echo "## Game pack review"
+            if [ "$status" = "0" ]; then
+              echo "Nothing was refused. A maintainer still reads every pack before it is merged: passing this check does not make a pack safe, the format does."
+            else
+              echo "**Refused.** Change what is listed under *refused* below; a maintainer cannot merge a pack the review refuses."
+            fi
+            echo
+            head -c 60000 pack-review/review.md
+            echo
+            echo "<sub>From [this run]($RUN_URL). How packs are reviewed: [CONTRIBUTING.md](https://github.com/$REPO/blob/main/CONTRIBUTING.md#adding-a-game).</sub>"
+          } > body.md
+          existing=$(gh api "repos/$REPO/issues/$pr/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | head -n1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@body.md > /dev/null
+          else
+            gh pr comment "$pr" --repo "$REPO" --body-file body.md
+          fi
+          gh pr edit "$pr" --repo "$REPO" --add-label "game pack" || true
