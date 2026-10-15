@@ -251,6 +251,49 @@ jobs:
         shell: pwsh
         run: ./scripts/check-portable.ps1 launcher/src-tauri/target/debug/launcher.exe
 
+  pack-review:
+    name: game pack review
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `game-bridge review` (crates/game-bridge/src/review.rs) over every pack
+      # a pull request adds or changes, compared with the packs on its base
+      # branch; on main, over every pack. A refusal fails the job; what it only
+      # flags lands in the run's summary for the person merging. It is a
+      # reviewer's aid: the format's limits are what keep a pack from running
+      # anything, and a pack that passes still needs reading.
+      - name: review packs
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cargo build --quiet -p game-bridge --bin game-bridge
+          against=$(mktemp -d)
+          if [ -n "$BASE" ]; then
+            git archive "$BASE" packs | tar -x -C "$against" --strip-components=1 || true
+            mapfile -t changed < <(git diff --name-only --diff-filter=AMR "$BASE" HEAD -- 'packs/*.toml')
+          else
+            against=packs
+            changed=(packs/*.toml)
+          fi
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "No game pack changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## Game pack review" >> "$GITHUB_STEP_SUMMARY"
+          echo "A pack that passes still needs a person to read it." >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          ./target/debug/game-bridge review --markdown --against "$against" "${changed[@]}" > review.md
+          status=$?
+          set -e
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          cat review.md
+          exit $status
+
   frontend:
     name: frontend render pass
     runs-on: ubuntu-24.04

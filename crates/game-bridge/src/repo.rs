@@ -172,6 +172,7 @@ impl RepoIndex {
     /// to build.
     pub fn build(dir: &Path, name: &str) -> anyhow::Result<Self> {
         let mut packs = Vec::new();
+        let mut parsed: Vec<GamePack> = Vec::new();
         let mut files: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
@@ -206,6 +207,17 @@ impl RepoIndex {
                 sha256: sha256_hex(&bytes),
                 signed: Path::new(&sig).exists(),
             });
+            parsed.push(pack);
+        }
+        // A repository is where a pack reaches strangers, so it lists none a
+        // review refuses (`review.rs`). What a review only flags is for the
+        // repository's own reviewer, who runs `game-bridge review`.
+        for (i, pack) in parsed.iter().enumerate() {
+            let others: Vec<GamePack> =
+                parsed.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p.clone()).collect();
+            if let Some(why) = crate::review::refusal(&crate::review::review(pack, &others)) {
+                anyhow::bail!("{}: {why}", packs[i].file);
+            }
         }
         Ok(Self { format: INDEX_FORMAT, name: name.to_string(), packs })
     }
@@ -241,6 +253,20 @@ mod tests {
         std::fs::write(dir.path().join("a.toml"), SVEN).unwrap();
         std::fs::write(dir.path().join("b.toml"), SVEN).unwrap();
         assert!(RepoIndex::build(dir.path(), "x").unwrap_err().to_string().contains("two packs"));
+    }
+
+    /// A repository never lists a pack a review refuses.
+    #[test]
+    fn a_refused_pack_stops_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = SVEN.replace(
+            "args = [\"+connect {address}\"",
+            "args = [\"+exec evil.cfg\", \"+connect {address}\"",
+        );
+        assert_ne!(hostile, SVEN, "the shipped pack's launch args moved");
+        std::fs::write(dir.path().join("sven-coop.toml"), hostile).unwrap();
+        let e = RepoIndex::build(dir.path(), "x").unwrap_err().to_string();
+        assert!(e.contains("refused") && e.contains("+exec"), "{e}");
     }
 
     /// An index is somebody else's file. A path in it, or a digest that is

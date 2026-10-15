@@ -709,6 +709,15 @@ later change could quietly break:
 - **A pack id names a file, so it cannot name a path** (`pack::id_is_file_safe`,
   checked in `GamePack::parse`). Before this an id was only ASCII, and the
   node's import wrote `<id>.toml` from it. `a_pack_id_that_could_name_a_path_is_refused`.
+- **The pack review is a reviewer's aid, never the safety property**
+  (`game_bridge::review`, `game-bridge review`, CI's `pack-review` job). Its
+  refusals (a launch argument that runs a console command or names a fixed
+  address, a `[lan]` port `lan_filter::is_allowable` refuses, invisible
+  characters, another game's name or `app_name`) gate `repo build`, the
+  launcher's repository install and the node's import; everything else is
+  flagged for a person. Never describe a passing pack as safe or let a
+  refusal stand in for the format's own limits. `no_shipped_pack_is_refused`
+  keeps it honest: a check that refuses a shipped pack is a wrong check.
 - **One HTTP stack.** `launcher-core` uses the same reqwest 0.13 and rustls
   with ring the Tauri updater brings; do not add a second TLS stack.
 

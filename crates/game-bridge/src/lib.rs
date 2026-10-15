@@ -32,6 +32,7 @@ pub mod pack;
 pub mod profile;
 pub mod relay;
 pub mod repo;
+pub mod review;
 pub mod signing;
 pub mod stream;
 

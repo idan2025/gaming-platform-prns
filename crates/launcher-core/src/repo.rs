@@ -303,6 +303,13 @@ impl Launcher {
         if pack.id != entry.id {
             bail!("the repository lists {:?} but the pack inside is {:?}", entry.id, pack.id);
         }
+        // A pack no honest author needs is refused here too, for a repository
+        // that never ran `game-bridge review` (`review.rs`).
+        let others: Vec<GamePack> =
+            self.packs().iter().filter(|p| p.pack.id != pack.id).map(|p| p.pack.clone()).collect();
+        if let Some(why) = game_bridge::review::refusal(&game_bridge::review::review(&pack, &others)) {
+            bail!("{why}; nothing was installed");
+        }
 
         let policy = TrustPolicy::allowing_unsigned();
         let now = SystemTime::now();
@@ -525,6 +532,25 @@ mod tests {
         assert_eq!(state_of(view, "half-life"), "update");
         assert!(l.install_repo_pack(&url, "half-life").await.unwrap().replaced);
         assert_eq!(state_of(&l.browse_pack_repos().await[0], "half-life"), "installed");
+
+        // A repository that never ran a review lists a pack that runs a config
+        // file on the player's game: refused here, the install untouched.
+        let good = std::fs::read(&installed).unwrap();
+        let hostile = String::from_utf8(good.clone())
+            .unwrap()
+            .replace("args = [\"+connect {address}\"", "args = [\"+exec evil.cfg\", \"+connect {address}\"");
+        assert_ne!(hostile.as_bytes(), &good[..], "half-life's launch args moved");
+        std::fs::write(served.path().join("half-life.toml"), &hostile).unwrap();
+        let index_path = served.path().join(repo::INDEX_FILE);
+        let mut index = RepoIndex::parse(&std::fs::read(&index_path).unwrap()).unwrap();
+        index.packs.iter_mut().find(|e| e.id == "half-life").unwrap().sha256 =
+            repo::sha256_hex(hostile.as_bytes());
+        std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        let e = l.install_repo_pack(&url, "half-life").await.unwrap_err().to_string();
+        assert!(e.contains("+exec"), "{e}");
+        assert_eq!(std::fs::read(&installed).unwrap(), good);
+        std::fs::write(served.path().join("half-life.toml"), &good).unwrap();
+        build(served.path());
 
         // A signature for other bytes: refused, never installed as unsigned.
         sign_into(served.path(), "openttd.toml", b"something else");

@@ -76,6 +76,17 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### Game pack review
+
+- `game-bridge review <pack.toml> [--against DIR]` names what a person must
+  read in a pack before it is shared, and refuses what no honest pack needs:
+  launch arguments that run console commands or point the game at a fixed
+  address, LAN ports that are remote-access services, invisible characters,
+  and names or `app_name`s copying another game. CI runs it on every pull
+  request that changes a pack.
+- `repo build` will not list a refused pack, and the launcher and Lanthorn
+  Host refuse to install one.
+
 ### Lanthorn Host: each game says whose word its pack is
 
 - A game card on the Games page shows its pack's tier under this node's

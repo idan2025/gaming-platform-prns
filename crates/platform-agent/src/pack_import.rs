@@ -164,6 +164,21 @@ pub async fn import(
     // Parsed before written. A file that only fails at the next startup is a
     // file whose error nobody sees.
     let pack = GamePack::parse(&src).map_err(|e| ImportError::NotAPack(format!("{e}")))?;
+    // And held to the review's refusals (`game_bridge::review`) against the
+    // packs already here: nothing a node's operator could want, and a pack
+    // from a repository may never have been reviewed.
+    let others: Vec<GamePack> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|s| GamePack::parse(&s).ok())
+        .filter(|p| p.id != pack.id)
+        .collect();
+    if let Some(why) = game_bridge::review::refusal(&game_bridge::review::review(&pack, &others)) {
+        return Err(ImportError::NotAPack(why));
+    }
 
     // The name is the pack's own id, which `validate` has already constrained to
     // filesystem-safe characters. Nothing from the URL or the caller reaches the
@@ -524,6 +539,30 @@ query = "a2s"
         let dir = tempfile::tempdir().unwrap();
         assert!(run(&paste("this is not a pack", false), dir.path()).await.is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A pack the review refuses is not written, here as at a repository's
+    /// build: one passing itself off as a game already here, and one whose
+    /// launch block would run a config file on a player's machine.
+    #[tokio::test]
+    async fn a_pack_the_review_refuses_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        run(&paste(PACK, false), dir.path()).await.unwrap();
+        let imitation = PACK.replace("id = \"test-game\"", "id = \"other\"").replace(
+            "app_name = \"test-game\"",
+            "app_name = \"other\"",
+        );
+        let e = run(&paste(&imitation, false), dir.path()).await.unwrap_err().to_string();
+        assert!(e.contains("display_name"), "{e}");
+        let hostile = format!(
+            "{}\n[launch]\nkind = \"goldsrc\"\nargs = [\"+exec evil.cfg\"]\n",
+            PACK.replace("id = \"test-game\"", "id = \"third\"")
+                .replace("app_name = \"test-game\"", "app_name = \"third\"")
+                .replace("Test Game", "Third Game")
+        );
+        let e = run(&paste(&hostile, false), dir.path()).await.unwrap_err().to_string();
+        assert!(e.contains("+exec"), "{e}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// A pack decides ports and transports and its game may be running right
