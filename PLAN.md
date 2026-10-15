@@ -1014,6 +1014,16 @@ working, and each shortens the distance between installing and playing.
    surfaced where a person can see them, plus the `manual` driver saying exactly
    what to put where. Ends at: a player is never left guessing why a game will
    not start.
+   **Built 2026-10-15.** The launcher reads Steam's own manifest for a game
+   not here (`steam::parse_app_state`: `StateFlags`, `BytesDownloaded`,
+   `BytesToDownload`), offers Steam's install link or the store page (built
+   from the app id in the core; the page sends a game id), and shows the
+   download in Steam's numbers until the game is installed. Lanthorn Host's
+   game card shows `Agent::content_state`: a `manual` game's exact folder,
+   the folders the copy must have, the pack's note, and **Check again**; an
+   installed copy missing a mounted folder, and an automatic game on a node
+   with `allow_content_fetch` off, each say so. A node's own downloads
+   already showed size and the driver's errors (`ROADMAP.md` item 11).
 4. **First run.** One screen: generate an identity, pick or auto-detect an
    interface, confirm. Ends at: a fresh install reaches a server list without
    editing a file.
@@ -1041,8 +1051,10 @@ working, and each shortens the distance between installing and playing.
    `.sig` files, for any web host. Trust stays per pack, in each pack's own
    signature. `--identity` signs the index too (its own domain), and a
    launcher pins the key at add; the index decides what is listed, never
-   what is trusted. No review flow and no project repository
-   exist yet.
+   what is trusted. **The project repository is built too** (2026-10-15,
+   `packs.yml`, GitHub Pages, signed by the project key, mirrored and
+   seeded; `CLAUDE.md`), and `game-bridge review` runs on every pull
+   request.
 
 ### 13.5 Host-side UI — Tauri, and where a web UI does and does not fit
 

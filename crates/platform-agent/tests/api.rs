@@ -649,3 +649,44 @@ query = "a2s"
     let hostile = client.delete(format!("http://{addr}/packs/..%2Fagent")).send().await.unwrap();
     assert_eq!(hostile.status(), 404, "an id names no path");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_game_says_where_its_files_go_and_which_folders_they_need() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig::parse(&config_toml(dir.path())).unwrap();
+    let mut pack = game_bridge::GamePack::sven_coop();
+    pack.content = game_bridge::content::PackContent::Manual { note: Some("from your own Steam library".into()) };
+    let Ok(agent) = Agent::new(config, vec![pack.clone()]).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, api::router(Arc::new(agent))).await;
+    });
+    let content = || async {
+        let body: serde_json::Value =
+            reqwest::get(format!("http://{addr}/games")).await.unwrap().json().await.unwrap();
+        body.as_array().unwrap().iter().find(|g| g["id"] == "sven-coop").unwrap()["content"].clone()
+    };
+
+    let c = content().await;
+    let want = dir.path().join("content/sven-coop/test");
+    assert_eq!(c["driver"], "manual");
+    assert_eq!(c["installed"], false);
+    assert_eq!(c["install_dir"], want.display().to_string(), "the exact folder, before any Start fails");
+    assert_eq!(c["must_contain"], serde_json::json!(pack.writable_paths));
+    assert_eq!(c["note"], "from your own Steam library");
+
+    // Put there without one of the folders a server mounts over: named.
+    std::fs::create_dir_all(want.join(&pack.writable_paths[0])).unwrap();
+    let c = content().await;
+    assert_eq!(c["installed"], true);
+    assert!(c["install_dir"].is_null());
+    assert_eq!(c["missing"], serde_json::json!(pack.writable_paths[1..]));
+    for p in &pack.writable_paths {
+        std::fs::create_dir_all(want.join(p)).unwrap();
+    }
+    assert_eq!(content().await["missing"], serde_json::json!([]));
+}

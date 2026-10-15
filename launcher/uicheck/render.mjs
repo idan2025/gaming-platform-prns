@@ -149,6 +149,9 @@ function makeInvoke(scenario) {
         return null;
       case 'installed_games':
         return scenario.installed ?? [];
+      case 'get_game':
+        (scenario.gotten ??= []).push(args.gameId);
+        return null;
       case 'pick_game_path':
         scenario.picked = true;
         return scenario.pickResult ?? null;
@@ -384,6 +387,32 @@ await run('a game on this computer is badged Installed', {
   const rows = [...doc.querySelectorAll('#list .row')];
   const badged = rows.filter(r => r.querySelector('.installed-badge')).map(r => r.dataset.hash);
   check('only the installed game\'s row is badged', badged.length === 1 && badged[0] === 'aabbccddeeff00112233445566778899', JSON.stringify(badged));
+});
+
+await run('a game not here offers Install with Steam, and sends only its id', {
+  status: running,
+  rows: () => [row()],
+  installed: [{ game_id: 'sven-coop', installed: false, launch_ready: false, steam_download: null, get_url: 'steam://install/225840' }],
+}, async (win, doc, scenario) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const btn = [...doc.querySelectorAll('#detail button')].find(b => b.textContent === 'Install with Steam');
+  check('a game not here offers Install with Steam', !!btn, doc.querySelector('#detail')?.textContent.slice(0, 400));
+  btn?.click();
+  await settle();
+  check('the page sends a game id, never a link', JSON.stringify(scenario.gotten) === '["sven-coop"]', JSON.stringify(scenario.gotten));
+});
+
+await run('a game Steam is fetching says how far, in Steam\'s numbers', {
+  status: running,
+  rows: () => [row()],
+  installed: [{ game_id: 'sven-coop', installed: false, launch_ready: false, steam_download: { bytes_done: 1500000000, bytes_total: 3000000000 }, get_url: 'steam://install/225840' }],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const t = doc.querySelector('#detail').textContent;
+  check('Steam\'s progress is shown', t.includes('1.5 GB of 3.0 GB (50%)'), t.slice(0, 500));
+  check('and no install button while it runs', ![...doc.querySelectorAll('#detail button')].some(b => b.textContent === 'Install with Steam'));
 });
 
 await run('detail pane', {
