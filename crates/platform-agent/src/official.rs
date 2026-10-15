@@ -54,6 +54,8 @@ pub struct OfficialStatus {
     /// Games whose pack has an update that waits for their servers to go.
     pub waiting: Vec<String>,
     pub error: Option<String>,
+    /// Where it was read from: the official address, or a seed on the mesh.
+    pub source: Option<String>,
 }
 
 pub struct Official {
@@ -142,14 +144,39 @@ impl Official {
         now: SystemTime,
         status: &mut OfficialStatus,
     ) -> anyhow::Result<()> {
-        let index_url = check_repo_url(&self.url)?;
-        let read = read_index(&index_url).await?;
-        match &read.signature {
-            Some((who, _)) if *who == self.key => {}
-            _ => anyhow::bail!(
-                "the official list is not signed by the project key; nothing was taken"
-            ),
+        // The official address first; with no internet, a seed on the mesh
+        // that says it carries the same list, held to the same key.
+        let mut sources = vec![self.url.clone()];
+        sources.extend(
+            game_bridge::repo_mesh::heard()
+                .into_iter()
+                .filter(|h| h.announce.signer == Some(self.key))
+                .map(|h| h.address()),
+        );
+        let mut found = None;
+        let mut last_error = None;
+        for source in sources {
+            let attempt = async {
+                let read = read_index(&check_repo_url(&source)?).await?;
+                match &read.signature {
+                    Some((who, _)) if *who == self.key => Ok(read),
+                    _ => Err(anyhow::anyhow!(
+                        "the official list is not signed by the project key; nothing was taken"
+                    )),
+                }
+            };
+            match attempt.await {
+                Ok(read) => {
+                    found = Some((source, read));
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
         }
+        let Some((source, read)) = found else {
+            return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no source for the official packs")));
+        };
+        status.source = Some(source.clone());
         let policy = agent.config().pack_trust_policy();
         // What is here now, by id: the bytes' digest, and whether the copy
         // is the project's own with time left on its signature.
@@ -182,9 +209,10 @@ impl Official {
             let request = ImportRequest {
                 toml: None,
                 url: None,
-                repository: Some(self.url.clone()),
+                repository: Some(source.clone()),
                 id: Some(e.id.clone()),
                 replace: true,
+                pinned_key: Some(self.key),
             };
             match import(&request, dir, &policy, now, |id| agent.config().runtime_for(id).is_some()).await {
                 Ok(_) if existed => status.updated.push(e.id.clone()),

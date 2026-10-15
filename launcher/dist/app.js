@@ -3806,6 +3806,7 @@ async function loadOfficial() {
 
 async function loadRepos() {
   await loadOfficial();
+  try { state.heardRepos = await invoke('heard_pack_repos'); } catch (_) { state.heardRepos = []; }
   try {
     state.repos = await invoke('pack_repos');
   } catch (err) {
@@ -4068,6 +4069,34 @@ function renderGames() {
     });
     repos.appendChild(box);
   });
+  // Repositories seeded on the mesh (`repo_mesh.rs`): packs with no
+  // internet. What one says about itself is shown as its words; the list's
+  // signature is what is checked when it is read.
+  const heard = (state.heardRepos || []).filter(h => !h.added);
+  if (heard.length) {
+    const hb = el('div', 'repo');
+    hb.appendChild(el('div', 'item-title', 'Heard on the mesh'));
+    hb.appendChild(el('p', 'note', 'Pack repositories someone is seeding over Reticulum. One carrying the official packs is used by itself when the internet is out.'));
+    heard.forEach(h => {
+      const item = el('div', 'item');
+      const text = el('div', 'item-text');
+      text.appendChild(el('div', 'item-title', h.official ? 'Official packs, seeded on the mesh' : h.name));
+      const bits = [h.packs + (h.packs === 1 ? ' pack' : ' packs'), h.hops + (h.hops === 1 ? ' hop' : ' hops')];
+      bits.push(h.signer ? (h.official ? 'says it is signed by the Lanthorn project' : 'says it is signed by ' + h.signer.slice(0, 12) + '…') : 'unsigned');
+      text.appendChild(el('div', 'item-sub', bits.join(' · ')));
+      text.appendChild(el('div', 'item-sub mono', h.address));
+      item.appendChild(text);
+      if (!h.official) {
+        const add = el('button', 'btn', 'Add');
+        add.type = 'button';
+        add.disabled = !!state.repoBusy;
+        add.onclick = () => repoAction(() => invoke('add_pack_repo', { url: h.address }), 'add');
+        item.appendChild(add);
+      }
+      hb.appendChild(item);
+    });
+    repos.appendChild(hb);
+  }
   body.appendChild(repos);
   if (keep) document.getElementById(keep)?.focus({ preventScroll: true });
 }

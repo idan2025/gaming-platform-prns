@@ -122,6 +122,15 @@ pub fn check_repo_url(url: &str) -> anyhow::Result<String> {
     if url.len() > 512 || url.contains(['?', '#']) {
         anyhow::bail!("a pack repository address has no query or fragment");
     }
+    // A seed on the mesh (`repo_mesh.rs`): `rns://<destination>/`.
+    if url.starts_with("rns://") {
+        let (destination, file) = crate::repo_mesh::parse_address(url)
+            .ok_or_else(|| anyhow::anyhow!("an rns:// repository is rns://<32 hex digits>/"))?;
+        if !(file.is_empty() || file == INDEX_FILE) {
+            anyhow::bail!("an rns:// repository is rns://<32 hex digits>/");
+        }
+        return Ok(format!("rns://{}/{INDEX_FILE}", hex::encode(destination.as_bytes())));
+    }
     let looks_local = url.starts_with("file://") || std::path::Path::new(url).is_absolute();
     if looks_local {
         let path = if url.starts_with("file://") {
@@ -189,6 +198,9 @@ pub const MAX_SIG_BYTES: usize = 16 * 1024;
 /// bytes. `Ok(None)` is "not there": a 404, or no such file.
 pub async fn fetch_optional(url: &str, max: usize) -> anyhow::Result<Option<Vec<u8>>> {
     use anyhow::Context;
+    if url.starts_with("rns://") {
+        return crate::repo_mesh::fetch_over_mesh(url, max).await;
+    }
     if url.starts_with("file://") {
         let path = url::Url::parse(url)
             .ok()

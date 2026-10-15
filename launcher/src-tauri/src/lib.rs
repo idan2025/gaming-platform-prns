@@ -593,6 +593,13 @@ async fn room_status(state: tauri::State<'_, AppState>) -> Result<RoomView, Stri
 }
 
 #[tauri::command]
+async fn heard_pack_repos(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<launcher_core::repo::HeardRepoView>, String> {
+    Ok(state.launcher.heard_pack_repos().await)
+}
+
+#[tauri::command]
 async fn sync_official_packs(
     state: tauri::State<'_, AppState>,
 ) -> Result<launcher_core::repo::OfficialSyncView, String> {
@@ -952,6 +959,7 @@ pub fn run() {
             mute_in_hosted_chat,
             pack_repos,
             sync_official_packs,
+            heard_pack_repos,
             set_official_packs,
             official_packs,
             add_pack_repo,

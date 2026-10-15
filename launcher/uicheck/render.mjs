@@ -201,6 +201,9 @@ function makeInvoke(scenario) {
       case 'finish_first_run':
         scenario.firstRunFinished = true;
         return null;
+      case 'heard_pack_repos':
+        if (!scenario.heard) throw new Error(`unknown command ${cmd}`);
+        return scenario.heard;
       case 'official_packs':
         if (!scenario.official) throw new Error(`unknown command ${cmd}`);
         return scenario.official;
@@ -1058,6 +1061,31 @@ await run('the official packs are on, sync by themselves, and can be turned off'
   await settle();
   check('Turn off reaches the core', (scenario.officialCalls || []).includes('off'), JSON.stringify(scenario.officialCalls));
   check('turned off, it offers Turn on', !!doc.querySelector('#official-on'), doc.querySelector('#games-body')?.textContent);
+});
+
+// Seeds heard on the mesh: listed with what they say, a stranger's with Add,
+// and a name is only ever text.
+await run('repositories heard on the mesh are listed and can be added', {
+  status: running,
+  rows: () => [row()],
+  official: { on: true, checked_unix: null, added: [], updated: [], error: null },
+  repos: [],
+  heard: [
+    { address: 'rns://' + 'ab'.repeat(16) + '/', name: 'Mesh <b>packs</b>', packs: 3, signer: 'cd'.repeat(16), official: false, added: false, hops: 2 },
+    { address: 'rns://' + 'ef'.repeat(16) + '/', name: 'x', packs: 21, signer: '7a656c1da3347bfcfe6b3981f71099c8', official: true, added: false, hops: 1 },
+  ],
+}, async (win, doc, scenario) => {
+  win.setView('games');
+  await settle();
+  await settle();
+  const t = doc.querySelector('#games-body')?.textContent || '';
+  check('seeds heard on the mesh are listed', t.includes('Heard on the mesh') && t.includes('Official packs, seeded on the mesh'), t);
+  check('a seed\u2019s name is text, never markup', t.includes('Mesh <b>packs</b>') && !doc.querySelector('#games-body b'));
+  const add = [...doc.querySelectorAll('#games-body button')].find(b => b.textContent === 'Add');
+  check('a stranger\u2019s seed can be added', !!add);
+  add.click();
+  await settle();
+  check('Add takes its rns:// address', (scenario.repoCalls || []).some(c => c[0] === 'add' && c[1].startsWith('rns://')), JSON.stringify(scenario.repoCalls));
 });
 
 await run('the Games page lists games and installs from a repository', {

@@ -307,7 +307,18 @@ game-bridge repo mirror ./lanthorn-packs          # the official repository
 game-bridge repo mirror <url-or-folder> <dir> --key <signer>   # any signed one
 ```
 
-A folder is a repository too: add its path in Lanthorn or Lanthorn Host.
+A folder is a repository too: add its path in Lanthorn, or put it under
+`<data_root>/mirrors/` for Lanthorn Host.
+
+To share packs where there is no internet, **seed** a mirror over
+Reticulum. Launchers and nodes on the mesh hear it, list it on their Games
+page, and fall back to it by themselves for the official packs when GitHub
+cannot be reached — held to the same project key, so a seed serves the
+official packs exactly or not at all:
+
+```
+game-bridge repo seed ./lanthorn-packs --official --tcp 0.0.0.0:4242   # re-mirrors every 6 h
+```
 
 Players add the folder's https address on the launcher's **Games** page, and
 node operators add it under **Add a game…** in Lanthorn Host. A pack is

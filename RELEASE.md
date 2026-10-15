@@ -88,6 +88,10 @@ is missing, which makes pushing a tag sufficient on its own.
 - `game-bridge repo mirror` makes an exact, one-way copy of a signed
   repository (the official one by default), and a folder can be added as a
   repository in Lanthorn and Lanthorn Host.
+- `game-bridge repo seed` serves a mirror over Reticulum and keeps it
+  current. Lanthorn lists repositories it hears on the mesh, and both the
+  launcher and Lanthorn Host take the official packs from a seed by
+  themselves when GitHub cannot be reached, held to the project key.
 - Fixed: `game-bridge repo build` left its list in a hidden partial file.
 - **The project key (`7a656c1da3347bfcfe6b3981f71099c8`) is a release
   secret like the updater key**: `PACK_SIGNING_IDENTITY` in the repository

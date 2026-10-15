@@ -147,8 +147,34 @@ impl Launcher {
         out
     }
 
+    /// The official repository, or the seed standing in for it now.
     pub(crate) fn is_official(&self, url: &str) -> bool {
         url == self.official.0
+            || self.official_mirror.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(url)
+    }
+
+    /// Repositories seeded on the mesh that this launcher heard
+    /// (`game_bridge::repo_mesh`), newest first.
+    pub async fn heard_pack_repos(&self) -> Vec<HeardRepoView> {
+        let added = self.pack_repos().await;
+        let official_key = self.official.1.clone();
+        game_bridge::repo_mesh::heard()
+            .into_iter()
+            .map(|h| {
+                let signer = h.announce.signer.map(|s| hex::encode(s.as_bytes()));
+                let address = h.address();
+                let index = check_repo_url(&address).unwrap_or_default();
+                HeardRepoView {
+                    official: signer.as_deref() == Some(official_key.as_str()),
+                    added: added.contains(&index),
+                    address,
+                    name: h.announce.name,
+                    packs: h.announce.packs,
+                    signer,
+                    hops: h.hops,
+                }
+            })
+            .collect()
     }
 
     /// Add a repository, after reading its index once: an address that is not
@@ -397,6 +423,23 @@ impl Launcher {
     }
 }
 
+/// A seed heard on the mesh, as the Games page lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeardRepoView {
+    /// `rns://<destination>/`, what Add takes.
+    pub address: String,
+    /// What it calls itself. Its words: shown, never trusted.
+    pub name: String,
+    pub packs: u16,
+    /// Who it says signed its list. A hint: the signature is checked on read.
+    pub signer: Option<String>,
+    /// It says it carries the official packs (the project key's list).
+    pub official: bool,
+    /// Already one of this launcher's repositories.
+    pub added: bool,
+    pub hops: u8,
+}
+
 /// What the last look at the official repository did.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct OfficialSyncView {
@@ -409,6 +452,9 @@ pub struct OfficialSyncView {
     pub updated: Vec<String>,
     /// Why it could not be read, or a pack not taken: offline is normal.
     pub error: Option<String>,
+    /// Where it was read from: the official address, or a seed on the mesh
+    /// standing in for it.
+    pub source: Option<String>,
 }
 
 impl Launcher {
@@ -428,8 +474,26 @@ impl Launcher {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs());
-        let url = self.official.0.clone();
-        match self.pinned_index(&url).await {
+        let mut url = self.official.0.clone();
+        *self.official_mirror.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut index = self.pinned_index(&url).await;
+        if index.is_err() {
+            // No internet, or no GitHub: a seed on the mesh that says it
+            // carries the official list is asked, and held to the same key.
+            for h in self.heard_pack_repos().await.into_iter().filter(|h| h.official) {
+                let Ok(seed) = check_repo_url(&h.address) else { continue };
+                *self.official_mirror.lock().unwrap_or_else(|e| e.into_inner()) = Some(seed.clone());
+                let read = self.pinned_index(&seed).await;
+                if read.is_ok() {
+                    url = seed;
+                    index = read;
+                    break;
+                }
+                *self.official_mirror.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        view.source = Some(url.clone());
+        match index {
             Err(e) => view.error = Some(crate::error_text(e)),
             Ok((index, _)) => {
                 let repo = self.repo_view(url.clone(), Ok((index, None)));
@@ -729,6 +793,62 @@ mod tests {
         l.remove_pack_repo(&url).await.unwrap();
         assert!(l.pack_repos().await.is_empty());
         assert!(!l.sync_official_packs().await.on);
+    }
+
+    /// No internet: the official address does not answer, and a seed on the
+    /// mesh that carries the official list (signed by its key) stands in for
+    /// it — packs arrive over Reticulum, held to the same key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_internet_the_official_packs_come_from_a_seed_on_the_mesh() {
+        let packs_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let served = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let k = prns_core::identity::PrivateIdentityMaterial::from_slice(&[13; 64]).unwrap();
+        {
+            let f = "half-life.toml";
+            std::fs::copy(packs_src.join(f), served.path().join(f)).unwrap();
+            let sig = PackSignature::sign(
+                &std::fs::read(served.path().join(f)).unwrap(),
+                &k,
+                SystemTime::now() - Duration::from_secs(60),
+                Duration::from_secs(game_bridge::repo::PACK_SIGNATURE_DAYS * 86_400),
+            )
+            .unwrap();
+            std::fs::write(served.path().join(format!("{f}{SIGNATURE_SUFFIX}")), sig.to_toml()).unwrap();
+        }
+        build(served.path());
+        sign_index(served.path(), 13);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let seed = game_bridge::repo_mesh::start_seed(game_bridge::repo_mesh::SeedArgs {
+            dir: served.path().to_path_buf(),
+            identity: home.path().join("seed.identity"),
+            tcp: Some(format!("0.0.0.0:{port}")),
+            auto: false,
+            announce_every: Duration::from_secs(5),
+        })
+        .await
+        .unwrap();
+        let mut args = game_bridge::config::BrowserArgs::new();
+        args.tcp = Some(format!("127.0.0.1:{port}"));
+        let browser = game_bridge::BridgeSession::start_browser(args).await.unwrap();
+        game_bridge::repo_mesh::set_mesh_handle(Some(browser.handle().clone()));
+        let hash = seed.own_hash().unwrap();
+        for _ in 0..120 {
+            if game_bridge::repo_mesh::heard().iter().any(|h| h.destination == hash) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let key = hex::encode(k.public().identity_hash().as_bytes());
+        let l = Launcher::new(vec![GamePack::sven_coop()])
+            .with_settings_file(home.path().join("launcher.json"))
+            .with_official_repo("http://127.0.0.1:1/index.json", &key);
+        let heard = l.heard_pack_repos().await;
+        assert!(heard.iter().any(|h| h.official && h.packs == 1), "{heard:?}");
+        let done = l.sync_official_packs().await;
+        assert!(done.source.as_deref().is_some_and(|s| s.starts_with("rns://")), "{done:?}");
+        assert_eq!(done.added, vec!["half-life".to_string()], "{done:?}");
+        assert!(l.list_games().iter().any(|g| g.id == "half-life"));
     }
 
     fn sign_index(dir: &std::path::Path, seed: u8) {

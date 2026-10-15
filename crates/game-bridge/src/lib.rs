@@ -32,6 +32,7 @@ pub mod pack;
 pub mod profile;
 pub mod relay;
 pub mod repo;
+pub mod repo_mesh;
 pub mod review;
 pub mod server_chat;
 pub mod signing;

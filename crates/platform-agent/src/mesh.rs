@@ -434,6 +434,9 @@ impl MeshBridges {
         }
 
         tracing::info!(port, "this node's mesh hub is up; game servers will share it");
+        // `rns://` pack repositories (`game_bridge::repo_mesh`) are read
+        // through this node's hub, the one that owns its interfaces.
+        game_bridge::repo_mesh::set_mesh_handle(Some(session.handle().clone()));
         *hub = Some(session);
         Ok(port)
     }
