@@ -65,7 +65,7 @@ the release notes shown, and a "do this automatically" checkbox.
 ## 2. Invite links
 
 **Done in v0.2.31** (`launcher-core/src/invite.rs`; the scheme is
-`lanthorn`, with `room=1` for rooms; the https fallback page is not built yet).
+`lanthorn`, with `room=1` for rooms; Copy invite gives the https page `site/join/`, which carries the invite in its fragment and opens the `lanthorn://` link).
 
 **What.** "Copy invite" on a server or room gives a link such as
 `lanthorn://join/<destination>?game=<id>`. Clicking it in Discord, WhatsApp or

@@ -18,6 +18,13 @@ use serde::Serialize;
 
 pub const SCHEME: &str = "lanthorn";
 
+/// The invite's page on the web, for a friend whose chat does not open a
+/// `lanthorn://` link or who has no Lanthorn yet. The invite rides in the
+/// fragment, which a browser never sends to the web host; the page reads
+/// it with these same rules and opens the `lanthorn://` link
+/// (`site/join/`).
+pub const WEB_PAGE: &str = "https://idan2025.github.io/gaming-platform-prns/join/";
+
 /// The longest name an invite carries; an announce's own is shorter still.
 const MAX_NAME: usize = 64;
 /// Pack ids are short ASCII (`pack.rs`: at most 24 bytes).
@@ -44,6 +51,7 @@ pub fn parse(input: &str) -> Result<Invite, String> {
     }
     let rest = input
         .strip_prefix(&format!("{SCHEME}://join/"))
+        .or_else(|| input.strip_prefix(WEB_PAGE)?.strip_prefix('#'))
         .ok_or_else(|| format!("not an invite: it should start with {SCHEME}://join/"))?;
     let (hash, query) = match rest.split_once('?') {
         Some((h, q)) => (h, Some(q)),
@@ -104,6 +112,13 @@ pub fn link(destination_hash: &str, game_id: Option<&str>, name: Option<&str>, r
         out.push_str("room=1");
     }
     out
+}
+
+/// The same invite as [`link`], as its web page: what Copy invite gives, so
+/// it is a link every chat app opens.
+pub fn web_link(destination_hash: &str, game_id: Option<&str>, name: Option<&str>, room: bool) -> String {
+    let app = link(destination_hash, game_id, name, room);
+    format!("{WEB_PAGE}#{}", app.strip_prefix(&format!("{SCHEME}://join/")).unwrap_or(&app))
 }
 
 fn is_hash(s: &str) -> bool {
@@ -216,5 +231,21 @@ mod tests {
         assert_eq!(i.game_id.as_deref(), Some("counter-strike-16"));
         assert_eq!(i.name.as_deref(), Some("Dust2 (EU)! ñ*' ~ok"));
         assert!(!i.room);
+    }
+
+    #[test]
+    fn a_web_invite_carries_the_same_invite_in_its_fragment() {
+        let hash = "00112233445566778899aabbccddeeff";
+        let web = web_link(hash, Some("sven-coop"), Some("Friday & co"), true);
+        assert_eq!(
+            web,
+            "https://idan2025.github.io/gaming-platform-prns/join/#00112233445566778899aabbccddeeff?game=sven-coop&name=Friday%20%26%20co&room=1"
+        );
+        assert_eq!(parse(&web).unwrap(), parse(&link(hash, Some("sven-coop"), Some("Friday & co"), true)).unwrap());
+        // Only the project's page, and only its fragment: another site, or
+        // the invite in a query the web host would see, is not one.
+        assert!(parse(&format!("https://example.com/join/#{hash}")).is_err());
+        assert!(parse(&format!("{WEB_PAGE}?{hash}")).is_err());
+        assert!(parse(&format!("{WEB_PAGE}#not-a-hash")).is_err());
     }
 }

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Lanthorn invite</title>
+<meta name="description" content="Someone invited you to a game on Lanthorn, the decentralized server browser over Reticulum.">
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Lanthorn invite</p>
+    <h1 id="title">You're invited to a game</h1>
+    <p class="lede" id="what">Open it in Lanthorn to see the server and join.</p>
+    <p class="meta" id="game" hidden></p>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="ok" hidden>
+    <p class="actions">
+      <a class="button primary" id="open" href="#">Open in Lanthorn</a>
+      <a class="button" href="https://github.com/idan2025/gaming-platform-prns/releases/latest">Get Lanthorn</a>
+    </p>
+    <p class="note">Nothing joins by itself: Lanthorn shows the server, and you press Join. If nothing opens, install Lanthorn first, then come back to this link, or paste this address into Lanthorn's <strong>Join by invite</strong>:</p>
+    <pre><code id="address"></code></pre>
+  </section>
+  <section id="bad" hidden>
+    <p class="error">The link does not name a server Lanthorn could open.</p>
+    <p><a href="https://github.com/idan2025/gaming-platform-prns/releases/latest">Get Lanthorn</a></p>
+  </section>
+  <p class="note">The invite is in the part of the address after <code>#</code>, which your browser never sends to this website.</p>
+</main>
+
+<footer class="wrap foot">
+  <p>Lanthorn is a decentralized server browser over Reticulum. <a href="../">Game packs</a> · <a href="https://github.com/idan2025/gaming-platform-prns">GitHub</a></p>
+</footer>
+<script src="join.js"></script>
+</body>
+</html>

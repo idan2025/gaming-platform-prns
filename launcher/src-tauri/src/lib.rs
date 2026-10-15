@@ -365,7 +365,7 @@ fn invite_link(
     name: Option<String>,
     room: bool,
 ) -> String {
-    launcher_core::invite::link(&destination_hash, game_id.as_deref(), name.as_deref(), room)
+    launcher_core::invite::web_link(&destination_hash, game_id.as_deref(), name.as_deref(), room)
 }
 
 /// Open the release page in the player's browser. The one URL this opens:
