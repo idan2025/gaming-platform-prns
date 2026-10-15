@@ -1,0 +1,27 @@
+name: Request a game
+description: Ask for a game to be added to the official packs.
+labels: ["game pack"]
+body:
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Its name, and its Steam store page if it has one.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How it is played
+      options:
+        - Dedicated servers (a node hosts it)
+        - LAN only (a Lanthorn room)
+        - Both
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: facts
+    attributes:
+      label: What you know
+      description: Ports, the dedicated server's Steam app id, whether it runs on Linux, anything that went wrong when you tried. Facts from the game itself help most.

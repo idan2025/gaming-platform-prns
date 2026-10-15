@@ -292,7 +292,21 @@ jobs:
           set -e
           cat review.md >> "$GITHUB_STEP_SUMMARY"
           cat review.md
+          mkdir -p pack-review
+          cp review.md pack-review/review.md
+          echo "$status" > pack-review/status
           exit $status
+
+      # The review travels to pack-review-comment.yml, which posts it on the
+      # pull request. That workflow runs no code from the pull request: this
+      # job has no write access, and that one only reads this text.
+      - name: keep the review for the pull request
+        if: always() && github.event_name == 'pull_request' && hashFiles('pack-review/review.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pack-review
+          path: pack-review/
+          retention-days: 7
 
   frontend:
     name: frontend render pass

@@ -721,6 +721,12 @@ later change could quietly break:
   flagged for a person. Never describe a passing pack as safe or let a
   refusal stand in for the format's own limits. `no_shipped_pack_is_refused`
   keeps it honest: a check that refuses a shipped pack is a wrong check.
+  CI posts the result on the pull request through
+  `pack-review-comment.yml`, a `workflow_run` that holds the write token and
+  **never checks out or runs anything from the pull request**: it reads the
+  review text and finds the pull request by the run's head commit. Never
+  move the comment into `ci.yml` or onto `pull_request_target`.
+  `CONTRIBUTING.md` is the contributor's and the maintainer's checklist.
 - **The official repository is `packs/`, published by `packs.yml` and
   signed by the project key** (`signing::PROJECT_KEY_HEX`, secret
   `PACK_SIGNING_IDENTITY`, offline copy with the maintainer). The job reviews
