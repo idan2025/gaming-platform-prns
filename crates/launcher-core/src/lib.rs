@@ -19,6 +19,7 @@
 //! tests at the bottom pin the JSON key names for exactly that reason.
 
 pub mod desktop;
+pub mod gamepad;
 pub mod host;
 pub mod invite;
 pub mod lan;

@@ -24,10 +24,18 @@ tracing = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
+# Big screen mode's gamepads on Linux (`src/gamepad.rs`), where the webview
+# may not read them. Pure Rust; reads /dev/input, never grabs it.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13.2"
+
 # Holding notifications back over a fullscreen game (`src/desktop.rs`). The
 # same windows-sys game-bridge already links.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+evdev = "0.13.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

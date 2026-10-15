@@ -626,6 +626,43 @@ await run('many hops and no round trip yet is said', {
   });
 }
 
+// With no Gamepad API at all (WebKitGTK without libmanette), the launcher's
+// own reader (gamepad.rs) reports a pad over the `pad` event, and it drives
+// the page the same way, once per press.
+{
+  let frames = [];
+  let padListener = null;
+  await run('a pad the launcher reads drives the page without the Gamepad API', {
+    status: running,
+    rows: () => [row(), row({ destination_hash: '0202'.repeat(8), name: 'Second', hops: 2 })],
+    beforeApp(w) {
+      w.__TAURI__.event = { listen: (name, cb) => { if (name === 'pad') padListener = cb; return Promise.resolve(() => {}); } };
+      w.requestAnimationFrame = cb => { frames.push(cb); return frames.length; };
+      w.performance.now = () => Date.now();
+      w.Element.prototype.scrollIntoView ??= () => {};
+      w.CSS ??= { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+    },
+  }, async (win, doc) => {
+    await settle();
+    check('the page listens for the launcher\'s pad', !!padListener);
+    const frame = () => { const f = frames; frames = []; f.forEach(cb => cb()); };
+    const send = held => { padListener({ payload: { connected: 1, held } }); frame(); };
+    await win.pollAll();
+    send([]);
+    check('a found controller is told', (doc.querySelector('#toast')?.textContent || '').includes('Controller found'));
+    send(['DOWN']); send([]); send(['DOWN']); send([]);
+    await settle();
+    const active = () => doc.querySelector('#list .row[tabindex="0"]')?.dataset.hash;
+    check('down moves through the list', active() === '0202'.repeat(8), active());
+    send(['START']); send(['START']); send([]);
+    await settle();
+    check('one Start held over two frames is one press', doc.body.classList.contains('bigscreen'));
+    padListener({ payload: { connected: 0, held: [] } });
+    frame();
+    check('the loop stops when the pad goes', frames.length === 0);
+  });
+}
+
 await run('no round trip, no playability hint', {
   status: running,
   rows: () => [row()],

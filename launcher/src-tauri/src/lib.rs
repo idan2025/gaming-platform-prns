@@ -825,6 +825,15 @@ pub fn run() {
                 tray: std::sync::atomic::AtomicBool::new(false),
                 told_tray: std::sync::atomic::AtomicBool::new(false),
             });
+            // Gamepads for big screen mode, read here on Linux because the
+            // webview may not (`launcher_core::gamepad`). The page merges
+            // these with its own Gamepad API.
+            {
+                let handle = app.handle().clone();
+                launcher_core::gamepad::watch(move |report| {
+                    let _ = handle.emit("pad", report);
+                });
+            }
             // On Linux the tray loads libayatana-appindicator at run time and
             // panics when the desktop has none; that must cost the tray, not
             // the launcher.

@@ -475,6 +475,14 @@ has gone. Rules a later change could quietly break:
 - **Never hold the session lock across a network round trip.** A detail probe
   did, for a whole link timeout, and froze the list, the status and Remove
   behind it. Probes and traces clone the handle (`probe_details_via`).
+- **On Linux the launcher reads gamepads itself** (`gamepad.rs`), because
+  WebKitGTK's Gamepad API needs libmanette. It only **reads** `/dev/input`
+  (never `EVIOCGRAB`: the game and Steam must still get every event), opens
+  only devices with `BTN_SOUTH` (never a keyboard), and the page takes the
+  **union** with the Gamepad API, so a pad seen both ways is one pad. Pinned
+  by `a pad the launcher reads drives the page…` in `render.mjs` and
+  `tests/gamepad_uinput.rs` (skips without `/dev/uinput`; run its binary as
+  root).
 - **The launcher's right-click is its own.** The webview's menu is a
   browser's, and its Reload throws the page away under a running core; F5 and
   Ctrl+R are blocked too. Text fields keep the native menu for cut and paste.

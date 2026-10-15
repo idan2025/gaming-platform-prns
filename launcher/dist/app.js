@@ -3711,7 +3711,21 @@ function initBigScreen() {
   });
   // A pad already connected before the page loaded shows up on first poll.
   if (navigator.getGamepads && [...navigator.getGamepads()].some(Boolean)) startPadLoop();
+  // On Linux the launcher reads gamepads itself (launcher-core gamepad.rs),
+  // because WebKitGTK sees them only when built with libmanette. Its report
+  // is merged with the Gamepad API's, so a pad seen both ways is one pad.
+  const ev = window.__TAURI__ && window.__TAURI__.event;
+  if (ev && ev.listen) ev.listen('pad', e => {
+    const r = e.payload || {};
+    const was = nativePad.connected;
+    nativePad.connected = r.connected || 0;
+    nativePad.held = new Set(r.held || []);
+    if (!was && nativePad.connected && !state.bigScreen) toast('Controller found. Press Start for big screen mode.');
+    if (nativePad.connected) startPadLoop();
+  });
 }
+// What the launcher's own reader reports (see initBigScreen).
+const nativePad = { connected: 0, held: new Set() };
 
 // Standard mapping (https://w3c.github.io/gamepad/#remapping).
 const PAD = { A: 0, B: 1, X: 2, Y: 3, LB: 4, RB: 5, BACK: 8, START: 9, UP: 12, DOWN: 13, LEFT: 14, RIGHT: 15 };
@@ -3720,12 +3734,12 @@ const PAD_REPEAT_MS = 110;
 let padLoop = null;
 const padHeld = new Map(); // logical button -> { since, last }
 function startPadLoop() {
-  if (padLoop || !navigator.getGamepads) return;
+  if (padLoop) return;
   const tick = () => {
-    const pads = [...navigator.getGamepads()].filter(Boolean);
-    if (!pads.length) { padLoop = null; padHeld.clear(); return; }
+    const pads = navigator.getGamepads ? [...navigator.getGamepads()].filter(Boolean) : [];
+    if (!pads.length && !nativePad.connected) { padLoop = null; padHeld.clear(); return; }
     const now = performance.now();
-    const pressed = new Set();
+    const pressed = new Set(nativePad.held);
     for (const p of pads) {
       const b = i => !!(p.buttons[i] && p.buttons[i].pressed);
       for (const [name, i] of Object.entries(PAD)) if (b(i)) pressed.add(name);
