@@ -15,7 +15,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
 | 4 | Installed-game detection | every player | M | **built**: Installed badge, Flatpak/Snap Steam, file picker |
 | 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, notifications, quiet over a fullscreen game |
-| 6 | Chat and player names in rooms | LAN-room players | L | **built** for rooms: chat, names, rate limit; server chat designed (§6.1), not built |
+| 6 | Chat and player names in rooms | LAN-room players | L | **built**: room chat and names; server chat for bridged players (§6.1) |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; no project repository yet |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
@@ -182,7 +182,7 @@ stripped; chat is held to a per-member gate at the host (burst 5, then one
 every two seconds). The player's name is set in Settings → You, which also
 finally gives the launch template's `{name}` a way in.
 
-### 6.1 Server chat — design (decided 2026-10-15)
+### 6.1 Server chat (built 2026-10-15)
 
 **What.** Players who joined a server in the launcher can talk to each other
 and to its host before and while they play, in the same chat card as a room.
@@ -269,6 +269,17 @@ keep-alives) and a few hundred bytes per line.
   exclude them.
 - Wire: a v0.2.40 launcher browsing a chat-flagged server lists it unchanged
   (decode with the old flag reader).
+
+**Built** as designed: `game_bridge::server_chat` (codec, `ChatHub`,
+`ChatClient`), the server's chat reader and `ChatHello` in `relay.rs`, the
+announce bit, `game-bridge server --chat`; the launcher's server chat under
+the list and its hosted-server chat on the Games page
+(`launcher-core/src/server_chat.rs`); a node's per-server switch in
+`chat.json` and "Chat…" in Lanthorn Host (`Agent::chat`, loopback routes
+`/instances/:id/chat`). Tests: `tests/server_chat.rs` in game-bridge (all
+four above but the wire one, which is `an_older_decoder_reads_a_chat_server_as_any_other`
+in `announce.rs`), the agent's Docker-gated `tests/server_chat.rs`, and the
+render pass.
 
 **Decided by the user (2026-10-15):**
 - **On by default for a server hosted from the launcher; off on a node**

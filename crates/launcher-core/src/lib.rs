@@ -24,6 +24,7 @@ pub mod invite;
 pub mod lan;
 pub mod portable;
 pub mod repo;
+pub mod server_chat;
 pub mod settings;
 pub mod steam;
 pub mod update;
@@ -497,6 +498,8 @@ struct Inner {
     hidden: std::collections::HashSet<String>,
     /// The browse node's keep-alive (`start_browse`), aborted when it stops.
     keepalive: Option<tokio::task::JoinHandle<()>>,
+    /// The chat of the server joined, if it has one (`server_chat.rs`).
+    joined_chat: Option<server_chat::JoinedChat>,
 }
 
 /// The address a live join is pointed at, kept so Play can start a game against
@@ -628,6 +631,7 @@ impl Launcher {
                 host: None,
                 hidden: Default::default(),
                 keepalive: None,
+                joined_chat: None,
             })),
             packs: Arc::new(std::sync::RwLock::new(packs)),
             settings: Arc::new(Mutex::new(settings)),
@@ -1417,6 +1421,7 @@ impl Launcher {
         let can_launch = self.launch_profile(&game_id).is_some();
         let launch_ready = self.game_location(&game_id).await.launch_ready;
         let listen_addr = format!("127.0.0.1:{listen_port}");
+        let chat_name = server_chat::chat_name(self.player_name().await);
 
         let mut inner = self.inner.lock().await;
 
@@ -1446,10 +1451,17 @@ impl Launcher {
 
         // Stop any previous join first: two clients cannot share a listen port,
         // and `stop` waits for the socket to actually be released.
+        inner.joined_chat = None;
         if let Some(mut old) = inner.client.take() {
             old.stop().await;
         }
-        inner.client = Some(BridgeSession::start_client(args).await?);
+        let client = BridgeSession::start_client(args).await?;
+        // The server's chat opens beside the join, never in its way: a server
+        // without chat, or a slow one, does not hold the join up.
+        inner.joined_chat = client
+            .chat_opener()
+            .map(|opener| server_chat::JoinedChat::start(opener, hash, chat_name));
+        inner.client = Some(client);
         inner.last_join = Some(JoinState {
             destination: hash,
             listen_addr: listen_addr.clone(),
@@ -1717,6 +1729,7 @@ impl Launcher {
         drop(settings);
         if !trimmed.is_empty() {
             self.rename_in_room(trimmed).await;
+            self.rename_in_hosted_chat(trimmed).await;
         }
         Ok(())
     }
@@ -1776,6 +1789,7 @@ impl Launcher {
 
     pub async fn leave(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
+        inner.joined_chat = None;
         if let Some(mut session) = inner.client.take() {
             session.stop().await;
         }

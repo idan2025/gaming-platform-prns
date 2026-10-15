@@ -445,6 +445,20 @@ impl MeshBridges {
 
     /// Ask every running bridge — or the one serving `instance` — to announce
     /// now. Returns how many were asked.
+    /// An instance's chat, if it is on the mesh. The hub is shared, so the
+    /// caller reads and writes it without holding the bridges lock.
+    pub async fn chat_hub(&self, instance_id: &str) -> Option<Arc<game_bridge::server_chat::ChatHub>> {
+        self.bridges.lock().await.get(instance_id).and_then(|b| b.session.chat().cloned())
+    }
+
+    /// Turn an instance's chat on or off while it runs; off closes every chat
+    /// link. Silent when it is not on the mesh: the file decides next start.
+    pub async fn set_chat(&self, instance_id: &str, on: bool) {
+        if let Some(b) = self.bridges.lock().await.get(instance_id) {
+            b.session.set_chat(on);
+        }
+    }
+
     pub async fn announce_now(&self, instance: Option<&str>) -> usize {
         let bridges = self.bridges.lock().await;
         let mut asked = 0;
@@ -595,6 +609,11 @@ impl MeshBridges {
         // new, so there is no deployed peer whose expectations it has to match —
         // and the record is what carries the game id a browser filters on.
         args.announce_format = AnnounceFormat::Record;
+        // Chat is off on a node until its operator turns it on for this
+        // server (`ROADMAP.md` §6.1, the user's call: a node serves
+        // strangers, and someone must moderate). The choice is a file in the
+        // instance folder, so it outlives a restart.
+        args.chat = identity_path.parent().is_some_and(chat_on);
 
         let session = BridgeSession::start_server(args)
             .await
@@ -656,6 +675,18 @@ not announced: {e}"
             self.stop(&id).await;
         }
     }
+}
+
+/// The file in an instance's folder that turns its chat on. Absent is off.
+pub const CHAT_FILE: &str = "chat.json";
+
+/// Whether the instance in `instance_dir` has chat on.
+pub fn chat_on(instance_dir: &Path) -> bool {
+    std::fs::read(instance_dir.join(CHAT_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("on").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Where an instance's mesh identity lives: beside its own state, so it is

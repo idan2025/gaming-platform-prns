@@ -900,6 +900,20 @@ Rules a later change could quietly break:
   `a_room_chats_with_names_and_the_host_says_who_spoke`, which fails with the
   gate removed; the UI only ever sets a line as text
   (`a room chats, by name, and a line is only ever text` in `render.mjs`).
+- **Server chat never touches a game link** (2026-10-15, ROADMAP §6.1,
+  `server_chat.rs`). A deployed peer reads anything on a game link as game
+  data, so chat rides its own link and byte stream (ids `0x100`/`0x101`),
+  asked of a server only when its announce sets the chat bit (`0x20`,
+  reserved before, ignored by every older decoder). **The client says
+  `Hello` before identifying**, because an open server connects a TCP game
+  on identify; `Hello` marks the link chat-only and its game side is never
+  started (a UDP relay is detached, not closed — `spawn_server_link_relay`
+  closes the link only if it still owns it). The server writes chat only to
+  links that said `Hello`, stamps lines with the identity the link proved,
+  and gates them per identity. A node's chat is off until the operator turns
+  it on per server (`chat.json`), loopback API only. Caught by
+  `a_chat_link_never_starts_a_game_connection` and
+  `a_link_that_never_said_hello_never_receives_chat`.
 - **Steam's 27031–27036 are chatter** (`OS_CHATTER`): Proton runs Steam's LAN
   discovery beside every game, and 27036 was offered and allowed as NFSU2's
   missing port.

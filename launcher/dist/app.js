@@ -1843,6 +1843,8 @@ async function pollAll() {
   await pollFavorites();
   await pollServers();
   await pollRoom();
+  await pollServerChat('joined');
+  await pollServerChat('hosted');
 }
 
 // ---------- indexes ----------
@@ -2488,6 +2490,157 @@ async function pollChat() {
     notify((l.name || l.address || 'Someone') + ' in your LAN room', l.text);
   }
 }
+// ---------- server chat (ROADMAP.md §6.1) ----------
+//
+// Two cards — the server this launcher joined, and the one it hosts — each
+// built once into its own stable slot and only appended to, like the room's:
+// the list and the Games page are rebuilt on every poll, and a chat box
+// rebuilt under someone typing loses their line. Names and lines are other
+// players' text, so they only ever go in as textContent. A shell without the
+// commands shows no card at all.
+const serverChats = { joined: { seq: 0, key: null, members: '' }, hosted: { seq: 0, key: null, members: '' } };
+function ensureServerChat(kind) {
+  const hosted = kind === 'hosted';
+  const slot = $(hosted ? 'host-chat-slot' : 'server-chat-dock');
+  if (!slot) return null;
+  let box = $('sc-' + kind);
+  if (box) return box;
+  box = el('div', 'card room-chat server-chat');
+  box.id = 'sc-' + kind;
+  box.hidden = true;
+  const head = el('div', 'card-head');
+  head.appendChild(el('h2', '', hosted ? 'Chat on your server' : 'Server chat'));
+  if (hosted) {
+    const toggle = el('button', 'btn', 'Turn chat off');
+    toggle.type = 'button';
+    toggle.id = 'sc-hosted-toggle';
+    head.appendChild(toggle);
+  }
+  box.appendChild(head);
+  const members = el('div', 'chat-members');
+  members.id = 'sc-' + kind + '-members';
+  box.appendChild(members);
+  const log = el('div', 'chat-log');
+  log.id = 'sc-' + kind + '-log';
+  log.setAttribute('role', 'log');
+  log.setAttribute('aria-live', 'polite');
+  box.appendChild(log);
+  const note = el('p', 'note');
+  note.id = 'sc-' + kind + '-note';
+  note.hidden = true;
+  box.appendChild(note);
+  const form = el('form', 'chat-form');
+  const input = el('input');
+  input.id = 'sc-' + kind + '-input';
+  input.type = 'text';
+  input.maxLength = 280;
+  input.autocomplete = 'off';
+  input.placeholder = hosted ? 'Say something to your players' : 'Say something to the server';
+  input.setAttribute('aria-label', 'Chat message');
+  const send = el('button', 'btn btn-primary', 'Send');
+  send.type = 'submit';
+  form.append(input, send);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    try {
+      await invoke('send_server_chat', { hosted, text });
+      input.value = '';
+      hideError();
+      setTimeout(() => pollServerChat(kind), 400);
+    } catch (err) {
+      showError('Not sent: ' + errText(err));
+    }
+  };
+  box.appendChild(form);
+  slot.appendChild(box);
+  return box;
+}
+async function pollServerChat(kind) {
+  const hosted = kind === 'hosted';
+  const box = ensureServerChat(kind);
+  if (!box) return;
+  const c = serverChats[kind];
+  const slot = $(hosted ? 'host-chat-slot' : 'server-chat-dock');
+  let v;
+  try { v = await invoke('server_chat_view', { hosted }); } catch (_) { box.hidden = true; slot.hidden = true; return; }
+  // A joined server without chat shows nothing: most have none, and that is
+  // not a problem to report. The host's card stays, to turn it on.
+  const show = hosted ? v.state !== 'none' : (v.state !== 'none' && v.state !== 'unavailable');
+  box.hidden = !show;
+  slot.hidden = !show;
+  const key = hosted ? (show ? 'hosted' : null) : (show ? state.joinedHash : null);
+  const log = $('sc-' + kind + '-log');
+  if (key !== c.key) {
+    c.key = key;
+    c.seq = 0;
+    c.members = '';
+    log.textContent = '';
+  }
+  if (!show) return;
+  const open = v.state === 'open';
+  box.querySelector('.chat-form').hidden = !open;
+  const note = $('sc-' + kind + '-note');
+  const words = {
+    opening: 'Joining the server\u2019s chat\u2026',
+    closed: 'The server ended its chat.',
+    unavailable: 'Chat is off. Players who join cannot talk here until you turn it on.',
+  };
+  note.textContent = words[v.state] || (!state.playerName ? 'Set a name in Settings to be known by it.' : '');
+  note.hidden = !note.textContent;
+  if (hosted) {
+    const toggle = $('sc-hosted-toggle');
+    toggle.textContent = open ? 'Turn chat off' : 'Turn chat on';
+    toggle.onclick = async () => {
+      try { await invoke('set_hosted_chat', { on: !open }); hideError(); } catch (err) { showError(errText(err)); }
+      pollServerChat(kind);
+    };
+  }
+  const members = $('sc-' + kind + '-members');
+  const sig = JSON.stringify(v.members || []);
+  if (sig !== c.members && !members.contains(document.activeElement)) {
+    c.members = sig;
+    members.textContent = '';
+    (v.members || []).forEach(m => {
+      const chip = el('span', 'chat-member' + (m.muted ? ' muted' : ''));
+      chip.appendChild(el('span', '', m.name + (m.is_self ? ' (you)' : m.is_host ? ' (host)' : '') + (m.muted ? ' · muted' : '')));
+      if (hosted && !m.is_self) {
+        const mute = el('button', 'btn', m.muted ? 'Unmute' : 'Mute');
+        mute.type = 'button';
+        mute.title = m.muted ? 'Let them talk again' : 'Hide what they say from everyone until the server stops';
+        mute.onclick = async () => {
+          try { await invoke('mute_in_hosted_chat', { identity: m.identity, muted: !m.muted }); hideError(); }
+          catch (err) { showError(errText(err)); }
+          pollServerChat(kind);
+        };
+        chip.appendChild(mute);
+      }
+      members.appendChild(chip);
+    });
+  }
+  if (!open && v.state !== 'closed') return;
+  let lines;
+  try { lines = await invoke('server_chat', { hosted, since: c.seq }); } catch (_) { return; }
+  if (!lines || !lines.length) return;
+  const atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+  const first = c.seq === 0;
+  lines.forEach(l => {
+    c.seq = Math.max(c.seq, l.seq);
+    const row = el('div', 'chat-line' + (l.is_self ? ' self' : ''));
+    row.append(el('span', 'chat-who', l.is_self ? 'You' : (l.name || 'Someone who left') + (l.is_host ? ' (host)' : '')),
+      el('span', 'chat-text', l.text));
+    log.appendChild(row);
+  });
+  while (log.children.length > 200) log.removeChild(log.firstChild);
+  if (atEnd || first) log.scrollTop = log.scrollHeight;
+  const heard = lines.filter(l => !l.is_self);
+  if (!first && heard.length) {
+    const l = heard[heard.length - 1];
+    notify((l.name || 'Someone') + (hosted ? ' on your server' : ' in server chat'), l.text);
+  }
+}
+
 // Someone new in the room this launcher hosts or sits in. Never on the first
 // look, and never for this machine itself.
 function noticeRoomJoins() {

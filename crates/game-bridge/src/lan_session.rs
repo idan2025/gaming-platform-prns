@@ -500,6 +500,8 @@ impl LanSession {
                         allowlisted: !allowlist.is_empty(),
                         dedicated: false,
                         transport_mode: TRANSPORT_MODE_LAN,
+                        // A room's chat is the room's own (`lan.rs`).
+                        chat: false,
                     },
                     min_link_class: args.profile.min_link_class,
                     players: 0,
@@ -828,6 +830,8 @@ impl Host {
                     let _ = self.handle.close_link(link_id);
                 }
             }
+            // Only a game server's chat reader makes these; a room has none.
+            BridgeEvent::ChatHello { .. } => {}
             BridgeEvent::LinkClosed { link_id } => {
                 if let Some(Some(identity)) = self.links.remove(&link_id) {
                     if self.seated.get(identity.as_bytes()) == Some(&link_id) {

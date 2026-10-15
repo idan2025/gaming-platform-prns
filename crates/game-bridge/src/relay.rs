@@ -76,6 +76,7 @@ use crate::config::{
     AnnounceFormat, BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, ServerArgs,
 };
 use crate::framing::{self, ChannelReassembler};
+use crate::server_chat::{self, ChatClient, ChatHub, ChatMessage};
 use crate::profile::GameTransport;
 use crate::stream::{self, ByteStreamReader, ByteStreamWriter};
 use crate::profile::{ASPECT_CLIENT, ASPECT_SERVER};
@@ -316,6 +317,10 @@ pub struct BridgeSession {
     /// Asks the announcer for an extra announce, outside its timer. `None` for
     /// roles that announce nothing.
     announce_tx: Option<mpsc::UnboundedSender<()>>,
+    /// A server's chat (`server_chat.rs`), whether or not it is on.
+    chat: Option<Arc<ChatHub>>,
+    /// The identity a client's links prove, for its chat link.
+    client_identity: Option<IdentityHash>,
     stop_tx: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<()>>,
 }
@@ -531,6 +536,40 @@ impl BridgeSession {
             .map_err(|e| anyhow!("announce failed: {e:?}"))
     }
 
+    /// A server's chat, on or off. `None` for every other role.
+    pub fn chat(&self) -> Option<&Arc<ChatHub>> {
+        self.chat.as_ref()
+    }
+
+    /// Turn a server's chat on or off while it runs. Off closes every chat
+    /// link; either way the next announce says so, and one is asked for now.
+    pub fn set_chat(&self, on: bool) {
+        let Some(hub) = &self.chat else { return };
+        for link in hub.set_enabled(on) {
+            let _ = self.handle.close_link(link);
+        }
+        self.request_announce();
+    }
+
+    /// Join `server`'s chat as `name` (`server_chat.rs`); see [`ChatOpener::open`].
+    pub async fn open_chat(&self, server: DestinationHash, name: &str) -> Result<ChatClient> {
+        self.chat_opener()
+            .ok_or_else(|| anyhow!("only a client session joins a server's chat"))?
+            .open(server, name)
+            .await
+    }
+
+    /// What opening a chat needs, without the session: a caller that keeps
+    /// the session behind a lock takes this and lets go of the lock before
+    /// the round trips (`CLAUDE.md`, "never hold the session lock").
+    pub fn chat_opener(&self) -> Option<ChatOpener> {
+        Some(ChatOpener {
+            handle: self.handle.clone(),
+            discovered: self.discovered.clone(),
+            identity: self.client_identity?,
+        })
+    }
+
     /// Stop the node and wait for it to fully tear down — including releasing
     /// bound sockets — before returning. Callers that immediately start a new
     /// session on the same port depend on this: returning before teardown
@@ -587,6 +626,13 @@ impl BridgeSession {
             .map_err(|e| anyhow!("invalid destination name: {e:?}"))?
         };
 
+        // Chat lives on the session so the host can read, write and switch it
+        // while the server runs; the host's own lines come from the server's
+        // identity.
+        let host_identity =
+            InMemoryNodeIdentity::from_secret_key_bytes(&*load_identity(&args.identity)?).identity_hash();
+        let hub = Arc::new(ChatHub::new(args.chat, host_identity));
+        let node_hub = hub.clone();
         let (announce_tx, announce_rx) = mpsc::unbounded_channel::<()>();
         let mut session = spawn_bridge_node(BridgeRole::Server, Some(precomputed_hash), args.relay_transit, move |discovered, connected_clients| async move {
             let identity = load_identity(&args.identity)?;
@@ -749,6 +795,7 @@ impl BridgeSession {
             let base_record = server_announce_record(&args);
             let fallback_name = args.name.clone();
             let announce_state = state.clone();
+            let announce_hub = node_hub.clone();
             let mut announce_rx = announce_rx;
             let _announce_task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval.max(1)));
@@ -791,9 +838,13 @@ impl BridgeSession {
                             }
                         }
                     }
+                    // Whether chat is on is read each time: the host can
+                    // switch it while the server runs.
+                    let mut record = base_record.clone();
+                    record.flags.chat = announce_hub.enabled();
                     let app_data = current_announce_app_data(
                         announce_format,
-                        &base_record,
+                        &record,
                         &fallback_name,
                         announce_state.live_summary(),
                     );
@@ -821,7 +872,11 @@ impl BridgeSession {
             let identify_timeout_secs = args.identify_timeout_secs.max(1);
             let router_extra_udp = extra_udp.clone();
             let router_extra_tcp = extra_tcp.clone();
+            let router_hub = node_hub.clone();
+            let chat_event_tx = event_tx.clone();
             let _router_task = tokio::spawn(async move {
+                // Links that said chat `Hello`: never a game's.
+                let mut chat_links: std::collections::HashSet<LinkId> = std::collections::HashSet::new();
                 let mut event_rx = event_rx;
                 // Links accepted but not yet identified, held with their
                 // buffered data: an allowlisted server's, or an open
@@ -837,6 +892,37 @@ impl BridgeSession {
                     match event {
                         BridgeEvent::AnnounceHeard { destination, hops, source_interface, info } => {
                             remember_server(&router_discovered, destination, hops, source_interface, info).await;
+                        }
+                        BridgeEvent::PeerIdentified { link_id, identity } if chat_links.contains(&link_id) => {
+                            // A chat link: it may speak now, under this
+                            // identity, if the allowlist lets it in at all.
+                            if allowlist.is_empty() || allowlist.contains(&identity) {
+                                router_hub.identified(link_id, identity);
+                            } else {
+                                warn!(link = ?link_id, "chat peer is not on the allowlist; closing link");
+                                router_hub.left(link_id);
+                                chat_links.remove(&link_id);
+                                let _ = router_handle.close_link(link_id);
+                            }
+                        }
+                        BridgeEvent::ChatHello { link_id, name, tx } => {
+                            // The link is for chat: whatever the game side
+                            // had started or was holding for it goes, so a
+                            // chat link never becomes a game connection.
+                            chat_links.insert(link_id);
+                            pending_identify.remove(&link_id);
+                            pending_streams.remove(&link_id);
+                            if let Some(game_tx) = router_senders.write().await.remove(&link_id) {
+                                let _ = game_tx.send(Vec::new()).await;
+                            }
+                            router_connected_clients.write().await.remove(&link_id);
+                            router_state.set_bridge_clients(router_senders.read().await.len());
+                            if router_hub.enabled() {
+                                router_hub.hello(link_id, name, tx);
+                            } else {
+                                chat_links.remove(&link_id);
+                                let _ = router_handle.close_link(link_id);
+                            }
                         }
                         BridgeEvent::PeerIdentified { link_id, identity } => {
                             router_connected_clients.write().await.insert(link_id, identity);
@@ -868,6 +954,15 @@ impl BridgeSession {
                                 pending_streams.remove(&link_id);
                                 router_senders.write().await.remove(&link_id);
                                 router_connected_clients.write().await.remove(&link_id);
+                                let _ = router_handle.close_link(link_id);
+                            }
+                        }
+                        BridgeEvent::IdentifyTimeout { link_id } if chat_links.contains(&link_id) => {
+                            // An allowlisted server's chat is for the
+                            // allowlist only, listening included.
+                            if !allowlist.is_empty() && !router_hub.is_identified(link_id) {
+                                router_hub.left(link_id);
+                                chat_links.remove(&link_id);
                                 let _ = router_handle.close_link(link_id);
                             }
                         }
@@ -909,6 +1004,15 @@ impl BridgeSession {
                             }
                             let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
                             router_senders.write().await.insert(link_id, tx);
+
+                            // Every link gets a chat reader, registered now for
+                            // the same reason as a TCP game's: a chat client
+                            // writes `Hello` the moment the link is up. A game
+                            // link never writes to it.
+                            let (to_server, to_client) = server_chat::stream_ids();
+                            let (chat_reader, chat_writer) =
+                                router_handle.byte_stream(link_id, to_server, to_client).await;
+                            spawn_server_chat_link(link_id, chat_reader, chat_writer, chat_event_tx.clone(), router_hub.clone());
 
                             // Every TCP port's stream reader is registered the
                             // instant the link is up, before the allowlist has
@@ -972,6 +1076,9 @@ impl BridgeSession {
                             });
                         }
                         BridgeEvent::LinkClosed { link_id } => {
+                            if chat_links.remove(&link_id) {
+                                router_hub.left(link_id);
+                            }
                             pending_identify.remove(&link_id);
                             pending_streams.remove(&link_id);
                             if let Some(tx) = router_senders.write().await.remove(&link_id) {
@@ -1001,6 +1108,7 @@ impl BridgeSession {
         // a caller whose reachability has changed can ask for an announce
         // without waiting out the interval.
         session.announce_tx = Some(announce_tx);
+        session.chat = Some(hub);
         Ok(session)
     }
 
@@ -1027,7 +1135,9 @@ impl BridgeSession {
             .map_err(|e| anyhow!("invalid destination name: {e:?}"))?
         };
 
-        spawn_bridge_node(BridgeRole::Client, Some(precomputed_hash), args.relay_transit, move |discovered, _connected_clients| async move {
+        let client_identity =
+            InMemoryNodeIdentity::from_secret_key_bytes(&*load_identity(&args.identity)?).identity_hash();
+        let mut session = spawn_bridge_node(BridgeRole::Client, Some(precomputed_hash), args.relay_transit, move |discovered, _connected_clients| async move {
             let identity = load_identity(&args.identity)?;
             let app_name = args.profile.app_name.clone();
             let game_id = args.profile.id.clone();
@@ -1198,6 +1308,7 @@ impl BridgeSession {
                         // and it never allowlists anyone.
                         BridgeEvent::PeerIdentified { .. } => {}
                         BridgeEvent::IdentifyTimeout { .. } => {}
+                        BridgeEvent::ChatHello { .. } => {}
                         BridgeEvent::LinkClosed { link_id } => {
                             router_link_data.write().await.remove(&link_id);
                         }
@@ -1244,7 +1355,9 @@ impl BridgeSession {
             info!("client node running");
             Ok((handle, async move { let _ = node.run().await; }))
         })
-        .await
+        .await?;
+        session.client_identity = Some(client_identity);
+        Ok(session)
     }
 }
 
@@ -1577,8 +1690,12 @@ fn spawn_server_link_relay(
         for task in from_game_tasks {
             task.abort();
         }
-        senders.write().await.remove(&link_id);
-        let _ = handle.close_link(link_id);
+        // Closed only if this relay still owned the link. A link taken off
+        // the game because it said chat `Hello` (`server_chat.rs`) lives on
+        // without its relay, and a closed link needs no second close.
+        if senders.write().await.remove(&link_id).is_some() {
+            let _ = handle.close_link(link_id);
+        }
         debug!(link = ?link_id, "server relay ended");
     });
 }
@@ -1652,6 +1769,125 @@ fn start_server_link(
 /// said generation 2 out loud, because `Reassembler::push` on a generation-1
 /// peer masks only `FLAG_FINAL` and mis-reassembles the rest of the header
 /// instead of rejecting it.
+/// A client session's way into a server's chat, clonable and lock-free
+/// (`BridgeSession::chat_opener`).
+#[derive(Clone)]
+pub struct ChatOpener {
+    handle: PrnsNodeHandle,
+    discovered: Arc<RwLock<Vec<DiscoveredServer>>>,
+    identity: IdentityHash,
+}
+
+impl ChatOpener {
+    /// The identity this client's chat lines are stamped with.
+    pub fn identity(&self) -> IdentityHash {
+        self.identity
+    }
+
+    /// Join `server`'s chat as `name`.
+    ///
+    /// Only a server whose own announce offers chat is asked: the gate reads
+    /// the peer's announce, never this side's wishes. A server not heard yet
+    /// is asked for its path (its answer is an announce) for a few seconds
+    /// first. The link says `Hello` and identifies only once welcomed, so the
+    /// server knows it is a chat link before it would start a game for it.
+    pub async fn open(&self, server: DestinationHash, name: &str) -> Result<ChatClient> {
+        let me = self.identity;
+        let hello = ChatMessage::Hello { name: name.to_string() }
+            .frame()
+            .ok_or_else(|| anyhow!("a name is one line of plain text, at most 32 bytes"))?;
+        let deadline = Instant::now() + server_chat::WELCOME_TIMEOUT;
+        loop {
+            let offered = self
+                .discovered
+                .read()
+                .await
+                .iter()
+                .find(|s| s.destination_hash == server)
+                .map(|s| s.record().is_some_and(|r| r.flags.chat));
+            match offered {
+                Some(true) => break,
+                Some(false) => anyhow::bail!("this server has no chat"),
+                None if Instant::now() < deadline => {
+                    let _ = self.handle.request_path(server).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                None => anyhow::bail!("this server has not been heard, so it cannot be asked for chat"),
+            }
+        }
+        let link_id = establish_link_with_path_retry(&self.handle, server)
+            .await
+            .ok_or_else(|| anyhow!("could not reach the server for chat"))?;
+        let (to_server, to_client) = server_chat::stream_ids();
+        // The reader first: the server answers `Hello` at once.
+        let (mut reader, writer) = self.handle.byte_stream(link_id, to_client, to_server).await;
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(server_chat::pump_writes(writer, rx));
+        let _ = tx.send(hello);
+        let welcomed = tokio::time::timeout(server_chat::WELCOME_TIMEOUT, async {
+            loop {
+                match server_chat::read_message(&mut reader).await {
+                    Ok(Some(b)) if ChatMessage::decode(&b) == Some(ChatMessage::Welcome) => return true,
+                    Ok(Some(_)) => continue,
+                    _ => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !welcomed {
+            let _ = self.handle.close_link(link_id);
+            anyhow::bail!("the server did not answer chat");
+        }
+        if let Err(e) = self.handle.identify(link_id, me).await {
+            let _ = self.handle.close_link(link_id);
+            anyhow::bail!("could not identify for chat: {e:?}");
+        }
+        let state = Arc::new(std::sync::Mutex::new(server_chat::ClientChatState {
+            open: true,
+            ..Default::default()
+        }));
+        let reader_state = state.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(b)) = server_chat::read_message(&mut reader).await {
+                if let Some(msg) = ChatMessage::decode(&b) {
+                    server_chat::client_apply(&reader_state, msg);
+                }
+            }
+            reader_state.lock().unwrap_or_else(|e| e.into_inner()).open = false;
+        });
+        Ok(ChatClient { link_id, handle: self.handle.clone(), tx, state })
+    }
+
+}
+
+/// A server link's chat reader. Nothing happens unless the first thing on
+/// the stream is `Hello`; then the router is told (it takes the link off the
+/// game, then welcomes it), and every `Say` after is the hub's to stamp and
+/// gate. A game link never writes here, so this waits out its life.
+fn spawn_server_chat_link(
+    link_id: LinkId,
+    mut reader: ByteStreamReader,
+    writer: ByteStreamWriter,
+    events: mpsc::UnboundedSender<BridgeEvent>,
+    hub: Arc<ChatHub>,
+) {
+    tokio::spawn(async move {
+        let Ok(Some(first)) = server_chat::read_message(&mut reader).await else { return };
+        let Some(ChatMessage::Hello { name }) = ChatMessage::decode(&first) else { return };
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(server_chat::pump_writes(writer, rx));
+        if events.send(BridgeEvent::ChatHello { link_id, name, tx }).is_err() {
+            return;
+        }
+        while let Ok(Some(bytes)) = server_chat::read_message(&mut reader).await {
+            if let Some(ChatMessage::Say { text }) = ChatMessage::decode(&bytes) {
+                hub.say(link_id, text, Instant::now());
+            }
+        }
+    });
+}
+
 fn may_use_channel(channel: u8, peer_version: u8) -> bool {
     channel == framing::CHANNEL_GAME || framing::supports_channels(peer_version)
 }
@@ -2033,6 +2269,8 @@ where
         role,
         relay_transit,
         announce_tx: None,
+        chat: None,
+        client_identity: None,
         stop_tx: Some(stop_tx),
         done: Some(done_rx),
     })
@@ -2085,6 +2323,9 @@ pub(crate) enum BridgeEvent {
     /// Synthesized by the server's own timer, not by the engine: an accepted
     /// link never identified itself while an allowlist was in force.
     IdentifyTimeout { link_id: LinkId },
+    /// Synthesized by a server's chat reader: the link said `Hello`, so it
+    /// is a chat link and never a game's (`server_chat.rs`).
+    ChatHello { link_id: LinkId, name: String, tx: mpsc::UnboundedSender<Vec<u8>> },
     LinkClosed { link_id: LinkId },
     LinkData { link_id: LinkId, bytes: Vec<u8> },
 }
@@ -2207,6 +2448,7 @@ pub fn server_announce_record(args: &ServerArgs) -> AnnounceRecord {
             allowlisted: !args.allowlist.is_empty(),
             dedicated: args.dedicated,
             transport_mode: args.transport_mode,
+            chat: args.chat,
         },
         min_link_class: args.profile.min_link_class,
         players: args.players,

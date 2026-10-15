@@ -68,6 +68,10 @@ pub struct ServerArgs {
     /// differs by role. A host volunteering a game server is already
     /// volunteering resources, so this defaults **on** for a server.
     pub relay_transit: bool,
+    /// Offer chat to bridged players (`server_chat.rs`), and say so in the
+    /// announce. Can be turned on and off while running
+    /// (`BridgeSession::set_chat`).
+    pub chat: bool,
 }
 
 impl ServerArgs {
@@ -94,6 +98,7 @@ impl ServerArgs {
             allowlist: Vec::new(),
             identify_timeout_secs: 10,
             relay_transit: true,
+            chat: false,
         }
     }
 }

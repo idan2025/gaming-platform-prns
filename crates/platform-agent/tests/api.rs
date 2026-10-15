@@ -159,6 +159,10 @@ async fn without_the_token_every_route_is_refused() {
         (reqwest::Method::PUT, "/instances/anything/backup-schedule"),
         (reqwest::Method::DELETE, "/backups/anything"),
         (reqwest::Method::POST, "/instances/anything/backups/import"),
+        (reqwest::Method::GET, "/instances/anything/chat"),
+        (reqwest::Method::POST, "/instances/anything/chat"),
+        (reqwest::Method::PUT, "/instances/anything/chat"),
+        (reqwest::Method::POST, "/instances/anything/chat/mute"),
     ] {
         let status = client
             .request(method.clone(), format!("http://{addr}{path}"))

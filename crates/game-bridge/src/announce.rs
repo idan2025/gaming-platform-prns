@@ -57,6 +57,10 @@ const FLAG_ALLOWLISTED: u8 = 0x02;
 const FLAG_DEDICATED: u8 = 0x04;
 const FLAG_TRANSPORT_MODE_MASK: u8 = 0x18;
 const FLAG_TRANSPORT_MODE_SHIFT: u32 = 3;
+/// The server offers chat to its bridged players (`server_chat.rs`). Bit 5
+/// was reserved and every decoder reads known bits only, so an older build
+/// never sees it; a client sends chat only to a server that set it.
+const FLAG_CHAT: u8 = 0x20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnnounceFlags {
@@ -64,6 +68,7 @@ pub struct AnnounceFlags {
     pub allowlisted: bool,
     pub dedicated: bool,
     pub transport_mode: u8,
+    pub chat: bool,
 }
 
 impl AnnounceFlags {
@@ -73,6 +78,7 @@ impl AnnounceFlags {
             allowlisted: b & FLAG_ALLOWLISTED != 0,
             dedicated: b & FLAG_DEDICATED != 0,
             transport_mode: (b & FLAG_TRANSPORT_MODE_MASK) >> FLAG_TRANSPORT_MODE_SHIFT,
+            chat: b & FLAG_CHAT != 0,
         }
     }
 
@@ -86,6 +92,9 @@ impl AnnounceFlags {
         }
         if self.dedicated {
             b |= FLAG_DEDICATED;
+        }
+        if self.chat {
+            b |= FLAG_CHAT;
         }
         b |= self.transport_mode.wrapping_shl(FLAG_TRANSPORT_MODE_SHIFT) & FLAG_TRANSPORT_MODE_MASK;
         b
@@ -105,6 +114,7 @@ impl Default for AnnounceFlags {
             // Mode 1, not 0: `encode` refuses an unknown mode, so a default
             // that cannot be encoded is a trap.
             transport_mode: 1,
+            chat: false,
         }
     }
 }
@@ -416,6 +426,7 @@ mod tests {
                 allowlisted: true,
                 dedicated: false,
                 transport_mode: 3,
+                chat: false,
             },
             min_link_class: 2,
             players: 5,
@@ -544,6 +555,7 @@ mod tests {
                 allowlisted: false,
                 dedicated: false,
                 transport_mode: 1,
+                chat: false,
             },
             min_link_class: 1,
             players: 0,
@@ -615,6 +627,7 @@ mod tests {
                 allowlisted: false,
                 dedicated: false,
                 transport_mode: 1,
+                chat: false,
             },
             min_link_class: 1,
             players: 0,
@@ -640,6 +653,7 @@ mod tests {
                 allowlisted: false,
                 dedicated: false,
                 transport_mode: 1,
+                chat: false,
             },
             min_link_class: 1,
             players: 0,
@@ -655,20 +669,38 @@ mod tests {
 
     #[test]
     fn flags_round_trip_and_reserved_bits_ignored() {
-        let flags = AnnounceFlags {
-            passworded: true,
-            allowlisted: false,
-            dedicated: true,
-            transport_mode: 2,
-        };
-        let byte = flags.to_byte();
-        let decoded = AnnounceFlags::from_byte(byte);
-        assert_eq!(decoded, flags);
+        for chat in [false, true] {
+            let flags = AnnounceFlags {
+                passworded: true,
+                allowlisted: false,
+                dedicated: true,
+                transport_mode: 2,
+                chat,
+            };
+            let byte = flags.to_byte();
+            let decoded = AnnounceFlags::from_byte(byte);
+            assert_eq!(decoded, flags);
 
-        // Set all reserved bits (0xE0) — they must be ignored on decode.
-        let byte_with_reserved = byte | 0xE0;
-        let decoded2 = AnnounceFlags::from_byte(byte_with_reserved);
-        assert_eq!(decoded2, flags);
+            // Set all reserved bits (0xC0) — they must be ignored on decode.
+            let byte_with_reserved = byte | 0xC0;
+            let decoded2 = AnnounceFlags::from_byte(byte_with_reserved);
+            assert_eq!(decoded2, flags);
+        }
+    }
+
+    /// The chat bit was reserved, and what a v0.2.40 launcher does with it is
+    /// read known bits only. This is that decoder, copied as it shipped: a
+    /// chat-flagged server must look to it exactly like one without chat.
+    #[test]
+    fn an_older_decoder_reads_a_chat_server_as_any_other() {
+        fn v0_2_40_from_byte(b: u8) -> (bool, bool, bool, u8) {
+            (b & 0x01 != 0, b & 0x02 != 0, b & 0x04 != 0, (b & 0x18) >> 3)
+        }
+        let plain = AnnounceFlags { chat: false, ..AnnounceFlags::default() };
+        let chat = AnnounceFlags { chat: true, ..plain };
+        assert_ne!(plain.to_byte(), chat.to_byte());
+        assert_eq!(v0_2_40_from_byte(plain.to_byte()), v0_2_40_from_byte(chat.to_byte()));
+        assert_eq!(chat.to_byte() & 0x1F, plain.to_byte(), "chat touches no bit an older build reads");
     }
 
     // ---- added in review; the cases the draft did not cover ----

@@ -79,6 +79,8 @@ server options
   --allow HASH       identity hash permitted to link; repeatable. Absent means
                      open to anyone.
   --no-transit       do not also carry other people's traffic
+  --chat             offer chat to players who joined through a launcher
+                     (ROADMAP.md §6.1); off unless given
 
 client options
   --server HASH      destination to join. Absent means take the first server
@@ -259,6 +261,7 @@ fn build_game_role(role: &str, rest: &[String]) -> Result<BridgeConfig> {
                 "--allow" => args.allowlist.push(value(&mut it, "--allow")?),
                 "--no-transit" => args.relay_transit = false,
                 "--passworded" => args.passworded = true,
+                "--chat" => args.chat = true,
                 other => bail!("unknown option {other:?} for game-bridge server\n\n{USAGE}"),
             }
         }

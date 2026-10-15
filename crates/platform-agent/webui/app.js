@@ -899,6 +899,10 @@ function openInstanceMenu(id, x, y) {
     action: () => onBackups(id) });
   items.push({ label: "Daily restart…", icon: "restart", title: "Restart this server once a day in a window you pick, when nobody is playing.",
     action: () => onRestartSchedule(id) });
+  items.push({ label: "Chat…", icon: "users", disabled: !inst.mesh_destination,
+    title: inst.mesh_destination ? "Talk with the players who joined through Lanthorn, and turn this server's chat on or off."
+      : "Only a server on the mesh has chat.",
+    action: () => onChat(id) });
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
   showMenu(x, y, items);
@@ -1712,6 +1716,113 @@ function onBackups(instanceId) {
       }
     });
     load();
+  });
+}
+
+// ---------- chat (ROADMAP.md §6.1) ----------
+//
+// Off on a node until the operator turns it on, per server. Every name and
+// line is a player's text, so it only ever goes in as textContent. The dialog
+// polls while it is open and stops when it closes.
+async function onChat(instanceId) {
+  const inst = instById(instanceId);
+  const name = (inst && inst.name) || instanceId;
+  const path = "/instances/" + encodeURIComponent(instanceId) + "/chat";
+  let view;
+  try { view = await api("GET", path + "?since=0"); } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "This node's agent has no chat. Update the agent.");
+    return;
+  }
+  openModal("chat-dialog", inst && inst.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Chat · " + name));
+    body.appendChild(el("p", "muted small", "Players who joined this server through Lanthorn can talk here, and so can you. " +
+      "Only what is said while the server runs is kept, and nothing after it stops."));
+    const onWrap = el("label", "check");
+    const on = el("input");
+    on.type = "checkbox";
+    on.id = "chat-on";
+    onWrap.append(on, el("span", null, "Chat on this server"));
+    body.appendChild(onWrap);
+    const members = el("div", "chat-members");
+    members.id = "chat-members";
+    body.appendChild(members);
+    const log = el("div", "chat-log");
+    log.id = "chat-log";
+    log.setAttribute("role", "log");
+    body.appendChild(log);
+    const form = el("form", "chat-form");
+    const input = el("input", "field");
+    input.id = "chat-input";
+    input.maxLength = 280;
+    input.autocomplete = "off";
+    input.placeholder = "Say something to the players";
+    const send = el("button", "btn btn-primary", "Send");
+    send.type = "submit";
+    form.append(input, send);
+    body.appendChild(form);
+    const actions = el("div", "form-actions");
+    const done = el("button", "btn", "Close");
+    done.type = "button";
+    done.onclick = close;
+    actions.appendChild(done);
+    body.appendChild(actions);
+
+    let seq = 0;
+    let memberSig = "";
+    const render = v => {
+      on.checked = !!v.on;
+      form.hidden = !(v.on && v.live);
+      const sig = JSON.stringify(v.members || []);
+      if (sig !== memberSig && !members.contains(document.activeElement)) {
+        memberSig = sig;
+        members.textContent = "";
+        (v.members || []).forEach(m => {
+          const chip = el("span", "chip chat-member" + (m.muted ? " muted" : ""), m.name + (m.host ? " (you)" : "") + (m.muted ? " · muted" : ""));
+          if (!m.host) {
+            const b = el("button", "btn btn-small", m.muted ? "Unmute" : "Mute");
+            b.type = "button";
+            b.onclick = async () => {
+              try { await withInFlight(api("POST", path + "/mute", { identity: m.identity, muted: !m.muted })); clearError(); }
+              catch (e) { showError((e && e.error) || "That did not change."); }
+              refresh();
+            };
+            chip.appendChild(b);
+          }
+          members.appendChild(chip);
+        });
+      }
+      for (const l of v.lines || []) {
+        if (l.seq <= seq) continue;
+        seq = l.seq;
+        const row = el("div", "chat-line");
+        row.append(el("strong", null, l.host ? "You" : (l.name || "Someone who left")), document.createTextNode(" "), el("span", null, l.text));
+        log.appendChild(row);
+        log.scrollTop = log.scrollHeight;
+      }
+    };
+    const refresh = async () => {
+      try { render(await api("GET", path + "?since=" + seq)); } catch (_) { /* the next tick tries again */ }
+    };
+    on.addEventListener("change", async () => {
+      try { await withInFlight(api("PUT", path, { on: on.checked })); clearError();
+        toast(on.checked ? "Chat is on for " + name + "." : "Chat is off for " + name + "."); }
+      catch (e) { if (e && e.__auth) { close(); return; } showError((e && e.error) || "That did not change."); }
+      refresh();
+    });
+    form.addEventListener("submit", async e => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      try { await withInFlight(api("POST", path, { text })); input.value = ""; clearError(); }
+      catch (err) { if (err && err.__auth) { close(); return; } showError((err && err.error) || "Not sent."); }
+      refresh();
+    });
+    render(view);
+    const tick = setInterval(() => {
+      if (!body.isConnected) { clearInterval(tick); return; }
+      refresh();
+    }, 2000);
   });
 }
 
