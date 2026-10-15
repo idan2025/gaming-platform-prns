@@ -744,6 +744,19 @@ later change could quietly break:
   expired signature is an error that hides the pack, offline too. The
   project key is always first-party in `pack_trust_policy`. Turning it off is
   a setting (`official_packs_off`, `official-packs.json`), never config.
+- **A repository can be seeded over Reticulum** (`repo_mesh.rs`,
+  `game-bridge repo seed`), addressed `rns://<destination>/` and read through
+  the same `repo::fetch` and checks, chunk by chunk over a link request.
+  **Its announce starts with `0xFE`** — not a record version, not UTF-8 — so
+  no Lanthorn build lists it as a server (`a_seed_announce_is_never_a_server_row`).
+  A seed serves only repository names from its folder. A launcher or node
+  falls back by itself to a seed that says it carries the official list when
+  the official address does not answer, and holds it to the project key;
+  **the node's import re-reads the list held to that key**
+  (`ImportRequest::pinned_key`, never from a request), or a seed could show
+  one list to the check and another to the import. `tests/repo_mesh.rs`,
+  `without_internet_the_official_packs_come_from_a_seed_on_the_mesh`,
+  `a_list_held_to_a_key_is_refused_when_another_signed_it`.
 - **A folder is a repository** (`file://` or an absolute path,
   `repo::check_repo_url`), read through the same `repo::fetch` and the same
   checks as https. **On a node only under `<data_root>/mirrors/`**

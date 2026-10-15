@@ -38,6 +38,8 @@ usage: game-bridge server <game-id> [options]
        game-bridge verify <pack.toml> [options]
        game-bridge repo build <dir> [--name NAME] [--identity PATH [--days N]]
        game-bridge repo mirror [<source>] <dir> [--key HEX]
+       game-bridge repo seed <dir> [--from <source>|--official] [--key HEX]
+                             [--every HOURS] [--identity PATH] [--tcp HOST:PORT] [--auto]
        game-bridge review <pack.toml>... [--against DIR] [--markdown]
        game-bridge --help | --version
 
@@ -59,7 +61,11 @@ roles (PLAN.md §1)
            from any web host. `repo mirror` copies a signed repository
            (the official one when no source is given) into a folder, exactly
            and one way: run it again to take what was added since. Serve the
-           folder from any web host, or add it in a launcher or node as is
+           folder from any web host, or add it in a launcher or node as is.
+           `repo seed` serves a folder on the mesh (rns://<destination>/);
+           with --from or --official it mirrors first and again every
+           --every hours (default 6), so packs reach launchers and nodes with
+           no internet
   review   name what a person must read in a pack before sharing or merging
            it, and refuse what no honest pack needs; exits 1 on a refusal.
            --against DIR compares with the packs it would sit beside. A pack
@@ -673,6 +679,7 @@ fn repo_cli(rest: &[String]) -> Result<()> {
     match it.next().map(String::as_str) {
         Some("build") => {}
         Some("mirror") => return repo_mirror_cli(&rest[1..]),
+        Some("seed") => return repo_seed_cli(&rest[1..]),
         _ => bail!("game-bridge repo takes `build <dir>` or `mirror [<source>] <dir>`\n\n{USAGE}"),
     }
     let mut dir: Option<PathBuf> = None;
@@ -779,6 +786,89 @@ fn repo_mirror_cli(rest: &[String]) -> Result<()> {
         if report.changed.is_empty() { String::new() } else { format!(" ({})", report.changed.join(", ")) }
     );
     Ok(())
+}
+
+/// `game-bridge repo seed <dir> ...`: a repository on the mesh
+/// (`repo_mesh.rs`), kept an exact mirror of `--from` when one is given.
+fn repo_seed_cli(rest: &[String]) -> Result<()> {
+    let mut dir: Option<PathBuf> = None;
+    let mut from: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut every_hours: u64 = 6;
+    let mut identity = PathBuf::from("repo-seed.identity");
+    let mut tcp: Option<String> = None;
+    let mut auto = false;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--from" => from = Some(value(&mut it, "--from")?),
+            "--official" => from = Some(game_bridge::repo::OFFICIAL_REPOSITORY.to_string()),
+            "--key" => key = Some(value(&mut it, "--key")?),
+            "--every" => every_hours = parse_num(&value(&mut it, "--every")?, "--every")?,
+            "--identity" => identity = PathBuf::from(value(&mut it, "--identity")?),
+            "--tcp" => tcp = Some(value(&mut it, "--tcp")?),
+            "--auto" => auto = true,
+            other if other.starts_with('-') => {
+                bail!("unknown option {other:?} for game-bridge repo seed\n\n{USAGE}")
+            }
+            other if dir.is_none() => dir = Some(PathBuf::from(other)),
+            other => bail!("game-bridge repo seed takes one directory, not also {other:?}"),
+        }
+    }
+    let dir = dir.ok_or_else(|| anyhow!("game-bridge repo seed needs a directory\n\n{USAGE}"))?;
+    if tcp.is_none() && !auto {
+        bail!("a seed nobody can reach serves nothing: give --tcp HOST:PORT or --auto");
+    }
+    let key = match key {
+        None => game_bridge::signing::project_key(),
+        Some(hex_key) => {
+            let mut b = [0u8; 16];
+            hex::decode_to_slice(hex_key.trim(), &mut b)
+                .map_err(|_| anyhow!("--key is an identity hash, 32 hex digits"))?;
+            prns_core::identity::IdentityHash::new(b)
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let remirror = |source: String| {
+            let dir = dir.clone();
+            async move {
+                match game_bridge::repo::mirror(&source, &dir, key).await {
+                    Ok(r) => println!("mirrored {}: {} pack(s), {} new or changed", r.name, r.packs, r.changed.len()),
+                    // Offline is normal for a seed: it keeps serving the last copy.
+                    Err(e) => eprintln!("could not mirror {source} ({e:#}); serving the copy already here"),
+                }
+            }
+        };
+        if let Some(source) = &from {
+            remirror(source.clone()).await;
+        }
+        if !dir.join(game_bridge::repo::INDEX_FILE).is_file() {
+            bail!("{} holds no repository to serve", dir.display());
+        }
+        let session = game_bridge::repo_mesh::start_seed(game_bridge::repo_mesh::SeedArgs {
+            dir: dir.clone(),
+            identity,
+            tcp,
+            auto,
+            announce_every: game_bridge::repo_mesh::ANNOUNCE_EVERY,
+        })
+        .await?;
+        let own = session.own_hash().map(|h| hex::encode(h.as_bytes())).unwrap_or_default();
+        println!("serving {} on the mesh as rns://{own}/", dir.display());
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = tokio::time::sleep(Duration::from_secs(every_hours.max(1) * 3600)) => {
+                    if let Some(source) = &from {
+                        remirror(source.clone()).await;
+                        session.request_announce();
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 fn verify_pack_cli(rest: &[String]) -> Result<()> {

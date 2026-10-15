@@ -476,6 +476,9 @@ pub struct Launcher {
     official: Arc<(String, String)>,
     /// What the last look at the official repository did.
     official_sync: Arc<std::sync::Mutex<repo::OfficialSyncView>>,
+    /// A seed on the mesh standing in for the official repository while
+    /// its https address cannot be reached (`repo.rs`), held to the same key.
+    official_mirror: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 struct Inner {
@@ -648,6 +651,7 @@ impl Launcher {
                 game_bridge::signing::PROJECT_KEY_HEX.to_string(),
             )),
             official_sync: Default::default(),
+            official_mirror: Default::default(),
         }
     }
 
@@ -756,7 +760,10 @@ impl Launcher {
             return Ok(());
         }
         let args = BrowserArgs { tcp: opts.tcp.clone(), auto: opts.auto };
-        inner.browse = Some(BridgeSession::start_browser(args).await?);
+        let session = BridgeSession::start_browser(args).await?;
+        // `rns://` pack repositories are read through the browse node.
+        game_bridge::repo_mesh::set_mesh_handle(Some(session.handle().clone()));
+        inner.browse = Some(session);
         // A join has to attach the same interfaces, and this is the only record
         // of which ones the player actually started browsing with.
         inner.browse_opts = Some(opts);
@@ -805,6 +812,7 @@ impl Launcher {
             task.abort();
         }
         if let Some(mut session) = inner.browse.take() {
+            game_bridge::repo_mesh::set_mesh_handle(None);
             session.stop().await;
         }
         Ok(())

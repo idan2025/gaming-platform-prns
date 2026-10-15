@@ -72,6 +72,12 @@ pub struct ImportRequest {
     /// Replace a pack with this id if one is already installed.
     #[serde(default)]
     pub replace: bool,
+    /// The key `repository`'s list must be signed by, set by the node itself
+    /// (`official.rs`), never by a request: the import reads the list again,
+    /// and a seed could otherwise show the key's list to the check and its
+    /// own to the import.
+    #[serde(skip)]
+    pub pinned_key: Option<prns_core::identity::IdentityHash>,
 }
 
 /// What was installed.
@@ -154,7 +160,7 @@ pub async fn import(
     let (src, sig) = match (&request.toml, &request.url, &request.repository, &request.id) {
         (Some(t), None, None, None) => (t.clone(), None),
         (None, Some(u), None, None) => (fetch_pack(u).await?, None),
-        (None, None, Some(r), Some(id)) => fetch_from_repository(r, id, now).await?,
+        (None, None, Some(r), Some(id)) => fetch_from_repository(r, id, now, request.pinned_key).await?,
         _ => return Err(ImportError::SourceNotClear),
     };
     if src.len() > MAX_PACK_BYTES {
@@ -260,6 +266,7 @@ async fn fetch_from_repository(
     repository: &str,
     id: &str,
     now: SystemTime,
+    pinned_key: Option<prns_core::identity::IdentityHash>,
 ) -> Result<(String, Option<String>), ImportError> {
     use game_bridge::repo::{beside, sha256_hex};
     let url = game_bridge::repo::check_repo_url(repository)
@@ -267,14 +274,18 @@ async fn fetch_from_repository(
     let read = game_bridge::repo::read_index(&url)
         .await
         .map_err(|e| ImportError::Repository(format!("{e:#}")))?;
-    // The official list is held to the project key, whoever serves it.
-    if game_bridge::repo::check_repo_url(game_bridge::repo::OFFICIAL_REPOSITORY).ok().as_deref()
-        == Some(url.as_str())
-        && read.signature.as_ref().map(|(who, _)| *who) != Some(game_bridge::signing::project_key())
-    {
-        return Err(ImportError::Repository(
-            "the official list is not signed by the project key".into(),
-        ));
+    // The official list is held to the project key, whoever serves it, and
+    // any list to the key its caller pinned.
+    let official = game_bridge::repo::check_repo_url(game_bridge::repo::OFFICIAL_REPOSITORY)
+        .ok()
+        .is_some_and(|o| o == url);
+    let wanted = pinned_key.or(official.then(game_bridge::signing::project_key));
+    if let Some(key) = wanted {
+        if read.signature.as_ref().map(|(who, _)| *who) != Some(key) {
+            return Err(ImportError::Repository(
+                "the list is not signed by the key it is held to".into(),
+            ));
+        }
     }
     let index = read.index;
     let entry = index
@@ -421,7 +432,7 @@ query = "a2s"
 "#;
 
     fn paste(toml: &str, replace: bool) -> ImportRequest {
-        ImportRequest { toml: Some(toml.to_string()), url: None, repository: None, id: None, replace }
+        ImportRequest { toml: Some(toml.to_string()), url: None, repository: None, id: None, replace, pinned_key: None }
     }
 
     /// Serve `dir` over plain HTTP on loopback.
@@ -483,7 +494,7 @@ query = "a2s"
             url: None,
             repository: Some(url.clone()),
             id: Some(id.to_string()),
-            replace,
+            replace, pinned_key: None
         };
 
         let out = run(&req("test-game", false), dir.path()).await.unwrap();
@@ -510,6 +521,43 @@ query = "a2s"
 
     async fn run(req: &ImportRequest, dir: &Path) -> Result<ImportedPack, ImportError> {
         import(req, dir, &TrustPolicy::allowing_unsigned(), now(), |_| true).await
+    }
+
+    /// A list held to a key is refused when another key signed it, even
+    /// from a source that also offers it signed by the right one: the
+    /// import's own read of the list is held to the key, not only the
+    /// caller's check.
+    #[tokio::test]
+    async fn a_list_held_to_a_key_is_refused_when_another_signed_it() {
+        use std::time::Duration;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("test-game.toml"), PACK).unwrap();
+        let index = game_bridge::repo::RepoIndex::build(repo.path(), "R").unwrap();
+        let json = serde_json::to_vec(&index).unwrap();
+        std::fs::write(repo.path().join("index.json"), &json).unwrap();
+        let signer = |seed: u8| prns_core::identity::PrivateIdentityMaterial::from_slice(&[seed; 64]).unwrap();
+        let sig = game_bridge::signing::PackSignature::sign_index(
+            &json,
+            &signer(21),
+            SystemTime::now() - Duration::from_secs(60),
+            Duration::from_secs(86_400),
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("index.json.sig"), sig.to_toml()).unwrap();
+        let url = game_bridge::repo::check_repo_url(&repo.path().to_string_lossy()).unwrap();
+        let req = |key| ImportRequest {
+            toml: None,
+            url: None,
+            repository: Some(url.clone()),
+            id: Some("test-game".into()),
+            replace: false,
+            pinned_key: Some(key),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let other = signer(22).public().identity_hash();
+        assert!(run(&req(other), dir.path()).await.is_err());
+        assert!(!dir.path().join("test-game.toml").exists());
+        run(&req(signer(21).public().identity_hash()), dir.path()).await.unwrap();
     }
 
     #[tokio::test]
@@ -584,7 +632,7 @@ query = "a2s"
             url: Some("file:///etc/passwd".into()),
             repository: None,
             id: None,
-            replace: false,
+            replace: false, pinned_key: None
         };
         assert!(matches!(
             run(&req, dir.path()).await,
@@ -595,7 +643,7 @@ query = "a2s"
     #[tokio::test]
     async fn a_request_with_no_source_or_two_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let neither = ImportRequest { toml: None, url: None, repository: None, id: None, replace: false };
+        let neither = ImportRequest { toml: None, url: None, repository: None, id: None, replace: false, pinned_key: None };
         assert!(matches!(run(&neither, dir.path()).await, Err(ImportError::SourceNotClear)));
 
         let both = ImportRequest {
@@ -603,7 +651,7 @@ query = "a2s"
             url: Some("https://example.org/p.toml".into()),
             repository: None,
             id: None,
-            replace: false,
+            replace: false, pinned_key: None
         };
         assert!(matches!(run(&both, dir.path()).await, Err(ImportError::SourceNotClear)));
     }

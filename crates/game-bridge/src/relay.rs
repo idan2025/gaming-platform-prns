@@ -536,6 +536,12 @@ impl BridgeSession {
             .map_err(|e| anyhow!("announce failed: {e:?}"))
     }
 
+    /// Hand this session the channel its announcer listens on, for a role
+    /// built outside this module (`repo_mesh::start_seed`).
+    pub(crate) fn set_announce_tx(&mut self, tx: mpsc::UnboundedSender<()>) {
+        self.announce_tx = Some(tx);
+    }
+
     /// A server's chat, on or off. `None` for every other role.
     pub fn chat(&self) -> Option<&Arc<ChatHub>> {
         self.chat.as_ref()
@@ -2365,6 +2371,16 @@ pub(crate) fn funnel_event(event: PrnsEvent<'_>, tx: &mpsc::UnboundedSender<Brid
                 cause = ?cause,
                 "an announce was held by the mesh rather than carried"
             );
+        }
+        PrnsEvent::Diagnostic(Diagnostic::AnnounceHeard {
+            destination,
+            hops,
+            source_interface,
+            app_data,
+        }) if crate::repo_mesh::note_heard(destination, hops, app_data) => {
+            // A pack repository's seed: remembered for the launcher's
+            // Games page, never offered to the server list.
+            let _ = source_interface;
         }
         PrnsEvent::Diagnostic(Diagnostic::AnnounceHeard {
             destination,
