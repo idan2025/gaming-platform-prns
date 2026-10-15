@@ -399,6 +399,13 @@ impl MeshBridges {
     /// identity, and `Browse` deliberately holds none (`PLAN.md` §4 — browsing
     /// a list is not consent to carry strangers' traffic). Here the traffic
     /// being carried is this node's own servers'.
+    /// The loopback port of this node's shared instance, starting the hub if
+    /// it is not up yet. What a seed of the official packs joins
+    /// (`official.rs`), as the game servers do.
+    pub async fn hub_port(&self) -> Result<u16> {
+        self.ensure_hub().await
+    }
+
     async fn ensure_hub(&self) -> Result<u16> {
         let config = self.config.as_ref().ok_or_else(|| anyhow!("this node runs its games LAN-only"))?;
         let port = config.shared_instance_port;

@@ -1020,7 +1020,7 @@ working, and each shortens the distance between installing and playing.
    from the app id in the core; the page sends a game id), and shows the
    download in Steam's numbers until the game is installed. Lanthorn Host's
    game card shows `Agent::content_state`: a `manual` game's exact folder,
-   the folders the copy must have, the pack's note, and **Check again**; an
+   the folders the copy must have, the pack's note, and **Recheck**; an
    installed copy missing a mounted folder, and an automatic game on a node
    with `allow_content_fetch` off, each say so. A node's own downloads
    already showed size and the driver's errors (`ROADMAP.md` item 11).

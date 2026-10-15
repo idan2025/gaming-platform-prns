@@ -319,6 +319,10 @@ pub struct SeedArgs {
     pub identity: PathBuf,
     pub tcp: Option<String>,
     pub auto: bool,
+    /// Reach the mesh through this machine's shared instance on this
+    /// loopback port, as a node's game servers do, instead of interfaces of
+    /// its own.
+    pub shared_instance: Option<u16>,
     pub announce_every: Duration,
 }
 
@@ -327,6 +331,7 @@ pub struct SeedArgs {
 /// so a re-mirror shows.
 pub async fn start_seed(args: SeedArgs) -> Result<BridgeSession> {
     let secret = load_identity(&args.identity)?;
+    let shared_instance = args.shared_instance;
     let destination_of = |secret| PreConfiguredDestination::Single {
         app_name: APP_NAME,
         aspects: &[ASPECT],
@@ -400,6 +405,9 @@ pub async fn start_seed(args: SeedArgs) -> Result<BridgeSession> {
     })
     .await?;
     session.set_announce_tx(announce_tx);
+    if let Some(port) = shared_instance {
+        session.join_shared_instance(port).await?;
+    }
     Ok(session)
 }
 

@@ -851,6 +851,7 @@ fn repo_seed_cli(rest: &[String]) -> Result<()> {
             identity,
             tcp,
             auto,
+            shared_instance: None,
             announce_every: game_bridge::repo_mesh::ANNOUNCE_EVERY,
         })
         .await?;

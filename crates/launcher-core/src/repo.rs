@@ -824,6 +824,7 @@ mod tests {
             identity: home.path().join("seed.identity"),
             tcp: Some(format!("0.0.0.0:{port}")),
             auto: false,
+            shared_instance: None,
             announce_every: Duration::from_secs(5),
         })
         .await

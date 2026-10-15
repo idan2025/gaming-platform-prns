@@ -61,6 +61,7 @@ async fn a_seed_is_heard_never_listed_and_mirrors_exactly_over_the_mesh() {
         identity: scratch.join("seed.identity"),
         tcp: Some(format!("0.0.0.0:{mesh_port}")),
         auto: false,
+        shared_instance: None,
         announce_every: Duration::from_secs(5),
     })
     .await

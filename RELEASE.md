@@ -84,7 +84,7 @@ is missing, which makes pushing a tag sufficient on its own.
   numbers. A game Steam is still downloading is no longer counted as
   installed.
 - Lanthorn Host says, on the game's card, exactly where a hand-installed
-  game's files go and which folders the copy needs, with **Check again**,
+  game's files go and which folders the copy needs, with **Recheck**,
   before a Start fails. An installed copy missing a folder a server needs
   says so too, and a game this node may not download says why.
 
@@ -107,6 +107,11 @@ is missing, which makes pushing a tag sufficient on its own.
 - Adding a game: `CONTRIBUTING.md` walks through a pack pull request, the
   review posts its result on the pull request, and there is a form to
   request a game.
+- Lanthorn Host can share the official packs on the mesh itself
+  (**Share on the mesh** beside the official packs): it keeps an exact copy
+  in `mirrors/official` and serves it through the node's own Reticulum
+  connection, so nodes and launchers without internet still get the packs.
+  Off by default.
 - Fixed: `game-bridge repo build` left its list in a hidden partial file.
 - **The project key (`7a656c1da3347bfcfe6b3981f71099c8`) is a release
   secret like the updater key**: `PACK_SIGNING_IDENTITY` in the repository

@@ -766,6 +766,12 @@ later change could quietly break:
   one list to the check and another to the import. `tests/repo_mesh.rs`,
   `without_internet_the_official_packs_come_from_a_seed_on_the_mesh`,
   `a_list_held_to_a_key_is_refused_when_another_signed_it`.
+  **A node seeds the official packs only when its operator turns it on**
+  (`official.rs`, `seed` in `official-packs.json`): each pass mirrors them
+  into `<data_root>/mirrors/official` and serves that folder through the
+  node's own hub (`SeedArgs::shared_instance`), never interfaces of its
+  own. A failed mirror keeps serving the last good copy.
+  `a_node_seeds_the_official_packs_through_its_own_hub`.
 - **A folder is a repository** (`file://` or an absolute path,
   `repo::check_repo_url`), read through the same `repo::fetch` and the same
   checks as https. **On a node only under `<data_root>/mirrors/`**
