@@ -37,6 +37,7 @@ usage: game-bridge server <game-id> [options]
        game-bridge sign   <pack.toml> [options]
        game-bridge verify <pack.toml> [options]
        game-bridge repo build <dir> [--name NAME] [--identity PATH [--days N]]
+       game-bridge review <pack.toml>... [--against DIR] [--markdown]
        game-bridge --help | --version
 
 roles (PLAN.md §1)
@@ -55,6 +56,11 @@ roles (PLAN.md §1)
   repo     write the index.json that makes a directory of packs a repository
            a launcher can add (PLAN.md §13.3 step 6); serve the directory
            from any web host
+  review   name what a person must read in a pack before sharing or merging
+           it, and refuse what no honest pack needs; exits 1 on a refusal.
+           --against DIR compares with the packs it would sit beside. A pack
+           that passes is not thereby safe: the format's limits are what keep
+           a pack from running anything, and this is a reviewer's aid
 
 common options
   --packs DIR        where to read game packs from (default: ./packs)
@@ -146,6 +152,7 @@ fn main() -> Result<()> {
         "sign" => return sign_pack(&args[1..]),
         "verify" => return verify_pack_cli(&args[1..]),
         "repo" => return repo_cli(&args[1..]),
+        "review" => return review_cli(&args[1..]),
         other => bail!("unknown role {other:?}\n\n{USAGE}"),
     };
 
@@ -559,6 +566,95 @@ fn sign_pack(rest: &[String]) -> Result<()> {
          Re-sign before it closes: a node that has not refreshed refuses the pack rather than\n\
          trusting it forever (PLAN.md §11.3)."
     );
+    Ok(())
+}
+
+/// `game-bridge review <pack.toml>... [--against DIR] [--markdown]`: what a
+/// reviewer must read in each pack (`review.rs`). Exits non-zero when any pack
+/// is refused or does not parse, so CI can gate a contribution on it.
+fn review_cli(rest: &[String]) -> Result<()> {
+    use game_bridge::review::{review, Severity};
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut against: Option<PathBuf> = None;
+    let mut markdown = false;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--against" => against = Some(PathBuf::from(value(&mut it, "--against")?)),
+            "--markdown" => markdown = true,
+            other if other.starts_with('-') => {
+                bail!("unknown option {other:?} for game-bridge review\n\n{USAGE}")
+            }
+            other => files.push(PathBuf::from(other)),
+        }
+    }
+    if files.is_empty() {
+        bail!("game-bridge review needs at least one pack\n\n{USAGE}");
+    }
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut others: Vec<(PathBuf, GamePack)> = Vec::new();
+    if let Some(dir) = &against {
+        let entries =
+            std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            if let Ok(pack) = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| GamePack::parse(&s).map_err(|e| e.to_string()))
+            {
+                others.push((canonical(&path), pack));
+            }
+        }
+    }
+    let mut refused = 0;
+    for file in &files {
+        let name = file.display();
+        let parsed = std::fs::read_to_string(file)
+            .map_err(|e| e.to_string())
+            .and_then(|s| GamePack::parse(&s).map_err(|e| e.to_string()));
+        let findings = match parsed {
+            // Compared with every pack but this file itself.
+            Ok(pack) => {
+                let me = canonical(file);
+                let beside: Vec<GamePack> =
+                    others.iter().filter(|(p, _)| *p != me).map(|(_, o)| o.clone()).collect();
+                review(&pack, &beside)
+            }
+            Err(e) => {
+                refused += 1;
+                if markdown {
+                    println!("### `{name}`\n\n- **refuse**: does not parse: {e}\n");
+                } else {
+                    println!("{name}: refuse: does not parse: {e}");
+                }
+                continue;
+            }
+        };
+        if findings.iter().any(|f| f.severity == Severity::Refuse) {
+            refused += 1;
+        }
+        if markdown {
+            println!("### `{name}`\n");
+            if findings.is_empty() {
+                println!("Nothing to flag.\n");
+            }
+            for f in &findings {
+                println!("- **{}** `{}`: {}", f.severity.label(), f.field, f.message);
+            }
+            println!();
+        } else if findings.is_empty() {
+            println!("{name}: nothing to flag");
+        } else {
+            for f in &findings {
+                println!("{name}: {f}");
+            }
+        }
+    }
+    if refused > 0 {
+        bail!("{refused} pack(s) refused");
+    }
     Ok(())
 }
 

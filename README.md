@@ -297,6 +297,17 @@ installed only if its bytes are the ones the list names and its signature,
 if it has one, holds. A signed list is held to the key it was first added
 with. Lanthorn ships with no repository configured.
 
+Before sharing or merging a pack, run `game-bridge review my-game.toml
+--against packs/`. It refuses what no honest pack needs (a launch argument
+that runs a config file or points the game somewhere else, a LAN port that
+is a remote-access service, a name copying another game's) and names what a
+person must read (an archive download, a Steam app no other pack uses, a
+link in the notes). CI runs it on every pull request that touches `packs/`,
+`repo build` will not list a refused pack, and neither the launcher nor a
+node installs one. **Passing is not proof a pack is safe**: what keeps a
+pack from running anything is the format itself, and a pack still needs a
+person to read it.
+
 ## Relationship to Svencoop-Prns
 
 [`idan2025/Svencoop-Prns`](https://github.com/idan2025/Svencoop-Prns) **stays a
