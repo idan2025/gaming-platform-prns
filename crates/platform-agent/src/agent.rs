@@ -1675,6 +1675,88 @@ impl Agent {
         Ok(())
     }
 
+    /// A server's chat (`ROADMAP.md` §6.1): whether it is on, who is in it,
+    /// and what was said after `since`. Loopback API only — the uplink never
+    /// gets chat, as it never got the console.
+    pub async fn chat(&self, instance_id: &str, since: u64) -> Result<NodeChat> {
+        self.ensure_instance(instance_id).await?;
+        let dir = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?;
+        let on = crate::mesh::chat_on(&dir);
+        let Some(hub) = self.mesh.chat_hub(instance_id).await else {
+            return Ok(NodeChat { on, live: false, members: Vec::new(), lines: Vec::new() });
+        };
+        let host = hub.host_identity();
+        let names = hub.names();
+        let muted = hub.muted();
+        let hex_of = |id: &prns_core::identity::IdentityHash| hex::encode(id.as_bytes());
+        Ok(NodeChat {
+            on,
+            live: true,
+            members: names
+                .iter()
+                .map(|(id, name)| NodeChatMember {
+                    identity: hex_of(id),
+                    name: name.clone(),
+                    host: *id == host,
+                    muted: muted.contains(id),
+                })
+                .collect(),
+            lines: hub
+                .lines_since(since)
+                .into_iter()
+                .map(|l| NodeChatLine {
+                    seq: l.seq,
+                    identity: hex_of(&l.from),
+                    name: names.iter().find(|(id, _)| *id == l.from).map(|(_, n)| n.clone()),
+                    host: l.from == host,
+                    text: l.text,
+                    at_unix: l.at_unix,
+                })
+                .collect(),
+        })
+    }
+
+    /// Turn a server's chat on or off, now and from its next start.
+    pub async fn set_chat(&self, instance_id: &str, on: bool) -> Result<()> {
+        self.ensure_instance(instance_id).await?;
+        let dir = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?;
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join(crate::mesh::CHAT_FILE),
+            serde_json::to_vec(&serde_json::json!({ "on": on }))?,
+        )?;
+        self.mesh.set_chat(instance_id, on).await;
+        tracing::info!(instance = %instance_id, on, "server chat switched");
+        Ok(())
+    }
+
+    /// Say one line in a server's chat, as its host.
+    pub async fn chat_say(&self, instance_id: &str, text: &str) -> Result<()> {
+        self.ensure_instance(instance_id).await?;
+        let hub = self
+            .mesh
+            .chat_hub(instance_id)
+            .await
+            .ok_or_else(|| anyhow!("this server is not on the mesh"))?;
+        hub.host_say(text.trim()).map(|_| ()).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Mute or unmute someone in a server's chat until it stops.
+    pub async fn chat_mute(&self, instance_id: &str, identity: &str, muted: bool) -> Result<()> {
+        self.ensure_instance(instance_id).await?;
+        let bytes: [u8; 16] = hex::decode(identity.trim())
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| anyhow!("{identity:?} is not an identity hash"))?;
+        let hub = self
+            .mesh
+            .chat_hub(instance_id)
+            .await
+            .ok_or_else(|| anyhow!("this server is not on the mesh"))?;
+        hub.set_muted(prns_core::identity::IdentityHash::new(bytes), muted);
+        Ok(())
+    }
+
     /// Where a server's backups are kept: `backups/<id>` under the data root,
     /// outside the instance folder, so they outlive the server's own files.
     fn backups_dir(&self, instance_id: &str) -> Result<std::path::PathBuf> {
@@ -2989,6 +3071,37 @@ impl Agent {
         };
         Ok(self.layout.orphan_instance_dirs(&live, &entries))
     }
+}
+
+
+/// A server's chat, as Lanthorn Host shows it (`Agent::chat`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeChat {
+    /// Whether the operator turned it on (`chat.json` in the instance folder).
+    pub on: bool,
+    /// Whether the server is on the mesh, where chat happens.
+    pub live: bool,
+    pub members: Vec<NodeChatMember>,
+    pub lines: Vec<NodeChatLine>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeChatMember {
+    pub identity: String,
+    /// A player's own name for themselves: shown, never trusted.
+    pub name: String,
+    pub host: bool,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeChatLine {
+    pub seq: u64,
+    pub identity: String,
+    pub name: Option<String>,
+    pub host: bool,
+    pub text: String,
+    pub at_unix: u64,
 }
 
 #[cfg(test)]

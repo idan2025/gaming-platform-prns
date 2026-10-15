@@ -76,6 +76,17 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### Chat on servers
+
+- Players who join a server through Lanthorn can talk to each other and to
+  its host, before and while they play, in a chat under the server list.
+  Only servers that offer chat are asked; older servers and launchers are
+  unaffected.
+- A server hosted from the launcher offers chat by default (not when it
+  has a password); the host can turn it off and mute someone until it
+  stops. On a node, chat is off until the operator turns it on for a server
+  under **Chat…** in Lanthorn Host.
+
 ### Game pack review
 
 - `game-bridge review <pack.toml> [--against DIR]` names what a person must

@@ -33,6 +33,7 @@ pub mod profile;
 pub mod relay;
 pub mod repo;
 pub mod review;
+pub mod server_chat;
 pub mod signing;
 pub mod stream;
 
@@ -43,7 +44,7 @@ pub use config::{BridgeConfig, BridgeRole, BrowserArgs, ClientArgs, RelayArgs, S
 pub use profile::{GameProfile, GameTransport, ASPECT_CLIENT, ASPECT_SERVER};
 pub use relay::{
     run_bridge, server_announce_app_data, server_announce_name_bytes, BridgeSession,
-    ConnectedClient, DiscoveredServer,
+    ChatOpener, ConnectedClient, DiscoveredServer,
 };
 
 use prns_core::engine::MAX_SEND_TO_LINK_PLAINTEXT_LEN;

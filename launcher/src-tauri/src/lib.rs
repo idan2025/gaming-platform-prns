@@ -640,6 +640,58 @@ async fn send_room_chat(state: tauri::State<'_, AppState>, text: String) -> Resu
 }
 
 #[tauri::command]
+async fn server_chat_view(
+    state: tauri::State<'_, AppState>,
+    hosted: bool,
+) -> Result<launcher_core::server_chat::ServerChatView, String> {
+    Ok(if hosted {
+        state.launcher.hosted_chat_view().await
+    } else {
+        state.launcher.server_chat_view().await
+    })
+}
+
+#[tauri::command]
+async fn server_chat(
+    state: tauri::State<'_, AppState>,
+    hosted: bool,
+    since: u64,
+) -> Result<Vec<launcher_core::server_chat::ServerChatLineView>, String> {
+    Ok(if hosted {
+        state.launcher.hosted_chat(since).await
+    } else {
+        state.launcher.server_chat(since).await
+    })
+}
+
+#[tauri::command]
+async fn send_server_chat(
+    state: tauri::State<'_, AppState>,
+    hosted: bool,
+    text: String,
+) -> Result<(), String> {
+    if hosted {
+        state.launcher.send_hosted_chat(&text).await.map_err(fmt_err)
+    } else {
+        state.launcher.send_server_chat(&text).await.map_err(fmt_err)
+    }
+}
+
+#[tauri::command]
+async fn set_hosted_chat(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.launcher.set_hosted_chat(on).await.map_err(fmt_err)
+}
+
+#[tauri::command]
+async fn mute_in_hosted_chat(
+    state: tauri::State<'_, AppState>,
+    identity: String,
+    muted: bool,
+) -> Result<(), String> {
+    state.launcher.mute_in_hosted_chat(&identity, muted).await.map_err(fmt_err)
+}
+
+#[tauri::command]
 async fn check_room(state: tauri::State<'_, AppState>) -> Result<RoomCheckView, String> {
     state.launcher.check_room().await.map_err(fmt_err)
 }
@@ -872,6 +924,11 @@ pub fn run() {
             set_player_name,
             room_chat,
             send_room_chat,
+            server_chat_view,
+            server_chat,
+            send_server_chat,
+            set_hosted_chat,
+            mute_in_hosted_chat,
             pack_repos,
             add_pack_repo,
             remove_pack_repo,

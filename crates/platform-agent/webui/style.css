@@ -446,3 +446,12 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .repo-pack { display: flex; align-items: center; gap: 10px; }
 .repo-pack-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip.chip-muted { opacity: 0.75; font-style: italic; }
+
+/* ---------- chat (ROADMAP.md §6.1) ---------- */
+.chat-members { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.chat-member { display: inline-flex; align-items: center; gap: 6px; }
+.chat-member.muted { opacity: 0.6; }
+.chat-log { max-height: 260px; min-height: 80px; overflow-y: auto; padding: 6px 2px; display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 6px 0; overflow-wrap: anywhere; }
+.chat-line { font-size: 13.5px; line-height: 1.4; }
+.chat-form { display: flex; gap: 8px; }
+.chat-form .field { flex: 1; min-width: 0; }

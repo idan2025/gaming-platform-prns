@@ -135,6 +135,9 @@
             <button class="col col-seen" data-sort="last_seen" type="button">Heard<span class="arrow"></span></button>
           </div>
           <div class="list-body" id="list" tabindex="0" role="listbox" aria-label="Servers"></div>
+          <!-- The joined server's chat (ROADMAP.md §6.1). Its own stable slot:
+               the list above is rebuilt on every poll. -->
+          <div id="server-chat-dock" class="server-chat-dock" hidden></div>
         </div>
         <aside class="detail" id="detail" hidden aria-label="Server details"></aside>
       </section>
@@ -166,6 +169,8 @@
             <h1>Games</h1>
           </header>
           <div id="games-body"></div>
+          <!-- The hosted server's chat: outside games-body, which is rebuilt. -->
+          <div id="host-chat-slot"></div>
         </div>
       </section>
       <section class="view view-page" id="view-connections" hidden>

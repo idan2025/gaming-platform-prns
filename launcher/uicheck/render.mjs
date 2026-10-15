@@ -225,6 +225,20 @@ function makeInvoke(scenario) {
       case 'send_room_chat':
         (scenario.said ??= []).push(args.text);
         return null;
+      case 'server_chat_view':
+        if (!scenario.serverChat) throw new Error(`unknown command ${cmd}`);
+        return (args.hosted ? scenario.serverChat.hosted : scenario.serverChat.joined) ?? { state: 'none', members: [] };
+      case 'server_chat':
+        return ((args.hosted ? scenario.serverChat.hostedLines : scenario.serverChat.lines) ?? []).filter(l => l.seq > args.since);
+      case 'send_server_chat':
+        (scenario.serverSaid ??= []).push([args.hosted, args.text]);
+        return null;
+      case 'set_hosted_chat':
+        (scenario.serverChatCalls ??= []).push(['chat', args.on]);
+        return null;
+      case 'mute_in_hosted_chat':
+        (scenario.serverChatCalls ??= []).push(['mute', args.identity, args.muted]);
+        return null;
       case 'room_status':
         if (!scenario.lanHelper) throw new Error(`unknown command ${cmd}`);
         return scenario.room ?? noRoom;
@@ -1073,6 +1087,72 @@ await run('a room chats, by name, and a line is only ever text', {
   check('Send says it to the room', (scenario.said || []).includes('half typed'), JSON.stringify(scenario.said));
 });
 
+// Server chat (ROADMAP.md §6.1): the joined server's card lives in its own
+// slot under the list, so a poll that rebuilds the list keeps a typed line;
+// lines are text only; a server with no chat shows no card; and the host can
+// mute anyone but themselves.
+await run('a joined server chats, and a line is only ever text', {
+  status: running,
+  rows: () => [row()],
+  playerName: 'Me',
+  serverChat: {
+    joined: { state: 'open', hosting: false, members: [
+      { identity: 'aa', name: 'Host', is_self: false, is_host: true, muted: false },
+      { identity: 'bb', name: 'Me', is_self: true, is_host: false, muted: false },
+    ] },
+    lines: [
+      { seq: 1, identity: 'aa', name: 'Host', is_self: false, is_host: true, text: '<img src=x onerror=alert(1)> welcome', at_unix: 0 },
+      { seq: 2, identity: 'bb', name: 'Me', is_self: true, is_host: false, text: 'hi', at_unix: 0 },
+    ],
+  },
+}, async (win, doc, scenario) => {
+  await win.pollAll();
+  await settle();
+  const box = doc.querySelector('#sc-joined');
+  check('the joined server\u2019s chat is shown under the list', !!box && !box.hidden && !!box.closest('#server-chat-dock'));
+  const log = doc.querySelector('#sc-joined-log');
+  check('a server chat line is text, never markup', log && !log.querySelector('img') && log.textContent.includes('<img'), log && log.innerHTML);
+  check('the host is marked', log && log.textContent.includes('Host (host)'), log && log.textContent);
+  const input = doc.querySelector('#sc-joined-input');
+  input.value = 'half typed';
+  await win.pollAll();
+  await settle();
+  check('a server chat line being typed survives the poll', doc.querySelector('#sc-joined-input')?.value === 'half typed');
+  check('no server chat line is shown twice', doc.querySelectorAll('#sc-joined-log .chat-line').length === 2);
+  doc.querySelector('#sc-joined .chat-form button[type=submit]').click();
+  await settle();
+  check('Send says it on the server', JSON.stringify(scenario.serverSaid) === JSON.stringify([[false, 'half typed']]), JSON.stringify(scenario.serverSaid));
+  scenario.serverChat.joined = { state: 'unavailable', detail: 'this server has no chat', members: [] };
+  await win.pollAll();
+  await settle();
+  check('a server without chat shows no card', doc.querySelector('#sc-joined').hidden && doc.querySelector('#server-chat-dock').hidden);
+});
+
+await run('the host mutes in their server\u2019s chat and can turn it off', {
+  status: running,
+  rows: () => [row()],
+  hostingNow: { active: true, game_id: 'sven-coop', name: 'Mine', clients: 1, invite: 'lanthorn://x', chat: true },
+  serverChat: {
+    hosted: { state: 'open', hosting: true, members: [
+      { identity: 'aa', name: 'Me', is_self: true, is_host: true, muted: false },
+      { identity: 'cc', name: 'Loud', is_self: false, is_host: false, muted: false },
+    ] },
+  },
+}, async (win, doc, scenario) => {
+  win.setView('games');
+  await win.pollAll();
+  await settle();
+  const box = doc.querySelector('#sc-hosted');
+  check('the hosted server\u2019s chat is on the Games page, outside its rebuilt body', !!box && !box.hidden && !box.closest('#games-body'));
+  const mutes = [...doc.querySelectorAll('#sc-hosted-members button')];
+  check('everyone but the host can be muted', mutes.length === 1, String(mutes.length));
+  mutes[0].click();
+  await settle();
+  doc.querySelector('#sc-hosted-toggle').click();
+  await settle();
+  check('Mute and Turn chat off reach the core', JSON.stringify(scenario.serverChatCalls) === JSON.stringify([['mute', 'cc', true], ['chat', false]]), JSON.stringify(scenario.serverChatCalls));
+});
+
 await run('a room whose host has no chat says so', {
   status: running,
   games: [svenGame, lanGame()],
@@ -1084,7 +1164,7 @@ await run('a room whose host has no chat says so', {
   await win.pollRoom();
   await settle();
   const t = doc.querySelector('#room-chat')?.textContent || '';
-  check('an old host is explained, not a dead box', t.includes('without chat') && doc.querySelector('.chat-form').hidden, t);
+  check('an old host is explained, not a dead box', t.includes('without chat') && doc.querySelector('#room-chat .chat-form').hidden, t);
 });
 
 // The banner was rebuilt on every 2 s poll, so a press on Leave that spanned

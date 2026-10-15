@@ -351,6 +351,7 @@ mod tests {
             allowlisted,
             dedicated,
             transport_mode,
+            chat: false,
         }
     }
 

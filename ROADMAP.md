@@ -15,7 +15,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 3 | Favorites and "it's up" alerts | regulars | S | **built**: star, offline section, always looked for, "is up" |
 | 4 | Installed-game detection | every player | M | **built**: Installed badge, Flatpak/Snap Steam, file picker |
 | 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, notifications, quiet over a fullscreen game |
-| 6 | Chat and player names in rooms | LAN-room players | L | **built** for rooms: chat, names, rate limit; server chat not started |
+| 6 | Chat and player names in rooms | LAN-room players | L | **built**: room chat and names; server chat for bridged players (§6.1) |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
 | 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; no project repository yet |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
@@ -182,9 +182,113 @@ stripped; chat is held to a per-member gate at the host (burst 5, then one
 every two seconds). The player's name is set in Settings → You, which also
 finally gives the launch template's `{name}` a way in.
 
-**Not started:** chat on a server for its bridged players. A server's link is
-the game's own, so a chat there needs its own message channel; LXMF is still
-worth measuring for it.
+### 6.1 Server chat (built 2026-10-15)
+
+**What.** Players who joined a server in the launcher can talk to each other
+and to its host before and while they play, in the same chat card as a room.
+Only the people on that one server, never a lobby (`PLAN.md` §0).
+
+**Why this is not "rooms again".** A room's links carry only `lan.rs`
+messages, so new types were safe there. A server's links are the game's:
+every link-data packet is a framing chunk, and a deployed peer (v0.1.10
+Sven, every v0.2 launcher and node) reassembles anything it receives there
+as game data (`framing.rs:17`). Chat may never touch a game link's data.
+
+**Transport: its own link, its own byte stream, announced by one flag bit.**
+
+1. **The server says it has chat** with announce flag bit `0x20`
+   (`FLAG_CHAT`, `announce.rs:55`). Bits 5–7 are unused, and every decoder
+   since the record existed reads known bits only
+   (`flags_round_trip_and_reserved_bits_ignored`, 2026-08-30, before v0.1.0),
+   so an older launcher simply never sees chat. The announce stays the same
+   size. A v0.1.10 Sven server announces a bare name, so it never has the flag.
+2. **A client chats only with a server whose announce set the flag**, the
+   same rule as framing channels (`relay::may_use_channel`): the gate reads
+   the peer's announce, never the local pack.
+3. **A separate link to the same destination, not the game's link.** Chat
+   must work before the game is started, and a game link exists only while
+   the game runs (one per local game socket, `relay.rs:1725`). The launcher
+   opens one chat link per joined server while it is joined.
+4. **Chat rides a byte stream on that link**, stream ids `0x100` (to server)
+   and `0x101` (to client), clear of the game's `stream_ids(0..=7)` = 1..16
+   (`stream.rs:66`). A stream is reliable and ordered; link data on a
+   `ProveNone` destination is neither (`CLAUDE.md`, "ProveNone"). Messages
+   inside it are length-prefixed: `Hello{name}`, `Say{text}` up,
+   `Welcome{recent, names}`, `Line{from, name, text}`, `Names{..}` down.
+5. **The server must know a link is for chat before it starts the game for
+   it.** An open server starts a UDP link at once and connects a TCP game on
+   identify (`relay.rs:933-966`, `841-860`), so a chat link that just
+   identified would open a phantom game connection — a ghost player on a TCP
+   game. So the client writes `Hello` **before** identifying, and identifies
+   only after `Welcome` comes back (its own reader registered first, the
+   rule `stream.rs:33` already states). The server registers the chat reader
+   at link-up next to the TCP readers (only when chat is on); a `Hello` marks
+   the link chat-only, its game side is never started (UDP: torn down), and
+   it is left out of `bridge_clients` and the detail probe's count.
+   A request endpoint cannot be the marker: a request carries the
+   requester's identity but not its link
+   (`prns-runtime/core/src/runtime/request_endpoints.rs:187`).
+6. **The server writes chat only to a link that said `Hello`.** A game link
+   and an old client's link never receive a byte of it.
+7. **Who said it is the server's word.** A line is stamped with the identity
+   the link proved (`PeerIdentified`); a chat link that has not identified may
+   only say `Hello`. Names and lines reuse `lan::valid_name` / `valid_chat`
+   (refused, never stripped) and `lan::ChatGate` per identity (burst 5, then
+   one every two seconds). The allowlist applies unchanged: a chat link from
+   an identity not on it is closed like any other.
+8. **The server keeps the last 50 lines in memory** for `Welcome`, nothing
+   on disk.
+
+**Who hosts the chat.** The server-side bridge: the launcher's own hosting
+(`host.rs`), `game-bridge server`, and a node's servers. On a node the
+operator can read and write it in Lanthorn Host, on the **loopback API only**
+— the uplink never gets a chat route, for the same reason it never got the
+console (`CLAUDE.md`, item 7).
+
+**Why not LXMF.** Every member would need the others' delivery
+destinations, and a server fanning a line out to N members is N LXMF
+messages with their own proofs. Messages would also outlive the session in
+propagation nodes, which a server chat should not do. The server-hosted
+stream is one hop per member, ephemeral, and reuses the room's rules.
+
+**Cost.** Nothing for anyone not chatting: one flag bit, an idle reader per
+link on servers with chat on. Per chatting player: one extra link (its
+keep-alives) and a few hundred bytes per line.
+
+**Tests to write first** (each fails with its rule removed):
+- `chat_is_never_offered_to_a_server_that_did_not_announce_it` — no chat
+  link, no stream byte, to a server without the flag.
+- `a_link_that_never_said_hello_never_receives_chat` — a game link and a
+  stand-in old client get nothing while others chat.
+- `a_chat_link_never_starts_a_game_connection` — a TCP pack's game sees no
+  connect from a chat link (a stand-in game counts accepts), on an open and
+  an allowlisted server.
+- `a_line_is_from_the_identity_its_link_proved` — a client cannot speak for
+  another, and cannot speak before identifying.
+- `chat_links_are_not_players` — `bridge_clients` and the probe's count
+  exclude them.
+- Wire: a v0.2.40 launcher browsing a chat-flagged server lists it unchanged
+  (decode with the old flag reader).
+
+**Built** as designed: `game_bridge::server_chat` (codec, `ChatHub`,
+`ChatClient`), the server's chat reader and `ChatHello` in `relay.rs`, the
+announce bit, `game-bridge server --chat`; the launcher's server chat under
+the list and its hosted-server chat on the Games page
+(`launcher-core/src/server_chat.rs`); a node's per-server switch in
+`chat.json` and "Chat…" in Lanthorn Host (`Agent::chat`, loopback routes
+`/instances/:id/chat`). Tests: `tests/server_chat.rs` in game-bridge (all
+four above but the wire one, which is `an_older_decoder_reads_a_chat_server_as_any_other`
+in `announce.rs`), the agent's Docker-gated `tests/server_chat.rs`, and the
+render pass.
+
+**Decided by the user (2026-10-15):**
+- **On by default for a server hosted from the launcher; off on a node**
+  until the operator turns it on per server, since a node serves strangers
+  and someone must moderate.
+- **Off on a passworded server unless its host turns it on**: the bridge
+  never sees the game's password, so chat there would be open to anyone who
+  can link.
+- **The host can mute an identity for the session**; nothing is kept.
 
 ## 7. Node: console, resources, schedules, backups
 

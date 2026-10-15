@@ -118,6 +118,11 @@ pub fn router_full(
         .route("/instances/:id/restart", post(restart))
         .route("/instances/:id/map", post(change_map))
         .route("/instances/:id/console", post(send_console))
+        // Chat (ROADMAP.md §6.1): loopback only, like the console. The
+        // uplink must never gain these, or an index could speak on, or
+        // silence, a node's servers.
+        .route("/instances/:id/chat", get(chat).post(chat_say).put(set_chat))
+        .route("/instances/:id/chat/mute", post(chat_mute))
         .route("/instances/:id/restart-schedule", axum::routing::put(set_restart_schedule))
         .route("/restart-schedules", get(restart_schedules))
         .route("/instances/:id/backups", get(list_backups).post(create_backup))
@@ -1032,6 +1037,75 @@ async fn send_console(
         .send_console(&id, &req.line)
         .await
         .map(|()| Json(json!({ "instance_id": id, "sent": req.line })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(Deserialize)]
+struct ChatQuery {
+    #[serde(default)]
+    since: u64,
+}
+
+async fn chat(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ChatQuery>,
+) -> ApiResult<crate::agent::NodeChat> {
+    state.agent.chat(&id, q.since).await.map(Json).map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct ChatSayReq {
+    text: String,
+}
+
+async fn chat_say(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatSayReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .chat_say(&id, &req.text)
+        .await
+        .map(|()| Json(json!({ "instance_id": id })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(Deserialize)]
+struct ChatSetReq {
+    on: bool,
+}
+
+async fn set_chat(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatSetReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .set_chat(&id, req.on)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "on": req.on })))
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct ChatMuteReq {
+    identity: String,
+    muted: bool,
+}
+
+async fn chat_mute(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatMuteReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .chat_mute(&id, &req.identity, req.muted)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "identity": req.identity, "muted": req.muted })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 

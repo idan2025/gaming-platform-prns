@@ -34,6 +34,11 @@ pub struct HostRequest {
     pub game_port: Option<u16>,
     #[serde(default)]
     pub passworded: bool,
+    /// Offer chat to players who join (`ROADMAP.md` §6.1). `None` is the
+    /// default the user chose: on, except on a passworded server, where the
+    /// bridge cannot hold chat to the game's password.
+    #[serde(default)]
+    pub chat: Option<bool>,
 }
 
 /// The server this launcher hosts, as the UI shows it.
@@ -50,6 +55,8 @@ pub struct HostView {
     pub invite: Option<String>,
     /// Players linked to it now.
     pub clients: usize,
+    /// Whether it offers chat now.
+    pub chat: bool,
 }
 
 pub(crate) struct HostState {
@@ -74,6 +81,7 @@ impl Launcher {
             .profile_for(&request.game_id)
             .ok_or_else(|| anyhow!("no game pack installed for {:?}", request.game_id))?;
         let saved = self.saved_browse_opts().await;
+        let host_name = crate::server_chat::chat_name(self.player_name().await);
         let identity = self.client_identity_path().with_file_name("server.identity");
         if let Some(parent) = identity.parent() {
             std::fs::create_dir_all(parent)?;
@@ -102,7 +110,11 @@ impl Launcher {
         // and never volunteered as a transit node for strangers.
         args.dedicated = false;
         args.relay_transit = false;
+        args.chat = request.chat.unwrap_or(!request.passworded);
         let session = BridgeSession::start_server(args).await?;
+        if let Some(hub) = session.chat() {
+            hub.set_host_name(&host_name);
+        }
         inner.host = Some(HostState { session, request: HostRequest { name, ..request } });
         drop(inner);
         Ok(self.hosting().await)
@@ -134,6 +146,7 @@ impl Launcher {
                 .map(|h| crate::invite::link(h, Some(&r.game_id), Some(&r.name), false)),
             destination_hash: hash,
             clients,
+            chat: host.session.chat().is_some_and(|h| h.enabled()),
         }
     }
 }
@@ -150,6 +163,7 @@ mod tests {
             max_players: max,
             game_port: Some(1),
             passworded: false,
+            chat: None,
         }
     }
 
@@ -179,6 +193,7 @@ mod tests {
             "destination_hash",
             "invite",
             "clients",
+            "chat",
         ] {
             assert!(keys.get(k).is_some(), "the frontend reads {k}");
         }
@@ -208,7 +223,27 @@ mod tests {
             "its own identity, beside the settings"
         );
         assert_eq!(l.keeps_running().await, Some("server"));
+
+        // Chat is on by default, and the host speaks under the server's name.
+        assert!(view.chat, "a launcher-hosted server offers chat");
+        l.send_hosted_chat("welcome in").await.unwrap();
+        let lines = l.hosted_chat(0).await;
+        assert!(lines[0].is_host && lines[0].is_self && lines[0].text == "welcome in", "{lines:?}");
+        assert!(l.send_hosted_chat("two\nlines").await.is_err());
+        let host_id = l.hosted_chat_view().await.members[0].identity.clone();
+        assert!(l.mute_in_hosted_chat(&host_id, true).await.is_err(), "not the host itself");
+        l.set_hosted_chat(false).await.unwrap();
+        assert!(!l.hosting().await.chat);
+        assert_eq!(l.hosted_chat_view().await.state, "unavailable");
         l.stop_hosting().await;
         assert!(!l.hosting().await.active);
+
+        // A passworded server has no chat unless the host asks for it.
+        let mut pw = req("Locked", 8);
+        pw.passworded = true;
+        assert!(!l.host_server(pw.clone()).await.unwrap().chat);
+        pw.chat = Some(true);
+        assert!(l.host_server(pw).await.unwrap().chat, "the host may turn it on");
+        l.stop_hosting().await;
     }
 }
