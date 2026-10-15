@@ -438,6 +438,21 @@ pub struct InstalledGameView {
     pub installed: bool,
     /// Play would start it without asking anything.
     pub launch_ready: bool,
+    /// Steam is downloading it now (`PLAN.md` §13.3 step 3), read from
+    /// Steam's own manifest. `None` when it is not.
+    pub steam_download: Option<SteamDownloadView>,
+    /// Where to get it when it is not here: Steam's install link when Steam
+    /// is on this machine, else the store page. Built from the pack's
+    /// numeric app id only. `None` for a game installed, or not on Steam.
+    pub get_url: Option<String>,
+}
+
+/// How far Steam is with a game, in Steam's own numbers.
+#[derive(Debug, Clone, Serialize)]
+pub struct SteamDownloadView {
+    pub bytes_done: u64,
+    /// Zero when Steam has not said yet: the UI then shows no percentage.
+    pub bytes_total: u64,
 }
 
 /// The outcome of a successful [`Launcher::play`], for the UI to confirm what it
@@ -1567,13 +1582,33 @@ impl Launcher {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let loc = self.game_location(&id).await;
+            let installed = loc.steam_installed || loc.saved_path_valid;
+            let (steam_download, get_url) = match loc.steam_app_id {
+                Some(app) if !installed => {
+                    let download = steam::app_state(app)
+                        .filter(|s| s.downloading)
+                        .map(|s| SteamDownloadView { bytes_done: s.bytes_done, bytes_total: s.bytes_total });
+                    let url = if loc.steam_available { steam::install_link(app) } else { steam::store_page(app) };
+                    (download, Some(url))
+                }
+                _ => (None, None),
+            };
             out.push(InstalledGameView {
-                installed: loc.steam_installed || loc.saved_path_valid,
+                installed,
                 launch_ready: loc.launch_ready,
+                steam_download,
+                get_url,
                 game_id: id,
             });
         }
         out
+    }
+
+    /// Where to get a game that is not on this machine: the same link
+    /// [`installed_games`](Self::installed_games) offers, worked out here
+    /// again so the UI hands over a game id and never a URL.
+    pub async fn get_game_url(&self, game_id: &str) -> Option<String> {
+        self.installed_games().await.into_iter().find(|g| g.game_id == game_id)?.get_url
     }
 
     /// Remember the player's own path to a game's executable, after checking it

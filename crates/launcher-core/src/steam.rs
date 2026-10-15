@@ -49,6 +49,76 @@ fn first_existing<I: IntoIterator<Item = PathBuf>>(candidates: I) -> Option<Path
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// A field of a Steam `.acf` manifest, as text. Same VDF line shape as
+/// [`parse_app_installdir`]; the first line naming `key` wins.
+fn acf_field<'a>(acf: &'a str, key: &str) -> Option<&'a str> {
+    acf.lines().find_map(|line| {
+        let fields: Vec<&str> = line.trim().split('"').collect();
+        (fields.get(1) == Some(&key)).then(|| fields.get(3).copied()).flatten()
+    })
+}
+
+/// What Steam's own manifest says about one app on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppState {
+    /// Steam's `StateFlags` has "fully installed" (4) set. A manifest whose
+    /// flags cannot be read counts as installed, as before this was read.
+    pub installed: bool,
+    /// Steam is fetching it now, or has it queued: the flags say an update
+    /// is required or running and it is not installed yet.
+    pub downloading: bool,
+    /// `BytesDownloaded` and `BytesToDownload`, when Steam wrote them. The
+    /// total is Steam's number, never a guess; zero is "not known".
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+const STATE_UPDATE_REQUIRED: u64 = 2;
+const STATE_FULLY_INSTALLED: u64 = 4;
+const STATE_UPDATE_RUNNING: u64 = 1024;
+const STATE_UPDATE_STARTED: u64 = 1 << 20;
+
+/// Read an app's state out of its `appmanifest_<id>.acf`.
+pub fn parse_app_state(acf: &str) -> AppState {
+    let num = |key| acf_field(acf, key).and_then(|v| v.parse::<u64>().ok());
+    let flags = num("StateFlags");
+    let installed = flags.is_none_or(|f| f & STATE_FULLY_INSTALLED != 0);
+    let busy = flags.is_some_and(|f| {
+        f & (STATE_UPDATE_REQUIRED | STATE_UPDATE_RUNNING | STATE_UPDATE_STARTED) != 0
+    });
+    AppState {
+        installed,
+        downloading: !installed && busy,
+        bytes_done: num("BytesDownloaded").unwrap_or(0),
+        bytes_total: num("BytesToDownload").unwrap_or(0),
+    }
+}
+
+/// What Steam says about `app_id` on this machine, from the first library
+/// holding a manifest for it. `None`: Steam has never been asked for it here.
+pub fn app_state(app_id: u32) -> Option<AppState> {
+    let libraries = library_dirs(&steam_library_roots());
+    app_state_in(app_id, &libraries)
+}
+
+pub fn app_state_in(app_id: u32, libraries: &[PathBuf]) -> Option<AppState> {
+    libraries.iter().find_map(|lib| {
+        let body = std::fs::read_to_string(lib.join(format!("steamapps/appmanifest_{app_id}.acf"))).ok()?;
+        Some(parse_app_state(&body))
+    })
+}
+
+/// Where Steam installs `app_id`, as a link the operating system hands to
+/// Steam. Built from the number alone: nothing a pack wrote is in it.
+pub fn install_link(app_id: u32) -> String {
+    format!("steam://install/{app_id}")
+}
+
+/// The game's store page, for a machine without Steam.
+pub fn store_page(app_id: u32) -> String {
+    format!("https://store.steampowered.com/app/{app_id}/")
+}
+
 /// Parse a Steam `libraryfolders.vdf` into the library root directories it
 /// lists. Steam's VDF is a nested key/quote format; every `"path" "<dir>"` line
 /// names a library, so those are what we extract, tolerating the format's two
@@ -133,6 +203,11 @@ pub fn find_app_install_dir(app_id: u32, libraries: &[PathBuf]) -> Option<PathBu
     for lib in libraries {
         let manifest = lib.join(format!("steamapps/appmanifest_{app_id}.acf"));
         let Ok(body) = std::fs::read_to_string(&manifest) else { continue };
+        // A game Steam is still downloading has its manifest and folder
+        // already, and is not playable yet.
+        if !parse_app_state(&body).installed {
+            continue;
+        }
         let Some(installdir) = parse_app_installdir(&body) else { continue };
         let full = lib.join("steamapps/common").join(installdir);
         if full.is_dir() {
@@ -222,6 +297,41 @@ fn steam_executable_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_game_steam_is_still_downloading_is_not_installed_and_says_how_far() {
+        let acf = |flags: &str| {
+            format!(
+                "\"AppState\"\n{{\n\t\"appid\"\t\t\"440\"\n\t\"StateFlags\"\t\t\"{flags}\"\n\t\"installdir\"\t\t\"Team Fortress 2\"\n\t\"BytesToDownload\"\t\t\"20000\"\n\t\"BytesDownloaded\"\t\t\"5000\"\n}}\n"
+            )
+        };
+        let fetching = parse_app_state(&acf("1026"));
+        assert!(!fetching.installed && fetching.downloading);
+        assert_eq!((fetching.bytes_done, fetching.bytes_total), (5000, 20000));
+        let queued = parse_app_state(&acf("2"));
+        assert!(!queued.installed && queued.downloading);
+        // An installed game being updated is still installed: Play works.
+        let updating = parse_app_state(&acf("1030"));
+        assert!(updating.installed && !updating.downloading);
+        assert!(parse_app_state(&acf("4")).installed);
+        // An old manifest with no flags reads as before: installed.
+        assert!(parse_app_state("\"installdir\"\t\"x\"").installed);
+
+        let lib = std::env::temp_dir().join(format!("steam-state-{}", std::process::id()));
+        std::fs::create_dir_all(lib.join("steamapps/common/Team Fortress 2")).unwrap();
+        std::fs::write(lib.join("steamapps/appmanifest_440.acf"), acf("1026")).unwrap();
+        assert_eq!(find_app_install_dir(440, std::slice::from_ref(&lib)), None, "not until Steam is done");
+        assert!(app_state_in(440, std::slice::from_ref(&lib)).unwrap().downloading);
+        std::fs::write(lib.join("steamapps/appmanifest_440.acf"), acf("4")).unwrap();
+        assert!(find_app_install_dir(440, std::slice::from_ref(&lib)).is_some());
+        let _ = std::fs::remove_dir_all(&lib);
+    }
+
+    #[test]
+    fn steam_links_are_built_from_the_number_alone() {
+        assert_eq!(install_link(440), "steam://install/440");
+        assert_eq!(store_page(440), "https://store.steampowered.com/app/440/");
+    }
 
     #[test]
     fn library_folders_vdf_yields_every_named_path() {

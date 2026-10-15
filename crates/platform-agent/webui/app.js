@@ -914,7 +914,8 @@ function renderGames() {
   const grid = $("games-grid");
   const n = $("nav-games-count");
   if (n) n.textContent = state.games.length ? String(state.games.length) : "";
-  const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")).join(";");
+  const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
+    + "|" + (g.content ? (g.content.installed ? "i" : "-") + g.content.missing.join(",") : "")).join(";");
   if (grid.dataset.sig !== sig) {
     grid.dataset.sig = sig;
     grid.textContent = "";
@@ -943,6 +944,7 @@ function buildGameCard(g) {
   }
   body.appendChild(meta);
   if (!g.runnable) body.appendChild(el("p", "card-reason", "Cannot start here: " + (g.reason || "unavailable on this node.")));
+  const manualMissing = renderContentHelp(body, g);
   body.appendChild(el("p", "install-status hidden"));
   const actions = el("div", "card-actions");
   const startBtn = el("button", "btn btn-primary start-btn", "Start server");
@@ -954,7 +956,16 @@ function buildGameCard(g) {
   installBtn.title = "Download this game's files to the node now";
   installBtn.appendChild(icon("download"));
   installBtn.appendChild(el("span", null, "Install"));
-  installBtn.addEventListener("click", () => onInstall(g.id));
+  if (manualMissing) {
+    // Nothing here can download a manual game: the button looks again.
+    installBtn.textContent = "";
+    installBtn.title = "Look for the files again once they are in place";
+    installBtn.dataset.label = "Check again";
+    installBtn.appendChild(el("span", null, "Check again"));
+    installBtn.addEventListener("click", recheckGames);
+  } else {
+    installBtn.addEventListener("click", () => onInstall(g.id));
+  }
   const removeBtn = el("button", "card-remove");
   removeBtn.type = "button";
   removeBtn.title = "Remove this game from the node: its pack goes, its files stay on the Installed page";
@@ -965,6 +976,51 @@ function buildGameCard(g) {
   body.appendChild(actions);
   card.append(removeBtn, body);
   return card;
+}
+
+// Where a game's files stand (PLAN.md §13.3 step 3, Agent::content_state):
+// a manual game says exactly where its files go and which folders the copy
+// must have, so an operator never learns it from a failed Start. Returns
+// true for a manual game that is not there yet.
+function renderContentHelp(body, g) {
+  const c = g.content;
+  if (!c || !g.runnable) return false;
+  if (c.driver === "manual" && !c.installed) {
+    const box = el("div", "content-help");
+    box.appendChild(el("p", null, "This game's files are installed by hand. Put them here, on the node:"));
+    const line = el("div", "content-path");
+    line.appendChild(el("code", null, c.install_dir || ""));
+    const copy = el("button", "btn btn-small", "Copy");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(c.install_dir || ""); toast("Path copied."); }
+      catch (_) { toast("Select the path and copy it."); }
+    });
+    line.appendChild(copy);
+    box.appendChild(line);
+    if (c.must_contain.length) {
+      box.appendChild(el("p", "muted small", "Inside it, these folders must exist (servers mount over them): " + c.must_contain.join(", ")));
+    }
+    if (c.note) box.appendChild(el("p", "muted small", "The pack says: " + c.note));
+    body.appendChild(box);
+    return true;
+  }
+  if (c.installed && c.missing.length) {
+    body.appendChild(el("p", "card-reason", "The files are there but these folders are missing, and a server will not start until they exist: "
+      + c.missing.join(", ")));
+  } else if (!c.installed && c.driver !== "manual" && !c.fetch_allowed) {
+    body.appendChild(el("p", "card-reason", "Not installed, and this node does not download games by itself: set allow_content_fetch = true in agent.toml once you trust this pack, or put the files in place by hand."));
+  }
+  return false;
+}
+async function recheckGames() {
+  try {
+    const games = await api("GET", "/games");
+    state.games = Array.isArray(games) ? games : [];
+    renderGames();
+    const left = state.games.filter(g => g.content && g.content.driver === "manual" && !g.content.installed).length;
+    toast(left ? "Still not found. Check the path on the card." : "Found the files.");
+  } catch (err) { showError(err.message || String(err)); }
 }
 
 // ---------- adding a game (POST /packs) ----------
@@ -1170,13 +1226,13 @@ function refreshCardDynamic(g) {
     status.textContent = state.installingMsg.get(g.id) || "Installing… this can take several minutes.";
   } else if (state.installingMsg.has(g.id)) {
     installBtn.disabled = false;
-    label.textContent = "Install";
+    label.textContent = installBtn.dataset.label || "Install";
     status.classList.remove("hidden");
     status.classList.add(state.installDone.get(g.id) === "error" ? "err" : "ok");
     status.textContent = state.installingMsg.get(g.id);
   } else {
     installBtn.disabled = false;
-    label.textContent = "Install";
+    label.textContent = installBtn.dataset.label || "Install";
     status.classList.add("hidden");
     status.textContent = "";
   }

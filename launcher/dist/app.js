@@ -72,6 +72,9 @@ const state = {
   // Which games are on this machine (ROADMAP item 4), by game id, from
   // `installed_games`. Read at start and after a Locate: it reads files.
   installed: new Map(),
+  // Steam is installing a game, or was just asked to: `watchSteam` polls.
+  steamTimer: null,
+  steamWatchUntil: 0,
   // Mode 3 LAN rooms (PLAN.md §14). `roomsAvailable` is false for an older
   // shell without the room commands, which then shows no room UI at all
   // rather than buttons that throw.
@@ -1316,7 +1319,10 @@ function renderPackSection(gameId) {
   const have = state.installed.get(pack.id);
   if (have) {
     sec.appendChild(el('p', 'pack-detail ' + (have.installed ? 'have-game' : 'no-game'),
-      have.installed ? 'You have this game on this computer.' : 'This game was not found on this computer. Join anyway, then Locate it, or install it.'));
+      have.installed ? 'You have this game on this computer.'
+        : have.steam_download ? 'Steam is installing this game.'
+        : 'This game was not found on this computer. Join anyway, then Locate it, or install it.'));
+    renderGetGame(sec, pack.id, have);
   }
   if (pack.signer) {
     const kv = el('div', 'kv');
@@ -1498,6 +1504,72 @@ async function loadInstalled() {
     const list = await invoke('installed_games');
     state.installed = new Map((list || []).map(g => [g.game_id, g]));
   } catch (_) { /* an older core: no badges */ }
+  watchSteam();
+}
+
+// A game that is not here (PLAN.md §13.3 step 3): Steam's own install
+// link, or its store page without Steam, and while Steam downloads, how far
+// it is in Steam's numbers. The link is the core's; the page sends a game id.
+function steamProgressText(dl) {
+  if (!dl) return '';
+  if (!dl.bytes_total) return 'Steam is downloading it…';
+  const pct = Math.min(100, Math.floor(dl.bytes_done * 100 / dl.bytes_total));
+  return 'Steam is downloading it: ' + fmtBytes(dl.bytes_done) + ' of ' + fmtBytes(dl.bytes_total) + ' (' + pct + '%)';
+}
+function fmtBytes(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
+  if (n >= 1e6) return Math.round(n / 1e6) + ' MB';
+  return Math.max(1, Math.round(n / 1e3)) + ' KB';
+}
+function renderGetGame(parent, gameId, have) {
+  if (!have || have.installed) return;
+  if (have.steam_download) {
+    const p = el('p', 'pack-detail steam-progress', steamProgressText(have.steam_download));
+    p.dataset.steamProgress = gameId;
+    parent.appendChild(p);
+    return;
+  }
+  if (!have.get_url) return;
+  const steam = have.get_url.startsWith('steam:');
+  const b = el('button', 'btn btn-small', steam ? 'Install with Steam' : 'Get it on Steam');
+  b.type = 'button';
+  b.title = steam ? 'Steam opens and installs it; this shows how far it is.' : 'Opens the game\'s store page.';
+  b.onclick = async () => {
+    try {
+      await invoke('get_game', { gameId });
+      // Steam takes a moment to write its manifest: look for a while.
+      state.steamWatchUntil = Date.now() + 15 * 60 * 1000;
+      watchSteam();
+    } catch (err) { showError(errText(err)); }
+  };
+  parent.appendChild(b);
+}
+// Polls only while Steam is downloading a game or was just asked to. A tick
+// that changes nothing but the numbers updates their text and nothing else,
+// so no picture is rebuilt (a polled list must not blink).
+function watchSteam() {
+  const busy = [...state.installed.values()].some(g => g.steam_download)
+    || (state.steamWatchUntil || 0) > Date.now();
+  if (!busy) { clearInterval(state.steamTimer); state.steamTimer = null; return; }
+  if (state.steamTimer) return;
+  state.steamTimer = setInterval(async () => {
+    const shape = m => [...m.values()].map(g => g.game_id + (g.installed ? 'I' : '') + (g.steam_download ? 'D' : '')).join();
+    const before = shape(state.installed);
+    let list;
+    try { list = await invoke('installed_games'); } catch (_) { return; }
+    state.installed = new Map((list || []).map(g => [g.game_id, g]));
+    if (shape(state.installed) !== before) {
+      renderList();
+      renderDetail();
+      renderGames();
+    } else {
+      document.querySelectorAll('[data-steam-progress]').forEach(p => {
+        const g = state.installed.get(p.dataset.steamProgress);
+        if (g && g.steam_download) p.textContent = steamProgressText(g.steam_download);
+      });
+    }
+    watchSteam();
+  }, 5000);
 }
 
 async function locateGame(gameId) {
@@ -3948,6 +4020,7 @@ function renderGames() {
     const sub = el('div', 'item-sub', bits.join(' · '));
     sub.title = g.trust_detail || '';
     text.appendChild(sub);
+    renderGetGame(text, g.id, have);
     item.appendChild(text);
     if (g.removable) {
       const rm = el('button', 'btn', 'Remove');

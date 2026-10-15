@@ -76,6 +76,18 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### Getting a game
+
+- A game that is not on this computer has **Install with Steam** in its
+  server's pane and on the Games page (the store page without Steam), and
+  while Steam downloads it the launcher shows how far, in Steam's own
+  numbers. A game Steam is still downloading is no longer counted as
+  installed.
+- Lanthorn Host says, on the game's card, exactly where a hand-installed
+  game's files go and which folders the copy needs, with **Check again**,
+  before a Start fails. An installed copy missing a folder a server needs
+  says so too, and a game this node may not download says why.
+
 ### The official pack repository
 
 - `packs/` is published to <https://idan2025.github.io/gaming-platform-prns/>

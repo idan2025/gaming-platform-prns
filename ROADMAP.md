@@ -17,7 +17,7 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 5 | Tray icon and notifications | hosts, regulars | M | **built**: tray while in a room or joined, notifications, quiet over a fullscreen game |
 | 6 | Chat and player names in rooms | LAN-room players | L | **built**: room chat and names; server chat for bridged players (§6.1) |
 | 7 | Node: console, resources, schedules, backups | node operators | M–L | **built**: live usage, log, console, players, crash restarts, daily restarts, backups, scheduled backups |
-| 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; no project repository yet |
+| 8 | In-launcher pack browser | everyone, pack authors | L | **built**: Games page, repositories, install/update/remove, `game-bridge repo build`; the official repository, mirrors, seeding over Reticulum |
 | 9 | Playability check before joining | players on slow links | S | **built**: round trip in words, link tier, list mark, Join anyway |
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
@@ -148,9 +148,8 @@ Quit to quit). Closing the window hides it to the tray only while a room is
 open or a server is joined, with a one-time note saying so; otherwise it
 quits. Desktop notifications for a favorite coming up, someone joining your
 room, a failed room check and an update found at start, with a switch in
-Settings; skipped while the window is in front. **Not yet:** holding them
-back while a game is fullscreen — none of the three OSes says so in a way
-this build reads.
+Settings; skipped while the window is in front, and held back while a game
+is fullscreen on Windows (`desktop.rs`); Linux desktops and macOS do it themselves.
 
 ## 6. Chat and player names in rooms
 

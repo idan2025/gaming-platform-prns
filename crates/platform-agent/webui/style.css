@@ -233,6 +233,10 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .card-meta { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 4px; background: var(--surface-3); color: var(--text-2); font-size: 11.5px; font-weight: 550; }
 .card-reason { font-size: 12px; color: var(--warn); }
+.content-help { font-size: 12px; display: grid; gap: 6px; }
+.content-help p { margin: 0; }
+.content-path { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.content-path code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; padding: 4px 6px; border-radius: 6px; background: var(--surface-2, rgba(127,127,127,.12)); }
 .card-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
 .card-actions .btn { flex: 1; }
 .backup-list { display: grid; gap: 6px; max-height: 260px; overflow: auto; margin: 8px 0; }

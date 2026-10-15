@@ -291,6 +291,8 @@ struct GameOption {
     trust: Option<String>,
     /// Who signed it, hex identity hash, when someone did.
     signer: Option<String>,
+    /// Where the game's files stand on this node, `None` without a runtime.
+    content: Option<crate::agent::ContentState>,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -599,6 +601,10 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
         // A pack loaded from a file named otherwise is not guessed at.
         game_bridge::GamePack::load_verified(&path, &policy, now).ok().map(|p| p.trust)
     };
+    let mut contents = std::collections::HashMap::new();
+    for id in packs.keys() {
+        contents.insert(id.clone(), state.agent.content_state(id).await);
+    }
     let mut out: Vec<GameOption> = packs
         .values()
         .map(|pack| {
@@ -629,6 +635,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 art_url: pack.art_url(),
                 signer: trust.as_ref().and_then(|t| t.signer()).map(|s| hex::encode(s.as_bytes())),
                 trust: trust.map(|t| t.label().to_string()),
+                content: contents.remove(&pack.id).flatten(),
             }
         })
         .collect();

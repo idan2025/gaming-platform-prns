@@ -486,6 +486,14 @@ async fn pick_game_path(
     Ok(Some(path.display().to_string()))
 }
 
+/// Open Steam's install page for a game, or its store page without Steam.
+#[tauri::command]
+async fn get_game(app: tauri::AppHandle, state: tauri::State<'_, AppState>, game_id: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let url = state.launcher.get_game_url(&game_id).await.ok_or("this game has no Steam page to open")?;
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
 /// Every game with a pack, and whether it is on this machine.
 #[tauri::command]
 async fn installed_games(state: tauri::State<'_, AppState>) -> Result<Vec<launcher_core::InstalledGameView>, String> {
@@ -944,6 +952,7 @@ pub fn run() {
             set_notifications_on,
             pick_game_path,
             installed_games,
+            get_game,
             player_name,
             list_interfaces,
             add_interface,

@@ -340,6 +340,29 @@ pub struct InstalledCopy {
     pub updatable: bool,
 }
 
+/// Where one game's files stand (`Agent::content_state`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContentState {
+    /// The pack's `[content]` driver: `manual`, `archive` or `steamcmd`.
+    pub driver: String,
+    /// The copy new servers use is on disk.
+    pub installed: bool,
+    pub version: String,
+    /// Where a person puts a `manual` game's files, as this agent sees its
+    /// disk. Only while it is not there.
+    pub install_dir: Option<String>,
+    /// Folders a `manual` copy must have inside it: the pack's writable paths
+    /// and the operator's, which servers mount over and cannot create.
+    pub must_contain: Vec<String>,
+    /// Of those, the ones an installed copy lacks. A server will not start
+    /// until they exist.
+    pub missing: Vec<String>,
+    /// The pack's own words on where to get the files. Shown as text only.
+    pub note: Option<String>,
+    /// This node may download it by itself (`allow_content_fetch`).
+    pub fetch_allowed: bool,
+}
+
 /// What an update did, for the Installed page.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateReport {
@@ -2166,6 +2189,41 @@ impl Agent {
     /// The version new servers of `game` use: the one an update made active
     /// (`active.rs`) while it is installed and `agent.toml` has not moved on,
     /// else the config's.
+    /// Where a game's files stand on this node, for the Games page
+    /// (`PLAN.md` §13.3 step 3): which driver brings them, whether the copy
+    /// new servers use is there, and for a `manual` game exactly where a
+    /// person puts it and which folders it must have. `None` for a game this
+    /// node has no runtime for: nothing says which version it would be.
+    pub async fn content_state(&self, game_id: &str) -> Option<ContentState> {
+        let packs = self.packs.read().await;
+        let pack = packs.get(game_id)?;
+        let version = self.active_version(game_id)?;
+        let dir = self
+            .layout
+            .content_dir(&ContentRef { game_id: game_id.to_string(), version: version.clone() })
+            .ok()?;
+        let installed = dir.is_dir();
+        let manual = !pack.content.is_automatic();
+        let missing: Vec<String> = self
+            .writable_paths_for(game_id, pack)
+            .into_iter()
+            .filter(|p| installed && !dir.join(p).is_dir())
+            .collect();
+        Some(ContentState {
+            driver: pack.content.driver_name().to_string(),
+            installed,
+            version,
+            install_dir: (manual && !installed).then(|| dir.display().to_string()),
+            must_contain: if manual { self.writable_paths_for(game_id, pack) } else { Vec::new() },
+            missing,
+            note: match &pack.content {
+                PackContent::Manual { note } => note.clone(),
+                _ => None,
+            },
+            fetch_allowed: !manual && self.config.allow_content_fetch,
+        })
+    }
+
     pub fn active_version(&self, game_id: &str) -> Option<String> {
         let runtime = self.config.runtime_for(game_id)?;
         Some(self.active_version_of(game_id, &runtime.content_version))
