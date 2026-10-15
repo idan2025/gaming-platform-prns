@@ -10,14 +10,21 @@
 # An empty `games` list means hosting is off.
 games = ["sven-coop"]
 
-# Reach, honestly: an agent's API is loopback-only and refuses to bind anything
-# else, because it creates containers and has no authentication. So an index can
-# only drive agents on its own host today. Multi-node needs the agent uplink
-# over Reticulum, which is not built — do NOT work around it by exposing an
-# agent to the network.
+# Reach: an agent's HTTP API is loopback-only and refuses to bind anything
+# else, because it creates containers and has no authentication. A node on
+# another machine is driven over its Reticulum uplink instead (the agent's
+# `platform-agent.control` destination as `agent = "<hex>"`, with this
+# index's identity in the agent's `trusted_indexes`; see agent.example.toml).
+# Do NOT work around that by exposing an agent's HTTP API to the network.
 [[nodes]]
 name = "local"
 api = "http://127.0.0.1:4750"
+
+# A node on another machine, over its uplink:
+# [[nodes]]
+# name = "eu-1"
+# api = "http://127.0.0.1:4750"   # unused while `agent` is set
+# agent = "<32 hex chars: the agent's platform-agent.control destination>"
 
 [quota]
 max_instances_per_account = 3
