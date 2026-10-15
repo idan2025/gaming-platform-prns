@@ -142,6 +142,8 @@ pub struct Agent {
     /// the API's state so an automatic download waits in the same queue as
     /// the operator's.
     installs: Arc<crate::install::Installs>,
+    /// The official pack repository's passes (`official.rs`).
+    official: Arc<crate::official::Official>,
     /// Moves of servers onto a new copy (`move_instance`): one at a time, the
     /// servers and copies in one now, what happened last, and how long a move
     /// watches and warns.
@@ -510,12 +512,24 @@ impl Agent {
             updates: crate::updates::UpdateChecks::load(&config_data_root),
             check_lock: Mutex::new(()),
             installs: Arc::new(crate::install::Installs::new()),
+            official: Arc::new(crate::official::Official::new(&config_data_root)),
             move_lock: Mutex::new(()),
             moving: std::sync::Mutex::new(HashMap::new()),
             move_log: std::sync::Mutex::new(BTreeMap::new()),
             move_timing: std::sync::Mutex::new(MoveTiming::default()),
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// The official pack repository on this node.
+    pub fn official(&self) -> Arc<crate::official::Official> {
+        self.official.clone()
+    }
+
+    /// Point the official repository elsewhere: a test's own signed folder.
+    #[doc(hidden)]
+    pub fn set_official(&mut self, official: crate::official::Official) {
+        self.official = Arc::new(official);
     }
 
     /// This node's downloads and their queue.

@@ -159,6 +159,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The official pack repository (`official.rs`): on unless the operator
+    // turned it off; a pass takes new games and updates packs no server uses.
+    {
+        let agent = agent.clone();
+        let dir = std::path::PathBuf::from(&pack_dir);
+        tokio::spawn(async move {
+            tokio::time::sleep(platform_agent::official::FIRST_SYNC_AFTER).await;
+            loop {
+                agent.official().sync(&agent, &dir).await;
+                tokio::time::sleep(platform_agent::official::SYNC_EVERY).await;
+            }
+        });
+    }
+
     // Moving servers onto a new copy (`ROADMAP.md` §12.4): nothing moves
     // until the operator picks when, per game, on the Installed page.
     {

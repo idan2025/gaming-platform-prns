@@ -81,6 +81,10 @@ is missing, which makes pushing a tag sufficient on its own.
 - `packs/` is published to <https://idan2025.github.io/gaming-platform-prns/>
   with a website, every pack and the list signed by the project key, after
   the same review a pull request gets; weekly, so signatures never lapse.
+- Lanthorn and Lanthorn Host read it by default and take new and updated
+  packs by themselves, every six hours and with **Check now**; either can
+  turn it off. A node never changes a pack while a server of that game
+  exists.
 - `game-bridge repo mirror` makes an exact, one-way copy of a signed
   repository (the official one by default), and a folder can be added as a
   repository in Lanthorn and Lanthorn Host.

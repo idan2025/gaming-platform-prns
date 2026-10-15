@@ -156,6 +156,8 @@ pub fn router_full(
         .route("/games/:game/maps", get(game_maps))
         .route("/packs", post(import_pack))
         .route("/packs/repository", get(list_repository))
+        .route("/packs/official", get(official_status).put(set_official))
+        .route("/packs/official/sync", post(sync_official))
         .route("/packs/:id", delete(remove_pack))
         // Configuring the mesh interfaces binds sockets and joins meshes, so it
         // rides behind the same token gate as every container-creating route
@@ -399,6 +401,7 @@ async fn list_repository(
     State(state): State<ApiState>,
     Query(q): Query<RepositoryQuery>,
 ) -> ApiResult<serde_json::Value> {
+    node_repository_allowed(&state, &q.url)?;
     let index = crate::pack_import::read_repository(&q.url)
         .await
         .map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
@@ -434,6 +437,66 @@ async fn list_repository(
 /// straight into the agent's map would be an import route that bypasses the
 /// trust gate — the one thing that gate exists to stop. So a pack the policy
 /// refuses lands on disk and still does not run, and the response says so.
+async fn official_status(State(state): State<ApiState>) -> Json<crate::official::OfficialStatus> {
+    Json(state.agent.official().status())
+}
+
+#[derive(Deserialize)]
+struct OfficialReq {
+    on: bool,
+}
+
+async fn set_official(
+    State(state): State<ApiState>,
+    Json(req): Json<OfficialReq>,
+) -> ApiResult<crate::official::OfficialStatus> {
+    state
+        .agent
+        .official()
+        .set_on(req.on)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(state.agent.official().status()))
+}
+
+/// Read the official list now, as the timer would.
+async fn sync_official(State(state): State<ApiState>) -> ApiResult<crate::official::OfficialStatus> {
+    let Some(dir) = state.pack_dir.clone() else {
+        return Err(fail(
+            StatusCode::NOT_IMPLEMENTED,
+            "this agent was not told where packs live, so it cannot install one",
+        ));
+    };
+    Ok(Json(state.agent.official().sync(&state.agent, &dir).await))
+}
+
+/// A folder repository on a node must be under `<data_root>/mirrors/`: a
+/// repository address from a request would otherwise be a way to read the
+/// node's disk. An https one is unchanged.
+fn node_repository_allowed(state: &ApiState, repository: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let Ok(url) = game_bridge::repo::check_repo_url(repository) else { return Ok(()) };
+    if !url.starts_with("file://") {
+        return Ok(());
+    }
+    let mirrors = state.agent.config().data_root.join("mirrors");
+    let path = url::Url::parse(&url).ok().and_then(|u| u.to_file_path().ok());
+    let inside = path
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .zip(std::fs::canonicalize(&mirrors).ok())
+        .is_some_and(|(d, m)| d.starts_with(m));
+    if inside {
+        Ok(())
+    } else {
+        Err(fail(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a folder repository on this node must be inside {} (put a mirror there with `game-bridge repo mirror`)",
+                mirrors.display()
+            ),
+        ))
+    }
+}
+
 async fn import_pack(
     State(state): State<ApiState>,
     Json(request): Json<crate::pack_import::ImportRequest>,
@@ -444,6 +507,9 @@ async fn import_pack(
             "this agent was not told where packs live, so it cannot install one",
         ));
     };
+    if let Some(repository) = &request.repository {
+        node_repository_allowed(&state, repository)?;
+    }
     let policy = state.agent.config().pack_trust_policy();
     let now = std::time::SystemTime::now();
 

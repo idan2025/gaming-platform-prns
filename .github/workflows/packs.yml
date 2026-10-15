@@ -3,8 +3,10 @@ name: packs
 # Publishes the official pack repository to GitHub Pages: every pack in
 # `packs/`, signed with the project key (`signing::PROJECT_KEY_HEX`), its
 # signed `index.json`, and the website in `site/`. Runs when a pack, the site
-# or the tool that builds them changes on main, and weekly, so the signatures
-# (60 days) are always renewed long before they close.
+# or the tool that builds them changes on main, and weekly, so signatures are
+# always renewed long before they close: each pack's for 400 days (checked at
+# every load, offline too — `repo::PACK_SIGNATURE_DAYS`), the list's for 60
+# (checked only when it is read online).
 #
 # The key is the `PACK_SIGNING_IDENTITY` secret (base64 of the identity file).
 # The last step mirrors what is about to be published and holds it to the
@@ -65,7 +67,7 @@ jobs:
           # The same review a pull request had; a refusal stops the publish.
           "$gb" review --against _site/packs _site/packs/*.toml
           for f in _site/packs/*.toml; do
-            "$gb" sign "$f" --identity "$key" --days 60 --force
+            "$gb" sign "$f" --identity "$key" --days 400 --force
           done
           "$gb" repo build _site/packs --name "Lanthorn official packs" --identity "$key" --days 60
           cp site/* _site/

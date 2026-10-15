@@ -262,9 +262,21 @@ async fn fetch_from_repository(
     now: SystemTime,
 ) -> Result<(String, Option<String>), ImportError> {
     use game_bridge::repo::{beside, sha256_hex};
-    let index = read_repository(repository).await?;
     let url = game_bridge::repo::check_repo_url(repository)
         .map_err(|e| ImportError::Repository(e.to_string()))?;
+    let read = game_bridge::repo::read_index(&url)
+        .await
+        .map_err(|e| ImportError::Repository(format!("{e:#}")))?;
+    // The official list is held to the project key, whoever serves it.
+    if game_bridge::repo::check_repo_url(game_bridge::repo::OFFICIAL_REPOSITORY).ok().as_deref()
+        == Some(url.as_str())
+        && read.signature.as_ref().map(|(who, _)| *who) != Some(game_bridge::signing::project_key())
+    {
+        return Err(ImportError::Repository(
+            "the official list is not signed by the project key".into(),
+        ));
+    }
+    let index = read.index;
     let entry = index
         .entry(id)
         .ok_or_else(|| ImportError::Repository(format!("the repository does not list {id:?}")))?;

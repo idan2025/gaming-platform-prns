@@ -161,6 +161,24 @@ pub fn check_repo_url(url: &str) -> anyhow::Result<String> {
     Ok(url)
 }
 
+/// How long the official repository's pack signatures are made for
+/// (`.github/workflows/packs.yml`). Long, because a signature is checked at
+/// every load, offline too, and an expired one is an error that hides the
+/// pack (`signing.rs`); the list's own signature is only checked online, so
+/// it stays short. The publish renews both weekly.
+pub const PACK_SIGNATURE_DAYS: u64 = 400;
+
+/// A copy whose signature has less than this left is taken again from the
+/// official repository, however unchanged its bytes, so a launcher or node
+/// that syncs at all never meets an expired one.
+pub const REFRESH_BEFORE_SECS: u64 = 200 * 86_400;
+
+/// Whether a signature ending at `expires_at` is due for renewal.
+pub fn signature_due(expires_at: Option<u64>, now: std::time::SystemTime) -> bool {
+    let now = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    expires_at.is_some_and(|t| t.saturating_sub(now) < REFRESH_BEFORE_SECS)
+}
+
 /// How long one fetch may take.
 pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 

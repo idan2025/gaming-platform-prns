@@ -2249,6 +2249,7 @@ async function init() {
   state.pollTimer = setInterval(pollAll, 2000);
   await takeInvite();
   startupUpdateCheck();
+  startOfficialSync();
   try { if (await invoke('first_run')) openWelcome(); } catch (_) {}
 }
 
@@ -3772,7 +3773,39 @@ const REPO_STATE = {
   installed: 'Installed',
   shipped: 'Ships with Lanthorn',
 };
+// ---------- the official pack repository ----------
+//
+// Read in the background: at start, then every six hours while Lanthorn
+// runs. New games arrive by themselves; offline is normal and says nothing
+// outside the Games page. A shell without the command does none of this.
+const OFFICIAL_SYNC_EVERY_MS = 6 * 60 * 60 * 1000;
+function startOfficialSync() {
+  setTimeout(syncOfficial, AUTO_CHECK_DELAY_MS + 2000);
+  setInterval(syncOfficial, OFFICIAL_SYNC_EVERY_MS);
+}
+async function syncOfficial(asked) {
+  let v;
+  try { v = await invoke('sync_official_packs'); } catch (_) { return; }
+  state.official = v;
+  const fresh = (v.added || []).length + (v.updated || []).length;
+  if (fresh) {
+    await loadGames();
+    if (state.view === 'games') await loadRepos();
+  }
+  if ((v.added || []).length) {
+    const names = v.added.map(gameName).join(', ');
+    toast((v.added.length === 1 ? 'New game: ' : 'New games: ') + names + '.');
+  } else if (asked) {
+    toast(v.error ? 'Could not read the official packs: ' + v.error : 'The official packs are up to date.');
+  }
+  renderGames();
+}
+async function loadOfficial() {
+  try { state.official = await invoke('official_packs'); } catch (_) { state.official = null; }
+}
+
 async function loadRepos() {
+  await loadOfficial();
   try {
     state.repos = await invoke('pack_repos');
   } catch (err) {
@@ -3931,9 +3964,26 @@ function renderGames() {
   const rh = el('div', 'card-head');
   rh.appendChild(el('h2', '', 'Pack repositories'));
   repos.appendChild(rh);
-  repos.appendChild(el('p', 'card-text', 'A repository is somebody\u2019s list of game packs, and it is '
-    + 'optional: Lanthorn ships with none. A pack tells Lanthorn how to find and join a game and never '
-    + 'runs anything here; each one shows whether its author signed it.'));
+  repos.appendChild(el('p', 'card-text', 'A repository is a list of game packs. The official one, reviewed '
+    + 'and signed by the Lanthorn project, is on unless you turn it off; others are yours to add. A pack '
+    + 'tells Lanthorn how to find and join a game and never runs anything here.'));
+  const o = state.official;
+  if (o && !o.on) {
+    const off = el('div', 'repo');
+    const head = el('div', 'repo-head');
+    const t = el('div', 'item-text');
+    t.appendChild(el('div', 'item-title', 'Official packs are off'));
+    t.appendChild(el('div', 'item-sub', 'New games from the Lanthorn project do not arrive while this is off.'));
+    head.appendChild(t);
+    const on = el('button', 'btn btn-primary', 'Turn on');
+    on.type = 'button';
+    on.id = 'official-on';
+    on.disabled = !!state.repoBusy;
+    on.onclick = () => repoAction(async () => { await invoke('set_official_packs', { on: true }); await syncOfficial(true); }, 'official');
+    head.appendChild(on);
+    off.appendChild(head);
+    repos.appendChild(off);
+  }
   const form = el('form', 'inline-form');
   const input = el('input');
   input.id = 'repo-url';
@@ -3963,9 +4013,12 @@ function renderGames() {
     const box = el('div', 'repo');
     const head = el('div', 'repo-head');
     const title = el('div', 'item-text');
-    title.appendChild(el('div', 'item-title', r.name || 'Repository'));
+    title.appendChild(el('div', 'item-title', r.official ? 'Official packs' : (r.name || 'Repository')));
     title.appendChild(el('div', 'item-sub mono', r.url));
-    if (!r.error) {
+    if (r.official) {
+      const when = o && o.checked_unix ? 'checked ' + fmtSeen(Math.max(0, Math.floor(Date.now() / 1000) - o.checked_unix)) : 'not checked yet';
+      title.appendChild(el('div', 'item-sub', 'Reviewed and signed by the Lanthorn project · new games arrive by themselves · ' + when));
+    } else if (!r.error) {
       const who = el('div', 'item-sub', r.signer
         ? 'List signed by ' + r.signer.slice(0, 12) + '… — held to that key'
         : 'List not signed');
@@ -3973,11 +4026,21 @@ function renderGames() {
       title.appendChild(who);
     }
     head.appendChild(title);
-    const rm = el('button', 'btn', 'Remove');
+    if (r.official) {
+      const now = el('button', 'btn', 'Check now');
+      now.type = 'button';
+      now.id = 'official-sync';
+      now.disabled = !!state.repoBusy;
+      now.onclick = () => repoAction(() => syncOfficial(true), 'official');
+      head.appendChild(now);
+    }
+    const rm = el('button', 'btn', r.official ? 'Turn off' : 'Remove');
     rm.type = 'button';
+    rm.id = r.official ? 'official-off' : '';
     rm.disabled = !!state.repoBusy;
-    rm.title = 'Stop reading this list. Packs installed from it stay.';
-    rm.onclick = () => repoAction(() => invoke('remove_pack_repo', { url: r.url }), 'drop');
+    rm.title = r.official ? 'Stop taking packs from the Lanthorn project. What is installed stays.'
+      : 'Stop reading this list. Packs installed from it stay.';
+    rm.onclick = () => repoAction(() => r.official ? invoke('set_official_packs', { on: false }) : invoke('remove_pack_repo', { url: r.url }), 'drop');
     head.appendChild(rm);
     box.appendChild(head);
     if (r.error) box.appendChild(el('p', 'room-err small', 'Could not read it: ' + r.error));

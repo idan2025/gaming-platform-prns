@@ -201,6 +201,19 @@ function makeInvoke(scenario) {
       case 'finish_first_run':
         scenario.firstRunFinished = true;
         return null;
+      case 'official_packs':
+        if (!scenario.official) throw new Error(`unknown command ${cmd}`);
+        return scenario.official;
+      case 'sync_official_packs':
+        if (!scenario.official) throw new Error(`unknown command ${cmd}`);
+        (scenario.officialCalls ??= []).push('sync');
+        scenario.official = { ...scenario.official, checked_unix: Math.floor(Date.now() / 1000), added: scenario.officialAdds ?? [], updated: [] };
+        return scenario.official;
+      case 'set_official_packs':
+        (scenario.officialCalls ??= []).push(args.on ? 'on' : 'off');
+        scenario.official = { ...scenario.official, on: args.on };
+        if (!args.on) scenario.repos = (scenario.repos ?? []).filter(r => !r.official);
+        return null;
       case 'pack_repos':
         return scenario.repos ?? [];
       case 'add_pack_repo':
@@ -1017,6 +1030,36 @@ await run('a launcher past its first run never shows it', {
 // Games and pack repositories (ROADMAP item 8): installed games with their
 // tier, a pack from a repository installs by its repository and id, a shipped
 // game offers no install, and only a repository pack can be removed.
+// The official pack repository: listed as such with Check now and Turn off,
+// a game that arrives by itself is announced, and an official list that was
+// turned off offers Turn on.
+await run('the official packs are on, sync by themselves, and can be turned off', {
+  status: running,
+  rows: () => [row()],
+  official: { on: true, checked_unix: null, added: [], updated: [], error: null },
+  officialAdds: ['sven-coop'],
+  repos: [{
+    url: 'https://idan2025.github.io/gaming-platform-prns/packs/index.json', official: true, name: 'Lanthorn official packs',
+    error: null, signer: '7a656c1da3347bfcfe6b3981f71099c8',
+    packs: [{ id: 'sven-coop', display_name: 'Sven Co-op', art_url: null, lan: false, signed: true, state: 'installed' }],
+  }],
+}, async (win, doc, scenario) => {
+  await win.syncOfficial();
+  await settle();
+  check('the background sync ran', (scenario.officialCalls || []).includes('sync'), JSON.stringify(scenario.officialCalls));
+  check('a game that arrived by itself is announced', (doc.querySelector('#toast')?.textContent || '').includes('New game'), doc.querySelector('#toast')?.textContent);
+  win.setView('games');
+  await settle();
+  const t = doc.querySelector('#games-body')?.textContent || '';
+  check('the official repository is named as such', t.includes('Official packs') && t.includes('signed by the Lanthorn project'), t);
+  check('it offers Check now and Turn off, not Remove', !!doc.querySelector('#official-sync') && doc.querySelector('#official-off')?.textContent === 'Turn off');
+  doc.querySelector('#official-off').click();
+  await settle();
+  await settle();
+  check('Turn off reaches the core', (scenario.officialCalls || []).includes('off'), JSON.stringify(scenario.officialCalls));
+  check('turned off, it offers Turn on', !!doc.querySelector('#official-on'), doc.querySelector('#games-body')?.textContent);
+});
+
 await run('the Games page lists games and installs from a repository', {
   status: running,
   rows: () => [row()],

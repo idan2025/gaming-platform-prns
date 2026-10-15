@@ -732,9 +732,23 @@ later change could quietly break:
   swapped in. `a_mirror_is_an_exact_one_way_copy_held_to_one_key` and the
   CLI's `a_repository_built_and_signed_by_the_cli_mirrors_exactly` (which
   caught `repo build` never renaming its list into place).
+- **The launcher and the node read the official repository by default,
+  held to the project key** (never TOFU), and take new and updated packs by
+  themselves (`Launcher::sync_official_packs`, `official.rs`; every 6 h, and
+  "Check now"). Only the official repository may update a shipped game, by a
+  copy signed with the project key, which then overrides the bundled one at
+  load. **A node never replaces a pack while a server of its game exists**
+  (it waits; `official_packs_arrive_and_never_change_under_a_server`), and
+  nothing is ever removed by a sync. **Pack signatures are 400 days and a copy
+  within 200 days of its end is taken again** (`repo::signature_due`): an
+  expired signature is an error that hides the pack, offline too. The
+  project key is always first-party in `pack_trust_policy`. Turning it off is
+  a setting (`official_packs_off`, `official-packs.json`), never config.
 - **A folder is a repository** (`file://` or an absolute path,
   `repo::check_repo_url`), read through the same `repo::fetch` and the same
-  checks as https.
+  checks as https. **On a node only under `<data_root>/mirrors/`**
+  (`api::node_repository_allowed`): a repository address from a request
+  must not be a way to read the node's disk.
 - **One HTTP stack.** `launcher-core` uses the same reqwest 0.13 and rustls
   with ring the Tauri updater brings; do not add a second TLS stack.
 
