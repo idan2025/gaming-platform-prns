@@ -143,7 +143,7 @@ impl Launcher {
             max_players: Some(r.max_players),
             invite: hash
                 .as_deref()
-                .map(|h| crate::invite::link(h, Some(&r.game_id), Some(&r.name), false)),
+                .map(|h| crate::invite::web_link(h, Some(&r.game_id), Some(&r.name), false)),
             destination_hash: hash,
             clients,
             chat: host.session.chat().is_some_and(|h| h.enabled()),

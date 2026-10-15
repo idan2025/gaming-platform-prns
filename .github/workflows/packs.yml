@@ -70,7 +70,7 @@ jobs:
             "$gb" sign "$f" --identity "$key" --days 400 --force
           done
           "$gb" repo build _site/packs --name "Lanthorn official packs" --identity "$key" --days 60
-          cp site/* _site/
+          cp -r site/* _site/
           chmod -R a+rX _site
 
       - name: check it is what a launcher will accept

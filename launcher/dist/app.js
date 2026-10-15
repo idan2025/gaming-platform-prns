@@ -3375,7 +3375,7 @@ async function copyInvite(row) {
     });
     const what = isRoom(row) ? 'room' : 'server';
     await navigator.clipboard.writeText(link);
-    toast('Invite link copied. Anyone with Lanthorn who opens it sees this ' + what + '.');
+    toast('Invite link copied. Lanthorn opens it on this ' + what + '; a friend without Lanthorn gets a page to download it.');
   } catch (err) {
     showError('Could not copy the invite: ' + errText(err));
   }

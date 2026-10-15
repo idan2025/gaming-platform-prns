@@ -40,3 +40,8 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 p code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
 .error { color: #c0392b; }
 .foot { color: var(--text-2); font-size: 13px; padding-top: 32px; padding-bottom: 40px; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 28px 0 16px; }
+.button { display: inline-block; padding: 10px 18px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--text); text-decoration: none; font-weight: 600; }
+.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.note { color: var(--text-2); font-size: 14px; max-width: 680px; }
+pre code { word-break: break-all; white-space: pre-wrap; }

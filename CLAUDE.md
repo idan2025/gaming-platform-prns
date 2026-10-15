@@ -426,6 +426,9 @@ quietly break:
   re-signed after its libwayland repack, or the updater rejects it.
 - **An invite link selects a server and never joins one**, and every field is
   validated as data in `invite::parse`; refused, never repaired.
+  Copy invite gives the web form (`invite::WEB_PAGE`, `site/join/`), with the
+  invite in the **fragment** so the web host never sees it; `parse` accepts
+  only that exact page, and the page's script applies the same rules.
 - **A portable launcher registers no link scheme** — it writes nothing
   outside its folder. Single-instance is what hands a clicked link to the
   running launcher instead of starting a second mesh node.
