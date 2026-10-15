@@ -182,7 +182,7 @@ stripped; chat is held to a per-member gate at the host (burst 5, then one
 every two seconds). The player's name is set in Settings → You, which also
 finally gives the launch template's `{name}` a way in.
 
-### 6.1 Server chat — design (proposed 2026-10-15, not built)
+### 6.1 Server chat — design (decided 2026-10-15)
 
 **What.** Players who joined a server in the launcher can talk to each other
 and to its host before and while they play, in the same chat card as a room.
@@ -270,14 +270,14 @@ keep-alives) and a few hundred bytes per line.
 - Wire: a v0.2.40 launcher browsing a chat-flagged server lists it unchanged
   (decode with the old flag reader).
 
-**Decisions that are the user's** (safe default in brackets):
-- On by default? [**On** for a server hosted from the launcher; **off** on a
-  node until the operator turns it on per server, since a node serves
-  strangers and someone must moderate.]
-- Passworded servers: the bridge never sees the game's password, so chat on
-  one is open to anyone who can link. [**Off** on a passworded server unless
-  the host turns it on.]
-- Mute: [the host can mute an identity for the session; nothing kept.]
+**Decided by the user (2026-10-15):**
+- **On by default for a server hosted from the launcher; off on a node**
+  until the operator turns it on per server, since a node serves strangers
+  and someone must moderate.
+- **Off on a passworded server unless its host turns it on**: the bridge
+  never sees the game's password, so chat there would be open to anyone who
+  can link.
+- **The host can mute an identity for the session**; nothing is kept.
 
 ## 7. Node: console, resources, schedules, backups
 
