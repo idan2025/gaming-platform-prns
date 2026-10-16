@@ -96,6 +96,20 @@ is missing, which makes pushing a tag sufficient on its own.
   reached that computer and it answered; start the game there and host a
   LAN game, then check again.
 
+### Windows Firewall: looked after, not left to the player
+
+- The Windows Firewall rule that lets a room in (`Lanthorn LAN rooms`) is
+  now checked, not assumed. While a room is up, Lanthorn's administrator
+  helper looks at it every 20 seconds and puts it back if it was removed,
+  switched off or edited by a clean-up tool, an update or a security suite.
+  A rule that is fine is never touched, so there is no gap.
+- The rule names no game and no port, only the room's addresses, so a game
+  added later needs nothing more.
+- A problem Lanthorn cannot fix by itself is said in the room pane as soon
+  as the room starts, before any game fails, in plain steps and with no
+  command to paste: Windows set to "Block all incoming connections", or a
+  policy that ignores rules made on the computer.
+
 ## v0.2.43
 
 ### LAN room traffic leaves through the room

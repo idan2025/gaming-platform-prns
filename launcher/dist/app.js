@@ -3015,9 +3015,12 @@ function renderRoomFirewall(parent, r) {
   const blocks = f.blocking_programs || [];
   const others = f.other_firewalls || [];
   const fw = state.firewallAction;
-  if (!dropped.length && !f.heads_up && !fw.message) return;
+  // What is wrong with the firewall's rule, known when the room starts.
+  const problems = f.rule_problems || [];
+  if (!dropped.length && !f.heads_up && !fw.message && !problems.length) return;
   const box = el('div', 'room-firewall');
   box.id = 'room-firewall';
+  problems.forEach(p => box.appendChild(el('p', 'room-err', p)));
   dropped.forEach(d => box.appendChild(el('p', 'room-err',
     d.from + ' tried to join a game on this computer (' + d.transport.toUpperCase() + ' ' + d.port
     + '), but this computer’s firewall blocked it.')));
@@ -3043,7 +3046,7 @@ function renderRoomFirewall(parent, r) {
     u.onclick = () => firewallAction('unblock_room_programs');
     box.appendChild(u);
   }
-  if (f.can_fix && (dropped.length || f.heads_up)) {
+  if (f.can_fix && (dropped.length || f.heads_up || f.rule_missing)) {
     const b = el('button', 'btn btn-join', fw.busy ? 'Working…' : 'Fix it');
     b.type = 'button';
     b.id = 'room-fix';

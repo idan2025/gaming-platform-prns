@@ -486,6 +486,144 @@ pub fn open(
     }
 }
 
+/// Whether Windows holds a rule named `name` that lets the whole room range in,
+/// on every network profile — not merely a rule of that name. Read through
+/// PowerShell, whose values do not change with the display language the way
+/// `netsh`'s labels do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleState {
+    /// There, enabled, inbound, allowing the room range on every profile.
+    Working,
+    /// No rule of that name.
+    Missing,
+    /// There, but something about it keeps it from letting the room in.
+    Broken(String),
+}
+
+fn rule_state_script(name: &str) -> String {
+    format!(
+        "$ErrorActionPreference = 'SilentlyContinue'; \
+         $o = @(Get-NetFirewallRule -DisplayName '{}' | ForEach-Object {{ \
+         [pscustomobject]@{{ enabled = ([string]$_.Enabled -eq 'True'); action = [string]$_.Action; \
+         direction = [string]$_.Direction; profile = [string]$_.Profile; \
+         remote = (($_ | Get-NetFirewallAddressFilter).RemoteAddress -join ',') }} }}); \
+         [pscustomobject]@{{ rules = $o }} | ConvertTo-Json -Compress -Depth 4",
+        name.replace('\'', "''")
+    )
+}
+
+/// Read [`RuleState`] of the rule `name`.
+pub fn rule_state(r: &impl Run, name: &str) -> std::io::Result<RuleState> {
+    let (ok, out) = r.run("powershell", &powershell(&rule_state_script(name)))?;
+    if !ok {
+        return Err(failed("reading the firewall rule", &out));
+    }
+    parse_rule_state(&out).ok_or_else(|| failed("reading the firewall rule", &out))
+}
+
+/// [`rule_state`]'s parse, apart so it is tested without Windows.
+pub fn parse_rule_state(json: &str) -> Option<RuleState> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(json.trim()).ok()?;
+    let rules: Vec<Value> = match &v["rules"] {
+        Value::Array(a) => a.clone(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    };
+    if rules.is_empty() {
+        return Some(RuleState::Missing);
+    }
+    let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut why = String::new();
+    for r in &rules {
+        let problem = if !r.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+            "it is switched off"
+        } else if !text(r, "action").eq_ignore_ascii_case("allow") {
+            "it does not allow"
+        } else if !text(r, "direction").eq_ignore_ascii_case("inbound") {
+            "it is not an inbound rule"
+        } else if !profile_is_every(&text(r, "profile")) {
+            "it does not cover every network profile"
+        } else if !remote_covers_room(&text(r, "remote")) {
+            "it does not cover the room's addresses"
+        } else {
+            return Some(RuleState::Working);
+        };
+        why = problem.to_string();
+    }
+    Some(RuleState::Broken(why))
+}
+
+/// `Any`, or every named profile.
+fn profile_is_every(profile: &str) -> bool {
+    let p = profile.to_ascii_lowercase();
+    p.contains("any") || ["domain", "private", "public"].iter().all(|n| p.contains(n))
+}
+
+/// Whether a rule's remote addresses (`Any`, or ranges as Windows prints
+/// them: `198.18.0.0/255.254.0.0` or `198.18.0.0/15`, comma-separated) take in
+/// the whole room range.
+fn remote_covers_room(remote: &str) -> bool {
+    let room_net = u32::from(crate::lan::ALLOWED_RANGE);
+    let room_len = u32::from(crate::lan::ALLOWED_RANGE_LEN);
+    remote.split(',').map(str::trim).any(|part| {
+        if part.eq_ignore_ascii_case("any") {
+            return true;
+        }
+        // A range: 198.18.0.0-198.19.255.255.
+        if let Some((from, to)) = part.split_once('-') {
+            let (Ok(from), Ok(to)) =
+                (from.trim().parse::<std::net::Ipv4Addr>(), to.trim().parse::<std::net::Ipv4Addr>())
+            else {
+                return false;
+            };
+            let room_end = room_net | !(u32::MAX << (32 - room_len));
+            return u32::from(from) <= room_net && u32::from(to) >= room_end;
+        }
+        let Some((net, mask)) = part.split_once('/') else { return false };
+        let Ok(net) = net.parse::<std::net::Ipv4Addr>() else { return false };
+        // The mask as bits, contiguous or not: a dotted mask Windows did not
+        // validate (255.0.255.0) must not be read as its leading ones.
+        let m = match mask.parse::<u32>() {
+            Ok(n) if n <= 32 => if n == 0 { 0 } else { u32::MAX << (32 - n) },
+            Ok(_) => return false,
+            Err(_) => match mask.parse::<std::net::Ipv4Addr>() {
+                Ok(m) => u32::from(m),
+                Err(_) => return false,
+            },
+        };
+        // It covers the room when it keeps none of the room's host bits and
+        // agrees with the room on every network bit it keeps.
+        let host_bits = !(u32::MAX << (32 - room_len));
+        m & host_bits == 0 && (u32::from(net) ^ room_net) & m == 0
+    })
+}
+
+/// Make sure the permanent room rule is there and working, adding or
+/// replacing it only if it is not — so a check made while a room is up never
+/// opens a gap by deleting a good rule. What the player never has to do.
+///
+/// `tried` remembers the state a repair was last made for: the same state
+/// again means the repair changed nothing (or the check misreads a good rule),
+/// and doing it every pass would only open a gap in a rule that is there.
+pub fn ensure_kept(
+    r: &impl Run,
+    adapter: &str,
+    tried: &mut Option<RuleState>,
+) -> std::io::Result<RuleState> {
+    let state = rule_state(r, RULE_NAME)?;
+    if state == RuleState::Working {
+        *tried = None;
+        return Ok(state);
+    }
+    if tried.as_ref() == Some(&state) {
+        return Ok(state);
+    }
+    *tried = Some(state.clone());
+    open(r, LocalFirewall::Windows, adapter, Lifetime::Kept)?;
+    rule_state(r, RULE_NAME)
+}
+
 /// Undo what [`open`] did for one room. Only a portable room closes anything,
 /// and only what it added itself.
 pub fn close(
@@ -540,6 +678,23 @@ pub struct WindowsFacts {
     /// Third-party firewalls Windows Security reports as on, by name. They
     /// ignore Windows Firewall's rules, so only the player can open them.
     pub other_firewalls: Vec<String>,
+    /// Each firewall profile's settings that decide whether an allow rule
+    /// does anything: Domain, Private and Public.
+    pub profiles: Vec<ProfileFacts>,
+}
+
+/// One Windows Firewall profile (Domain, Private or Public), as far as an
+/// allow rule is concerned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileFacts {
+    pub name: String,
+    pub enabled: bool,
+    /// "Block all incoming connections" is on, by the setting or by policy:
+    /// every allow rule is ignored on this profile.
+    pub blocks_all_incoming: bool,
+    /// A policy makes this profile ignore rules made on this computer, so a
+    /// rule Lanthorn adds does nothing until the policy allows it.
+    pub ignores_local_rules: bool,
 }
 
 /// One PowerShell run; read-only, needs no administrator.
@@ -552,8 +707,63 @@ $blocks = @(Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True |
 $fw = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct | ForEach-Object {
   [pscustomobject]@{ name = $_.displayName; state = [int64]$_.productState }
 })
-[pscustomobject]@{ rule = $rule; blocks = $blocks; firewalls = $fw } | ConvertTo-Json -Compress -Depth 4
+$keys = @{ Domain = 'DomainProfile'; Private = 'StandardProfile'; Public = 'PublicProfile' }
+$profiles = @(Get-NetFirewallProfile | ForEach-Object {
+  $k = $keys[[string]$_.Name]
+  $none = $false
+  foreach ($path in @(('HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\' + $k), ('HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\' + $k))) {
+    if ((Get-ItemProperty -Path $path -Name DoNotAllowExceptions).DoNotAllowExceptions -eq 1) { $none = $true }
+  }
+  [pscustomobject]@{
+    name = [string]$_.Name
+    enabled = ([string]$_.Enabled -eq 'True')
+    blocks_all = $none
+    local_rules = [string]$_.AllowLocalFirewallRules
+  }
+})
+[pscustomobject]@{ rule = $rule; blocks = $blocks; firewalls = $fw; profiles = $profiles } | ConvertTo-Json -Compress -Depth 4
 "#;
+
+/// What, in this machine's Windows Firewall, stops Lanthorn's rule from
+/// letting a room through — whatever the game: the rule names no program and
+/// no port, only the room's addresses, so a game added later needs nothing
+/// more. Said before anything is dropped, in words a player can act on.
+pub fn rule_problems(facts: &WindowsFacts) -> Vec<String> {
+    let names = |pred: &dyn Fn(&ProfileFacts) -> bool| {
+        facts
+            .profiles
+            .iter()
+            .filter(|p| p.enabled && pred(p))
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" and ")
+    };
+    let mut out = Vec::new();
+    if !facts.rule_present {
+        out.push(
+            "Lanthorn's Windows Firewall rule is not there, so Windows will drop other players' \
+             connections to games you host. Press Fix it to add it for good."
+                .to_string(),
+        );
+    }
+    let blocked = names(&|p| p.blocks_all_incoming);
+    if !blocked.is_empty() {
+        out.push(format!(
+            "Windows is set to block all incoming connections on its {blocked} network profile, \
+             which ignores every allow rule, Lanthorn's included. Turn off \"Block all incoming \
+             connections\" for that network under Windows Security → Firewall & network protection."
+        ));
+    }
+    let ignored = names(&|p| p.ignores_local_rules && !p.blocks_all_incoming);
+    if !ignored.is_empty() {
+        out.push(format!(
+            "A policy on this computer makes the {ignored} network profile ignore firewall rules made \
+             here, so Lanthorn's rule does nothing there until that policy allows it. Ask whoever \
+             manages this computer."
+        ));
+    }
+    out
+}
 
 fn powershell(script: &str) -> Vec<String> {
     argv(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
@@ -598,7 +808,20 @@ pub fn parse_windows_facts(json: &str) -> Option<WindowsFacts> {
         .map(|f| text(f, "name"))
         .filter(|n| !n.is_empty() && !n.to_ascii_lowercase().contains("windows"))
         .collect();
+    let profiles = list(&v["profiles"])
+        .iter()
+        .map(|p| ProfileFacts {
+            name: text(p, "name"),
+            enabled: p.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+            blocks_all_incoming: p.get("blocks_all").and_then(Value::as_bool).unwrap_or(false),
+            // "False" is the only value that turns local rules off; "True" and
+            // "NotConfigured" leave them on.
+            ignores_local_rules: text(p, "local_rules").eq_ignore_ascii_case("false"),
+        })
+        .filter(|p| !p.name.is_empty())
+        .collect();
     Some(WindowsFacts {
+        profiles,
         rule_present: v["rule"].as_bool().unwrap_or(false),
         blocks,
         other_firewalls,
@@ -894,6 +1117,160 @@ mod tests {
             "only a room adapter"
         );
         assert!(f.calls().is_empty(), "refused before anything ran");
+    }
+
+    const GOOD: &str = r#"{"rules":{"enabled":true,"action":"Allow","direction":"Inbound","profile":"Any","remote":"198.18.0.0/255.254.0.0"}}"#;
+
+    #[test]
+    fn a_rule_is_working_only_if_it_lets_the_whole_room_in_on_every_profile() {
+        assert_eq!(parse_rule_state(GOOD), Some(RuleState::Working));
+        // Windows prints a range as a mask or a prefix; a wider one, or Any, covers it.
+        for remote in ["198.18.0.0/15", "198.0.0.0/255.0.0.0", "Any", "10.0.0.0/8,198.18.0.0/15"] {
+            let j = GOOD.replace("198.18.0.0/255.254.0.0", remote);
+            assert_eq!(parse_rule_state(&j), Some(RuleState::Working), "{remote}");
+        }
+        let every = GOOD.replace(r#""Any""#, r#""Domain, Private, Public""#);
+        assert_eq!(parse_rule_state(&every), Some(RuleState::Working));
+        let broken = |from: &str, to: &str, why: &str| {
+            assert_eq!(
+                parse_rule_state(&GOOD.replace(from, to)),
+                Some(RuleState::Broken(why.into())),
+                "{to}"
+            );
+        };
+        broken("true", "false", "it is switched off");
+        broken("Allow", "Block", "it does not allow");
+        broken("Inbound", "Outbound", "it is not an inbound rule");
+        broken(r#""Any""#, r#""Public""#, "it does not cover every network profile");
+        // Narrower than the room range: only half the rooms.
+        broken("198.18.0.0/255.254.0.0", "198.19.0.0/255.255.0.0", "it does not cover the room's addresses");
+        broken("198.18.0.0/255.254.0.0", "192.168.0.0/16", "it does not cover the room's addresses");
+        assert_eq!(parse_rule_state(r#"{"rules":null}"#), Some(RuleState::Missing));
+        assert_eq!(parse_rule_state("Get-NetFirewallRule : not recognized"), None);
+    }
+
+    #[test]
+    fn a_good_rule_is_left_alone_and_a_missing_or_broken_one_is_put_back() {
+        let broken = GOOD.replace("true", "false");
+        let missing = r#"{"rules":null}"#;
+        // Good: read, nothing changed — no gap while a room is up.
+        let f = Fake::with(vec![("powershell", true, GOOD)]);
+        assert_eq!(ensure_kept(&f, "gbl0", &mut None).unwrap(), RuleState::Working);
+        assert!(f.calls().iter().all(|c| !c.starts_with("netsh")), "{:?}", f.calls());
+
+        // Missing, then added: netsh ran, and the second read is good.
+        struct Healing(Mutex<u32>);
+        impl Run for Healing {
+            fn run(&self, program: &str, _: &[String]) -> std::io::Result<(bool, String)> {
+                if program == "netsh" {
+                    *self.0.lock().unwrap() += 1;
+                    return Ok((true, String::new()));
+                }
+                let added = *self.0.lock().unwrap() > 0;
+                Ok((true, if added { GOOD } else { r#"{"rules":null}"# }.to_string()))
+            }
+        }
+        let h = Healing(Mutex::new(0));
+        assert_eq!(ensure_kept(&h, "gbl0", &mut None).unwrap(), RuleState::Working);
+        assert!(*h.0.lock().unwrap() >= 2, "deleted the stale one and added ours");
+
+        // A rule that stays broken is reported, not claimed fixed.
+        let f = Fake::with(vec![("powershell", true, Box::leak(broken.into_boxed_str()))]);
+        let mut tried = None;
+        assert_eq!(
+            ensure_kept(&f, "gbl0", &mut tried).unwrap(),
+            RuleState::Broken("it is switched off".into())
+        );
+        let adds = |f: &Fake| f.calls().iter().filter(|c| c.contains("add")).count();
+        assert_eq!(adds(&f), 1, "repaired once");
+        // The same state again: that repair changed nothing, so the rule is
+        // not deleted and re-added on every pass.
+        ensure_kept(&f, "gbl0", &mut tried).unwrap();
+        ensure_kept(&f, "gbl0", &mut tried).unwrap();
+        assert_eq!(adds(&f), 1, "not repaired again: {:?}", f.calls());
+        let _ = missing;
+    }
+
+    #[test]
+    fn windows_may_print_the_rooms_range_as_a_range() {
+        assert!(remote_covers_room("198.18.0.0-198.19.255.255"));
+        assert!(remote_covers_room("10.0.0.1-10.0.0.9, 198.0.0.0-199.255.255.255"));
+        assert!(!remote_covers_room("198.18.0.0-198.18.255.255"), "half the room range");
+        assert!(!remote_covers_room("198.19.0.0-198.19.255.255"));
+        assert!(!remote_covers_room("garbage-and-more"));
+        // A non-contiguous mask is not a prefix: it must not "cover" the room.
+        assert!(!remote_covers_room("198.18.0.0/255.0.255.0"));
+        assert!(!remote_covers_room("198.0.0.0/255.0.255.0"));
+        assert!(remote_covers_room("0.0.0.0/0"));
+    }
+
+    fn profile(name: &str, enabled: bool, blocks_all: bool, ignores: bool) -> ProfileFacts {
+        ProfileFacts {
+            name: name.into(),
+            enabled,
+            blocks_all_incoming: blocks_all,
+            ignores_local_rules: ignores,
+        }
+    }
+
+    #[test]
+    fn profile_settings_are_read_and_only_a_false_local_rules_value_counts() {
+        let json = r#"{"rule":true,"blocks":[],"firewalls":[],"profiles":[
+            {"name":"Domain","enabled":true,"blocks_all":false,"local_rules":"NotConfigured"},
+            {"name":"Private","enabled":true,"blocks_all":false,"local_rules":"False"},
+            {"name":"Public","enabled":false,"blocks_all":true,"local_rules":"True"}]}"#;
+        let f = parse_windows_facts(json).unwrap();
+        assert_eq!(
+            f.profiles,
+            [
+                profile("Domain", true, false, false),
+                profile("Private", true, false, true),
+                profile("Public", false, true, false),
+            ]
+        );
+        // A PowerShell 5.1 single profile is a bare object; no profiles at all
+        // (an old script's output) is none, not a failure.
+        let one = r#"{"rule":true,"profiles":{"name":"Public","enabled":true,"blocks_all":false,"local_rules":"True"}}"#;
+        assert_eq!(parse_windows_facts(one).unwrap().profiles.len(), 1);
+        assert!(parse_windows_facts(r#"{"rule":true}"#).unwrap().profiles.is_empty());
+    }
+
+    /// Whatever the game: the rule names no program and no port, so what
+    /// stops it from working is the same for every game, now and later.
+    #[test]
+    fn what_stops_the_rule_is_named_and_a_healthy_firewall_says_nothing() {
+        let healthy = WindowsFacts {
+            rule_present: true,
+            profiles: vec![profile("Public", true, false, false)],
+            ..Default::default()
+        };
+        assert!(rule_problems(&healthy).is_empty());
+
+        let missing = WindowsFacts { rule_present: false, ..healthy.clone() };
+        let said = rule_problems(&missing);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("rule is not there") && said[0].contains("Fix it"), "{said:?}");
+
+        // "Block all incoming connections" beats every allow; a profile that
+        // is switched off cannot block anything.
+        let block_all = WindowsFacts {
+            profiles: vec![profile("Public", true, true, false), profile("Private", false, true, false)],
+            ..healthy.clone()
+        };
+        let said = rule_problems(&block_all);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("Public") && !said[0].contains("Private"), "{said:?}");
+        assert!(said[0].contains("Block all incoming connections"), "{said:?}");
+
+        // A policy that ignores local rules; said once, not also as the
+        // block-all it would be redundant with.
+        let policy = WindowsFacts {
+            profiles: vec![profile("Domain", true, false, true), profile("Public", true, true, true)],
+            ..healthy
+        };
+        let said = rule_problems(&policy);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[1].contains("Domain") && !said[1].contains("Public"), "{said:?}");
     }
 
     #[test]
