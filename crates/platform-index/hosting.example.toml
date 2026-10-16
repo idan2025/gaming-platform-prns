@@ -2,6 +2,11 @@
 # people's behalf. Entirely optional: an index with no such file is a directory,
 # which is what most of them should be.
 #
+# Edits to this file take effect within about ten seconds, no restart: add or
+# remove a node, a game or a quota by saving it. A save that does not parse is
+# logged and changes nothing. Servers on a node you remove keep running; the
+# index just stops placing on it and listing it.
+#
 # THE PLATFORM SHIPS NO LIST OF HOSTABLE GAMES. Which titles you may legally run
 # for other people depends on your jurisdiction and on agreements this project
 # cannot see (GAMES.md §5, PLAN.md §10). You decide, here — the same way

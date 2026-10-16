@@ -93,6 +93,12 @@ is missing, which makes pushing a tag sufficient on its own.
   first and a home machine only the overflow. A node with under 1 GiB free
   is treated as full.
 
+### Index config without a restart
+
+- An index now picks up edits to its hosting file within about ten seconds:
+  add or remove a node, a game or a quota by saving the file. A save that
+  does not parse is logged and changes nothing.
+
 ### Stop and start a hosted server
 
 - Someone running a server through an index can now stop it and start it

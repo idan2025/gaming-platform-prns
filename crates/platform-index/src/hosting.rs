@@ -206,8 +206,10 @@ fn default_max_players() -> u8 {
 }
 
 pub struct Hosting {
-    config: HostingConfig,
-    quotas: Quotas,
+    /// Swapped whole by [`reload`](Self::reload); every operation takes one
+    /// snapshot and works from it, so a reload never changes the rules
+    /// halfway through a deploy.
+    config: std::sync::RwLock<Arc<HostingConfig>>,
     http: reqwest::Client,
     /// The Reticulum uplink to remote agents. `None` when this index runs no
     /// Reticulum node, in which case nodes with `agent` set are unreachable
@@ -218,10 +220,8 @@ pub struct Hosting {
 
 impl Hosting {
     pub fn new(config: HostingConfig) -> Self {
-        let quotas = Quotas::new(QuotaPolicy::from(&config.quota));
         Self {
-            config,
-            quotas,
+            config: std::sync::RwLock::new(Arc::new(config)),
             http: reqwest::Client::builder()
                 // An agent that has stopped answering must not hold a request
                 // open until the caller gives up on the index itself.
@@ -232,8 +232,43 @@ impl Hosting {
         }
     }
 
-    pub fn config(&self) -> &HostingConfig {
-        &self.config
+    /// The configuration in force right now.
+    pub fn config(&self) -> Arc<HostingConfig> {
+        self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Put a new configuration in force: nodes, games and quotas, with no
+    /// restart. A node removed from the list is no longer placed on or
+    /// listed; the servers on it keep running, since only its operator
+    /// stops them. Ownership needs nothing carried over: it lives on the
+    /// nodes' containers.
+    pub fn reload(&self, config: HostingConfig) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+    }
+
+    /// Read and parse a hosting config file. A file that does not parse is an
+    /// error, never an empty config: an operator's typo must not switch
+    /// hosting off.
+    pub fn load(path: &std::path::Path) -> Result<HostingConfig> {
+        let src = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Re-read `path` and put it in force if it parses. On an error the
+    /// configuration in force stays as it was, and the error says why.
+    pub fn reload_from(&self, path: &std::path::Path) -> Result<()> {
+        let config = Self::load(path)?;
+        tracing::info!(
+            games = ?config.games,
+            nodes = ?config.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            "hosting config reloaded"
+        );
+        self.reload(config);
+        Ok(())
+    }
+
+    fn quotas(config: &HostingConfig) -> Quotas {
+        Quotas::new(QuotaPolicy::from(&config.quota))
     }
 
     /// Attach the Reticulum uplink, once the index's node has produced a handle.
@@ -265,8 +300,9 @@ impl Hosting {
 
     /// Everything running across every node this index drives.
     pub async fn all_instances(&self) -> Result<Vec<HostedInstance>> {
+        let config = self.config();
         let mut out = Vec::new();
-        for node in &self.config.nodes {
+        for node in &config.nodes {
             match self.node_instances(node).await {
                 Ok(mut rows) => out.append(&mut rows),
                 // One unreachable node must not blank the whole listing: the
@@ -353,16 +389,17 @@ impl Hosting {
         request: &DeployRequest,
         now: std::time::SystemTime,
     ) -> Result<HostedInstance> {
-        if !self.config.enabled() {
+        let config = self.config();
+        if !config.enabled() {
             return Err(anyhow!("this index does not offer hosting"));
         }
-        if !self.config.hosts_game(&request.game_id) {
+        if !config.hosts_game(&request.game_id) {
             // Named rather than a bare 404: an operator's list is a deliberate
             // choice, and a caller should be able to see what it is.
             return Err(anyhow!(
                 "this index does not host {:?}. It hosts: {}",
                 request.game_id,
-                self.config.games.join(", ")
+                config.games.join(", ")
             ));
         }
         if request.name.trim().is_empty() {
@@ -375,11 +412,11 @@ impl Hosting {
 
         let existing = self.all_instances().await?;
         let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
-        self.quotas
+        Self::quotas(&config)
             .admit(account, &records, now)
             .map_err(|e| anyhow!("{e}"))?;
 
-        let node = self.pick_node(&existing).await.ok_or_else(|| {
+        let node = self.pick_node(&config, &existing).await.ok_or_else(|| {
             anyhow!("no node with room for another instance")
         })?;
 
@@ -474,7 +511,7 @@ impl Hosting {
     ///
     /// Ownership is checked against the node's label, not against anything this
     /// index remembers, so a restarted index still enforces it correctly.
-    async fn owned(&self, account: &AccountId, instance_id: &str) -> Result<(HostedInstance, &NodeConfig)> {
+    async fn owned(&self, account: &AccountId, instance_id: &str) -> Result<(HostedInstance, NodeConfig)> {
         let all = self.all_instances().await?;
         let found = all
             .into_iter()
@@ -485,10 +522,11 @@ impl Hosting {
             .filter(|i| i.owner.as_deref() == Some(account.0.as_str()))
             .ok_or_else(|| anyhow!("no such instance"))?;
         let node = self
-            .config
+            .config()
             .nodes
             .iter()
             .find(|n| n.name == found.node)
+            .cloned()
             .ok_or_else(|| anyhow!("the node holding it is no longer configured"))?;
         Ok((found, node))
     }
@@ -497,7 +535,7 @@ impl Hosting {
     /// stay; [`start`](Self::start) brings it back.
     pub async fn stop(&self, account: &AccountId, instance_id: &str) -> Result<()> {
         let (_, node) = self.owned(account, instance_id).await?;
-        self.stop_on(node, instance_id).await
+        self.stop_on(&node, instance_id).await
     }
 
     /// Start one of the caller's own stopped instances again, on the node that
@@ -513,7 +551,7 @@ impl Hosting {
         if found.state == "running" {
             return Err(anyhow!("it is already running"));
         }
-        self.start_on(node, instance_id).await
+        self.start_on(&node, instance_id).await
     }
 
     /// Stop and remove one of the caller's own instances.
@@ -523,7 +561,7 @@ impl Hosting {
         // Remote agent over Reticulum: ask it to remove the instance. Ownership
         // was just checked against the label the agent itself reported, so a
         // restarted index still enforces it correctly on either path.
-        if let Some(dest) = Self::agent_dest(node) {
+        if let Some(dest) = Self::agent_dest(&node) {
             let dest = dest?;
             let client = self
                 .agent_client()
@@ -623,18 +661,20 @@ impl Hosting {
     /// logged and skipped rather than failing the sweep: the other instances
     /// are still costing the same node time.
     pub async fn reap_idle(&self, now: SystemTime) -> Result<Vec<(String, ReapReason)>> {
-        if self.quotas.policy().idle_timeout.is_none() {
+        let config = self.config();
+        let quotas = Self::quotas(&config);
+        if quotas.policy().idle_timeout.is_none() {
             return Ok(Vec::new());
         }
         let existing = self.all_instances().await?;
         let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
 
         let mut reaped = Vec::new();
-        for (instance_id, reason) in self.quotas.to_reap(&records, now) {
+        for (instance_id, reason) in quotas.to_reap(&records, now) {
             let Some(instance) = existing.iter().find(|i| i.instance_id == instance_id) else {
                 continue;
             };
-            let Some(node) = self.config.nodes.iter().find(|n| n.name == instance.node) else {
+            let Some(node) = config.nodes.iter().find(|n| n.name == instance.node) else {
                 continue;
             };
             // Stop, not remove. The instance directory holds whatever players
@@ -667,9 +707,9 @@ impl Hosting {
     /// the index's own count and ranks behind every node that did answer: an
     /// unreachable node is the least attractive place to put something, and
     /// "silence means room" is how an outage becomes a pile-up.
-    async fn pick_node(&self, existing: &[HostedInstance]) -> Option<&NodeConfig> {
+    async fn pick_node<'c>(&self, config: &'c HostingConfig, existing: &[HostedInstance]) -> Option<&'c NodeConfig> {
         let mut best: Option<(&NodeConfig, Rank)> = None;
-        for node in &self.config.nodes {
+        for node in &config.nodes {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let Some(ranked) = rank_node(self.node_capacity(node).await, here, node.priority) else {
                 continue;
@@ -945,7 +985,7 @@ mod tests {
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
-        assert_eq!(h.pick_node(&existing).await.unwrap().name, "second");
+        assert_eq!(h.pick_node(&h.config(), &existing).await.unwrap().name, "second");
     }
 
     fn hosted(id: &str, uptime: Option<u64>, players: Option<u32>) -> HostedInstance {
@@ -1080,6 +1120,29 @@ mod tests {
     #[test]
     fn among_nodes_that_answered_the_emptiest_wins() {
         assert!(rank_node(Some(cap(1, 8)), 0, 0) > rank_node(Some(cap(6, 8)), 0, 0));
+    }
+
+    /// An operator adds a node by editing the file, with no restart; a file
+    /// that no longer parses changes nothing and says why.
+    #[test]
+    fn a_node_added_to_the_file_is_in_force_without_a_restart_and_a_typo_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("gpp-hosting-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosting.toml");
+        let one = "games = [\"sven-coop\"]\n[[nodes]]\nname = \"local\"\napi = \"http://127.0.0.1:4750\"\n";
+        std::fs::write(&path, one).unwrap();
+        let h = Hosting::new(Hosting::load(&path).unwrap());
+        assert_eq!(h.config().nodes.len(), 1);
+
+        let two = format!("{one}[[nodes]]\nname = \"eu-1\"\napi = \"http://127.0.0.1:4751\"\npriority = 10\n");
+        std::fs::write(&path, two).unwrap();
+        h.reload_from(&path).unwrap();
+        assert_eq!(h.config().nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["local", "eu-1"]);
+
+        std::fs::write(&path, "games = [\"sven-coop\"\n[[nodes]]").unwrap();
+        assert!(h.reload_from(&path).is_err());
+        assert_eq!(h.config().nodes.len(), 2, "a file that does not parse changed what is in force");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
