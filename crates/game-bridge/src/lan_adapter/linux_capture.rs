@@ -580,6 +580,15 @@ impl State {
     }
 }
 
+// Removing the rules goes with the state itself, so they go however it ends:
+// the room over, or the refresh thread failing to start after the first rules
+// were put in place.
+impl Drop for State {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 /// The room's traffic-control rules, kept in step with this machine's
 /// interfaces until dropped, then removed.
 pub struct Capture {
@@ -610,11 +619,11 @@ impl Capture {
         state.sync();
         let (tx, rx) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new().name("lan-capture".into()).spawn(move || {
-            // A message, or the sender dropped, is the room ending.
+            // A message, or the sender dropped, is the room ending; dropping
+            // the state removes the rules.
             while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(REFRESH) {
                 state.sync();
             }
-            state.clear();
         })?;
         Ok(Self { stop: Some(tx), thread: Some(thread) })
     }
