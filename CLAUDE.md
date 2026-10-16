@@ -102,6 +102,11 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   caller's identity. Pinned by
   `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
 
+- **The hosting file is re-read without a restart** (`Hosting::reload_from`,
+  checked every 10 s by modification time). The config is swapped whole and
+  each operation takes one snapshot, so a reload never changes the rules
+  halfway through a deploy; **a save that does not parse changes nothing**.
+  Pinned by `a_node_added_to_the_file_is_in_force_without_a_restart_and_a_typo_changes_nothing`.
 - **An owner stops and starts their own server through the index**
   (`POST /instances/:id/stop` and `/start`, uplink `OP_START`), checked
   against the node's owner label like destroy, and "not yours" is the same

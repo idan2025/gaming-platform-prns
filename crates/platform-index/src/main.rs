@@ -27,6 +27,9 @@ const INGEST_INTERVAL: Duration = Duration::from_secs(5);
 /// A minute is far below any sane timeout and costs one listing per node.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the hosting file is checked for edits.
+const HOSTING_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
 const USAGE: &str = "\
 platform-index — an optional announce indexer and HTTP front door
 
@@ -81,10 +84,7 @@ async fn main() -> Result<()> {
             None
         }
         Some(path) => {
-            let src = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {path}"))?;
-            let config: platform_index::hosting::HostingConfig =
-                toml::from_str(&src).with_context(|| format!("parsing {path}"))?;
+            let config = platform_index::hosting::Hosting::load(std::path::Path::new(path))?;
             if config.enabled() {
                 tracing::info!(games = ?config.games, nodes = config.nodes.len(), "hosting enabled");
             } else {
@@ -122,6 +122,33 @@ async fn main() -> Result<()> {
         auth: Mutex::new(Authenticator::new(identity.identity_hash())),
         hosting,
     });
+
+    // Edits to the hosting file are picked up without a restart: an operator
+    // adds or removes a node, a game or a quota by saving the file. Checked by
+    // modification time; a save that does not parse is logged and the
+    // configuration in force stays.
+    if let (Some(path), true) = (hosting_path.clone(), state.hosting.is_some()) {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let path = std::path::PathBuf::from(path);
+            let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let mut seen = modified(&path);
+            let mut tick = tokio::time::interval(HOSTING_RELOAD_EVERY);
+            loop {
+                tick.tick().await;
+                let now = modified(&path);
+                if now.is_none() || now == seen {
+                    continue;
+                }
+                seen = now;
+                if let Some(hosting) = &state.hosting {
+                    if let Err(e) = hosting.reload_from(&path) {
+                        tracing::warn!(error = %format!("{e:#}"), "hosting config not reloaded; keeping the one in force");
+                    }
+                }
+            }
+        });
+    }
 
     // The Reticulum half. This is the one that has to exist for an index to be
     // a convenience rather than a dependency: a client on a mesh with no
