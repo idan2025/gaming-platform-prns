@@ -2,3 +2,7 @@
 /launcher/src-tauri/target
 /launcher/src-tauri/gen/schemas
 /launcher/src-tauri/binaries
+
+# Pack signatures are made by packs.yml when it publishes; a node or launcher
+# run against this folder also writes the official copies here.
+/packs/*.sig
