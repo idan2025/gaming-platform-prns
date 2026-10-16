@@ -504,6 +504,25 @@ has gone. Rules a later change could quietly break:
   free URL in an unreviewed pack would be a beacon reporting who browses.
   `every_shipped_pack_has_art` holds every shipped pack to having one.
 
+**Game servers are kept apart** (2026-10-16, `docker.rs` `GAMES_NETWORK`,
+`games_gateway`). Every game container joins `gpp-games`, a bridge with
+`enable_icc=false`, and drops all capabilities, gets `no-new-privileges` and a
+512-process ceiling (measured: Source, GoldSrc and Sven Co-op boot and answer
+under all of it). Rules a later change could quietly break:
+- **The agent reaches a game through the network's gateway and its published
+  host port** (`mesh::GameReach`), for the mesh bridge and for A2S alike,
+  never through the container's address, which nothing but the host can
+  reach on that network. Measured from the host, from a container on another
+  network and under host networking. Extra channels go through
+  `ServerArgs::extra_game_ports`, since the node publishes them on its own
+  numbers.
+- **A `gpp-games` network that lets containers talk is refused, never used**
+  (`only_a_games_network_that_keeps_containers_apart_is_used`).
+- **One network, not one per server**: Docker's default pools hold about
+  thirty networks. Pinned by
+  `game_servers_are_kept_apart_and_reached_through_their_published_port`,
+  which fails with `network_mode` removed.
+
 **A crashed server is restarted by the agent, never by Docker** (2026-10-11,
 `Agent::check_crashes`). Rules a later change could quietly break:
 - **No Docker restart policy.** `docker.rs` creates with none on purpose: a

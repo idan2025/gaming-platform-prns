@@ -50,6 +50,37 @@ use game_bridge::BridgeSession;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Where the agent reaches one running game: an address on this host and the
+/// host ports the game was published on (`DockerRuntime::games_gateway`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameReach {
+    pub host: String,
+    /// The game's own port (channel 0), as published.
+    pub port: u16,
+    /// Each extra channel's published port.
+    pub extra_ports: BTreeMap<u8, u16>,
+}
+
+impl GameReach {
+    /// From the games network's gateway and a container's port set. The set
+    /// comes off `PORTS_LABEL`; a container from before that label has only
+    /// its one published port, which is the game's. `None` when nothing is
+    /// published, since then nothing can be reached.
+    pub fn from_ports(host: String, ports: &[crate::instance::InstancePort], published: Option<u16>) -> Option<Self> {
+        let port = ports
+            .iter()
+            .find(|p| p.channel == game_bridge::framing::CHANNEL_GAME)
+            .map(|p| p.host_port)
+            .or(published)?;
+        let extra_ports = ports
+            .iter()
+            .filter(|p| p.channel != game_bridge::framing::CHANNEL_GAME)
+            .map(|p| (p.channel, p.host_port))
+            .collect();
+        Some(Self { host, port, extra_ports })
+    }
+}
+
 /// How a node reaches the mesh on behalf of the games it runs.
 ///
 /// Separate from `[uplink]` on purpose: an operator may want their node
@@ -575,7 +606,7 @@ impl MeshBridges {
         instance_id: &str,
         profile: &GameProfile,
         identity_path: &Path,
-        game_addr: (&str, u16),
+        game: &GameReach,
         announce: MeshAnnounce<'_>,
     ) -> Result<Option<MeshStatus>> {
         let Some(config) = &self.config else { return Ok(None) };
@@ -594,8 +625,9 @@ impl MeshBridges {
         let shared_port = self.ensure_hub().await?;
 
         let mut args = ServerArgs::new(profile.clone());
-        args.game_host = game_addr.0.to_string();
-        args.game_port = game_addr.1;
+        args.game_host = game.host.clone();
+        args.game_port = game.port;
+        args.extra_game_ports = game.extra_ports.clone();
         args.identity = identity_path.to_path_buf();
         // **No interfaces of its own.** A game bridge reaches the mesh through
         // this node's hub, so it binds nothing: no TCP port, no UDP local port,
@@ -653,7 +685,7 @@ not announced: {e}"
         tracing::info!(
             instance = %instance_id,
             destination = ?status.destination,
-            game_port = game_addr.1,
+            game_port = game.port,
             "announcing this server on the mesh"
         );
         bridges.insert(instance_id.to_string(), Bridge { session, status: status.clone() });
@@ -743,6 +775,24 @@ mod tests {
     }
     use super::*;
 
+    /// The agent reaches a game at the host ports it was published on, extra
+    /// channels included; a container from before the port label has only its
+    /// one published port, and one with nothing published cannot be reached.
+    #[test]
+    fn a_game_is_reached_at_its_published_ports() {
+        use crate::instance::InstancePort;
+        use game_bridge::profile::GameTransport;
+        let ports = [
+            InstancePort { channel: 0, host_port: 27300, transport: GameTransport::Udp },
+            InstancePort { channel: 1, host_port: 27301, transport: GameTransport::Tcp },
+        ];
+        let reach = GameReach::from_ports("172.19.0.1".into(), &ports, Some(1)).unwrap();
+        assert_eq!(reach.port, 27300, "the label wins over the bare published port");
+        assert_eq!(reach.extra_ports, BTreeMap::from([(1, 27301)]));
+        assert_eq!(GameReach::from_ports("h".into(), &[], Some(27015)).unwrap().port, 27015);
+        assert!(GameReach::from_ports("h".into(), &[], None).is_none());
+    }
+
     #[tokio::test]
     async fn a_node_with_no_mesh_config_starts_no_bridges() {
         let bridges = MeshBridges::new(None);
@@ -752,7 +802,7 @@ mod tests {
                 "i1",
                 &GameProfile::sven_coop(),
                 Path::new("/nonexistent/mesh.identity"),
-                ("127.0.0.1", 27015),
+                &GameReach { host: "127.0.0.1".into(), port: 27015, extra_ports: BTreeMap::new() },
                 MeshAnnounce { name: "Test", max_players: 16, map: Some("crystal") },
             )
             .await

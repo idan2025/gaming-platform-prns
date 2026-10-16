@@ -810,3 +810,118 @@ async fn a_server_started_without_a_console_is_refused_rather_than_silently_igno
         "the message has to say a restart is not the fix, because it is the obvious guess: {err}"
     );
 }
+
+/// A stand-in game that answers on TCP 7777, so reaching it can be tested
+/// from the host and from another container.
+const ANSWERING_IMAGE: &str = "gpp-test-answering:latest";
+
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+}
+
+fn ask(addr: std::net::SocketAddr) -> Option<String> {
+    use std::io::Read;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).ok()?;
+    Some(answer.trim().to_string())
+}
+
+/// Two servers on one node can never reach each other, and the agent reaches
+/// each through the games network's gateway and its published port. Also
+/// that a game container carries no Linux capability, can never gain one,
+/// and has a process ceiling. Removing `network_mode` from the create puts
+/// the containers back on Docker's default bridge, where the second one
+/// reaches the first, and fails this.
+#[tokio::test(flavor = "multi_thread")]
+async fn game_servers_are_kept_apart_and_reached_through_their_published_port() {
+    let Some(rt) = runtime_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_image(
+        ANSWERING_IMAGE,
+        "FROM busybox\nCMD [\"sh\", \"-c\", \"while true; do echo pong | nc -l -p 7777; done\"]\n",
+    ) {
+        eprintln!("skipping: could not build the test image");
+        return;
+    }
+
+    let pid = std::process::id();
+    let (first, second) = (format!("apart{pid}a"), format!("apart{pid}b"));
+    for id in [&first, &second] {
+        docker_rm(&format!("gpp-{id}"));
+    }
+    // Removed however the test ends, a failed assertion included.
+    let _cleanup = (Removed(format!("gpp-{first}")), Removed(format!("gpp-{second}")));
+    let dir = std::env::temp_dir().join(format!("gpp-apart-{pid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mounts = vec![Mount { host_path: dir.clone(), container_path: "/game".into(), read_only: true }];
+    let mut runtime = test_runtime();
+    runtime.image = ANSWERING_IMAGE.to_string();
+    let tcp_port = |host_port| {
+        vec![PublishedPort { channel: 0, container_port: 7777, host_port, transport: GameTransport::Tcp }]
+    };
+
+    let outcome = async {
+        let first_port = free_tcp_port();
+        rt.create_and_start(&spec(&first), &runtime, &mounts, &tcp_port(first_port)).await?;
+        rt.create_and_start(&spec(&second), &runtime, &mounts, &tcp_port(free_tcp_port())).await?;
+
+        // The agent's way in: the gateway and the published port.
+        let gateway: std::net::IpAddr = rt.games_gateway().await?.parse()?;
+        let mut reached = None;
+        for _ in 0..20 {
+            reached = ask(std::net::SocketAddr::new(gateway, first_port));
+            if reached.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert_eq!(reached.as_deref(), Some("pong"), "the agent could not reach a game through its published port");
+
+        // The other server cannot reach it directly.
+        let first_ip = docker_inspect(&format!("gpp-{first}"), "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}");
+        assert!(!first_ip.is_empty(), "the first server has no address");
+        let from_second = std::process::Command::new("docker")
+            .args(["exec", &format!("gpp-{second}"), "sh", "-c", &format!("timeout 3 nc {first_ip} 7777 </dev/null")])
+            .output()?;
+        let heard = String::from_utf8_lossy(&from_second.stdout);
+        assert!(!heard.contains("pong"), "one game server reached another directly at {first_ip}: {heard:?}");
+
+        let hardening = docker_inspect(
+            &format!("gpp-{first}"),
+            "{{.HostConfig.NetworkMode}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.HostConfig.PidsLimit}}",
+        );
+        assert_eq!(
+            hardening,
+            format!(
+                "{} [ALL] [no-new-privileges] {}",
+                platform_agent::docker::GAMES_NETWORK,
+                platform_agent::docker::GAME_PIDS_LIMIT
+            )
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome.expect("game servers should be kept apart and still reachable");
+}
+
+struct Removed(String);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        docker_rm(&self.0);
+    }
+}
+
+fn docker_inspect(name: &str, format: &str) -> String {
+    std::process::Command::new("docker")
+        .args(["inspect", "-f", format, name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}

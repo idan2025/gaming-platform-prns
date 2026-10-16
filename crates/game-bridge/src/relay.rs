@@ -687,7 +687,8 @@ impl BridgeSession {
                 })?;
             let transport = args.profile.transport;
             // Extra ports live on the same host as the game (`GAMES.md` §3 is
-            // about one server's several ports, not several hosts).
+            // about one server's several ports, not several hosts), at the
+            // pack's number unless the caller says where each one was put.
             let extra_udp: Vec<(u8, SocketAddr)> = args
                 .profile
                 .extra_ports
@@ -696,7 +697,7 @@ impl BridgeSession {
                 .map(|p| -> Result<(u8, SocketAddr)> {
                     Ok((
                         p.channel,
-                        format!("{}:{}", args.game_host, p.port)
+                        format!("{}:{}", args.game_host, extra_port(&args, p))
                             .parse()
                             .with_context(|| format!("invalid extra port {}", p.port))?,
                     ))
@@ -710,7 +711,7 @@ impl BridgeSession {
                 .map(|p| -> Result<(u8, SocketAddr)> {
                     Ok((
                         p.channel,
-                        format!("{}:{}", args.game_host, p.port)
+                        format!("{}:{}", args.game_host, extra_port(&args, p))
                             .parse()
                             .with_context(|| format!("invalid extra port {}", p.port))?,
                     ))
@@ -1907,6 +1908,12 @@ fn spawn_server_chat_link(
     });
 }
 
+/// Where a server bridge reaches one of the game's extra ports: the number
+/// the caller gave for that channel, else the pack's own.
+fn extra_port(args: &ServerArgs, port: &crate::profile::GamePort) -> u16 {
+    args.extra_game_ports.get(&port.channel).copied().unwrap_or(port.port)
+}
+
 fn may_use_channel(channel: u8, peer_version: u8) -> bool {
     channel == framing::CHANNEL_GAME || framing::supports_channels(peer_version)
 }
@@ -2794,6 +2801,23 @@ mod tests {
             server_announce_name_bytes(&Some(long_name)).len(),
             MAX_ANNOUNCE_APP_DATA_LEN
         );
+    }
+
+    /// A node publishes a game's extra ports on its own numbers, so a server
+    /// bridge reaches each where it was told, and at the pack's number
+    /// otherwise.
+    #[test]
+    fn an_extra_port_is_reached_where_the_caller_put_it() {
+        let rcon = crate::profile::GamePort {
+            channel: 1,
+            name: "rcon".to_string(),
+            port: 27015,
+            transport: GameTransport::Tcp,
+        };
+        let mut args = sven_server_args();
+        assert_eq!(extra_port(&args, &rcon), 27015);
+        args.extra_game_ports.insert(1, 27301);
+        assert_eq!(extra_port(&args, &rcon), 27301);
     }
 
     fn sven_server_args() -> ServerArgs {

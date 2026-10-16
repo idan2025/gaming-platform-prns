@@ -169,6 +169,28 @@ compose file publishes to `127.0.0.1` deliberately; if you widen that, put TLS
 and a real proxy in front, because the token travels in a header and plain HTTP
 hands it to anyone on the path.
 
+### Game servers are kept apart from each other
+
+Every game server joins one Docker network the agent creates, `gpp-games`,
+with container-to-container traffic turned off. A server cannot reach another
+server, the agent, or any other container on the machine directly; the agent
+reaches each game through the network's gateway (this machine's own address
+on it) and the game's published port, which works whether the agent runs on
+the host or in a container. Each game container also drops every Linux
+capability, can never gain one (`no-new-privileges`), and may hold at most
+512 processes and threads.
+
+- A network called `gpp-games` that **does** let containers talk is refused,
+  with the command to remove it; the agent then makes its own.
+- Servers created by an older agent stay on Docker's default bridge until
+  they are recreated (a move onto a new copy does this). They keep working:
+  the agent reaches them through their published port too.
+- **What this does not do: keep a game off your home network.** A game
+  server still reaches the internet (Steam needs it) and, like any
+  container, your LAN. If strangers run servers on this machine, block
+  container traffic to your LAN in the host firewall (Docker's
+  `DOCKER-USER` chain).
+
 ### Game files are not included
 
 A pack describes a game; it does not ship one. `[content]` drivers can fetch

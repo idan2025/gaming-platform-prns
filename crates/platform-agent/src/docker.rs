@@ -56,6 +56,27 @@ pub const TASK_LABEL: &str = "org.idan2025.gaming-platform-prns.task";
 /// an HTTP error body.
 const TASK_LOG_TAIL_LINES: usize = 40;
 
+/// The Docker network every game container joins, with container-to-container
+/// traffic off (`enable_icc=false`).
+///
+/// A node runs strangers' servers side by side, and on Docker's default bridge
+/// each container can reach every other one directly. On this network none
+/// can: not another game, not the agent if it runs in a container, not another
+/// container on the host. What a game can still reach is the outside world
+/// (Steam needs it) and any port the host publishes, which is what a player on
+/// the internet can reach anyway. Measured on Docker 29.7 with the Source,
+/// GoldSrc and Sven Co-op images.
+///
+/// One network, not one per server: Docker's default address pools hold about
+/// thirty networks, fewer than a node's servers.
+pub const GAMES_NETWORK: &str = "gpp-games";
+const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
+
+/// How many processes and threads one game container may hold. A Source
+/// server runs about ten; this is a ceiling against a fork bomb taking the
+/// node, not a budget.
+pub const GAME_PIDS_LIMIT: i64 = 512;
+
 /// What a one-shot container did.
 #[derive(Debug, Clone)]
 pub struct TaskOutcome {
@@ -70,6 +91,8 @@ pub struct TaskOutcome {
 #[derive(Clone)]
 pub struct DockerRuntime {
     docker: Docker,
+    /// The games network's gateway, once known (`games_gateway`).
+    games_gateway: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 /// One port to publish: the number the game binds *inside* the container, the
@@ -92,6 +115,26 @@ fn proto(transport: GameTransport) -> &'static str {
         GameTransport::Udp => "udp",
         GameTransport::Tcp => "tcp",
     }
+}
+
+/// The gateway of the games network, after checking it really keeps
+/// containers apart.
+fn games_network_gateway(network: &bollard::models::Network) -> Result<String> {
+    let icc = network.options.as_ref().and_then(|o| o.get(ICC_OPTION)).map(String::as_str);
+    if icc != Some("false") {
+        return Err(anyhow!(
+            "a Docker network called {GAMES_NETWORK} already exists and lets containers reach each \
+             other, so it cannot keep game servers apart. Remove it (docker network rm \
+             {GAMES_NETWORK}) and this agent will create it again with that turned off"
+        ));
+    }
+    network
+        .ipam
+        .as_ref()
+        .and_then(|i| i.config.as_ref())
+        .and_then(|c| c.iter().find_map(|c| c.gateway.clone()))
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| anyhow!("the {GAMES_NETWORK} network has no gateway address"))
 }
 
 /// Render a port set for `PORTS_LABEL`: `channel:host_port/proto`, comma
@@ -173,7 +216,63 @@ impl DockerRuntime {
     pub fn connect() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .context("connecting to the local Docker socket")?;
-        Ok(Self { docker })
+        Ok(Self { docker, games_gateway: Default::default() })
+    }
+
+    /// Make sure [`GAMES_NETWORK`] exists with container-to-container traffic
+    /// off, and return its gateway: this host's own address on that network.
+    ///
+    /// **The agent reaches every game through that address and the game's
+    /// published host port**, never the container's own address, because on
+    /// this network nothing can reach a container's address but the host. The
+    /// address works from the host, from a container on any other network,
+    /// and under host networking alike (measured), so the agent never has to
+    /// guess where it runs. A container on the default bridge from before this
+    /// network existed is reached the same way, through its published port.
+    ///
+    /// A network of that name that lets containers talk to each other is
+    /// refused, never used: it would look isolated and not be.
+    pub async fn games_gateway(&self) -> Result<String> {
+        let mut cached = self.games_gateway.lock().await;
+        if let Some(gateway) = cached.as_ref() {
+            return Ok(gateway.clone());
+        }
+        let network = match self
+            .docker
+            .inspect_network(GAMES_NETWORK, None::<bollard::network::InspectNetworkOptions<String>>)
+            .await
+        {
+            Ok(network) => network,
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                let mut options = HashMap::new();
+                options.insert(ICC_OPTION.to_string(), "false".to_string());
+                let mut labels = HashMap::new();
+                labels.insert(MANAGED_LABEL.to_string(), "1".to_string());
+                let created = self
+                    .docker
+                    .create_network(bollard::network::CreateNetworkOptions {
+                        name: GAMES_NETWORK.to_string(),
+                        driver: "bridge".to_string(),
+                        options,
+                        labels,
+                        ..Default::default()
+                    })
+                    .await;
+                // Two agents on one daemon can race to create it; the loser
+                // reads what the winner made, and the check below still runs.
+                if let Err(e) = created {
+                    tracing::debug!(error = %e, "creating the games network; reading it back");
+                }
+                self.docker
+                    .inspect_network(GAMES_NETWORK, None::<bollard::network::InspectNetworkOptions<String>>)
+                    .await
+                    .with_context(|| format!("creating the {GAMES_NETWORK} network"))?
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading the {GAMES_NETWORK} network")),
+        };
+        let gateway = games_network_gateway(&network)?;
+        *cached = Some(gateway.clone());
+        Ok(gateway)
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -320,6 +419,11 @@ impl DockerRuntime {
         ports: &[PublishedPort],
     ) -> Result<String> {
         let name = spec.container_name();
+        // The network must exist before a container can join it. Read afresh
+        // rather than from the cache, so a network an operator removed is
+        // made again here instead of failing every create.
+        self.games_gateway.lock().await.take();
+        self.games_gateway().await?;
 
         let mut labels = HashMap::new();
         labels.insert(MANAGED_LABEL.to_string(), "1".to_string());
@@ -418,6 +522,14 @@ impl DockerRuntime {
             port_bindings: Some(port_bindings),
             memory: runtime.memory_limit_bytes,
             nano_cpus: runtime.cpus.map(|c| (c * 1_000_000_000.0) as i64),
+            // Isolated from every other container (`GAMES_NETWORK`), and held
+            // to what a game server needs: it runs as an ordinary user, so it
+            // needs no Linux capability and never gains one, and a process
+            // ceiling keeps a runaway from taking the node.
+            network_mode: Some(GAMES_NETWORK.to_string()),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges".to_string()]),
+            pids_limit: Some(GAME_PIDS_LIMIT),
             // No restart policy on purpose: the agent decides what runs, and a
             // container that resurrects itself behind the agent's back is a
             // container the agent's state no longer describes.
@@ -1106,6 +1218,33 @@ fn usage_from(instance_id: &str, stats: &Stats, sampled_at_ms: u64) -> InstanceU
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network(icc: Option<&str>, gateway: Option<&str>) -> bollard::models::Network {
+        bollard::models::Network {
+            options: icc.map(|v| HashMap::from([(ICC_OPTION.to_string(), v.to_string())])),
+            ipam: Some(bollard::models::Ipam {
+                config: Some(vec![bollard::models::IpamConfig {
+                    gateway: gateway.map(str::to_string),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A network of that name that lets containers reach each other is
+    /// refused, never used: it would look isolated and not be. Only one with
+    /// container-to-container traffic explicitly off gives its gateway.
+    #[test]
+    fn only_a_games_network_that_keeps_containers_apart_is_used() {
+        assert_eq!(games_network_gateway(&network(Some("false"), Some("172.19.0.1"))).unwrap(), "172.19.0.1");
+        for icc in [None, Some("true"), Some("")] {
+            let refused = games_network_gateway(&network(icc, Some("172.19.0.1"))).unwrap_err();
+            assert!(format!("{refused}").contains("docker network rm"), "{refused}");
+        }
+        assert!(games_network_gateway(&network(Some("false"), None)).is_err());
+    }
 
     /// A server is recreated from what its container carries, every port
     /// fixed, so a move keeps the numbers players know it by.

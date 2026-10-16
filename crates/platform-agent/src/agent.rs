@@ -25,7 +25,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
 use game_bridge::console::{BotProtocol, ConsoleProtocol};
-use game_bridge::profile::GameProfile;
 use game_bridge::GamePack;
 use tokio::sync::{Mutex, RwLock};
 
@@ -588,31 +587,29 @@ impl Agent {
         Ok(loaded)
     }
 
-    /// Where this node can actually reach a running instance's game.
+    /// Where this node can actually reach a running instance's game: the games
+    /// network's gateway and the game's published host ports
+    /// ([`GameReach`](crate::mesh::GameReach)).
     ///
-    /// The container's own address on the Docker network and the port the game
-    /// binds **inside** it — not `127.0.0.1:<host_port>`. The agent is meant to
-    /// run in a container, and there that loopback is its own namespace: a mesh
-    /// bridge pointed at it announces a destination, accepts a link, and then
-    /// forwards every packet into nothing. The game is up, the announce is
-    /// real, and joining does not work, which is the worst of the three
-    /// possible failures because it looks like it should be fine.
-    ///
-    /// Same reasoning as `player_count`. Both learned it the same way.
-    async fn game_address(
-        &self,
-        instance_id: &str,
-        profile: &GameProfile,
-    ) -> Option<(String, u16)> {
+    /// Never `127.0.0.1:<host_port>`: the agent is meant to run in a container,
+    /// where that loopback is its own namespace, and a mesh bridge pointed at
+    /// it announces a destination, accepts a link, and forwards every packet
+    /// into nothing. And never the container's own address any more: game
+    /// containers are kept apart on `GAMES_NETWORK`, where nothing but the
+    /// host reaches a container's address. The gateway is this host's own
+    /// address, reachable from the host and from any container
+    /// (`DockerRuntime::games_gateway`).
+    async fn game_address(&self, instance_id: &str) -> Option<crate::mesh::GameReach> {
         let containers = self.docker.list_managed().await.ok()?;
         let container = containers.iter().find(|c| c.instance_id == instance_id)?;
-        match &container.ip {
-            Some(ip) if !ip.is_empty() => Some((ip.clone(), profile.default_port)),
-            // No network address means nothing can reach it, the agent
-            // included. Better to announce nothing than a destination that
-            // forwards into the void.
-            _ => None,
-        }
+        let host = match self.docker.games_gateway().await {
+            Ok(host) => host,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot reach game servers: no games network");
+                return None;
+            }
+        };
+        crate::mesh::GameReach::from_ports(host, &container.ports, container.port)
     }
 
     /// Put every already-running instance back on the mesh.
@@ -640,7 +637,7 @@ impl Agent {
         for instance in instances.iter().filter(|i| i.state == InstanceState::Running) {
             let Some(pack) = packs.get(&instance.game_id) else { continue };
             let Ok(profile) = pack.to_profile() else { continue };
-            let Some(addr) = self.game_address(&instance.instance_id, &profile).await else {
+            let Some(addr) = self.game_address(&instance.instance_id).await else {
                 continue;
             };
             let identity = crate::mesh::identity_path(&self.config.data_root, &instance.instance_id);
@@ -669,7 +666,7 @@ impl Agent {
                     &instance.instance_id,
                     &profile,
                     &identity,
-                    (&addr.0, addr.1),
+                    &addr,
                     crate::mesh::MeshAnnounce {
                         name: &instance.name,
                         max_players,
@@ -1083,7 +1080,7 @@ impl Agent {
         // the create here would leave one that is not reachable at all, which
         // is broken. So this is logged and the instance stands.
         let mut mesh_destination_now = None;
-        if let Some(addr) = self.game_address(&spec.instance_id, &profile).await {
+        if let Some(addr) = self.game_address(&spec.instance_id).await {
             let identity = crate::mesh::identity_path(&self.config.data_root, &spec.instance_id);
             match self
                 .mesh
@@ -1091,7 +1088,7 @@ impl Agent {
                     &spec.instance_id,
                     &profile,
                     &identity,
-                    (&addr.0, addr.1),
+                    &addr,
                     crate::mesh::MeshAnnounce {
                         name: &spec.name,
                         max_players: spec.max_players,
@@ -1392,7 +1389,7 @@ impl Agent {
         let packs = self.packs.read().await;
         let Some(pack) = packs.get(&instance.game_id) else { return Ok(()) };
         let profile = pack.to_profile().map_err(|e| anyhow!("{e}"))?;
-        let Some(addr) = self.game_address(instance_id, &profile).await else { return Ok(()) };
+        let Some(addr) = self.game_address(instance_id).await else { return Ok(()) };
         let max_players = self
             .specs
             .lock()
@@ -1408,7 +1405,7 @@ impl Agent {
                 instance_id,
                 &profile,
                 &identity,
-                (&addr.0, addr.1),
+                &addr,
                 crate::mesh::MeshAnnounce {
                     name: &instance.name,
                     max_players,
@@ -1665,16 +1662,17 @@ impl Agent {
         // game declaring no query is unknown, which is the honest answer.
         match profile.query? {
             game_bridge::profile::QueryProtocol::A2s => {
-                // The container's own address and the port the game binds
-                // *inside* it. Not `127.0.0.1:<host_port>`: this agent is meant
-                // to run in a container, where that loopback is its own
+                // The same place the mesh bridge reaches the game
+                // (`game_address`). Not `127.0.0.1:<host_port>`: this agent is
+                // meant to run in a container, where that loopback is its own
                 // namespace and the query reaches nothing — every instance
                 // would report "could not ask", and reaping would then never
                 // touch anything because unknown is deliberately never treated
                 // as empty.
-                let ip: std::net::IpAddr = instance.container_ip.as_ref()?.parse().ok()?;
-                let addr = std::net::SocketAddr::new(ip, profile.default_port);
-                game_bridge::a2s::query(addr).await.ok()
+                let host = self.docker.games_gateway().await.ok()?;
+                let reach = crate::mesh::GameReach::from_ports(host, &instance.ports, instance.port)?;
+                let ip: std::net::IpAddr = reach.host.parse().ok()?;
+                game_bridge::a2s::query(std::net::SocketAddr::new(ip, reach.port)).await.ok()
             }
         }
     }
