@@ -269,6 +269,14 @@ pub struct RoomFirewallView {
     /// Third-party firewalls Windows reports as on. They ignore Windows
     /// Firewall's rules: only the player can open them.
     pub other_firewalls: Vec<String>,
+    /// What stops Lanthorn's Windows Firewall rule from letting the room in,
+    /// found when the room starts and before any game fails
+    /// (`lan_firewall::rule_problems`). Not about any game: the rule names
+    /// no program and no port.
+    pub rule_problems: Vec<String>,
+    /// The rule is not there. The Fix button adds it; the room's helper adds
+    /// it on its own and keeps it, so this is rare.
+    pub rule_missing: bool,
 }
 
 /// One Windows Block rule, as the room pane names it.
@@ -387,6 +395,9 @@ pub(crate) struct RoomState {
     facts: Arc<std::sync::Mutex<FactsState>>,
 }
 
+/// How long Windows' firewall facts are trusted before they are read again.
+const FACTS_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// [`RoomState::facts`]: read in the background, since PowerShell takes a
 /// second or two and the room pane polls.
 #[derive(Debug, Default)]
@@ -394,7 +405,11 @@ pub(crate) enum FactsState {
     #[default]
     Unread,
     Reading,
-    Read(game_bridge::lan_firewall::WindowsFacts),
+    /// What Windows said, and when: it is read again after [`FACTS_FRESH`].
+    Read(game_bridge::lan_firewall::WindowsFacts, std::time::Instant),
+    /// Windows would not say, when last asked. Claims nothing: an empty answer
+    /// is not "no rule". Asked again after [`FACTS_FRESH`].
+    Unreadable(std::time::Instant),
 }
 
 /// Where `lan-helper` ships: beside this executable, on every platform the
@@ -616,7 +631,7 @@ impl Launcher {
             let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
             let facts = room.facts.lock().expect("facts lock");
             match &*facts {
-                FactsState::Read(f) => f.blocks.iter().map(|b| hex::encode(b.name.as_bytes())).collect(),
+                FactsState::Read(f, _) => f.blocks.iter().map(|b| hex::encode(b.name.as_bytes())).collect(),
                 _ => Vec::new(),
             }
         };
@@ -1105,36 +1120,74 @@ fn firewall_view(room: &RoomState, portable: bool, opened_before: bool) -> RoomF
         can_fix,
         blocking_programs: Vec::new(),
         other_firewalls: Vec::new(),
+        rule_problems: Vec::new(),
+        rule_missing: false,
         dropped,
     };
-    if room.firewall == LocalFirewall::Windows && !view.dropped.is_empty() {
+    // Read as soon as the room is up, not once something was dropped: what is
+    // wrong with Windows Firewall is known before any game tries to connect.
+    // Not before it is up (the helper makes the rule as it starts, after its
+    // administrator prompt), and again every so often, so a rule the helper
+    // has put back stops being reported.
+    if room.firewall == LocalFirewall::Windows
+        && matches!(*room.phase.borrow(), AdapterPhase::Up { .. })
+    {
         let mut facts = room.facts.lock().expect("facts lock");
-        match &*facts {
+        let read_now = |slot: Arc<std::sync::Mutex<FactsState>>, keep_old: bool| {
+            tokio::task::spawn_blocking(move || {
+                let read = game_bridge::lan_firewall::windows_facts(&game_bridge::lan_firewall::System);
+                let mut slot = slot.lock().expect("facts lock");
+                    match read {
+                        Ok(f) => *slot = FactsState::Read(f, std::time::Instant::now()),
+                        // A refresh that fails leaves what was known; a first read
+                        // that fails claims nothing, and is tried again later.
+                        Err(_) if !keep_old => *slot = FactsState::Unreadable(std::time::Instant::now()),
+                        Err(_) => {}
+                    }
+            });
+        };
+        match &mut *facts {
             FactsState::Unread => {
                 *facts = FactsState::Reading;
-                let slot = room.facts.clone();
-                tokio::task::spawn_blocking(move || {
-                    let read = game_bridge::lan_firewall::windows_facts(&game_bridge::lan_firewall::System)
-                        .unwrap_or_default();
-                    *slot.lock().expect("facts lock") = FactsState::Read(read);
-                });
+                read_now(room.facts.clone(), false);
             }
             FactsState::Reading => {}
-            FactsState::Read(f) => {
-                view.blocking_programs = f
-                    .blocks
-                    .iter()
-                    .map(|b| RoomBlockView {
-                        program: b
-                            .program
-                            .rsplit(['\\', '/'])
-                            .next()
-                            .unwrap_or(&b.program)
-                            .to_string(),
-                        path: b.program.clone(),
-                    })
-                    .collect();
-                view.other_firewalls = f.other_firewalls.clone();
+            FactsState::Unreadable(at) => {
+                // Shown as nothing between tries; tried again once the interval
+                // has passed, so one failed read cannot blind the pane for good.
+                if at.elapsed() > FACTS_FRESH {
+                    *at = std::time::Instant::now();
+                    read_now(room.facts.clone(), false);
+                }
+            }
+            FactsState::Read(f, at) => {
+                // Programs somebody blocked, and other firewalls, are named
+                // only once something was dropped: a Block rule for an
+                // unrelated program is the player's own business until a
+                // game's connection fails.
+                if !view.dropped.is_empty() {
+                    view.blocking_programs = f
+                        .blocks
+                        .iter()
+                        .map(|b| RoomBlockView {
+                            program: b
+                                .program
+                                .rsplit(['\\', '/'])
+                                .next()
+                                .unwrap_or(&b.program)
+                                .to_string(),
+                            path: b.program.clone(),
+                        })
+                        .collect();
+                    view.other_firewalls = f.other_firewalls.clone();
+                }
+                view.rule_problems = game_bridge::lan_firewall::rule_problems(f);
+                view.rule_missing = !f.rule_present;
+                if at.elapsed() > FACTS_FRESH {
+                    // Stamped now, so the polls that follow do not each start a read.
+                    *at = std::time::Instant::now();
+                    read_now(room.facts.clone(), true);
+                }
             }
         }
     }
@@ -1242,6 +1295,8 @@ mod tests {
                 path: "C:\\Games\\speed2.exe".into(),
             }],
             other_firewalls: vec!["Norton Firewall".into()],
+            rule_problems: vec!["Lanthorn's Windows Firewall rule is not there".into()],
+            rule_missing: true,
         })
         .unwrap();
         assert_eq!(
@@ -1253,7 +1308,9 @@ mod tests {
                 "command",
                 "dropped",
                 "heads_up",
-                "other_firewalls"
+                "other_firewalls",
+                "rule_missing",
+                "rule_problems"
             ]
         );
         assert_eq!(keys(&f["dropped"][0]), ["from", "port", "transport"]);

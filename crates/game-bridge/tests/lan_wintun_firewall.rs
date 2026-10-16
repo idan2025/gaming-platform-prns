@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 use game_bridge::lan_adapter::{is_elevated, run_room_on_adapter, AdapterSetup, WINTUN_DLL_ENV};
 use game_bridge::lan_filter::{LanPolicy, LanPort, LanProto};
 use game_bridge::lan_firewall::{
-    self, open, unblock, windows_facts, Lifetime, LocalFirewall, System, PORTABLE_RULE_NAME,
-    RULE_NAME,
+    self, ensure_kept, open, rule_problems, rule_state, unblock, windows_facts, Lifetime,
+    LocalFirewall, RuleState, System, PORTABLE_RULE_NAME, RULE_NAME,
 };
 use game_bridge::lan_session::{LanHostArgs, LanMemberArgs, LanSession};
 use game_bridge::profile::GameProfile;
@@ -301,6 +301,28 @@ async fn a_firewall_that_drops_the_room_is_noticed_opened_and_unblocked() {
     assert!(accepted(answer), "the room rule did not let the join in: {answer:?}");
     let facts = windows_facts(&System).expect("PowerShell reads the firewall without trouble");
     assert!(facts.rule_present, "{facts:?}");
+
+    // --- 2b. The rule is checked, not assumed — in Windows' own terms, so the
+    // check does not depend on the display language — and a rule that goes
+    // missing or is switched off while a room is up is put back, with no gap
+    // for a good one.
+    assert!(!facts.profiles.is_empty(), "the firewall profiles were not read: {facts:?}");
+    let state = rule_state(&System, RULE_NAME).unwrap();
+    assert_eq!(state, RuleState::Working, "Windows prints the rule in a way the check misreads");
+    assert!(
+        rule_problems(&facts).iter().all(|p| !p.contains("rule is not there")),
+        "{:?}",
+        rule_problems(&facts)
+    );
+    delete_rule(RULE_NAME);
+    assert_eq!(rule_state(&System, RULE_NAME).unwrap(), RuleState::Missing);
+    assert_eq!(ensure_kept(&System, "gbl0", &mut None).unwrap(), RuleState::Working);
+    assert!(rule_exists(RULE_NAME), "a missing rule was not put back");
+    assert!(netsh(&["set", "rule", &format!("name={RULE_NAME}"), "new", "enable=no"]));
+    assert!(matches!(rule_state(&System, RULE_NAME).unwrap(), RuleState::Broken(_)));
+    assert_eq!(ensure_kept(&System, "gbl0", &mut None).unwrap(), RuleState::Working);
+    let answer = connect_from_member(&member, m_addr, h_addr, 40010).await;
+    assert!(accepted(answer), "the repaired rule does not let the room in: {answer:?}");
 
     // --- 3. A Block rule for the program beats the allow, is named, and is
     // lifted.

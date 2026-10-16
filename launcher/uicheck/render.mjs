@@ -1548,6 +1548,63 @@ await run('a firewall here dropping the room is said plainly, and fixed with one
   check('and the banner is calm again', !doc.querySelector('#room-banner').classList.contains('err'));
 });
 
+// Nobody should need a command or a diagnosis: what is wrong with Windows
+// Firewall's rule is known when the room starts, said before any game fails,
+// and fixed with a click where Lanthorn can fix it.
+const ruleMissing = {
+  ...memberRoom,
+  firewall: fw({
+    can_fix: true,
+    rule_missing: true,
+    rule_problems: ['Lanthorn\u2019s Windows Firewall rule is not there, so Windows will drop other players\u2019 connections to games you host. Press Fix it to add it for good.'],
+  }),
+};
+
+await run('a missing Windows Firewall rule is said before any game fails, with a Fix button', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: ruleMissing,
+  roomAfterFix: { ...memberRoom, firewall: fw({ can_fix: true }) },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const t = doc.querySelector('#room-firewall')?.textContent || '';
+  check('the rule problem is shown with nothing dropped', t.includes('rule is not there'), t);
+  check('with a Fix button, and no command pasted at the player', !!doc.querySelector('#room-fix') && !doc.querySelector('#room-firewall-command'));
+  doc.querySelector('#room-fix')?.click();
+  await settle();
+  check('Fix calls the launcher', calls.includes('fix_room_firewall'));
+  check('and the problem is gone', !(doc.querySelector('#room-firewall')?.textContent || '').includes('rule is not there'));
+});
+
+await run('a Windows setting only the player can change is explained in steps, with no button', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: {
+    ...memberRoom,
+    firewall: fw({
+      can_fix: true,
+      rule_problems: ['Windows is set to block all incoming connections on its Public network profile, which ignores every allow rule, Lanthorn\u2019s included. Turn off "Block all incoming connections" for that network under Windows Security \u2192 Firewall & network protection.'],
+    }),
+  },
+  rows: () => [row()],
+}, async (win, doc) => {
+  const t = doc.querySelector('#room-firewall')?.textContent || '';
+  check('the setting is named', t.includes('Block all incoming connections') && t.includes('Public'), t);
+  check('there is no Fix button for what a rule cannot fix', !doc.querySelector('#room-fix'));
+});
+
+await run('a healthy firewall shows no firewall box at all', {
+  status: running,
+  games: [lanGame()],
+  lanHelper: readyHelper,
+  room: { ...memberRoom, firewall: fw({ can_fix: true, rule_problems: [], rule_missing: false }) },
+  rows: () => [row()],
+}, async (win, doc) => {
+  check('nothing to say, so nothing said', !doc.querySelector('#room-firewall'));
+});
+
 await run('a Fix that was refused says so', {
   status: running,
   games: [lanGame()],

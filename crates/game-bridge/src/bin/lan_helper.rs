@@ -219,6 +219,72 @@ fn unblock(names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows: keeps the room's permanent firewall rule there and working while
+/// a room is up (`lan_firewall::ensure_kept`). Rules get removed, switched off
+/// or edited by clean-up tools, updates and security suites; a room that
+/// started with its rule must not lose it to that halfway.
+#[cfg(windows)]
+struct RuleKeeper {
+    stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl RuleKeeper {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn start(adapter: &str) -> Option<Self> {
+        use game_bridge::lan_firewall::{ensure_kept, RuleState, System};
+        if !fully_privileged() {
+            return None;
+        }
+        let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (s, adapter) = (stop.clone(), adapter.to_string());
+        let thread = std::thread::Builder::new()
+            .name("firewall-keeper".into())
+            .spawn(move || {
+                let mut said: Option<String> = None;
+                let mut tried = None;
+                loop {
+                    let problem = match ensure_kept(&System, &adapter, &mut tried) {
+                        Ok(RuleState::Working) => None,
+                        Ok(other) => Some(format!("{other:?}")),
+                        Err(e) => Some(e.to_string()),
+                    };
+                    // Said once per kind of trouble, not every pass.
+                    if problem != said {
+                        if let Some(p) = &problem {
+                            eprintln!("lan-helper: the room's firewall rule is not working: {p}");
+                        }
+                        said = problem;
+                    }
+                    let (lock, wake) = &*s;
+                    let held = lock.lock().expect("keeper lock");
+                    let (held, _) = wake
+                        .wait_timeout_while(held, Self::EVERY, |stopped| !*stopped)
+                        .expect("keeper lock");
+                    if *held {
+                        return;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { stop, thread: Some(thread) })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RuleKeeper {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.stop;
+        *lock.lock().expect("keeper lock") = true;
+        wake.notify_all();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", windows))]
 fn serve(name: &str, cidr: &str, rest: &[String]) -> Result<(), String> {
     let config = game_bridge::lan_adapter::AdapterConfig::from_cidr(name, cidr)
@@ -230,6 +296,13 @@ fn serve(name: &str, cidr: &str, rest: &[String]) -> Result<(), String> {
         game_bridge::lan_firewall::Lifetime::Kept
     };
     let opened = open_firewall(name, lifetime);
+    // An installed launcher's rule is permanent, and is looked after for as
+    // long as the room is up: it is checked, and put back if it is gone,
+    // switched off or edited, so a player never has to.
+    #[cfg(windows)]
+    let _rule_keeper = (lifetime == game_bridge::lan_firewall::Lifetime::Kept)
+        .then(|| RuleKeeper::start(name))
+        .flatten();
     // A game bound to the Wi-Fi's or the Ethernet's address answers through
     // the room only with this on (`lan_rebind.rs`); off again when the room
     // ends. Nothing on Linux.
