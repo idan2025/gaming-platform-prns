@@ -365,6 +365,12 @@ impl ExtraPorts {
 // ---------------------------------------------------------------------------
 // What the filter refused, so a missing port names itself.
 
+/// Whether `port` is one operating systems chatter on by themselves
+/// ([`OS_CHATTER`]).
+pub fn is_os_chatter(port: u16) -> bool {
+    OS_CHATTER.contains(&port)
+}
+
 /// Ports operating systems chatter on by themselves — name lookup, network
 /// browsing, discovery, time, DHCP — and Steam's LAN discovery and In-Home
 /// Streaming (27031–27036), which Proton runs beside every game it starts.

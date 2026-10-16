@@ -775,7 +775,6 @@ mod tests {
         assert!(!s.is_pseudo_broadcast(Ipv4Addr::new(192, 168, 1, 255)), "not the room's");
     }
 
-
     fn id(n: u8) -> IdentityHash {
         let mut b = [0u8; 16];
         for (i, x) in b.iter_mut().enumerate() {
