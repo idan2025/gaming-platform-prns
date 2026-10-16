@@ -654,7 +654,7 @@ fn bind_udp_on(address: Ipv4Addr, port: u16, device: &str) -> std::io::Result<()
 /// An address a packet from the room may be translated to: not loopback
 /// (Linux drops a packet for `127/8` arriving on another interface), not
 /// link-local, not a room's own range.
-fn is_translatable(a: Ipv4Addr) -> bool {
+pub(crate) fn is_translatable(a: Ipv4Addr) -> bool {
     !a.is_loopback()
         && !a.is_unspecified()
         && !a.is_link_local()
