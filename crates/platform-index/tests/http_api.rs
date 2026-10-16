@@ -220,6 +220,7 @@ fn hosting_config() -> platform_index::hosting::HostingConfig {
             // reported — which is itself worth pinning.
             api: "http://127.0.0.1:1".to_string(),
             agent: None,
+            priority: 0,
         }],
         quota: Default::default(),
     }

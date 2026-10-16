@@ -272,6 +272,20 @@ async fn an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent() {
             "the remote agent did not list the instance we just created"
         );
 
+        // Capacity over the uplink carries the node's memory, which placement
+        // ranks by; an older agent's reply without it still parses.
+        let capacity = tn.client.capacity(tn.agent_dest).await?;
+        if cfg!(target_os = "linux") {
+            assert!(
+                capacity.memory_available_bytes.is_some_and(|m| m > 0) && capacity.cpus.is_some(),
+                "the node did not report its memory and CPUs: {capacity:?}"
+            );
+        }
+        let old_reply: platform_agent::uplink_wire::CapacityResp = serde_json::from_str(
+            r#"{"max_instances":4,"running":1,"port_range_start":27300,"port_range_end":27320}"#,
+        )?;
+        assert_eq!(old_reply.memory_available_bytes, None);
+
         // Stop over the uplink, then list confirms it stopped.
         let stopping = std::time::Instant::now();
         tn.client.stop(tn.agent_dest, &id).await?;
