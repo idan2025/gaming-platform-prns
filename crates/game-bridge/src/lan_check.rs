@@ -78,9 +78,13 @@ const ROUND_GAP: Duration = Duration::from_millis(300);
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(3);
 /// Probes and answers a [`ProbeLog`] remembers; a check needs a few dozen.
 const LOG_CAP: usize = 512;
-/// How long a TCP probe waits to connect. A stack answers a SYN at once; a
-/// firewall that drops it is what makes one wait this long.
-const TCP_WAIT: Duration = Duration::from_secs(3);
+/// How long one try of a TCP probe waits to connect. A stack answers a SYN at
+/// once; a firewall that drops it is what makes one wait this long.
+const TCP_WAIT: Duration = Duration::from_secs(2);
+/// How many times a silent TCP port is tried before it is called silent. A
+/// mesh loses packets, and a stack sends a connection's SYN only once in the
+/// first few seconds, so one lost packet looked exactly like a firewall.
+const TCP_TRIES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -340,6 +344,11 @@ pub struct CheckReport {
     /// The game's ports this machine's pump translates because the game
     /// listens on another of its addresses (`lan_rebind.rs`).
     pub rebound_here: Vec<crate::lan_rebind::Rebound>,
+    /// Networks, or the room, whose traffic this machine sends out from
+    /// another network's address: a VPN, a proxy running as a tunnel, a
+    /// virtual network ([`route_hijacks`]). A warning: it does not make the
+    /// room itself fail.
+    pub route_hijacks: Vec<RouteHijack>,
 }
 
 impl CheckReport {
@@ -353,8 +362,16 @@ impl CheckReport {
     }
 
     /// What went wrong, in words a player can act on — or that nothing did.
-    /// The first line is the verdict.
+    /// The first line is the verdict; what takes the routes away from the
+    /// room's and the local network's adapters follows it, whether or not
+    /// the room itself works, since a game can still fail on it.
     pub fn findings(&self) -> Vec<String> {
+        let mut out = self.verdict();
+        out.extend(self.route_hijacks.iter().map(RouteHijack::finding));
+        out
+    }
+
+    fn verdict(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.members.is_empty() {
             out.push(
@@ -376,10 +393,11 @@ impl CheckReport {
                     m.tcp.iter().filter(|t| t.state == TcpState::Closed).map(|t| t.port).collect();
                 (!closed.is_empty()).then(|| {
                     format!(
-                        "Nothing on {} is listening on TCP {} yet. That is normal before a game is \
-                         hosted there; if one is hosted there now, the game is not listening on the \
-                         room's address — a game run through Wine or with a fixed address set can do \
-                         that.",
+                        "Nothing on {} is listening on TCP {} yet, so no game is hosted there. That \
+                         is not a fault: the room reached that computer and it answered. Next: start \
+                         the game there and host a LAN game, then check again. If one is already \
+                         hosted there, the game is not listening on the room's address — a game run \
+                         through Wine or with a fixed address set can do that.",
                         m.address,
                         tcp_ports(&closed)
                     )
@@ -654,20 +672,19 @@ pub async fn check_room_with(
     let mut tcp_probes = tokio::task::JoinSet::new();
     for &member in &others {
         for &tcp_port in &tcp_ports {
-            let sock = new_tcp()?;
+            let socks = (0..TCP_TRIES).map(|_| new_tcp()).collect::<std::io::Result<Vec<_>>>()?;
             tcp_probes.spawn(async move {
-                let state =
-                    match tokio::time::timeout(TCP_WAIT, sock.connect((member, tcp_port).into())).await {
-                        Ok(Ok(_stream)) => TcpState::Open,
-                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                            TcpState::Closed
-                        }
-                        Ok(Err(e)) => {
-                            tracing::debug!(%member, tcp_port, error = %e, "a room check TCP probe failed");
-                            TcpState::NoAnswer
-                        }
-                        Err(_) => TcpState::NoAnswer,
-                    };
+                let mut socks = socks.into_iter();
+                let state = tcp_state(TCP_TRIES, TCP_WAIT, || {
+                    let sock = socks.next();
+                    async move {
+                        sock.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Other))?
+                            .connect((member, tcp_port).into())
+                            .await
+                            .map(|_stream| ())
+                    }
+                })
+                .await;
                 (member, TcpCheck { port: tcp_port, state })
             });
         }
@@ -738,6 +755,12 @@ pub async fn check_room_with(
         .into_iter()
         .map(|d| (d.port, d.from))
         .collect();
+    let route_hijacks = route_hijacks(
+        &crate::lan_rebind::local_networks(),
+        address,
+        &members.iter().map(|m| m.address).collect::<Vec<_>>(),
+        &source_toward,
+    );
     Ok(CheckReport {
         address,
         port,
@@ -749,7 +772,31 @@ pub async fn check_room_with(
         firewall_advice: None,
         refused_here: session.refused_log().refused(Instant::now()),
         rebound_here: session.rebound(),
+        route_hijacks,
     })
+}
+
+/// What connecting to a member's port comes to: the first try that is
+/// accepted or refused settles it at once; only tries that get no answer at
+/// all are repeated, up to `tries`.
+async fn tcp_state<F, Fut>(tries: usize, wait: Duration, mut attempt: F) -> TcpState
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    for _ in 0..tries {
+        match tokio::time::timeout(wait, attempt()).await {
+            Ok(Ok(())) => return TcpState::Open,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return TcpState::Closed;
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "a room check TCP probe failed");
+            }
+            Err(_) => {}
+        }
+    }
+    TcpState::NoAnswer
 }
 
 /// Every broadcast and unicast probe to `m` was answered; its TCP probes are
@@ -762,6 +809,137 @@ fn random_nonce() -> Result<u64> {
     let mut b = [0u8; 8];
     getrandom::getrandom(&mut b).map_err(|e| anyhow!("no randomness for a room check: {e}"))?;
     Ok(u64::from_be_bytes(b))
+}
+
+/// Traffic this machine sends toward a network leaves from an address of some
+/// other network: something took that network's route away from its adapter.
+///
+/// That is what a VPN does that routes a whole subnet the machine is also on
+/// (a zero-trust or SD-WAN client, say), and what a proxy running as a tunnel
+/// (a TUN-mode proxy) or a virtual network does with a range of its own. The
+/// lobby may still work, since that talks to the room's addresses; a game
+/// that then talks to the others from the wrong address hangs on joining or
+/// starting. A proxy that is only set in a program's or the system's
+/// settings does not touch game traffic, and is not looked for here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHijack {
+    /// Whose traffic it is.
+    pub target: HijackTarget,
+    /// An address the traffic was tried toward.
+    pub toward: Ipv4Addr,
+    /// The address it would leave from.
+    pub leaves_from: Ipv4Addr,
+    /// The interface that address is on, where this system names one.
+    pub interface: Option<String>,
+}
+
+/// What a [`RouteHijack`] takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HijackTarget {
+    /// A network this machine is on, other than the room.
+    Network { address: Ipv4Addr, prefix_len: u8 },
+    /// The room's own addresses, from `own`.
+    Room { own: Ipv4Addr },
+}
+
+impl RouteHijack {
+    /// In words a player can act on.
+    pub fn finding(&self) -> String {
+        let via = self.interface.as_deref().map_or(String::new(), |i| format!(" (interface {i})"));
+        match &self.target {
+            HijackTarget::Network { address, prefix_len } => format!(
+                "Traffic from this computer to your local network {address}/{prefix_len} (to {}, \
+                 for instance) leaves from {}{via}, not from that network's own adapter. A VPN, a \
+                 proxy running as a tunnel or a virtual network is taking that network's route. \
+                 The room's lobby can still work, but a game then talks to the other players from \
+                 an address they do not expect, and joining or starting a race can hang. Turn that \
+                 VPN or proxy off while you play, or exclude {address}/{prefix_len} from it.",
+                self.toward, self.leaves_from
+            ),
+            HijackTarget::Room { own } => format!(
+                "Traffic from this computer to {} in the room leaves from {}{via}, not from the \
+                 room address {own}. A VPN, a proxy running as a tunnel or a virtual network is \
+                 taking the room's addresses ({}/{}). Nobody can reach this computer through the \
+                 room until it is turned off or told to leave that range alone.",
+                self.toward,
+                self.leaves_from,
+                crate::lan::ALLOWED_RANGE,
+                crate::lan::ALLOWED_RANGE_LEN
+            ),
+        }
+    }
+}
+
+/// The address this machine would send from toward `to`, as its routing says,
+/// policy rules and VPN routes included. Nothing is sent: connecting a UDP
+/// socket only makes the system choose.
+pub fn source_toward(to: Ipv4Addr) -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((to, 9)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(a) => Some(a),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// Which of this machine's networks, and whether the room, have their traffic
+/// taken away from their own addresses. `source_toward` answers where traffic
+/// toward an address would leave from ([`source_toward`]; a test's own to
+/// stand for a VPN).
+pub fn route_hijacks(
+    networks: &[crate::lan_rebind::LocalNetwork],
+    room: Ipv4Addr,
+    members: &[Ipv4Addr],
+    source_toward: &dyn Fn(Ipv4Addr) -> Option<Ipv4Addr>,
+) -> Vec<RouteHijack> {
+    let name_of = |a: Ipv4Addr| {
+        networks
+            .iter()
+            .find(|n| n.address == a && !n.name.is_empty())
+            .map(|n| n.name.clone())
+    };
+    let mut out: Vec<RouteHijack> = Vec::new();
+    for n in networks {
+        // A network with room to hold other computers, that is not the room's
+        // and not this machine's alone.
+        if !crate::lan_rebind::is_translatable(n.address) || !(8..=30).contains(&n.prefix_len) {
+            continue;
+        }
+        let mask = u32::MAX << (32 - u32::from(n.prefix_len));
+        let network = u32::from(n.address) & mask;
+        let broadcast = network | !mask;
+        let own = u32::from(n.address);
+        // One computer at each end of the network: a route that covers only
+        // part of it is seen at the end it covers.
+        let ends = [
+            if network + 1 == own { network + 2 } else { network + 1 },
+            if broadcast - 1 == own { broadcast - 2 } else { broadcast - 1 },
+        ];
+        for end in ends.map(Ipv4Addr::from) {
+            let Some(from) = source_toward(end) else { continue };
+            if u32::from(from) & mask == network {
+                continue;
+            }
+            let target = HijackTarget::Network { address: Ipv4Addr::from(network), prefix_len: n.prefix_len };
+            if out.iter().any(|h| h.target == target && h.leaves_from == from) {
+                continue;
+            }
+            out.push(RouteHijack { target, toward: end, leaves_from: from, interface: name_of(from) });
+        }
+    }
+    for &member in members {
+        let Some(from) = source_toward(member) else { continue };
+        if from == room || out.iter().any(|h| matches!(h.target, HijackTarget::Room { .. }) && h.leaves_from == from) {
+            continue;
+        }
+        out.push(RouteHijack {
+            target: HijackTarget::Room { own: room },
+            toward: member,
+            leaves_from: from,
+            interface: name_of(from),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -862,6 +1040,7 @@ mod tests {
             firewall_advice: None,
             refused_here: Vec::new(),
             rebound_here: Vec::new(),
+            route_hijacks: Vec::new(),
         }
     }
 
@@ -985,4 +1164,150 @@ mod tests {
         assert!(f[1].contains("not the game"), "{f:?}");
         assert!(!report(vec![]).ok(), "an empty room proves nothing");
     }
+
+    fn net(name: &str, address: [u8; 4], prefix_len: u8) -> crate::lan_rebind::LocalNetwork {
+        crate::lan_rebind::LocalNetwork { name: name.into(), address: Ipv4Addr::from(address), prefix_len }
+    }
+
+    const WIFI: Ipv4Addr = Ipv4Addr::new(192, 168, 32, 203);
+    const TUNNEL: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 2);
+    const ROOM_ME: Ipv4Addr = Ipv4Addr::new(198, 19, 122, 17);
+    const PEER: Ipv4Addr = Ipv4Addr::new(198, 19, 173, 232);
+
+    fn this_machine() -> Vec<crate::lan_rebind::LocalNetwork> {
+        vec![
+            net("lo", [127, 0, 0, 1], 8),
+            net("wlan0", [192, 168, 32, 203], 24),
+            net("sdwan0", [100, 96, 0, 2], 32),
+            net("gbl0", [198, 19, 122, 17], 16),
+        ]
+    }
+
+    /// Where traffic would leave from with routing as it should be.
+    fn honest(to: Ipv4Addr) -> Option<Ipv4Addr> {
+        Some(if to.octets()[..2] == [198, 19] { ROOM_ME } else { WIFI })
+    }
+
+    #[test]
+    fn a_network_nothing_takes_is_not_reported() {
+        assert!(route_hijacks(&this_machine(), ROOM_ME, &[PEER], &honest).is_empty());
+    }
+
+    /// A zero-trust client routing the Wi-Fi's own subnet through its tunnel:
+    /// the case that made a race hang while the lobby worked.
+    #[test]
+    fn a_vpn_routing_the_local_network_is_named() {
+        let vpn = |to: Ipv4Addr| if to.octets()[..3] == [192, 168, 32] { Some(TUNNEL) } else { honest(to) };
+        let found = route_hijacks(&this_machine(), ROOM_ME, &[PEER], &vpn);
+        assert_eq!(found.len(), 1, "both ends of the network, one report: {found:?}");
+        assert_eq!(
+            found[0].target,
+            HijackTarget::Network { address: Ipv4Addr::new(192, 168, 32, 0), prefix_len: 24 }
+        );
+        assert_eq!(found[0].leaves_from, TUNNEL);
+        assert_eq!(found[0].interface.as_deref(), Some("sdwan0"));
+        let said = found[0].finding();
+        assert!(said.contains("192.168.32.0/24") && said.contains("100.96.0.2"), "{said}");
+        assert!(said.contains("sdwan0") && said.contains("VPN") && said.contains("proxy"), "{said}");
+    }
+
+    #[test]
+    fn a_route_over_only_half_of_the_network_is_seen_at_its_end() {
+        let half = |to: Ipv4Addr| if to.octets()[..3] == [192, 168, 32] && to.octets()[3] >= 128 { Some(TUNNEL) } else { honest(to) };
+        let found = route_hijacks(&this_machine(), ROOM_ME, &[], &half);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].toward, Ipv4Addr::new(192, 168, 32, 254));
+    }
+
+    #[test]
+    fn something_taking_the_rooms_addresses_is_named() {
+        let vpn = |to: Ipv4Addr| if to.octets()[..2] == [198, 19] { Some(TUNNEL) } else { honest(to) };
+        let found = route_hijacks(&this_machine(), ROOM_ME, &[PEER], &vpn);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target, HijackTarget::Room { own: ROOM_ME });
+        assert_eq!(found[0].toward, PEER);
+        assert!(found[0].finding().contains("198.19.122.17"));
+    }
+
+    #[test]
+    fn tunnels_with_one_address_and_unrouted_systems_are_left_alone() {
+        // A /32 tunnel has no neighbours to mis-route; a system that cannot
+        // say where traffic would go says nothing.
+        assert!(route_hijacks(&[net("sdwan0", [100, 96, 0, 2], 32)], ROOM_ME, &[], &honest).is_empty());
+        assert!(route_hijacks(&this_machine(), ROOM_ME, &[PEER], &|_| None).is_empty());
+    }
+
+    #[test]
+    fn a_hijack_is_a_warning_beside_a_working_room() {
+        let mut r = CheckReport {
+            route_hijacks: vec![RouteHijack {
+                target: HijackTarget::Network { address: Ipv4Addr::new(192, 168, 32, 0), prefix_len: 24 },
+                toward: Ipv4Addr::new(192, 168, 32, 1),
+                leaves_from: TUNNEL,
+                interface: None,
+            }],
+            ..report(vec![member(PEER, true)])
+        };
+        assert!(r.ok(), "the room itself works");
+        let f = r.findings();
+        assert!(f[0].starts_with("The room works"), "{f:?}");
+        assert!(f.iter().any(|l| l.contains("192.168.32.0/24") && l.contains("100.96.0.2")), "{f:?}");
+        r.route_hijacks.clear();
+        assert!(!r.findings().iter().any(|l| l.contains("VPN")));
+    }
+
+    #[test]
+    fn the_real_system_answers_for_loopback() {
+        assert_eq!(source_toward(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST));
+    }
+
+
+    fn refused() -> std::io::Result<()> {
+        Err(std::io::ErrorKind::ConnectionRefused.into())
+    }
+
+    /// A lost SYN or a lost reset on a mesh is not a firewall: the next try
+    /// is answered.
+    #[tokio::test]
+    async fn a_lost_packet_is_tried_again_before_a_port_is_called_silent() {
+        let tries = std::cell::Cell::new(0);
+        let state = tcp_state(3, Duration::from_millis(20), || {
+            tries.set(tries.get() + 1);
+            let n = tries.get();
+            async move {
+                if n == 1 {
+                    std::future::pending::<()>().await;
+                }
+                refused()
+            }
+        })
+        .await;
+        assert_eq!(state, TcpState::Closed);
+        assert_eq!(tries.get(), 2, "an answer settles it at once");
+    }
+
+    #[tokio::test]
+    async fn a_port_nothing_ever_answers_is_silent_after_every_try() {
+        let tries = std::cell::Cell::new(0);
+        let state = tcp_state(3, Duration::from_millis(10), || {
+            tries.set(tries.get() + 1);
+            std::future::pending::<std::io::Result<()>>()
+        })
+        .await;
+        assert_eq!(state, TcpState::NoAnswer);
+        assert_eq!(tries.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_connection_is_open_and_a_failure_that_is_not_a_refusal_is_retried() {
+        assert_eq!(tcp_state(3, Duration::from_millis(10), || async { Ok(()) }).await, TcpState::Open);
+        let tries = std::cell::Cell::new(0);
+        let state = tcp_state(3, Duration::from_millis(10), || {
+            tries.set(tries.get() + 1);
+            async { Err(std::io::ErrorKind::HostUnreachable.into()) }
+        })
+        .await;
+        assert_eq!((state, tries.get()), (TcpState::NoAnswer, 3));
+    }
+
 }

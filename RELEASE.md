@@ -74,6 +74,28 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## Unreleased
+
+### The room check: a VPN that takes the route, and a game not started yet
+
+- The room check now says when a VPN, a proxy running as a tunnel (TUN
+  mode) or a virtual network sends this computer's traffic to its local
+  network, or to the room, out of another address. That is what made a
+  race hang while the lobby worked: a zero-trust client routed the Wi-Fi's
+  own subnet through its tunnel, so the game talked to the other players
+  from an address they did not expect. The warning names the network, the
+  address and (on Linux) the interface the traffic leaves from, and shows
+  beside a room that otherwise works. A proxy set only in a program's or
+  the system's settings does not touch game traffic and is not looked for.
+- A TCP port that gets no answer is tried three times before the check
+  calls it silent, as the UDP probes already were. One lost packet on the
+  mesh looked exactly like a firewall, and showed a healthy room as "did
+  not answer TCP 3282, 3284, 3285, 9900".
+- When no game is hosted yet on another computer (its ports refuse the
+  connection), the check says so as a next step, not a fault: the room
+  reached that computer and it answered; start the game there and host a
+  LAN game, then check again.
+
 ## v0.2.43
 
 ### LAN room traffic leaves through the room
