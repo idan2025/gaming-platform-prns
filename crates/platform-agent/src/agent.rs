@@ -1428,6 +1428,22 @@ impl Agent {
         Ok(())
     }
 
+    /// Start a stopped instance again: [`restart`](Self::restart), but refused
+    /// while it runs, so a caller who means "turn it back on" can never drop
+    /// the players of a server that was already up. Same container, so the
+    /// same ports, files and mesh identity.
+    pub async fn start(&self, instance_id: &str) -> Result<()> {
+        let instances = self.list().await?;
+        let instance = instances
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
+        if instance.state == InstanceState::Running {
+            return Err(anyhow!("{instance_id:?} is already running"));
+        }
+        self.restart(instance_id).await
+    }
+
     /// Stop and remove, returning the port to the pool.
     pub async fn remove(&self, instance_id: &str) -> Result<()> {
         let held: Vec<u16> = self

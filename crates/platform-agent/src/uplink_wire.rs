@@ -44,6 +44,9 @@ pub const OP_STOP: u8 = 4;
 pub const OP_REMOVE: u8 = 5;
 pub const OP_LIST: u8 = 6;
 pub const OP_CAPACITY: u8 = 7;
+/// Start a stopped instance. An agent older than this op answers "unknown
+/// op", which the index turns into "update that node".
+pub const OP_START: u8 = 8;
 
 // Status byte in a response.
 const STATUS_OK: u8 = 0;
@@ -100,7 +103,7 @@ pub struct CreateReq {
     pub spec: InstanceSpec,
 }
 
-/// `OP_STOP` / `OP_REMOVE`: act on one instance the caller can see.
+/// `OP_STOP` / `OP_START` / `OP_REMOVE`: act on one instance the caller can see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceReq {
     pub token: String,

@@ -116,6 +116,7 @@ pub fn router_full(
         .route("/orphans/clean", post(orphans_clean))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/restart", post(restart))
+        .route("/instances/:id/start", post(start))
         .route("/instances/:id/map", post(change_map))
         .route("/instances/:id/console", post(send_console))
         // Chat (ROADMAP.md §6.1): loopback only, like the console. The
@@ -834,6 +835,19 @@ async fn restart(
         .restart(&id)
         .await
         .map(|_| Json(json!({ "instance_id": id, "restarted": true })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+/// Start a stopped instance; refused while it runs (`Agent::start`).
+async fn start(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .start(&id)
+        .await
+        .map(|_| Json(json!({ "instance_id": id, "started": true })))
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 

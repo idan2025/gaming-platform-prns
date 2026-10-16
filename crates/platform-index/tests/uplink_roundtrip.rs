@@ -212,11 +212,11 @@ where
 }
 
 /// The full multi-node round-trip: create over the uplink, see it listed, stop
-/// it, see it stopped, remove it, see it gone. The owner stamped by the index
+/// it, see it stopped, start it again, remove it, see it gone. The owner stamped by the index
 /// is the user's identity, not the index's own — the create carries it through
 /// `spec.owner` to `OWNER_LABEL`.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_index_creates_lists_stops_and_removes_on_a_remote_agent() {
+async fn an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent() {
     let Some(mut tn) = two_nodes(|idx| vec![idx.to_string()]).await else {
         eprintln!("skipping: no Docker daemon");
         return;
@@ -293,6 +293,22 @@ async fn an_index_creates_lists_stops_and_removes_on_a_remote_agent() {
             InstanceState::Stopped,
             "stop over the uplink did not stop it (the stop took {took:?}; docker: {docker_state}; {} rows)",
             listed.len()
+        );
+
+        // Start it again over the uplink: same instance, running.
+        tn.client.start(tn.agent_dest, &id).await?;
+        let listed: Vec<InstanceStatus> = tn.client.list(tn.agent_dest).await?;
+        let row = listed
+            .iter()
+            .find(|r| r.instance_id == id)
+            .ok_or_else(|| anyhow!("the instance vanished after start"))?;
+        assert_eq!(row.state, InstanceState::Running, "start over the uplink did not start it");
+
+        // Starting a running server is refused, never a restart under its players.
+        let again = tn.client.start(tn.agent_dest, &id).await;
+        assert!(
+            again.as_ref().is_err_and(|e| format!("{e:#}").contains("already running")),
+            "a second start should be refused as already running: {again:?}"
         );
 
         // Remove over the uplink, then list confirms it is gone.
