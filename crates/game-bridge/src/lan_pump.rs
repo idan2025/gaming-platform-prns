@@ -118,10 +118,10 @@ where
                     continue;
                 }
                 // A broadcast the adapter copied from another network is any
-                // program's, and with `inbound = "any"` the filter would pass
-                // them all: mDNS and SSDP name this machine and what is on it.
-                // The operating system's own chatter never goes, whatever the
-                // pack says.
+                // program's: mDNS and SSDP name this machine and what is on
+                // it. The filter keeps `any` off the operating system's
+                // chatter; a copied one does not go even to a port the pack
+                // lists.
                 if translated.source && is_chatter_broadcast(&buf[..n], &subnet) {
                     continue;
                 }

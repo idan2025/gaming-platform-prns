@@ -46,9 +46,11 @@ fn what_leaves_by_the_wifi_is_brought_to_the_room() {
         eprintln!("skipping: unprivileged user namespaces are not available here ({probe:?})");
         return;
     }
-    if !std::process::Command::new("ip").arg("-V").output().is_ok_and(|o| o.status.success()) {
-        eprintln!("skipping: no `ip` to make the stand-in Wi-Fi with");
-        return;
+    for tool in ["ip", "tc"] {
+        if !std::process::Command::new(tool).arg("-V").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("skipping: no `{tool}` to make the stand-in Wi-Fi with or read its rules");
+            return;
+        }
     }
     let exe = std::env::current_exe().unwrap();
     let out = std::process::Command::new("unshare")
