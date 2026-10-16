@@ -28,7 +28,10 @@
 //! Without it a broadcast to `255.255.255.255` leaves by the default route —
 //! the real LAN — which is the Hamachi "adapter metric" failure on Linux. It
 //! also means that while a room is up, *every* program's limited broadcasts go
-//! to the room; the route goes with the device.
+//! to the room; the route goes with the device. What no route can catch — a
+//! broadcast from a socket bound to the Wi-Fi's address, one to the Wi-Fi's
+//! own network, and everything from a socket Wine pinned to the Wi-Fi — is
+//! brought to the room by `linux_capture.rs`.
 
 use std::ffi::CString;
 use std::io;
@@ -290,14 +293,31 @@ pub async fn serve(
     token: &RelayToken,
 ) -> io::Result<()> {
     let device = TunDevice::from_fd(open_configured(config)?)?;
+    let _capture = capture(&config.name);
     let stream = lan_relay::connect_to_launcher(launcher, token).await?;
     lan_relay::relay(&device, stream).await
+}
+
+/// The room's traffic-control rules (`linux_capture.rs`), for what the routes
+/// cannot bring to the room. A failure is said and does not stop the room: a
+/// game on `0.0.0.0` — most of them — needs only the routes.
+fn capture(name: &str) -> Option<super::Capture> {
+    match super::Capture::start(name) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "lan-helper: the room adapter is up, but traffic a game sends from this machine's \
+                 other addresses will not reach the room: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// The adapter as the launcher holds it.
 pub enum LinuxAdapter {
     /// This process made it itself (it already holds the capability).
-    Direct(TunDevice),
+    Direct(TunDevice, Option<super::Capture>),
     /// `lan-helper serve` holds it and relays.
     Relayed(RemoteDevice),
 }
@@ -305,14 +325,14 @@ pub enum LinuxAdapter {
 impl PacketDevice for LinuxAdapter {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Direct(d) => d.recv(buf).await,
+            Self::Direct(d, _) => d.recv(buf).await,
             Self::Relayed(d) => d.recv(buf).await,
         }
     }
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
         match self {
-            Self::Direct(d) => d.send(packet).await,
+            Self::Direct(d, _) => d.send(packet).await,
             Self::Relayed(d) => d.send(packet).await,
         }
     }
@@ -462,7 +482,10 @@ pub(super) async fn open(
         AdapterSetup::InProcess => {
             let c = config.clone();
             let fd = tokio::task::spawn_blocking(move || open_configured(&c)).await??;
-            Ok(LinuxAdapter::Direct(TunDevice::from_fd(fd)?))
+            let device = TunDevice::from_fd(fd)?;
+            let name = config.name.clone();
+            let capture = tokio::task::spawn_blocking(move || capture(&name)).await?;
+            Ok(LinuxAdapter::Direct(device, capture))
         }
         AdapterSetup::Helper { path, portable } => {
             let path = path.clone();

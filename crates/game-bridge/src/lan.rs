@@ -151,6 +151,16 @@ impl RoomSubnet {
         addr.is_broadcast() || addr == self.broadcast() || addr.is_multicast()
     }
 
+    /// Whether `addr` is a broadcast an old game computed for itself inside
+    /// the room: the `.255` (or BSD-era `.0`) of a `/24` taken from its own
+    /// address whatever the real mask is. No member is ever given one
+    /// ([`Self::is_assignable`]), so without this the host would drop it as
+    /// addressed to nobody, and the game would find nothing. The member's pump
+    /// sends it on as the room's own broadcast (`lan_rebind.rs`).
+    pub fn is_pseudo_broadcast(&self, addr: Ipv4Addr) -> bool {
+        self.contains(addr) && !self.is_broadcast(addr) && !self.is_assignable(addr)
+    }
+
     /// Whether `addr` is one a member may be given.
     ///
     /// Beyond the subnet's own network and broadcast addresses, a host part
@@ -754,6 +764,17 @@ impl ChatGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_broadcast_an_old_game_computes_inside_the_room_is_one() {
+        let s = RoomSubnet::new(Ipv4Addr::new(198, 19, 0, 0), 16).unwrap();
+        assert!(s.is_pseudo_broadcast(Ipv4Addr::new(198, 19, 45, 255)));
+        assert!(s.is_pseudo_broadcast(Ipv4Addr::new(198, 19, 45, 0)));
+        assert!(!s.is_pseudo_broadcast(Ipv4Addr::new(198, 19, 45, 221)), "a member's");
+        assert!(!s.is_pseudo_broadcast(s.broadcast()), "already the room's own");
+        assert!(!s.is_pseudo_broadcast(Ipv4Addr::new(192, 168, 1, 255)), "not the room's");
+    }
+
 
     fn id(n: u8) -> IdentityHash {
         let mut b = [0u8; 16];

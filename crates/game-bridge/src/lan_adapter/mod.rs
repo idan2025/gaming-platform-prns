@@ -32,6 +32,10 @@
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::*;
+#[cfg(target_os = "linux")]
+mod linux_capture;
+#[cfg(target_os = "linux")]
+pub use linux_capture::{Capture, RULE_PRIO};
 
 #[cfg(windows)]
 mod windows;
@@ -281,7 +285,10 @@ pub async fn run_room_on_adapter_reporting(
             prefix_len = view.subnet.prefix_len,
             "the room is on this machine's adapter"
         );
-        let pump = tokio::spawn(crate::lan_pump::pump(device, session.clone(), policy.clone()));
+        let pump = tokio::spawn({
+            let (session, policy, name) = (session.clone(), policy.clone(), name.clone());
+            async move { crate::lan_pump::pump_on(device, session, policy, &name).await }
+        });
         current = Some((wanted, pump));
         let _ = phase.send(AdapterPhase::Up { address });
     };

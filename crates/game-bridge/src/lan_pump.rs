@@ -34,7 +34,25 @@ pub async fn pump<D>(device: Arc<D>, room: Arc<LanSession>, policy: LanPolicy) -
 where
     D: PacketDevice + Send + Sync + 'static,
 {
-    pump_surveying(device, room, policy, crate::lan_rebind::survey).await
+    pump_with(device, room, policy, Rebinder::default(), crate::lan_rebind::survey).await
+}
+
+/// [`pump`] for the room adapter named `adapter`, which lets the survey tell a
+/// game socket pinned to another interface (Wine's UDP) from one that is not.
+pub async fn pump_on<D>(
+    device: Arc<D>,
+    room: Arc<LanSession>,
+    policy: LanPolicy,
+    adapter: &str,
+) -> io::Result<()>
+where
+    D: PacketDevice + Send + Sync + 'static,
+{
+    let name = adapter.to_string();
+    let survey = move |own: std::net::Ipv4Addr, ports: &[crate::lan_filter::LanPort]| {
+        crate::lan_rebind::survey_on(own, ports, Some(&name))
+    };
+    pump_with(device, room, policy, Rebinder::on_adapter(adapter), survey).await
 }
 
 /// [`pump`], looking for the game with `survey`: the machine's own, except
@@ -50,8 +68,22 @@ where
     D: PacketDevice + Send + Sync + 'static,
     S: Fn(std::net::Ipv4Addr, &[crate::lan_filter::LanPort]) -> crate::lan_rebind::Survey,
 {
+    pump_with(device, room, policy, Rebinder::default(), survey).await
+}
+
+async fn pump_with<D, S>(
+    device: Arc<D>,
+    room: Arc<LanSession>,
+    policy: LanPolicy,
+    rebinder: Rebinder,
+    survey: S,
+) -> io::Result<()>
+where
+    D: PacketDevice + Send + Sync + 'static,
+    S: Fn(std::net::Ipv4Addr, &[crate::lan_filter::LanPort]) -> crate::lan_rebind::Survey,
+{
     let filter = Mutex::new(LanFilter::new(policy.clone()));
-    let rebinder = Mutex::new(Rebinder::default());
+    let rebinder = Mutex::new(rebinder);
 
     // Both halves are futures of this one task, not a spawned one: dropping
     // the pump must close the device at once. A spawned half outlives an
@@ -66,18 +98,41 @@ where
             // A game that listens on another of this machine's addresses
             // also answers from it; the room only ever sees the room address
             // (`lan_rebind.rs`), so the filter and the watches do too.
+            //
+            // What the adapter brings in from the other networks — a socket
+            // pinned to the Wi-Fi, a broadcast to the Wi-Fi's own network —
+            // is translated the same way, and anything still not from this
+            // member's address after that is not this member's to send: a
+            // forwarding host's traffic, DHCP's `0.0.0.0`.
+            let subnet = room.subnet();
+            let mut translated = crate::lan_rebind::Outbound::default();
             if let Some(own) = room.own_address() {
-                rebinder.lock().expect("rebinder lock").outbound(&mut buf[..n], own, Instant::now());
+                translated = rebinder.lock().expect("rebinder lock").outbound(
+                    &mut buf[..n],
+                    own,
+                    &subnet,
+                    Instant::now(),
+                );
+                if crate::lan::ipv4_endpoints(&buf[..n]).is_some_and(|(src, _)| src != own) {
+                    debug!("a packet from another address than this member's; not sent into the room");
+                    continue;
+                }
             }
             let packet = &buf[..n];
-            let subnet = room.subnet();
             let allowed = {
                 let mut f = filter.lock().expect("filter lock");
                 f.sync_extra(room.extra_ports());
                 f.outbound(packet, &subnet, Instant::now())
             };
             if !allowed {
-                // Only a broadcast is ever refused on the way out.
+                // Only a broadcast is ever refused on the way out. One the
+                // adapter brought from another network is as likely another
+                // program's as the game's (Steam's, a music player's), so it
+                // is not named as a port the pack lacks.
+                if translated.source {
+                    debug!("a broadcast from another network to a port the game did not declare; dropped");
+                    continue;
+                }
                 report_refused(room.refused_log().saw(
                     DropDirection::OutboundBroadcast,
                     packet,
@@ -146,14 +201,16 @@ where
         loop {
             tick.tick().await;
             let Some(own) = room.own_address() else { continue };
-            if policy.any {
-                // Every port is the game's; there is no list to look for.
-                continue;
-            }
-            let mut ports = policy.ports.clone();
-            for p in room.extra_ports().ports() {
-                if !ports.contains(&p) {
-                    ports.push(p);
+            // With `any`, every port is the game's and there is no list to
+            // look for; this machine's other addresses and networks are still
+            // needed, for what the adapter brings in from them.
+            let mut ports = Vec::new();
+            if !policy.any {
+                ports = policy.ports.clone();
+                for p in room.extra_ports().ports() {
+                    if !ports.contains(&p) {
+                        ports.push(p);
+                    }
                 }
             }
             let survey = survey(own, &ports);

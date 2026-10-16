@@ -68,31 +68,111 @@ const FRAGMENT_WINDOW: Duration = Duration::from_secs(5);
 /// the far address and port.
 type FlowKey = (LanProto, u16, Ipv4Addr, u16);
 
+/// A search this machine broadcast from another address: protocol, its own
+/// port, the port it searched. Answered by whoever heard it, so the far
+/// address is not part of it — the filter's own `ANY_MEMBER` flow, here.
+type SearchKey = (LanProto, u16, u16);
+
+/// The DSCP a packet for a socket pinned to another interface is delivered
+/// with: CS1-adjacent "lower effort" (RFC 8622), which no game asks for. The
+/// Linux adapter's ingress rule hands exactly these to the interface the
+/// socket is pinned to (`lan_adapter/linux.rs`), and nothing else; the pump
+/// sets it only on a packet it already translated to that interface's own
+/// address, so a member cannot use it to reach anything new.
+pub const PINNED_DSCP: u8 = 0x01;
+
 /// One of the game's ports, held on an address other than the room's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rebound {
     pub port: LanPort,
     /// The address the game is actually listening on.
     pub address: Ipv4Addr,
+    /// The socket is pinned to that address's interface (Wine does this to
+    /// every UDP socket bound to an interface's address, with
+    /// `SO_BINDTODEVICE`), so a packet reaches it only arriving *on* that
+    /// interface. Linux only.
+    pub pinned: bool,
 }
 
-/// What [`survey`] found: this machine's other addresses, and which of the
-/// game's ports are held on one of them instead of on the room's.
+/// What [`survey`] found: this machine's other addresses, the broadcast
+/// addresses of their networks, and which of the game's ports are held on one
+/// of them instead of on the room's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Survey {
     pub locals: Vec<Ipv4Addr>,
+    /// The directed broadcast of every other network this machine is on. A
+    /// game that computes its broadcast from the Wi-Fi's address sends to one
+    /// of these, and the adapter brings it to the room (Windows by route,
+    /// Linux by mirroring it); the pump makes it the room's broadcast.
+    pub broadcasts: Vec<Ipv4Addr>,
     pub rebound: Vec<Rebound>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Flow {
+    to: Ipv4Addr,
+    pinned: bool,
+    seen: Instant,
+}
+
 /// The pump's translation state.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Rebinder {
     survey: Survey,
-    flows: HashMap<FlowKey, (Ipv4Addr, Instant)>,
-    fragments: HashMap<(Ipv4Addr, u16, u8), (Ipv4Addr, Instant)>,
+    flows: HashMap<FlowKey, Flow>,
+    searches: HashMap<SearchKey, Flow>,
+    fragments: HashMap<(Ipv4Addr, u16, u8), (Ipv4Addr, bool, Instant)>,
+    /// Whether the socket on a local UDP port is pinned to another interface.
+    /// `None` where pinning cannot happen or cannot be told (not Linux, or no
+    /// adapter name to probe with).
+    pinned: Option<Box<dyn Fn(u16) -> bool + Send>>,
+}
+
+impl std::fmt::Debug for Rebinder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rebinder")
+            .field("survey", &self.survey)
+            .field("flows", &self.flows.len())
+            .field("searches", &self.searches.len())
+            .finish()
+    }
+}
+
+/// What [`Rebinder::outbound`] did to a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Outbound {
+    /// Its source was another of this machine's addresses, now the room's.
+    pub source: bool,
+    /// Its destination was a broadcast of another network, or one an old game
+    /// computed inside the room, now the room's own broadcast.
+    pub broadcast: bool,
+}
+
+impl Outbound {
+    pub fn any(self) -> bool {
+        self.source || self.broadcast
+    }
 }
 
 impl Rebinder {
+    /// A rebinder that can tell a socket pinned to another interface from one
+    /// that is not, by probing with the room adapter's name (Linux).
+    pub fn on_adapter(adapter: &str) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let adapter = adapter.to_string();
+            Self {
+                pinned: Some(Box::new(move |port| pinned_udp(port, &adapter))),
+                ..Self::default()
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = adapter;
+            Self::default()
+        }
+    }
+
     /// Take a new survey. Returns whether what is translated changed.
     pub fn update(&mut self, survey: Survey) -> bool {
         let changed = survey.rebound != self.survey.rebound;
@@ -104,26 +184,53 @@ impl Rebinder {
         &self.survey.rebound
     }
 
-    /// A packet this machine sent into the room adapter. If it left from
-    /// another of this machine's addresses, give it the room address and
-    /// remember the flow, so its replies find their way back.
-    pub fn outbound(&mut self, packet: &mut [u8], room: Ipv4Addr, now: Instant) -> bool {
-        let Some((src, dst)) = crate::lan::ipv4_endpoints(packet) else { return false };
-        if src == room || !self.survey.locals.contains(&src) {
-            return false;
+    /// A packet this machine sent into the room adapter.
+    ///
+    /// If it left from another of this machine's addresses, give it the room
+    /// address and remember the flow, so its replies find their way back. If
+    /// it is addressed to another network's broadcast, or to a broadcast an
+    /// old game computed inside the room, make it the room's broadcast.
+    pub fn outbound(
+        &mut self,
+        packet: &mut [u8],
+        room: Ipv4Addr,
+        subnet: &crate::lan::RoomSubnet,
+        now: Instant,
+    ) -> Outbound {
+        let mut done = Outbound::default();
+        let Some((src, dst)) = crate::lan::ipv4_endpoints(packet) else { return done };
+        if self.survey.broadcasts.contains(&dst) || subnet.is_pseudo_broadcast(dst) {
+            done.broadcast = rewrite(packet, Field::Dst, subnet.broadcast());
         }
+        if src == room || !self.survey.locals.contains(&src) {
+            return done;
+        }
+        let dst = crate::lan::ipv4_endpoints(packet).map_or(dst, |(_, d)| d);
         if let Some((proto, sport, dport)) = transport(packet) {
-            if !self.flows.contains_key(&(proto, sport, dst, dport))
-                && self.flows.len() >= MAX_FLOWS
-            {
-                self.flows.retain(|_, (_, t)| now.duration_since(*t) < FLOW_IDLE);
-                if self.flows.len() >= MAX_FLOWS {
-                    return rewrite(packet, Field::Src, room);
+            let pinned = proto == LanProto::Udp && self.pinned.as_ref().is_some_and(|p| p(sport));
+            let flow = Flow { to: src, pinned, seen: now };
+            if subnet.is_broadcast(dst) {
+                if !self.searches.contains_key(&(proto, sport, dport))
+                    && self.searches.len() >= MAX_FLOWS
+                {
+                    self.searches.retain(|_, f| now.duration_since(f.seen) < FLOW_IDLE);
+                }
+                if self.searches.len() < MAX_FLOWS {
+                    self.searches.insert((proto, sport, dport), flow);
+                }
+            } else {
+                if !self.flows.contains_key(&(proto, sport, dst, dport))
+                    && self.flows.len() >= MAX_FLOWS
+                {
+                    self.flows.retain(|_, f| now.duration_since(f.seen) < FLOW_IDLE);
+                }
+                if self.flows.len() < MAX_FLOWS {
+                    self.flows.insert((proto, sport, dst, dport), flow);
                 }
             }
-            self.flows.insert((proto, sport, dst, dport), (src, now));
         }
-        rewrite(packet, Field::Src, room)
+        done.source = rewrite(packet, Field::Src, room);
+        done
     }
 
     /// A packet the room delivered, already admitted by the filter. Returns
@@ -138,9 +245,9 @@ impl Rebinder {
         let id = u16::from_be_bytes([packet[4], packet[5]]);
         let flags_offset = u16::from_be_bytes([packet[6], packet[7]]);
         let (more, offset) = (flags_offset & 0x2000 != 0, flags_offset & 0x1fff);
-        let to = if offset != 0 {
-            let &(to, t) = self.fragments.get(&(src, id, protocol))?;
-            (now.duration_since(t) < FRAGMENT_WINDOW).then_some(to)?
+        let (to, pinned) = if offset != 0 {
+            let &(to, pinned, t) = self.fragments.get(&(src, id, protocol))?;
+            (now.duration_since(t) < FRAGMENT_WINDOW).then_some((to, pinned))?
         } else if protocol == PROTO_ICMP {
             // An error about a packet this machine sent: what it quotes is that
             // packet, from the room address, which is the flow to look up.
@@ -151,15 +258,23 @@ impl Rebinder {
             self.target(proto, dport, src, sport, now)?
         };
         if offset == 0 && more {
-            self.fragments.retain(|_, (_, t)| now.duration_since(*t) < FRAGMENT_WINDOW);
-            self.fragments.insert((src, id, protocol), (to, now));
+            self.fragments.retain(|_, (_, _, t)| now.duration_since(*t) < FRAGMENT_WINDOW);
+            self.fragments.insert((src, id, protocol), (to, pinned, now));
         }
         let mut out = packet.to_vec();
-        rewrite(&mut out, Field::Dst, to).then_some(out)
+        if !rewrite(&mut out, Field::Dst, to) {
+            return None;
+        }
+        if pinned {
+            set_dscp(&mut out, PINNED_DSCP);
+        }
+        Some(out)
     }
 
-    /// Where a packet for `local_port` from `peer:peer_port` goes: back to the
-    /// address that opened the flow, else to the address the game listens on.
+    /// Where a packet for `local_port` from `peer:peer_port` goes, and whether
+    /// the socket there is pinned: back to the address that opened the flow,
+    /// or that searched from that port, else to the address the game listens
+    /// on.
     fn target(
         &mut self,
         proto: LanProto,
@@ -167,19 +282,36 @@ impl Rebinder {
         peer: Ipv4Addr,
         peer_port: u16,
         now: Instant,
-    ) -> Option<Ipv4Addr> {
-        if let Some((to, seen)) = self.flows.get_mut(&(proto, local_port, peer, peer_port)) {
-            if now.duration_since(*seen) < FLOW_IDLE {
-                *seen = now;
-                return Some(*to);
+    ) -> Option<(Ipv4Addr, bool)> {
+        if let Some(f) = self.flows.get_mut(&(proto, local_port, peer, peer_port)) {
+            if now.duration_since(f.seen) < FLOW_IDLE {
+                f.seen = now;
+                return Some((f.to, f.pinned));
+            }
+        }
+        if let Some(f) = self.searches.get_mut(&(proto, local_port, peer_port)) {
+            if now.duration_since(f.seen) < FLOW_IDLE {
+                f.seen = now;
+                return Some((f.to, f.pinned));
             }
         }
         self.survey
             .rebound
             .iter()
             .find(|r| r.port.proto == proto && r.port.port == local_port)
-            .map(|r| r.address)
+            .map(|r| (r.address, r.pinned))
     }
+}
+
+/// Set a packet's DSCP, keeping its ECN bits and its header checksum right.
+fn set_dscp(packet: &mut [u8], dscp: u8) {
+    if packet.len() < 20 {
+        return;
+    }
+    let old = [packet[0], packet[1]];
+    packet[1] = (dscp << 2) | (packet[1] & 0x03);
+    let new = [packet[0], packet[1]];
+    adjust_at(packet, 10, &old, &new);
 }
 
 /// `(protocol, source port, destination port)` of a whole datagram or its
@@ -357,19 +489,156 @@ fn checksum_adjust(sum: u16, old: &[u8], new: &[u8]) -> u16 {
 /// Which of `ports` some program on this machine holds on one of its other
 /// addresses while nothing holds it on `room`.
 pub fn survey(room: Ipv4Addr, ports: &[LanPort]) -> Survey {
-    let locals: Vec<Ipv4Addr> =
-        local_addresses().into_iter().filter(|a| *a != room && is_translatable(*a)).collect();
+    survey_on(room, ports, None)
+}
+
+/// [`survey`], also telling a UDP socket *pinned* to another interface — which
+/// a packet arriving on the room adapter can never reach — by probing with
+/// the room adapter's name (Linux; elsewhere the name is unused).
+///
+/// Wine turns a UDP bind to the Wi-Fi's address into a bind to every address
+/// plus `SO_BINDTODEVICE` to the Wi-Fi (`server/sock.c`, `bind_to_interface`),
+/// so to a plain bind such a socket looks like it is on every address,
+/// the room's included, and the game was left untranslated and unreachable.
+/// A probe bound to the room address *on the room adapter* conflicts with
+/// every socket a room packet could be delivered to and with nothing else.
+pub fn survey_on(room: Ipv4Addr, ports: &[LanPort], adapter: Option<&str>) -> Survey {
+    let networks: Vec<LocalNetwork> = local_networks()
+        .into_iter()
+        .filter(|n| n.address != room && is_translatable(n.address))
+        .collect();
+    let mut locals: Vec<Ipv4Addr> = Vec::new();
+    let mut broadcasts: Vec<Ipv4Addr> = Vec::new();
+    for n in &networks {
+        if !locals.contains(&n.address) {
+            locals.push(n.address);
+        }
+        if let Some(b) = n.broadcast() {
+            if !broadcasts.contains(&b) {
+                broadcasts.push(b);
+            }
+        }
+    }
     let mut rebound = Vec::new();
     for &port in ports {
         let Some(&address) = locals.iter().find(|a| taken(port, **a)) else { continue };
+        #[cfg(target_os = "linux")]
+        if let (LanProto::Udp, Some(adapter)) = (port.proto, adapter) {
+            match bind_udp_on(room, port.port, adapter) {
+                // Something a room packet would reach holds it: the room
+                // address, or every address unpinned.
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Ok(()) => {
+                    if pinned_udp(port.port, adapter) {
+                        // Pinned somewhere: find where, by the same probe on
+                        // each interface in turn.
+                        let pinned_to = networks
+                            .iter()
+                            .find(|n| {
+                                bind_udp_on(Ipv4Addr::UNSPECIFIED, port.port, &n.name)
+                                    .is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+                            })
+                            .map(|n| n.address);
+                        if let Some(address) = pinned_to {
+                            rebound.push(Rebound { port, address, pinned: true });
+                        }
+                    } else {
+                        rebound.push(Rebound { port, address, pinned: false });
+                    }
+                    continue;
+                }
+                // A kernel that refuses an unprivileged SO_BINDTODEVICE
+                // (before 5.7): the plain survey below.
+                Err(_) => {}
+            }
+        }
+        let _ = adapter;
         // Taken on another address; if the room address is taken too, the
         // game is on every address (or on the room's as well) and reaches the
         // room without help.
         if !taken(port, room) {
-            rebound.push(Rebound { port, address });
+            rebound.push(Rebound { port, address, pinned: false });
         }
     }
-    Survey { locals, rebound }
+    Survey { locals, broadcasts, rebound }
+}
+
+/// One IPv4 address of this machine, with its network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalNetwork {
+    /// The interface's name (Linux); empty where the platform needs none.
+    pub name: String,
+    pub address: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+impl LocalNetwork {
+    /// The network's directed broadcast, for a network that has one.
+    pub fn broadcast(&self) -> Option<Ipv4Addr> {
+        if !(8..=30).contains(&self.prefix_len) || !is_translatable(self.address) {
+            return None;
+        }
+        let mask = u32::MAX << (32 - u32::from(self.prefix_len));
+        Some(Ipv4Addr::from(u32::from(self.address) | !mask))
+    }
+}
+
+/// Whether a UDP socket on `port` is pinned to an interface other than
+/// `adapter` — or nothing holds it at all, which is as good: a packet sent
+/// that way finds nobody either way. A probe bound to every address on
+/// `adapter` conflicts with any unpinned holder, whatever its address, and
+/// with one pinned to `adapter`; with nothing else.
+#[cfg(target_os = "linux")]
+pub fn pinned_udp(port: u16, adapter: &str) -> bool {
+    bind_udp_on(Ipv4Addr::UNSPECIFIED, port, adapter).is_ok()
+}
+
+/// Bind, and at once let go of, a UDP socket on `address:port` pinned to
+/// `device`. Unprivileged since Linux 5.7.
+#[cfg(target_os = "linux")]
+fn bind_udp_on(address: Ipv4Addr, port: u16, device: &str) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if device.is_empty() || device.len() >= libc::IFNAMSIZ || device.contains('\0') {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    // SAFETY: plain socket creation; the descriptor is owned at once.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `socket` returned a descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: the name's bytes, of the length given, outlive the call.
+    let r = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            device.as_ptr().cast(),
+            device.len() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sin = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr { s_addr: u32::from(address).to_be() },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: a sockaddr_in of the size given.
+    let r = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&sin as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// An address a packet from the room may be translated to: not loopback
@@ -409,8 +678,19 @@ fn taken(port: LanPort, address: Ipv4Addr) -> bool {
 }
 
 /// This machine's IPv4 addresses, every interface's.
-#[cfg(target_os = "linux")]
 pub fn local_addresses() -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    for n in local_networks() {
+        if !out.contains(&n.address) {
+            out.push(n.address);
+        }
+    }
+    out
+}
+
+/// This machine's IPv4 addresses with their networks, every interface's.
+#[cfg(target_os = "linux")]
+pub fn local_networks() -> Vec<LocalNetwork> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs fills `head` with a list freed below by freeifaddrs;
@@ -424,10 +704,16 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
             let addr = (*node).ifa_addr;
             if !addr.is_null() && i32::from((*addr).sa_family) == libc::AF_INET {
                 let sin = &*(addr as *const libc::sockaddr_in);
-                let a = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                if !out.contains(&a) {
-                    out.push(a);
-                }
+                let address = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                let mask = (*node).ifa_netmask;
+                let prefix_len = if mask.is_null() {
+                    32
+                } else {
+                    let m = &*(mask as *const libc::sockaddr_in);
+                    u32::from_be(m.sin_addr.s_addr).leading_ones() as u8
+                };
+                let name = std::ffi::CStr::from_ptr((*node).ifa_name).to_string_lossy().into_owned();
+                out.push(LocalNetwork { name, address, prefix_len });
             }
             node = (*node).ifa_next;
         }
@@ -436,9 +722,9 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
     out
 }
 
-/// This machine's IPv4 addresses, every interface's.
+/// This machine's IPv4 addresses with their networks, every interface's.
 #[cfg(windows)]
-pub fn local_addresses() -> Vec<Ipv4Addr> {
+pub fn local_networks() -> Vec<LocalNetwork> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE,
     };
@@ -454,10 +740,12 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
         let rows =
             std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
         for row in rows {
-            let a = Ipv4Addr::from(u32::from_be(row.Address.Ipv4.sin_addr.S_un.S_addr));
-            if !out.contains(&a) {
-                out.push(a);
-            }
+            let address = Ipv4Addr::from(u32::from_be(row.Address.Ipv4.sin_addr.S_un.S_addr));
+            out.push(LocalNetwork {
+                name: String::new(),
+                address,
+                prefix_len: row.OnLinkPrefixLength,
+            });
         }
         FreeMibTable(table.cast());
     }
@@ -466,7 +754,7 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
 
 /// No room adapter on any other system.
 #[cfg(not(any(target_os = "linux", windows)))]
-pub fn local_addresses() -> Vec<Ipv4Addr> {
+pub fn local_networks() -> Vec<LocalNetwork> {
     Vec::new()
 }
 
@@ -482,18 +770,28 @@ pub struct WeakHostSend {
     changed: Vec<u32>,
 }
 
+// One adapter that refuses must not cost the others theirs, nor lose the
+// list of what was already changed: an `-ErrorAction Stop` here once ended the
+// script before it printed `changed=`, leaving the rest strong-host and the
+// ones already done on until reboot.
 const WEAK_HOST_ON: &str = r#"
 $changed = @()
+$failed = @()
 $ix = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty InterfaceIndex -Unique)
 foreach ($i in $ix) {
-  $n = Get-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue
-  if ($n -and $n.WeakHostSend -ne 'Enabled') {
-    Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -WeakHostSend Enabled -PolicyStore ActiveStore -ErrorAction Stop
-    $changed += $i
+  try {
+    $n = Get-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction Stop
+    if ($n.WeakHostSend -ne 'Enabled') {
+      Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -WeakHostSend Enabled -PolicyStore ActiveStore -ErrorAction Stop
+      $changed += $i
+    }
+  } catch {
+    $failed += $i
   }
 }
 'changed=' + ($changed -join ',')
+'failed=' + ($failed -join ',')
 "#;
 
 impl WeakHostSend {
@@ -508,7 +806,16 @@ impl WeakHostSend {
 
     pub fn on_with(r: &impl crate::lan_firewall::Run) -> Self {
         let changed = match r.run("powershell", &powershell(WEAK_HOST_ON)) {
-            Ok((_, out)) => parse_changed(&out),
+            Ok((_, out)) => {
+                let failed = parse_list(&out, "failed=");
+                if !failed.is_empty() {
+                    eprintln!(
+                        "weak-host send could not be turned on for interfaces {failed:?}: a game bound \
+                         to their address answers out of them, not the room"
+                    );
+                }
+                parse_list(&out, "changed=")
+            }
             Err(e) => {
                 eprintln!("weak-host send was not turned on: {e}");
                 Vec::new()
@@ -555,10 +862,10 @@ fn powershell(script: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `changed=3,7` line [`WEAK_HOST_ON`] prints.
-fn parse_changed(out: &str) -> Vec<u32> {
+/// A `changed=3,7` or `failed=…` line [`WEAK_HOST_ON`] prints.
+fn parse_list(out: &str, key: &str) -> Vec<u32> {
     out.lines()
-        .find_map(|l| l.trim().strip_prefix("changed="))
+        .find_map(|l| l.trim().strip_prefix(key))
         .map(|l| l.split(',').filter_map(|i| i.trim().parse().ok()).collect())
         .unwrap_or_default()
 }
@@ -570,6 +877,8 @@ mod tests {
     const ROOM: Ipv4Addr = Ipv4Addr::new(198, 19, 45, 221);
     const WIFI: Ipv4Addr = Ipv4Addr::new(192, 168, 32, 203);
     const PEER: Ipv4Addr = Ipv4Addr::new(198, 19, 2, 2);
+    const SUBNET: crate::lan::RoomSubnet =
+        crate::lan::RoomSubnet { prefix: Ipv4Addr::new(198, 19, 0, 0), prefix_len: 16 };
 
     fn sum(bytes: &[u8]) -> u16 {
         let mut acc: u32 = 0;
@@ -668,9 +977,11 @@ mod tests {
         let mut r = Rebinder::default();
         r.update(Survey {
             locals: vec![WIFI],
+            broadcasts: vec![Ipv4Addr::new(192, 168, 32, 255)],
             rebound: vec![Rebound {
                 port: LanPort { proto: LanProto::Tcp, port: 9900 },
                 address: WIFI,
+                pinned: false,
             }],
         });
         r
@@ -710,7 +1021,7 @@ mod tests {
         assert!(verifies(&delivered));
 
         let mut answer = with_transport(WIFI, PEER, PROTO_TCP, 9900, 51000);
-        assert!(r.outbound(&mut answer, ROOM, now));
+        assert!(r.outbound(&mut answer, ROOM, &SUBNET, now).source);
         assert_eq!(crate::lan::ipv4_endpoints(&answer), Some((ROOM, PEER)));
         assert!(verifies(&answer));
     }
@@ -723,11 +1034,92 @@ mod tests {
         let mut r = rebinder();
         let now = Instant::now();
         let mut out = with_transport(WIFI, PEER, PROTO_UDP, 3658, 3658);
-        assert!(r.outbound(&mut out, ROOM, now));
+        assert!(r.outbound(&mut out, ROOM, &SUBNET, now).source);
         let reply = with_transport(PEER, ROOM, PROTO_UDP, 3658, 3658);
         let delivered = r.inbound(&reply, ROOM, now).expect("back to the address that asked");
         assert_eq!(crate::lan::ipv4_endpoints(&delivered), Some((PEER, WIFI)));
         assert!(r.inbound(&reply, ROOM, now + FLOW_IDLE).is_none(), "and forgotten when idle");
+    }
+
+    /// A game that computes its broadcast from the Wi-Fi's address sends to
+    /// the Wi-Fi network's broadcast; the adapter brings it here and the room
+    /// gets it as its own broadcast, from the room address.
+    #[test]
+    fn a_broadcast_to_another_network_becomes_the_rooms() {
+        let mut r = rebinder();
+        let now = Instant::now();
+        let mut p = with_transport(WIFI, Ipv4Addr::new(192, 168, 32, 255), PROTO_UDP, 9999, 9999);
+        let done = r.outbound(&mut p, ROOM, &SUBNET, now);
+        assert!(done.source && done.broadcast);
+        assert_eq!(crate::lan::ipv4_endpoints(&p), Some((ROOM, SUBNET.broadcast())));
+        assert!(verifies(&p));
+        // From the room address too (a socket on `0.0.0.0`, Windows' route).
+        let mut p = with_transport(ROOM, Ipv4Addr::new(192, 168, 32, 255), PROTO_UDP, 9999, 9999);
+        let done = r.outbound(&mut p, ROOM, &SUBNET, now);
+        assert!(!done.source && done.broadcast);
+        assert_eq!(crate::lan::ipv4_endpoints(&p), Some((ROOM, SUBNET.broadcast())));
+        assert!(verifies(&p));
+    }
+
+    /// An old game takes a `/24` from its own address whatever the mask, and
+    /// broadcasts to `198.19.45.255` in a `/16` room: nobody's address, so
+    /// the host dropped it. It goes as the room's broadcast instead.
+    #[test]
+    fn a_broadcast_an_old_game_computed_inside_the_room_reaches_it() {
+        let mut r = Rebinder::default();
+        for computed in [Ipv4Addr::new(198, 19, 45, 255), Ipv4Addr::new(198, 19, 45, 0)] {
+            let mut p = with_transport(ROOM, computed, PROTO_UDP, 9999, 9999);
+            assert!(r.outbound(&mut p, ROOM, &SUBNET, Instant::now()).broadcast, "{computed}");
+            assert_eq!(crate::lan::ipv4_endpoints(&p), Some((ROOM, SUBNET.broadcast())));
+            assert!(verifies(&p));
+        }
+        let mut unicast = with_transport(ROOM, PEER, PROTO_UDP, 9999, 9999);
+        let before = unicast.clone();
+        assert!(!r.outbound(&mut unicast, ROOM, &SUBNET, Instant::now()).any());
+        assert_eq!(unicast, before);
+    }
+
+    /// A search broadcast from the Wi-Fi's address is answered by whoever
+    /// heard it, at the room address: the answer goes back to the Wi-Fi's.
+    #[test]
+    fn the_answers_to_a_search_from_another_address_find_it() {
+        let mut r = rebinder();
+        let now = Instant::now();
+        let mut search = with_transport(WIFI, Ipv4Addr::BROADCAST, PROTO_UDP, 52000, 3658);
+        assert!(r.outbound(&mut search, ROOM, &SUBNET, now).source);
+        for member in [PEER, Ipv4Addr::new(198, 19, 9, 9)] {
+            let answer = with_transport(member, ROOM, PROTO_UDP, 3658, 52000);
+            let back = r.inbound(&answer, ROOM, now).expect("to the searching socket");
+            assert_eq!(crate::lan::ipv4_endpoints(&back), Some((member, WIFI)));
+            assert!(verifies(&back));
+        }
+        let elsewhere = with_transport(PEER, ROOM, PROTO_UDP, 3659, 52000);
+        assert!(r.inbound(&elsewhere, ROOM, now).is_none(), "pinned to the port it searched");
+    }
+
+    /// A socket Wine pinned to the Wi-Fi is reached only by a packet that
+    /// arrives on the Wi-Fi: what is translated for it is marked, so the
+    /// adapter hands exactly that in there; nothing else is.
+    #[test]
+    fn a_packet_for_a_pinned_socket_is_marked_and_no_other() {
+        let mut r = rebinder();
+        r.survey.rebound.push(Rebound {
+            port: LanPort { proto: LanProto::Udp, port: 3658 },
+            address: WIFI,
+            pinned: true,
+        });
+        let now = Instant::now();
+        let mut join = with_transport(PEER, ROOM, PROTO_UDP, 50000, 3658);
+        join[1] = 0x02; // an ECN bit, which must survive
+        join[10..12].copy_from_slice(&[0, 0]);
+        let header = sum(&join[..20]);
+        join[10..12].copy_from_slice(&header.to_be_bytes());
+        assert!(verifies(&join));
+        let marked = r.inbound(&join, ROOM, now).unwrap();
+        assert_eq!(marked[1], (PINNED_DSCP << 2) | 0x02);
+        assert!(verifies(&marked));
+        let tcp = with_transport(PEER, ROOM, PROTO_TCP, 50000, 9900);
+        assert_eq!(r.inbound(&tcp, ROOM, now).unwrap()[1], 0, "not pinned, not marked");
     }
 
     #[test]
@@ -736,7 +1128,7 @@ mod tests {
         let now = Instant::now();
         let mut out = with_transport(ROOM, PEER, PROTO_UDP, 9999, 9999);
         let before = out.clone();
-        assert!(!r.outbound(&mut out, ROOM, now));
+        assert!(!r.outbound(&mut out, ROOM, &SUBNET, now).source);
         assert_eq!(out, before);
         let other_port = with_transport(PEER, ROOM, PROTO_TCP, 51000, 3290);
         assert!(
@@ -753,7 +1145,7 @@ mod tests {
         let mut forwarded =
             with_transport(Ipv4Addr::new(172, 17, 0, 2), PEER, PROTO_TCP, 9900, 51000);
         let before = forwarded.clone();
-        assert!(!r.outbound(&mut forwarded, ROOM, Instant::now()));
+        assert!(!r.outbound(&mut forwarded, ROOM, &SUBNET, Instant::now()).source);
         assert_eq!(forwarded, before);
     }
 
@@ -768,14 +1160,14 @@ mod tests {
         let delivered = with_transport(PEER, WIFI, PROTO_UDP, 50000, 9900);
         let mut err = icmp_unreachable_about(&delivered, WIFI, PEER);
         assert!(verifies(&err));
-        assert!(r.outbound(&mut err, ROOM, now));
+        assert!(r.outbound(&mut err, ROOM, &SUBNET, now).source);
         assert_eq!(crate::lan::ipv4_endpoints(&err), Some((ROOM, PEER)));
         assert_eq!(crate::lan::ipv4_endpoints(&err[28..]), Some((PEER, ROOM)), "the quote too");
         assert!(verifies(&err));
 
         // A member refusing a packet this machine sent from the Wi-Fi address.
         let mut sent = with_transport(WIFI, PEER, PROTO_UDP, 3659, 3659);
-        assert!(r.outbound(&mut sent, ROOM, now));
+        assert!(r.outbound(&mut sent, ROOM, &SUBNET, now).source);
         let err = icmp_unreachable_about(&sent, PEER, ROOM);
         let back = r.inbound(&err, ROOM, now).expect("routed to the flow's address");
         assert_eq!(crate::lan::ipv4_endpoints(&back), Some((PEER, WIFI)));
@@ -786,9 +1178,11 @@ mod tests {
     #[test]
     fn the_later_pieces_of_a_fragmented_datagram_follow_the_first() {
         let mut r = rebinder();
-        r.survey
-            .rebound
-            .push(Rebound { port: LanPort { proto: LanProto::Udp, port: 9900 }, address: WIFI });
+        r.survey.rebound.push(Rebound {
+            port: LanPort { proto: LanProto::Udp, port: 9900 },
+            address: WIFI,
+            pinned: false,
+        });
         let now = Instant::now();
         let mut first = with_transport(PEER, ROOM, PROTO_UDP, 50000, 9900);
         first[6] = 0x20; // more fragments
@@ -865,7 +1259,7 @@ mod tests {
         let port = LanPort { proto: LanProto::Udp, port: held.local_addr().unwrap().port() };
         let s = survey(room, &[port]);
         assert!(s.locals.contains(&lan));
-        assert_eq!(s.rebound, [Rebound { port, address: lan }]);
+        assert_eq!(s.rebound, [Rebound { port, address: lan, pinned: false }]);
 
         let everywhere = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let port = LanPort { proto: LanProto::Udp, port: everywhere.local_addr().unwrap().port() };
@@ -873,6 +1267,6 @@ mod tests {
 
         let tcp = std::net::TcpListener::bind((lan, 0)).unwrap();
         let port = LanPort { proto: LanProto::Tcp, port: tcp.local_addr().unwrap().port() };
-        assert_eq!(survey(room, &[port]).rebound, [Rebound { port, address: lan }]);
+        assert_eq!(survey(room, &[port]).rebound, [Rebound { port, address: lan, pinned: false }]);
     }
 }
