@@ -1341,9 +1341,11 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
    came back "already exists" and was taken for success: the room competed
    at 257 and tied with any network pinned to 1 — the measurement above. The
    helper now sets the existing route to 0 (cost 1 against at least 256),
-   re-applies metric and routes every 3 s while the room is up, routes each
-   other network's directed broadcast to the room, and checks
-   `GetBestRoute2` (`lan_adapter/windows.rs`, `Keeper`). Linux had the same
+   re-applies metric and route every 3 s while the room is up, and checks
+   `GetBestRoute2` (`lan_adapter/windows.rs`, `Keeper`). Only the limited
+   broadcast is taken: multicast and the real networks' own broadcast
+   addresses keep their routes, so casting, printer and NAS discovery on the
+   home network keep working while a room is up. Linux had the same
    class of gap where routes are never consulted — a broadcast from a socket
    bound to the Wi-Fi's address, one to the Wi-Fi's own network, and every
    packet from a UDP socket Wine pins to the Wi-Fi with `SO_BINDTODEVICE` —

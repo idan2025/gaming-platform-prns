@@ -20,13 +20,18 @@
 //! Ethernet or Wi-Fi that is never a new adapter — which is why Hamachi users
 //! were told to lower its metric by hand, and why an old game on a virtual LAN
 //! so often "finds no games". [`configure`] sets this adapter's interface metric
-//! to 1 and gives its own routes to `255.255.255.255` and `224.0.0.0/4` route
-//! metric 0 ([`ensure_route`]: Windows has already made both, at 256, and
-//! taking "already exists" for success once left the room tied with any
-//! network pinned to metric 1). A [`Keeper`] re-applies all of it while the
-//! room is up, adds a route for each other network's own broadcast, and checks
+//! to 1 and gives its own route to `255.255.255.255` route metric 0
+//! ([`ensure_route`]: Windows has already made one, at 256, and taking "already
+//! exists" for success once left the room tied with any network pinned to
+//! metric 1). A [`Keeper`] re-applies both while the room is up and checks
 //! Windows' own choice of interface. `tests/lan_wintun.rs` proves a limited
 //! broadcast leaves through it.
+//!
+//! **Only the limited broadcast is taken.** Multicast keeps Windows' own
+//! routes, and the real networks keep their own broadcast addresses: pinning
+//! those to the room would send every program's casting, printer and NAS
+//! discovery into the room — where the pump drops it — for as long as the room
+//! is up.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -359,12 +364,7 @@ fn sockaddr_inet(addr: Ipv4Addr) -> SOCKADDR_INET {
 /// The interface metric the room adapter is given.
 const ROOM_INTERFACE_METRIC: u32 = 1;
 
-/// The multicast range, which gets the same treatment as the limited
-/// broadcast: games that search by multicast search out of the cheapest
-/// route to it.
-const MULTICAST: (Ipv4Addr, u8) = (Ipv4Addr::new(224, 0, 0, 0), 4);
-
-/// The room's address, the MTU, the metric and the broadcast routes.
+/// The room's address, the MTU, the metric and the limited-broadcast route.
 fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
     // SAFETY: the row is initialized by its Initialize* call before use, and
     // passed by pointer to the call that reads it.
@@ -382,7 +382,6 @@ fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
     }
     set_interface(luid)?;
     ensure_route(luid, Ipv4Addr::BROADCAST, 32)?;
-    ensure_route(luid, MULTICAST.0, MULTICAST.1)?;
     Ok(())
 }
 
@@ -441,8 +440,8 @@ fn route_row(luid: NET_LUID_LH, prefix: Ipv4Addr, len: u8) -> MIB_IPFORWARD_ROW2
 
 /// An on-link route to `prefix/len` on this adapter **with route metric 0**.
 ///
-/// Windows gives every interface its own `255.255.255.255/32` and
-/// `224.0.0.0/4` the moment it has an address, at route metric 256 — so the
+/// Windows gives every interface its own `255.255.255.255/32` the moment it
+/// has an address, at route metric 256 — so the
 /// create below found one already there, and this used to take that for
 /// success. The room then competed at 256 + its interface metric, which only
 /// ties a network pinned to metric 1 by hand (Hamachi's, Radmin's, ZeroTier's
@@ -479,12 +478,6 @@ fn ensure_route(luid: NET_LUID_LH, prefix: Ipv4Addr, len: u8) -> io::Result<()> 
     }
 }
 
-fn delete_route(luid: NET_LUID_LH, prefix: Ipv4Addr, len: u8) {
-    let row = route_row(luid, prefix, len);
-    // SAFETY: a fully initialized row, read by the call.
-    unsafe { DeleteIpForwardEntry2(&row) };
-}
-
 /// The interface Windows would send `to` out of right now.
 fn best_interface(to: Ipv4Addr) -> Option<u64> {
     let dst = sockaddr_inet(to);
@@ -506,23 +499,18 @@ const KEEP_EVERY_MS: u32 = 3000;
 /// Configuring once is not enough. The adapter is configured before its
 /// session starts, and only then does Windows see it connected; Network
 /// Location Awareness, a VPN client or a "network reset" may each put a
-/// metric back; and the Wi-Fi joining another network changes which directed
-/// broadcast a game computes. So the keeper re-applies all of it every few
-/// seconds — each step a read that changes nothing when nothing changed — and
+/// metric back. So the keeper re-applies it every few seconds — each step a read that changes nothing when nothing changed — and
 /// checks with Windows' own route choice that a limited broadcast really
 /// leaves through the room.
 struct Keeper {
     luid: NET_LUID_LH,
-    /// Directed-broadcast routes this keeper added, so it takes away exactly
-    /// those when a network goes.
-    lan_routes: Vec<Ipv4Addr>,
     /// The last thing said, so a lasting fault is said once.
     said: Option<String>,
 }
 
 impl Keeper {
     fn new(luid: NET_LUID_LH) -> Self {
-        Self { luid, lan_routes: Vec::new(), said: None }
+        Self { luid, said: None }
     }
 
     fn keep(&mut self) {
@@ -530,12 +518,9 @@ impl Keeper {
         if let Err(e) = set_interface(self.luid) {
             problems.push(e.to_string());
         }
-        for (prefix, len) in [(Ipv4Addr::BROADCAST, 32), MULTICAST] {
-            if let Err(e) = ensure_route(self.luid, prefix, len) {
-                problems.push(e.to_string());
-            }
+        if let Err(e) = ensure_route(self.luid, Ipv4Addr::BROADCAST, 32) {
+            problems.push(e.to_string());
         }
-        self.sync_lan_routes(&mut problems);
         // SAFETY: reading a plain union member of a copy.
         let ours = unsafe { self.luid.Value };
         match best_interface(Ipv4Addr::BROADCAST) {
@@ -552,41 +537,6 @@ impl Keeper {
             }
             self.said = now;
         }
-    }
-
-    /// A host route on the room adapter to the directed broadcast of every
-    /// other network this machine is on, so that a game which computes its
-    /// broadcast from the Wi-Fi's address — `192.168.1.255` — reaches the room
-    /// (whose pump makes it the room's broadcast) instead of the Wi-Fi. Like
-    /// the limited broadcast's, these take that one address from the real
-    /// network while the room is up; the pump passes on only the game's.
-    fn sync_lan_routes(&mut self, problems: &mut Vec<String>) {
-        let mut wanted: Vec<Ipv4Addr> = Vec::new();
-        for n in crate::lan_rebind::local_networks() {
-            if let Some(b) = n.broadcast() {
-                if !wanted.contains(&b) {
-                    wanted.push(b);
-                }
-            }
-        }
-        for b in &wanted {
-            match ensure_route(self.luid, *b, 32) {
-                Ok(()) => {
-                    if !self.lan_routes.contains(b) {
-                        self.lan_routes.push(*b);
-                    }
-                }
-                Err(e) => problems.push(e.to_string()),
-            }
-        }
-        let luid = self.luid;
-        self.lan_routes.retain(|b| {
-            let keep = wanted.contains(b);
-            if !keep {
-                delete_route(luid, *b, 32);
-            }
-            keep
-        });
     }
 }
 

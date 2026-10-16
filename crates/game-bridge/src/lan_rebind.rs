@@ -102,8 +102,8 @@ pub struct Survey {
     pub locals: Vec<Ipv4Addr>,
     /// The directed broadcast of every other network this machine is on. A
     /// game that computes its broadcast from the Wi-Fi's address sends to one
-    /// of these, and the adapter brings it to the room (Windows by route,
-    /// Linux by mirroring it); the pump makes it the room's broadcast.
+    /// of these; on Linux the adapter brings a copy to the room
+    /// (`linux_capture.rs`), and the pump makes it the room's broadcast.
     pub broadcasts: Vec<Ipv4Addr>,
     pub rebound: Vec<Rebound>,
 }
