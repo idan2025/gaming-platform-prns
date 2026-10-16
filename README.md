@@ -23,7 +23,7 @@ account, no port forwarding, no central service, and no internet required.
 > | 5 | More games | started — TCP games over a link's channel; Half-Life, CS 1.6 and Team Fortress 2 added as data with no Rust change; multi-port games (game + RCON + SourceTV on one destination) and a port set per hosted instance; a GoldSrc node image, so Counter-Strike 1.6 and Half-Life actually host; Day of Defeat, TFC and Opposing Force as packs; a Source node image, so Team Fortress 2, Counter-Strike: Source, Garry's Mod, HL2: Deathmatch, DoD: Source and Left 4 Dead 2 host, and six non-Valve Source games |
 > | Mode 3 | LAN rooms | started — a virtual LAN over Reticulum for games that only find each other by LAN broadcast (`PLAN.md` §14): rooms, a Linux and a Windows adapter, OpenTTD played end to end, rooms in the launcher, a room check that says what failed, and Need for Speed: Underground 2 and Most Wanted (2005) as packs |
 >
-> Current release: **v0.2.42**. What changed, release by release, is in
+> Current release: **v0.2.43**. What changed, release by release, is in
 > [`RELEASE.md`](RELEASE.md); building and tagging one is in there too.
 >
 > The working single-host implementation this generalizes is
@@ -205,6 +205,10 @@ the launcher as soon as it starts (v0.2.12). Every binary also answers
 Full notes per release are in [`RELEASE.md`](RELEASE.md); this is the shape of
 the last three.
 
+- **v0.2.43** — LAN rooms send a game's broadcasts through the room on
+  Windows even with Hamachi, Radmin or ZeroTier installed, and on Linux
+  even when a game or Wine ties itself to the Wi-Fi; casting, printer and
+  NAS discovery on the home network keep working while a room is up.
 - **v0.2.42** — Lanthorn reads controllers itself on Linux for big screen
   mode. Lanthorn Host keeps game servers apart from each other on the
   machine and can hold each to a disk limit. An index places servers by
@@ -215,10 +219,6 @@ the last three.
   and sharing them over Reticulum with no internet. Chat on servers for
   players who joined through Lanthorn. Invite links that open from any
   chat, Install with Steam with its progress, and Left 4 Dead 2.
-- **v0.2.40** — Lanthorn has chat and names in LAN rooms, a Games page
-  that installs packs from a repository you add, hosting a server you run on
-  this computer, and a welcome screen; notifications stay quiet over a
-  fullscreen game on Windows. Lanthorn Host adds games from a repository.
 
 ## The idea
 

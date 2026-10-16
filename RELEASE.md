@@ -74,6 +74,34 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.43
+
+### LAN room traffic leaves through the room
+
+- **Windows:** a game's broadcasts now go through the room even on a
+  computer with Hamachi, Radmin VPN or ZeroTier installed. Before, the room
+  tied with those adapters and lost, and the room check said "a broadcast to
+  255.255.255.255 did not go through the room's adapter". Windows already
+  has a broadcast route on every adapter, so the helper's own route was
+  never added; it now takes over the existing one and keeps it while the
+  room is up. Only that broadcast moves to the room: casting, printer and
+  NAS discovery on the home network keep working.
+- **Linux:** some broadcasts never look at routes at all: one sent from the
+  Wi-Fi's address, one sent to the Wi-Fi's own network, and anything from a
+  game Wine ties to the Wi-Fi. Lanthorn now copies those into the room with
+  traffic-control rules that exist only while the room is up and are removed
+  when it ends, even if starting it fails partway.
+- **Both:** a game that works out a `/24` broadcast address inside the
+  room's `/16`, or sends to its own network's broadcast address, now
+  reaches the room, and replies to a search sent from another address find
+  their way back. A member never sends a packet that is not from its own
+  address, and system discovery (mDNS, SSDP, Steam) from the home network is
+  never passed on to the room, whatever a game's pack allows.
+- **Games with unpredictable ports** (both Need for Speed packs) no longer
+  carry this machine's own name lookups and discovery broadcasts (NetBIOS,
+  SSDP, mDNS) to the other players. A pack that names such a port itself
+  still gets it.
+
 ## v0.2.42
 
 ### A disk limit per server
