@@ -77,7 +77,12 @@ pub struct LanPolicy {
 
 impl LanPolicy {
     fn declares(&self, proto: LanProto, port: u16) -> bool {
-        self.any || self.ports.iter().any(|p| p.proto == proto && p.port == port)
+        self.any || self.lists(proto, port)
+    }
+
+    /// Whether the pack names `port` itself, rather than opening it by `any`.
+    fn lists(&self, proto: LanProto, port: u16) -> bool {
+        self.ports.iter().any(|p| p.proto == proto && p.port == port)
     }
 }
 
@@ -206,7 +211,16 @@ impl LanFilter {
             // rare enough that sending it is not worth a table.
             return match (lan_proto(p.protocol), p.ports) {
                 (Some(proto), Some((sport, dport))) => {
-                    let allowed = self.admits(proto, dport);
+                    // `any` opens a game's unpredictable ports, not the
+                    // operating system's own broadcasts: with it, this
+                    // machine's NetBIOS, SSDP and mDNS — which the room's
+                    // broadcast route sends here — would name it to every
+                    // member. A pack that lists such a port still has it.
+                    let allowed = if is_os_chatter(dport) {
+                        self.policy.lists(proto, dport)
+                    } else {
+                        self.admits(proto, dport)
+                    };
                     if allowed {
                         // A search is a broadcast, and its answers are
                         // unicasts from whoever heard it — OpenTTD's LAN
@@ -654,6 +668,24 @@ mod tests {
         let now = Instant::now();
         assert!(f.inbound(&tcp(PEER, 1, ME, 22), now));
         assert!(f.outbound(&udp(ME, 1, Ipv4Addr::BROADCAST, 2), &RoomSubnet::default(), now));
+    }
+
+    /// The room's broadcast route brings this machine's own NetBIOS, SSDP and
+    /// mDNS to the adapter; `any` must not send them to every member.
+    #[test]
+    fn any_never_broadcasts_the_operating_systems_chatter() {
+        let s = RoomSubnet::default();
+        let now = Instant::now();
+        let mut f = LanFilter::new(LanPolicy { ports: Vec::new(), any: true });
+        assert!(!f.outbound(&udp(ME, 137, Ipv4Addr::BROADCAST, 137), &s, now), "NetBIOS");
+        assert!(!f.outbound(&udp(ME, 5353, Ipv4Addr::new(224, 0, 0, 251), 5353), &s, now), "mDNS");
+        assert!(f.outbound(&udp(ME, 4000, Ipv4Addr::BROADCAST, 4000), &s, now), "the game's own");
+        // A pack that names a chatter port still has it.
+        let mut f = LanFilter::new(LanPolicy {
+            ports: vec![LanPort { proto: LanProto::Udp, port: 1900 }],
+            any: true,
+        });
+        assert!(f.outbound(&udp(ME, 1900, Ipv4Addr::new(239, 255, 255, 250), 1900), &s, now));
     }
 
     #[test]

@@ -245,9 +245,23 @@ impl WintunDevice {
         let shared = Arc::new(Shared { api, adapter, session, quit });
         let (tx, rx) = mpsc::channel(READ_QUEUE);
         let reader_shared = shared.clone();
-        let reader = std::thread::Builder::new()
+        let reader = match std::thread::Builder::new()
             .name("wintun-reader".into())
-            .spawn(move || read_loop(&reader_shared, &tx))?;
+            .spawn(move || read_loop(&reader_shared, &tx))
+        {
+            Ok(reader) => reader,
+            Err(e) => {
+                // No device yet to drop: undo what it would have.
+                // SAFETY: the handles are live and nothing else uses them;
+                // the closure holding the other reference was never run.
+                unsafe {
+                    (shared.api.end_session)(shared.session);
+                    (shared.api.close_adapter)(shared.adapter);
+                    CloseHandle(shared.quit);
+                }
+                return Err(e);
+            }
+        };
         let mut device =
             Self { shared, packets: tokio::sync::Mutex::new(rx), reader: Some(reader), keeper: None };
         // The session is up, so Windows now sees the adapter connected: the
@@ -474,7 +488,13 @@ fn ensure_route(luid: NET_LUID_LH, prefix: Ipv4Addr, len: u8) -> io::Result<()> 
         if r != NO_ERROR && r != ERROR_NOT_FOUND {
             return check(r, &format!("replacing {what}"));
         }
-        check(CreateIpForwardEntry2(&wanted), &format!("adding {what}"))
+        let r = CreateIpForwardEntry2(&wanted);
+        if r == ERROR_OBJECT_ALREADY_EXISTS {
+            // Windows made its own again in the gap. Not worth failing a room
+            // over: the keeper sets its metric on the next pass.
+            return Ok(());
+        }
+        check(r, &format!("adding {what}"))
     }
 }
 

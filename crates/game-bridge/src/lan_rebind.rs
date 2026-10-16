@@ -207,9 +207,19 @@ impl Rebinder {
         }
         let dst = crate::lan::ipv4_endpoints(packet).map_or(dst, |(_, d)| d);
         if let Some((proto, sport, dport)) = transport(packet) {
-            let pinned = proto == LanProto::Udp && self.pinned.as_ref().is_some_and(|p| p(sport));
+            let broadcast = subnet.is_broadcast(dst);
+            // Probing takes a socket and a bind; a flow already knows.
+            let known = if broadcast {
+                self.searches.get(&(proto, sport, dport))
+            } else {
+                self.flows.get(&(proto, sport, dst, dport))
+            };
+            let pinned = match known {
+                Some(f) if f.to == src => f.pinned,
+                _ => proto == LanProto::Udp && self.pinned.as_ref().is_some_and(|p| p(sport)),
+            };
             let flow = Flow { to: src, pinned, seen: now };
-            if subnet.is_broadcast(dst) {
+            if broadcast {
                 if !self.searches.contains_key(&(proto, sport, dport))
                     && self.searches.len() >= MAX_FLOWS
                 {
@@ -1120,6 +1130,29 @@ mod tests {
         assert!(verifies(&marked));
         let tcp = with_transport(PEER, ROOM, PROTO_TCP, 50000, 9900);
         assert_eq!(r.inbound(&tcp, ROOM, now).unwrap()[1], 0, "not pinned, not marked");
+    }
+
+    /// Whether a socket is pinned is asked once per flow, not per packet: each
+    /// asking is a socket and a bind on the pump's path.
+    #[test]
+    fn a_flow_is_probed_for_pinning_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut r = rebinder();
+        let counter = asked.clone();
+        r.pinned = Some(Box::new(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            true
+        }));
+        let now = Instant::now();
+        for _ in 0..3 {
+            let mut out = with_transport(WIFI, PEER, PROTO_UDP, 3658, 50000);
+            assert!(r.outbound(&mut out, ROOM, &SUBNET, now).source);
+        }
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        let reply = with_transport(PEER, ROOM, PROTO_UDP, 50000, 3658);
+        assert_eq!(r.inbound(&reply, ROOM, now).unwrap()[1], PINNED_DSCP << 2, "still pinned");
     }
 
     #[test]
