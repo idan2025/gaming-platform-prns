@@ -40,7 +40,7 @@ use platform_agent::uplink::CONTROL_ENDPOINT_ID;
 use platform_agent::uplink_wire::{
     decode_response, encode_request, parse_payload, payload_bytes, CapacityResp, CreateReq,
     InstanceReq, ListResp, TokenReq, OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_LIST, OP_REMOVE,
-    OP_STOP, OP_VERIFY,
+    OP_START, OP_STOP, OP_VERIFY,
 };
 use platform_auth::{answer_challenge, Challenge, ChallengeResponse, Session};
 
@@ -96,6 +96,12 @@ impl AgentClient {
         let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
         let body = self.signed_op(agent, OP_STOP, &payload_bytes(&req)?).await?;
         expect_empty(&body, OP_STOP)
+    }
+
+    pub async fn start(&self, agent: DestinationHash, instance_id: &str) -> Result<()> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_START, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_START)
     }
 
     pub async fn remove(&self, agent: DestinationHash, instance_id: &str) -> Result<()> {
@@ -262,7 +268,7 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
-        OP_STOP | OP_REMOVE => {
+        OP_STOP | OP_START | OP_REMOVE => {
             let mut r: InstanceReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))

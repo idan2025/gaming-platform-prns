@@ -58,6 +58,8 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/hosting", get(hosting_info))
         .route("/instances", get(my_instances).post(deploy))
         .route("/instances/:id", axum::routing::delete(destroy))
+        .route("/instances/:id/stop", post(stop))
+        .route("/instances/:id/start", post(start))
         .with_state(state)
 }
 
@@ -294,6 +296,48 @@ async fn destroy(
         // "no such instance" covers both missing and not-yours, so this cannot
         // be used to enumerate other people's instances.
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+/// Stop one of the caller's own servers. Its files and address stay.
+async fn stop(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .stop(&account, &id)
+        .await
+        .map(|()| Json(json!({ "stopped": id })))
+        .map_err(owner_op_failure)
+}
+
+/// Start one of the caller's own stopped servers again.
+async fn start(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .start(&account, &id)
+        .await
+        .map(|()| Json(json!({ "started": id })))
+        .map_err(owner_op_failure)
+}
+
+/// "no such instance" covers both missing and not-yours and is a 404, so
+/// these routes cannot be used to enumerate other people's instances either;
+/// anything else (already running, a node that refused) is the caller's to
+/// read.
+fn owner_op_failure(e: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    if format!("{e:#}") == "no such instance" {
+        fail(StatusCode::NOT_FOUND, e)
+    } else {
+        fail(StatusCode::BAD_REQUEST, e)
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {

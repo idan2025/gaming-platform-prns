@@ -27,12 +27,13 @@
 //!
 //! # Reach, honestly
 //!
-//! An agent's API is loopback-only and refuses to bind anything else, because it
-//! creates containers and has no authentication. So an index can only drive
-//! agents it shares a host with. **Multi-node needs the agent uplink over
-//! Reticulum** (`PLAN.md` §8 phase 4), which is not built. Telling operators to
-//! expose the agent to the network instead would trade the whole authentication
-//! story for a shortcut.
+//! An agent's HTTP API is loopback-only and refuses to bind anything else,
+//! because it creates containers and has no authentication. A node on another
+//! machine is driven over its Reticulum uplink instead (`NodeConfig::agent`,
+//! `agent_client.rs`), which authenticates this index and is checked against
+//! the node's `trusted_indexes` on every op. Telling operators to expose the
+//! agent's HTTP API to the network instead would trade the whole
+//! authentication story for a shortcut.
 
 
 use std::sync::Arc;
@@ -463,27 +464,55 @@ impl Hosting {
         })
     }
 
-    /// Stop and remove one of the caller's own instances.
+    /// One of the caller's own instances, and the node holding it.
     ///
     /// Ownership is checked against the node's label, not against anything this
     /// index remembers, so a restarted index still enforces it correctly.
-    pub async fn destroy(&self, account: &AccountId, instance_id: &str) -> Result<()> {
+    async fn owned(&self, account: &AccountId, instance_id: &str) -> Result<(HostedInstance, &NodeConfig)> {
         let all = self.all_instances().await?;
         let found = all
-            .iter()
+            .into_iter()
             .find(|i| i.instance_id == instance_id)
             // Not found and not yours are the same answer on purpose: a
             // different one would let anyone enumerate other people's
             // instances by watching which ids come back "forbidden".
             .filter(|i| i.owner.as_deref() == Some(account.0.as_str()))
             .ok_or_else(|| anyhow!("no such instance"))?;
-
         let node = self
             .config
             .nodes
             .iter()
             .find(|n| n.name == found.node)
             .ok_or_else(|| anyhow!("the node holding it is no longer configured"))?;
+        Ok((found, node))
+    }
+
+    /// Stop one of the caller's own instances. Its files, ports and address
+    /// stay; [`start`](Self::start) brings it back.
+    pub async fn stop(&self, account: &AccountId, instance_id: &str) -> Result<()> {
+        let (_, node) = self.owned(account, instance_id).await?;
+        self.stop_on(node, instance_id).await
+    }
+
+    /// Start one of the caller's own stopped instances again, on the node that
+    /// holds it, with the same files, ports and mesh address.
+    ///
+    /// No quota admission: a stopped instance already counts against its
+    /// account (`Quotas::held_by` counts every instance the nodes report), so
+    /// starting it takes nothing new. A running one is refused, here and again
+    /// by the node, so "start" can never restart a server out from under its
+    /// players.
+    pub async fn start(&self, account: &AccountId, instance_id: &str) -> Result<()> {
+        let (found, node) = self.owned(account, instance_id).await?;
+        if found.state == "running" {
+            return Err(anyhow!("it is already running"));
+        }
+        self.start_on(node, instance_id).await
+    }
+
+    /// Stop and remove one of the caller's own instances.
+    pub async fn destroy(&self, account: &AccountId, instance_id: &str) -> Result<()> {
+        let (_, node) = self.owned(account, instance_id).await?;
 
         // Remote agent over Reticulum: ask it to remove the instance. Ownership
         // was just checked against the label the agent itself reported, so a
@@ -538,6 +567,41 @@ impl Hosting {
         let response = self.http.post(&url).send().await.context("asking the node")?;
         if !response.status().is_success() {
             return Err(anyhow!("the node refused to stop it"));
+        }
+        Ok(())
+    }
+
+    /// Ask one node to start one stopped instance, on whichever transport it
+    /// uses. A node whose agent predates the op says so in words an operator
+    /// can act on, rather than "unknown op".
+    async fn start_on(&self, node: &NodeConfig, instance_id: &str) -> Result<()> {
+        let too_old = || anyhow!("node {} runs an agent too old to start a stopped server; update it", node.name);
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client = self
+                .agent_client()
+                .await
+                .ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            return match client.start(dest, instance_id).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => Err(too_old()),
+                other => other.with_context(|| format!("asking agent {} to start it", node.name)),
+            };
+        }
+        let url = format!(
+            "{}/instances/{}/start",
+            node.api.trim_end_matches('/'),
+            instance_id
+        );
+        let response = self.http.post(&url).send().await.context("asking the node")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            || response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            return Err(too_old());
+        }
+        if !response.status().is_success() {
+            let detail: serde_json::Value = response.json().await.unwrap_or_default();
+            let msg = detail["error"].as_str().unwrap_or("the node refused to start it");
+            return Err(anyhow!("{msg}"));
         }
         Ok(())
     }

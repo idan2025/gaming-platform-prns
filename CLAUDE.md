@@ -96,7 +96,16 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   `spec.owner` from it and stamps `OWNER_LABEL` unchanged. The authenticated
   index is trusted to assert it; the agent does not overwrite it with the
   caller's identity. Pinned by
-  `an_index_creates_lists_stops_and_removes_on_a_remote_agent`.
+  `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
+
+- **An owner stops and starts their own server through the index**
+  (`POST /instances/:id/stop` and `/start`, uplink `OP_START`), checked
+  against the node's owner label like destroy, and "not yours" is the same
+  404 as "missing". **Start is never a restart**: a running server is refused
+  by the index and again by the node (`Agent::start`), so it can never drop
+  players. Starting takes no quota, because a stopped server already counts.
+  An agent too old for `OP_START` is named as such. Pinned by
+  `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
 
 **`StreamRelay` is built** (2026-08-31, `crates/game-bridge/src/stream.rs`): a
 pack declaring `transport = "tcp"` runs. It rides the link's **channel**, not

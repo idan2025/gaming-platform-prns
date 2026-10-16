@@ -251,6 +251,20 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_START => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_START, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_START, &msg);
+            }
+            match state.agent.start(&req.instance_id).await {
+                Ok(()) => encode_ok(OP_START, &[]),
+                Err(e) => encode_err(OP_START, &format!("{e:#}")),
+            }
+        }
+
         OP_REMOVE => {
             let req: InstanceReq = match parse_payload(body) {
                 Ok(r) => r,

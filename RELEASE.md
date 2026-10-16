@@ -76,6 +76,14 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### Stop and start a hosted server
+
+- Someone running a server through an index can now stop it and start it
+  again (`POST /instances/:id/stop`, `POST /instances/:id/start`), with the
+  same files, ports and address. Start never restarts a server that is
+  already running. A node needs this version of the agent for start over
+  the mesh; an older one is named as needing an update.
+
 ### Controllers on Linux
 
 - Big screen mode now works with a gamepad on Linux even where the system's

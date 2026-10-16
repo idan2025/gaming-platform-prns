@@ -323,3 +323,29 @@ async fn destroying_someone_elses_instance_is_indistinguishable_from_a_missing_o
         .unwrap();
     assert_eq!(missing.status(), 404);
 }
+
+/// Stop and start answer a missing instance and someone else's the same way
+/// as destroy does, so neither route can enumerate other people's servers.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_or_starting_someone_elses_instance_is_indistinguishable_from_a_missing_one() {
+    let (addr, index_key) =
+        serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let token = token_for(addr, &index_key, &key(1)).await;
+    let client = reqwest::Client::new();
+
+    for op in ["stop", "start"] {
+        let res = client
+            .post(format!("http://{addr}/instances/does-not-exist/{op}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404, "{op}");
+        let unauthenticated = client
+            .post(format!("http://{addr}/instances/does-not-exist/{op}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), 401, "{op} without a session");
+    }
+}
