@@ -71,6 +71,10 @@ content_root = "/game"
 content_version = "5.26"
 memory_limit_bytes = 2147483648
 cpus = 1.5
+# Most one server may keep in its own files (saves, logs, maps it downloaded).
+# Over it, the server is stopped and will not start until it is back under;
+# nothing is deleted. Absent means no limit.
+writable_limit_bytes = 5368709120
 
 # Counter-Strike 1.6 and Half-Life are the same steamcmd app (90) and the same
 # image; the mod directory is a start argument, so it is env here rather than a
