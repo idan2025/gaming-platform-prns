@@ -80,6 +80,12 @@ pub struct NodeConfig {
     /// `agent_client` (`PLAN.md` §8 phase 4); `api` is the loopback fallback.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Which nodes to fill first. Among nodes with room, a higher priority
+    /// always wins; equal ones go to whichever has the most free memory, then
+    /// the most free slots. Default 0, so an overflow node (a home machine
+    /// behind a rented one) is the one with a lower number.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 /// The quota knobs, as an operator writes them.
@@ -662,10 +668,10 @@ impl Hosting {
     /// unreachable node is the least attractive place to put something, and
     /// "silence means room" is how an outage becomes a pile-up.
     async fn pick_node(&self, existing: &[HostedInstance]) -> Option<&NodeConfig> {
-        let mut best: Option<(&NodeConfig, (u8, usize))> = None;
+        let mut best: Option<(&NodeConfig, Rank)> = None;
         for node in &self.config.nodes {
             let here = existing.iter().filter(|i| i.node == node.name).count();
-            let Some(ranked) = rank_node(self.node_capacity(node).await, here) else {
+            let Some(ranked) = rank_node(self.node_capacity(node).await, here, node.priority) else {
                 continue;
             };
             if best.is_none_or(|(_, current)| ranked > current) {
@@ -729,20 +735,37 @@ fn record_for(instance: &HostedInstance, now: SystemTime) -> InstanceRecord {
     }
 }
 
+/// A node reporting less free memory than this is full, whatever its slot
+/// count says: a game server needs about a gigabyte, and a node that starts
+/// one with less swaps or kills something.
+pub const MIN_FREE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// `(answered, priority, free memory in MiB, free slots)`, compared in that
+/// order. Higher is better.
+type Rank = (u8, i32, u64, usize);
+
 /// How attractive a node is to place on. Higher is better; `None` means skip.
 ///
-/// The tuple is `(answered, free)` so that **a reported figure always beats a
-/// guess**: a node that told us it has one slot left outranks a node that said
-/// nothing, however empty the index believes that one to be. Silence is not
-/// room, and treating it as room is how one unreachable node collects every
-/// create request during an outage.
-fn rank_node(capacity: Option<CapacityResp>, own_count: usize) -> Option<(u8, usize)> {
+/// **A reported figure always beats a guess**: `answered` comes first, so a
+/// node that told us it has one slot left outranks a node that said nothing,
+/// however empty the index believes that one to be, whatever its priority.
+/// Silence is not room, and treating it as room is how one unreachable node
+/// collects every create request during an outage. Among nodes that answered,
+/// the operator's priority decides, then free memory (an older agent that
+/// does not report it counts as none), then free slots.
+fn rank_node(capacity: Option<CapacityResp>, own_count: usize, priority: i32) -> Option<Rank> {
     match capacity {
         // Full is full. Picking it would pass quota admission and then fail the
         // create, after the user has been told a node was chosen.
         Some(cap) if cap.running >= cap.max_instances => None,
-        Some(cap) => Some((1, cap.max_instances - cap.running)),
-        None => Some((0, usize::MAX - own_count)),
+        Some(cap) if cap.memory_available_bytes.is_some_and(|m| m < MIN_FREE_MEMORY_BYTES) => None,
+        Some(cap) => Some((
+            1,
+            priority,
+            cap.memory_available_bytes.unwrap_or(0) / (1024 * 1024),
+            cap.max_instances - cap.running,
+        )),
+        None => Some((0, priority, 0, usize::MAX - own_count)),
     }
 }
 
@@ -769,6 +792,7 @@ mod tests {
             games: vec!["sven-coop".to_string()],
             nodes: vec![NodeConfig {
                 agent: None,
+                priority: 0,
                 name: "local".to_string(),
                 api: "http://127.0.0.1:4750".to_string(),
             }],
@@ -905,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_is_picked_by_load() {
         let mut c = config();
-        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None });
+        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0 });
         let h = Hosting::new(c);
         let existing = vec![HostedInstance {
             instance_id: "a".into(),
@@ -999,30 +1023,63 @@ mod tests {
             running,
             port_range_start: 27100,
             port_range_end: 27199,
+            memory_total_bytes: None,
+            memory_available_bytes: None,
+            cpus: None,
         }
+    }
+
+    fn with_memory(mut cap: CapacityResp, gib_free: u64) -> CapacityResp {
+        cap.memory_total_bytes = Some(16 << 30);
+        cap.memory_available_bytes = Some(gib_free << 30);
+        cap
+    }
+
+    /// A node that says it is nearly out of memory is full, whatever its slot
+    /// count; the most free memory wins among the rest; and the operator's
+    /// priority wins over both, so a home machine set lower only takes what
+    /// the rented one cannot. None of it lets a silent node jump the queue.
+    #[test]
+    fn placement_follows_priority_then_memory_and_silence_still_loses() {
+        assert_eq!(rank_node(Some(with_memory(cap(0, 8), 0)), 0, 0), None, "under 1 GiB free is full");
+        assert!(
+            rank_node(Some(with_memory(cap(6, 8), 10)), 0, 0) > rank_node(Some(with_memory(cap(0, 8), 2)), 0, 0),
+            "more free memory wins over more free slots"
+        );
+        assert!(
+            rank_node(Some(with_memory(cap(0, 8), 2)), 0, 0) > rank_node(Some(cap(0, 8)), 0, 0),
+            "a node that reports memory beats one that does not"
+        );
+        let rented = rank_node(Some(with_memory(cap(5, 8), 2)), 0, 10);
+        let home = rank_node(Some(with_memory(cap(0, 8), 12)), 0, 0);
+        assert!(rented > home, "priority comes first among nodes that answered");
+        assert!(
+            rank_node(Some(with_memory(cap(7, 8), 1)), 0, -5) > rank_node(None, 0, 100),
+            "silence is not room, whatever its priority"
+        );
     }
 
     /// The whole reason placement asks: a full node must not be chosen and then
     /// fail the create.
     #[test]
     fn a_full_node_is_skipped_rather_than_picked() {
-        assert_eq!(rank_node(Some(cap(4, 4)), 0), None);
-        assert_eq!(rank_node(Some(cap(5, 4)), 0), None, "over its own limit is still full");
-        assert!(rank_node(Some(cap(3, 4)), 0).is_some());
+        assert_eq!(rank_node(Some(cap(4, 4)), 0, 0), None);
+        assert_eq!(rank_node(Some(cap(5, 4)), 0, 0), None, "over its own limit is still full");
+        assert!(rank_node(Some(cap(3, 4)), 0, 0).is_some());
     }
 
     /// A node that answered outranks one that did not, even when the index
     /// believes the silent one is emptier. Silence is not room.
     #[test]
     fn a_reported_figure_beats_a_guess() {
-        let answered = rank_node(Some(cap(3, 4)), 99).expect("has one slot");
-        let silent = rank_node(None, 0).expect("unknown, not full");
+        let answered = rank_node(Some(cap(3, 4)), 99, 0).expect("has one slot");
+        let silent = rank_node(None, 0, 0).expect("unknown, not full");
         assert!(answered > silent, "{answered:?} should outrank {silent:?}");
     }
 
     #[test]
     fn among_nodes_that_answered_the_emptiest_wins() {
-        assert!(rank_node(Some(cap(1, 8)), 0) > rank_node(Some(cap(6, 8)), 0));
+        assert!(rank_node(Some(cap(1, 8)), 0, 0) > rank_node(Some(cap(6, 8)), 0, 0));
     }
 
     #[test]

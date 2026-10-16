@@ -85,6 +85,14 @@ is missing, which makes pushing a tag sufficient on its own.
   recreated, and keep working until then. Keeping game servers off your home
   network is still the host firewall's job (`HOSTING.md`).
 
+### Placement by memory, and node priority
+
+- A node now reports its memory and CPUs, and an index places a new server
+  on the node with the most free memory, after the operator's `priority`
+  (`[[nodes]] priority`, higher first): a rented machine can take servers
+  first and a home machine only the overflow. A node with under 1 GiB free
+  is treated as full.
+
 ### Stop and start a hosted server
 
 - Someone running a server through an index can now stop it and start it

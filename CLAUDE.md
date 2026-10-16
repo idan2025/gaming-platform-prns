@@ -90,7 +90,11 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   *behind* every node that answered. Treating no answer as an empty node is how
   one unreachable node collects every create during an outage. `Agent::capacity`
   is shared by the uplink and `GET /capacity`, so the two surfaces cannot
-  disagree.
+  disagree. Among nodes that answered (2026-10-16): the operator's
+  `priority`, then free memory (`MemAvailable`, reported by the node;
+  unreported counts as none), then free slots, and a node under
+  `MIN_FREE_MEMORY_BYTES` free is full. Priority never lifts a silent node
+  (`placement_follows_priority_then_memory_and_silence_still_loses`).
 - **The owner stamped over the uplink is the end-user's identity, not the
   index's.** The create request carries the user's identity hash; the agent sets
   `spec.owner` from it and stamps `OWNER_LABEL` unchanged. The authenticated

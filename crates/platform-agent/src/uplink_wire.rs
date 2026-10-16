@@ -137,6 +137,17 @@ pub struct CapacityResp {
     pub running: usize,
     pub port_range_start: u16,
     pub port_range_end: u16,
+    /// The machine's memory, and how much of it is free for more servers
+    /// (`MemAvailable`), as the node reads them. Absent from an older agent
+    /// and on a system that does not say, which an index reads as "not
+    /// reported", never as room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    /// CPUs this agent may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
 }
 
 // ---- Envelope encode/decode -------------------------------------------------

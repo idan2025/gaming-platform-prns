@@ -25,6 +25,11 @@ api = "http://127.0.0.1:4750"
 # name = "eu-1"
 # api = "http://127.0.0.1:4750"   # unused while `agent` is set
 # agent = "<32 hex chars: the agent's platform-agent.control destination>"
+# priority = 10   # filled first; a node with a lower number takes the overflow
+#
+# Placement: among nodes with room, the highest priority wins, then the most
+# free memory, then the most free slots. A node that reports under 1 GiB free
+# is full, and a node that does not answer is always last.
 
 [quota]
 max_instances_per_account = 3

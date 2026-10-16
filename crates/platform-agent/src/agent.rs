@@ -1490,11 +1490,15 @@ impl Agent {
                 instances.iter().filter(|i| i.state == InstanceState::Running).count()
             })
             .unwrap_or(0);
+        let memory = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| parse_meminfo(&m));
         CapacityResp {
             max_instances: self.config.max_instances,
             running,
             port_range_start: self.config.port_range.start,
             port_range_end: self.config.port_range.end,
+            memory_total_bytes: memory.map(|(total, _)| total),
+            memory_available_bytes: memory.map(|(_, available)| available),
+            cpus: std::thread::available_parallelism().ok().and_then(|n| u32::try_from(n.get()).ok()),
         }
     }
 
@@ -3188,6 +3192,35 @@ pub struct NodeChatLine {
     pub host: bool,
     pub text: String,
     pub at_unix: u64,
+}
+
+/// `MemTotal` and `MemAvailable` from `/proc/meminfo`, in bytes. Available,
+/// not free: the kernel's own estimate of what new work can use without
+/// swapping, page cache included.
+fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|kb| kb * 1024)
+    };
+    Some((field("MemTotal")?, field("MemAvailable")?))
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::parse_meminfo;
+
+    /// Placement reads the node's memory from the kernel's own figures; a
+    /// system that does not report `MemAvailable` reports nothing at all
+    /// rather than a guess.
+    #[test]
+    fn memory_is_read_from_meminfo_and_never_guessed() {
+        let text = "MemTotal:       16052940 kB\nMemFree:         7116948 kB\nMemAvailable:   14735260 kB\n";
+        assert_eq!(parse_meminfo(text), Some((16052940 * 1024, 14735260 * 1024)));
+        assert_eq!(parse_meminfo("MemTotal:       16052940 kB\nMemFree:  1 kB\n"), None);
+    }
 }
 
 #[cfg(test)]
