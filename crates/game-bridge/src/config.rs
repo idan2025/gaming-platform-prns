@@ -25,6 +25,13 @@ pub struct ServerArgs {
     pub game_host: String,
     /// Port the real game server listens on.
     pub game_port: u16,
+    /// Where each of the pack's extra ports (`GAMES.md` §3) is reached on
+    /// `game_host`, keyed by channel. A channel with no entry is at the pack's
+    /// own number, which is right for a game on this machine; a node reaches
+    /// its games through the host ports it published them on, which are the
+    /// node's numbers, not the pack's.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub extra_game_ports: std::collections::BTreeMap<u8, u16>,
     /// Where to persist the server identity. Generated on first run.
     pub identity: PathBuf,
     /// Optional TCP interface, e.g. `0.0.0.0:4234` to bind one, or
@@ -83,6 +90,7 @@ impl ServerArgs {
             profile,
             game_host: "127.0.0.1".to_string(),
             game_port,
+            extra_game_ports: std::collections::BTreeMap::new(),
             identity: PathBuf::from("./game-bridge-server.identity"),
             tcp: None,
             auto: false,

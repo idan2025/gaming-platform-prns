@@ -76,6 +76,15 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### Game servers kept apart on a node
+
+- Every game server now runs on its own Docker network, `gpp-games`, where it
+  cannot reach any other server or container on the machine. Each also runs
+  without Linux capabilities, can never gain one, and has a ceiling of 512
+  processes. Servers created before this move onto it when they are next
+  recreated, and keep working until then. Keeping game servers off your home
+  network is still the host firewall's job (`HOSTING.md`).
+
 ### Stop and start a hosted server
 
 - Someone running a server through an index can now stop it and start it
