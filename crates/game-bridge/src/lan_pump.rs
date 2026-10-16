@@ -34,7 +34,25 @@ pub async fn pump<D>(device: Arc<D>, room: Arc<LanSession>, policy: LanPolicy) -
 where
     D: PacketDevice + Send + Sync + 'static,
 {
-    pump_surveying(device, room, policy, crate::lan_rebind::survey).await
+    pump_with(device, room, policy, Rebinder::default(), crate::lan_rebind::survey).await
+}
+
+/// [`pump`] for the room adapter named `adapter`, which lets the survey tell a
+/// game socket pinned to another interface (Wine's UDP) from one that is not.
+pub async fn pump_on<D>(
+    device: Arc<D>,
+    room: Arc<LanSession>,
+    policy: LanPolicy,
+    adapter: &str,
+) -> io::Result<()>
+where
+    D: PacketDevice + Send + Sync + 'static,
+{
+    let name = adapter.to_string();
+    let survey = move |own: std::net::Ipv4Addr, ports: &[crate::lan_filter::LanPort]| {
+        crate::lan_rebind::survey_on(own, ports, Some(&name))
+    };
+    pump_with(device, room, policy, Rebinder::on_adapter(adapter), survey).await
 }
 
 /// [`pump`], looking for the game with `survey`: the machine's own, except
@@ -50,8 +68,22 @@ where
     D: PacketDevice + Send + Sync + 'static,
     S: Fn(std::net::Ipv4Addr, &[crate::lan_filter::LanPort]) -> crate::lan_rebind::Survey,
 {
+    pump_with(device, room, policy, Rebinder::default(), survey).await
+}
+
+async fn pump_with<D, S>(
+    device: Arc<D>,
+    room: Arc<LanSession>,
+    policy: LanPolicy,
+    rebinder: Rebinder,
+    survey: S,
+) -> io::Result<()>
+where
+    D: PacketDevice + Send + Sync + 'static,
+    S: Fn(std::net::Ipv4Addr, &[crate::lan_filter::LanPort]) -> crate::lan_rebind::Survey,
+{
     let filter = Mutex::new(LanFilter::new(policy.clone()));
-    let rebinder = Mutex::new(Rebinder::default());
+    let rebinder = Mutex::new(rebinder);
 
     // Both halves are futures of this one task, not a spawned one: dropping
     // the pump must close the device at once. A spawned half outlives an
@@ -66,18 +98,49 @@ where
             // A game that listens on another of this machine's addresses
             // also answers from it; the room only ever sees the room address
             // (`lan_rebind.rs`), so the filter and the watches do too.
+            //
+            // What the adapter brings in from the other networks — a socket
+            // pinned to the Wi-Fi, a broadcast to the Wi-Fi's own network —
+            // is translated the same way, and anything still not from this
+            // member's address after that is not this member's to send: a
+            // forwarding host's traffic, DHCP's `0.0.0.0`.
+            let subnet = room.subnet();
+            let mut translated = crate::lan_rebind::Outbound::default();
             if let Some(own) = room.own_address() {
-                rebinder.lock().expect("rebinder lock").outbound(&mut buf[..n], own, Instant::now());
+                translated = rebinder.lock().expect("rebinder lock").outbound(
+                    &mut buf[..n],
+                    own,
+                    &subnet,
+                    Instant::now(),
+                );
+                if crate::lan::ipv4_endpoints(&buf[..n]).is_some_and(|(src, _)| src != own) {
+                    debug!("a packet from another address than this member's; not sent into the room");
+                    continue;
+                }
+                // A broadcast the adapter copied from another network is any
+                // program's, and with `inbound = "any"` the filter would pass
+                // them all: mDNS and SSDP name this machine and what is on it.
+                // The operating system's own chatter never goes, whatever the
+                // pack says.
+                if translated.source && is_chatter_broadcast(&buf[..n], &subnet) {
+                    continue;
+                }
             }
             let packet = &buf[..n];
-            let subnet = room.subnet();
             let allowed = {
                 let mut f = filter.lock().expect("filter lock");
                 f.sync_extra(room.extra_ports());
                 f.outbound(packet, &subnet, Instant::now())
             };
             if !allowed {
-                // Only a broadcast is ever refused on the way out.
+                // Only a broadcast is ever refused on the way out. One the
+                // adapter brought from another network is as likely another
+                // program's as the game's (Steam's, a music player's), so it
+                // is not named as a port the pack lacks.
+                if translated.source {
+                    debug!("a broadcast from another network to a port the game did not declare; dropped");
+                    continue;
+                }
                 report_refused(room.refused_log().saw(
                     DropDirection::OutboundBroadcast,
                     packet,
@@ -146,14 +209,16 @@ where
         loop {
             tick.tick().await;
             let Some(own) = room.own_address() else { continue };
-            if policy.any {
-                // Every port is the game's; there is no list to look for.
-                continue;
-            }
-            let mut ports = policy.ports.clone();
-            for p in room.extra_ports().ports() {
-                if !ports.contains(&p) {
-                    ports.push(p);
+            // With `any`, every port is the game's and there is no list to
+            // look for; this machine's other addresses and networks are still
+            // needed, for what the adapter brings in from them.
+            let mut ports = Vec::new();
+            if !policy.any {
+                ports = policy.ports.clone();
+                for p in room.extra_ports().ports() {
+                    if !ports.contains(&p) {
+                        ports.push(p);
+                    }
                 }
             }
             let survey = survey(own, &ports);
@@ -182,6 +247,19 @@ where
     }
 }
 
+/// A UDP broadcast or multicast to a port operating systems chatter on.
+fn is_chatter_broadcast(packet: &[u8], subnet: &crate::lan::RoomSubnet) -> bool {
+    let Some((_, dst)) = crate::lan::ipv4_endpoints(packet) else { return false };
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    let first = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff == 0;
+    subnet.is_broadcast(dst)
+        && packet[9] == 17
+        && first
+        && packet
+            .get(ihl + 2..ihl + 4)
+            .is_some_and(|p| crate::lan_filter::is_os_chatter(u16::from_be_bytes([p[0], p[1]])))
+}
+
 /// Say once, in the log, that this machine left a member's connection
 /// unanswered (`lan_firewall.rs`). The launcher shows it from the watch.
 fn report_dropped(found: Vec<crate::lan_firewall::Dropped>) {
@@ -203,6 +281,37 @@ fn report_refused(new: Option<crate::lan_filter::Refused>) {
             port = r.suggested_port(),
             "the room refused {}: the game's pack does not list that port",
             r.describe()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn udp_to(dst: Ipv4Addr, dport: u16) -> Vec<u8> {
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&[198, 19, 0, 5]);
+        p[16..20].copy_from_slice(&dst.octets());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p
+    }
+
+    /// Another program's mDNS or SSDP, copied in from the Wi-Fi, never
+    /// reaches the room, even for a pack that admits every port.
+    #[test]
+    fn operating_system_chatter_is_never_a_broadcast_the_room_gets() {
+        let subnet = crate::lan::RoomSubnet::new(Ipv4Addr::new(198, 19, 0, 0), 16).unwrap();
+        assert!(is_chatter_broadcast(&udp_to(Ipv4Addr::new(224, 0, 0, 251), 5353), &subnet));
+        assert!(is_chatter_broadcast(&udp_to(Ipv4Addr::new(239, 255, 255, 250), 1900), &subnet));
+        assert!(is_chatter_broadcast(&udp_to(subnet.broadcast(), 27036), &subnet));
+        assert!(!is_chatter_broadcast(&udp_to(Ipv4Addr::BROADCAST, 9999), &subnet), "a game's");
+        assert!(
+            !is_chatter_broadcast(&udp_to(Ipv4Addr::new(198, 19, 0, 7), 5353), &subnet),
+            "a unicast is not a broadcast"
         );
     }
 }

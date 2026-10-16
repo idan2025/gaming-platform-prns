@@ -20,8 +20,18 @@
 //! Ethernet or Wi-Fi that is never a new adapter — which is why Hamachi users
 //! were told to lower its metric by hand, and why an old game on a virtual LAN
 //! so often "finds no games". [`configure`] sets this adapter's interface metric
-//! to 1 and adds its own host route to `255.255.255.255`, and
-//! `tests/lan_wintun.rs` proves a limited broadcast leaves through it.
+//! to 1 and gives its own route to `255.255.255.255` route metric 0
+//! ([`ensure_route`]: Windows has already made one, at 256, and taking "already
+//! exists" for success once left the room tied with any network pinned to
+//! metric 1). A [`Keeper`] re-applies both while the room is up and checks
+//! Windows' own choice of interface. `tests/lan_wintun.rs` proves a limited
+//! broadcast leaves through it.
+//!
+//! **Only the limited broadcast is taken.** Multicast keeps Windows' own
+//! routes, and the real networks keep their own broadcast addresses: pinning
+//! those to the room would send every program's casting, printer and NAS
+//! discovery into the room — where the pump drops it — for as long as the room
+//! is up.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -32,13 +42,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, ERROR_OBJECT_ALREADY_EXISTS, HANDLE, HMODULE,
-    NO_ERROR, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_OBJECT_ALREADY_EXISTS,
+    HANDLE, HMODULE, NO_ERROR, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, GetIpInterfaceEntry,
-    InitializeIpForwardEntry, InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry,
-    SetIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+    CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, GetBestRoute2,
+    GetIpForwardEntry2, GetIpInterfaceEntry, InitializeIpForwardEntry, InitializeIpInterfaceEntry,
+    InitializeUnicastIpAddressEntry, SetIpForwardEntry2, SetIpInterfaceEntry, MIB_IPFORWARD_ROW2,
+    MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{
@@ -48,7 +59,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE,
+    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
 };
 
 use super::{AdapterConfig, AdapterSetup};
@@ -182,6 +193,8 @@ pub struct WintunDevice {
     shared: Arc<Shared>,
     packets: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Keeps the adapter preferred while it is up ([`Keeper`]).
+    keeper: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WintunDevice {
@@ -235,7 +248,17 @@ impl WintunDevice {
         let reader = std::thread::Builder::new()
             .name("wintun-reader".into())
             .spawn(move || read_loop(&reader_shared, &tx))?;
-        Ok(Self { shared, packets: tokio::sync::Mutex::new(rx), reader: Some(reader) })
+        let mut device =
+            Self { shared, packets: tokio::sync::Mutex::new(rx), reader: Some(reader), keeper: None };
+        // The session is up, so Windows now sees the adapter connected: the
+        // keeper's first pass, at once, is the configuration that counts.
+        let keeper_shared = device.shared.clone();
+        device.keeper = Some(
+            std::thread::Builder::new()
+                .name("wintun-keeper".into())
+                .spawn(move || keep_loop(Keeper::new(luid), &keeper_shared))?,
+        );
+        Ok(device)
     }
 }
 
@@ -280,6 +303,9 @@ impl Drop for WintunDevice {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        if let Some(keeper) = self.keeper.take() {
+            let _ = keeper.join();
+        }
         let s = &self.shared;
         // SAFETY: the reader has exited, and these are freed exactly once.
         unsafe {
@@ -320,7 +346,7 @@ impl PacketDevice for WintunDevice {
 }
 
 fn check(result: u32, what: &str) -> io::Result<()> {
-    if result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS {
+    if result == NO_ERROR {
         Ok(())
     } else {
         Err(io::Error::other(format!("{what}: {}", io::Error::from_raw_os_error(result as i32))))
@@ -335,10 +361,13 @@ fn sockaddr_inet(addr: Ipv4Addr) -> SOCKADDR_INET {
     sa
 }
 
+/// The interface metric the room adapter is given.
+const ROOM_INTERFACE_METRIC: u32 = 1;
+
 /// The room's address, the MTU, the metric and the limited-broadcast route.
 fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
-    // SAFETY: each row is initialized by its Initialize* call before use, and
-    // passed by pointer to the call that reads or fills it.
+    // SAFETY: the row is initialized by its Initialize* call before use, and
+    // passed by pointer to the call that reads it.
     unsafe {
         let mut row: MIB_UNICASTIPADDRESS_ROW = std::mem::zeroed();
         InitializeUnicastIpAddressEntry(&mut row);
@@ -346,16 +375,38 @@ fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
         row.Address = sockaddr_inet(config.address);
         row.OnLinkPrefixLength = config.subnet.prefix_len;
         row.DadState = IpDadStatePreferred;
-        check(CreateUnicastIpAddressEntry(&row), "setting the room address")?;
+        let r = CreateUnicastIpAddressEntry(&row);
+        if r != ERROR_OBJECT_ALREADY_EXISTS {
+            check(r, "setting the room address")?;
+        }
+    }
+    set_interface(luid)?;
+    ensure_route(luid, Ipv4Addr::BROADCAST, 32)?;
+    Ok(())
+}
 
+/// The metric, the MTU and the host model; changes only what differs, and
+/// says whether it changed anything.
+fn set_interface(luid: NET_LUID_LH) -> io::Result<bool> {
+    // SAFETY: the row is initialized by its Initialize* call, filled by Get,
+    // and passed by pointer to Set.
+    unsafe {
         let mut iface: MIB_IPINTERFACE_ROW = std::mem::zeroed();
         InitializeIpInterfaceEntry(&mut iface);
         iface.Family = AF_INET;
         iface.InterfaceLuid = luid;
         check(GetIpInterfaceEntry(&mut iface), "reading the adapter's settings")?;
-        // The fix: the cheapest interface is where a limited broadcast goes.
+        let right = !iface.UseAutomaticMetric
+            && iface.Metric == ROOM_INTERFACE_METRIC
+            && iface.NlMtu == LAN_MTU as u32
+            && iface.WeakHostReceive
+            && iface.WeakHostSend;
+        if right {
+            return Ok(false);
+        }
+        // The cheapest interface is where a limited broadcast goes.
         iface.UseAutomaticMetric = false;
-        iface.Metric = 1;
+        iface.Metric = ROOM_INTERFACE_METRIC;
         iface.NlMtu = LAN_MTU as u32;
         // A game bound to the Wi-Fi's or the Ethernet's address is reached
         // by the pump translating the room address to it (`lan_rebind.rs`).
@@ -370,18 +421,135 @@ fn configure(luid: NET_LUID_LH, config: &AdapterConfig) -> io::Result<()> {
         // not 0 (ERROR_INVALID_PARAMETER), and Get fills it in.
         iface.SitePrefixLength = 0;
         check(SetIpInterfaceEntry(&mut iface), "setting the adapter's metric, MTU and host model")?;
-
-        let mut route: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
-        InitializeIpForwardEntry(&mut route);
-        route.InterfaceLuid = luid;
-        route.DestinationPrefix.Prefix = sockaddr_inet(Ipv4Addr::BROADCAST);
-        route.DestinationPrefix.PrefixLength = 32;
-        route.NextHop = sockaddr_inet(Ipv4Addr::UNSPECIFIED);
-        route.Metric = 0;
-        route.Protocol = MIB_IPPROTO_NETMGMT;
-        check(CreateIpForwardEntry2(&route), "adding the limited-broadcast route")?;
     }
-    Ok(())
+    Ok(true)
+}
+
+fn route_row(luid: NET_LUID_LH, prefix: Ipv4Addr, len: u8) -> MIB_IPFORWARD_ROW2 {
+    // SAFETY: plain data, initialized by InitializeIpForwardEntry.
+    let mut route: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpForwardEntry(&mut route) };
+    route.InterfaceLuid = luid;
+    route.DestinationPrefix.Prefix = sockaddr_inet(prefix);
+    route.DestinationPrefix.PrefixLength = len;
+    route.NextHop = sockaddr_inet(Ipv4Addr::UNSPECIFIED);
+    route.Metric = 0;
+    route.Protocol = MIB_IPPROTO_NETMGMT;
+    route
+}
+
+/// An on-link route to `prefix/len` on this adapter **with route metric 0**.
+///
+/// Windows gives every interface its own `255.255.255.255/32` the moment it
+/// has an address, at route metric 256 — so the
+/// create below found one already there, and this used to take that for
+/// success. The room then competed at 256 + its interface metric, which only
+/// ties a network pinned to metric 1 by hand (Hamachi's, Radmin's, ZeroTier's
+/// instructions all say to), and the tie went to the other network: "a
+/// broadcast to 255.255.255.255 did not go through the room's adapter". At
+/// metric 0 the room's cost is 1 against at least 256 for anything else.
+fn ensure_route(luid: NET_LUID_LH, prefix: Ipv4Addr, len: u8) -> io::Result<()> {
+    let what = format!("the route to {prefix}/{len}");
+    let wanted = route_row(luid, prefix, len);
+    // SAFETY: a fully initialized row, read by each call.
+    unsafe {
+        let r = CreateIpForwardEntry2(&wanted);
+        if r == NO_ERROR {
+            return Ok(());
+        }
+        if r != ERROR_OBJECT_ALREADY_EXISTS {
+            return check(r, &format!("adding {what}"));
+        }
+        let mut there = route_row(luid, prefix, len);
+        check(GetIpForwardEntry2(&mut there), &format!("reading {what}"))?;
+        if there.Metric == 0 {
+            return Ok(());
+        }
+        there.Metric = 0;
+        if SetIpForwardEntry2(&there) == NO_ERROR {
+            return Ok(());
+        }
+        // A route the system made may refuse a change; replace it instead.
+        let r = DeleteIpForwardEntry2(&there);
+        if r != NO_ERROR && r != ERROR_NOT_FOUND {
+            return check(r, &format!("replacing {what}"));
+        }
+        check(CreateIpForwardEntry2(&wanted), &format!("adding {what}"))
+    }
+}
+
+/// The interface Windows would send `to` out of right now.
+fn best_interface(to: Ipv4Addr) -> Option<u64> {
+    let dst = sockaddr_inet(to);
+    // SAFETY: plain data, filled by the call; the luid and source are
+    // optional and passed as null.
+    unsafe {
+        let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+        let mut src: SOCKADDR_INET = std::mem::zeroed();
+        let r = GetBestRoute2(std::ptr::null(), 0, std::ptr::null(), &dst, 0, &mut row, &mut src);
+        (r == NO_ERROR).then_some(row.InterfaceLuid.Value)
+    }
+}
+
+/// How often the keeper puts the adapter right again.
+const KEEP_EVERY_MS: u32 = 3000;
+
+/// What keeps the room adapter preferred for as long as it is up.
+///
+/// Configuring once is not enough. The adapter is configured before its
+/// session starts, and only then does Windows see it connected; Network
+/// Location Awareness, a VPN client or a "network reset" may each put a
+/// metric back. So the keeper re-applies it every few seconds — each step a read that changes nothing when nothing changed — and
+/// checks with Windows' own route choice that a limited broadcast really
+/// leaves through the room.
+struct Keeper {
+    luid: NET_LUID_LH,
+    /// The last thing said, so a lasting fault is said once.
+    said: Option<String>,
+}
+
+impl Keeper {
+    fn new(luid: NET_LUID_LH) -> Self {
+        Self { luid, said: None }
+    }
+
+    fn keep(&mut self) {
+        let mut problems = Vec::new();
+        if let Err(e) = set_interface(self.luid) {
+            problems.push(e.to_string());
+        }
+        if let Err(e) = ensure_route(self.luid, Ipv4Addr::BROADCAST, 32) {
+            problems.push(e.to_string());
+        }
+        // SAFETY: reading a plain union member of a copy.
+        let ours = unsafe { self.luid.Value };
+        match best_interface(Ipv4Addr::BROADCAST) {
+            Some(luid) if luid != ours => problems.push(format!(
+                "Windows still sends 255.255.255.255 out of another interface (LUID {luid:#x}): \
+                 a route to it was pinned by hand below the room's"
+            )),
+            _ => {}
+        }
+        let now = (!problems.is_empty()).then(|| problems.join("; "));
+        if now != self.said {
+            if let Some(p) = &now {
+                eprintln!("lan-helper: the room adapter is not preferred: {p}");
+            }
+            self.said = now;
+        }
+    }
+}
+
+/// Run `keeper` until `quit` is set.
+fn keep_loop(mut keeper: Keeper, quit: &Shared) {
+    loop {
+        keeper.keep();
+        // SAFETY: a live event handle, owned by `Shared`.
+        let woke = unsafe { WaitForSingleObject(quit.quit, KEEP_EVERY_MS) };
+        if woke != WAIT_TIMEOUT {
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

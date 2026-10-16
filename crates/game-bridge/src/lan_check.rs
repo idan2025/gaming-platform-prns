@@ -873,6 +873,7 @@ mod tests {
         r.rebound_here = vec![crate::lan_rebind::Rebound {
             port: crate::lan_filter::LanPort { proto: LanProto::Tcp, port: 9900 },
             address: Ipv4Addr::new(192, 168, 32, 203),
+            pinned: false,
         }];
         assert!(r.ok());
         let f = r.findings().join("\n");

@@ -1335,6 +1335,24 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
      lowest is 5), dearer than the room's 1 — **the fix passes and the broken
      branch fails** with "never reached the room". That is what CI now runs.
 
+   **Corrected 2026-10-16: the route metric never took.** Windows makes
+   every interface its own `255.255.255.255/32` (and `224.0.0.0/4`) at route
+   metric 256 as soon as it has an address, so the helper's metric-0 route
+   came back "already exists" and was taken for success: the room competed
+   at 257 and tied with any network pinned to 1 — the measurement above. The
+   helper now sets the existing route to 0 (cost 1 against at least 256),
+   re-applies metric and route every 3 s while the room is up, and checks
+   `GetBestRoute2` (`lan_adapter/windows.rs`, `Keeper`). Only the limited
+   broadcast is taken: multicast and the real networks' own broadcast
+   addresses keep their routes, so casting, printer and NAS discovery on the
+   home network keep working while a room is up. Linux had the same
+   class of gap where routes are never consulted — a broadcast from a socket
+   bound to the Wi-Fi's address, one to the Wi-Fi's own network, and every
+   packet from a UDP socket Wine pins to the Wi-Fi with `SO_BINDTODEVICE` —
+   closed with traffic-control rules (`lan_adapter/linux_capture.rs`, proven
+   in `tests/lan_capture.rs`). And on both, a `/24` broadcast an old game
+   computes inside a `/16` room now reaches the room (`lan_rebind.rs`).
+
    **Not done here:** code signing (`lan-helper.exe` is unsigned, so
    SmartScreen warns; a certificate is a purchase and the owner's call), the
    installer's opt-in (the launcher's, step 5), and a firewall rule — CI
