@@ -527,6 +527,11 @@ under all of it). Rules a later change could quietly break:
   numbers.
 - **A `gpp-games` network that lets containers talk is refused, never used**
   (`only_a_games_network_that_keeps_containers_apart_is_used`).
+- **A server's own files are held to `writable_limit_bytes`**
+  (`Agent::check_disk_limits`, every minute, operator config per game). Over
+  it, the server is **stopped, never trimmed**, and `restart` (so start,
+  the crash watch and scheduled restarts too) refuses until it is under.
+  Caught by `a_server_over_its_disk_limit_is_stopped_and_stays_stopped_until_it_is_under`.
 - **One network, not one per server**: Docker's default pools hold about
   thirty networks. Pinned by
   `game_servers_are_kept_apart_and_reached_through_their_published_port`,

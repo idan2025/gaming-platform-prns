@@ -125,6 +125,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Disk limits (`Agent::check_disk_limits`): only for games whose
+    // `[games.<id>]` sets `writable_limit_bytes`.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(platform_agent::agent::DISK_LIMIT_CHECK_EVERY).await;
+                agent.check_disk_limits().await;
+            }
+        });
+    }
+
     // Update checks (`updates.rs`): nothing runs until the operator sets an
     // interval on the Installed page.
     {

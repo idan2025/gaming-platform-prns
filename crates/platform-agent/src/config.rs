@@ -276,6 +276,12 @@ pub struct GameRuntime {
     /// has files in it makes them disappear for every instance.
     #[serde(default)]
     pub writable_paths: Vec<String>,
+    /// Most bytes one server of this game may keep in its own files (its
+    /// writable paths), so one server cannot fill the node's disk for the
+    /// rest. A server over it is stopped and will not start again until its
+    /// files are back under; nothing is deleted. Absent means no limit.
+    #[serde(default)]
+    pub writable_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

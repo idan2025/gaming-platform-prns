@@ -76,6 +76,12 @@ is missing, which makes pushing a tag sufficient on its own.
 
 ## Unreleased
 
+### A disk limit per server
+
+- `writable_limit_bytes` in a game's `[games.<id>]` caps what one server may
+  keep in its own files. A server over it is stopped and will not start
+  until it is back under; nothing is deleted.
+
 ### Game servers kept apart on a node
 
 - Every game server now runs on its own Docker network, `gpp-games`, where it

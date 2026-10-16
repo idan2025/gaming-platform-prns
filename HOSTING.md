@@ -185,6 +185,10 @@ capability, can never gain one (`no-new-privileges`), and may hold at most
 - Servers created by an older agent stay on Docker's default bridge until
   they are recreated (a move onto a new copy does this). They keep working:
   the agent reaches them through their published port too.
+- **One server cannot fill the disk for the others** if you set
+  `writable_limit_bytes` in a game's `[games.<id>]`: the agent measures each
+  server's own files every minute, stops one that is over, and refuses to
+  start it until it is back under. Nothing is deleted.
 - **What this does not do: keep a game off your home network.** A game
   server still reaches the internet (Steam needs it) and, like any
   container, your LAN. If strangers run servers on this machine, block

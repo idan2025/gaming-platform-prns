@@ -264,6 +264,9 @@ pub const MOVE_CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the agent looks for servers that crashed.
 pub const CRASH_CHECK_EVERY: Duration = Duration::from_secs(10);
+
+/// How often servers' own files are measured against their disk limit.
+pub const DISK_LIMIT_CHECK_EVERY: Duration = Duration::from_secs(60);
 /// Crash restarts allowed per server per hour. A server that dies at boot is
 /// started five times and then left stopped, with its last exit on the page.
 pub const MAX_CRASH_RESTARTS_PER_HOUR: usize = 5;
@@ -1369,6 +1372,45 @@ impl Agent {
         Ok(lines)
     }
 
+    /// Why a server may not run, if its own files are over its game's
+    /// `writable_limit_bytes`. `None` when under it, when the game has no
+    /// limit, and when the server is unknown here.
+    async fn over_disk_limit(&self, instance_id: &str) -> Option<String> {
+        let game_id = self.docker.list_managed().await.ok()?.into_iter().find(|c| c.instance_id == instance_id)?.game_id?;
+        let limit = self.config.runtime_for(&game_id)?.writable_limit_bytes?;
+        let writable = self.layout.instance_dir(instance_id).ok()?.join("writable");
+        let used = tokio::task::spawn_blocking(move || dir_size(&writable)).await.ok()?;
+        (used > limit).then(|| {
+            format!(
+                "{instance_id:?} keeps {} in its own files, over this node's {} limit for {game_id:?}; \
+                 delete some of them, or raise writable_limit_bytes in [games.{game_id}]",
+                human_bytes(used),
+                human_bytes(limit)
+            )
+        })
+    }
+
+    /// Stop every running server whose own files have grown past its game's
+    /// `writable_limit_bytes`, so one server cannot fill the disk the others
+    /// need. A stop, never a deletion, and it stays stopped: `restart` and
+    /// `start` refuse while it is over, and the crash watch reads it as a
+    /// stop. Returns what it stopped.
+    pub async fn check_disk_limits(&self) -> Vec<String> {
+        let Ok(instances) = self.list().await else { return Vec::new() };
+        let mut stopped = Vec::new();
+        for instance in instances.iter().filter(|i| i.state == InstanceState::Running) {
+            let Some(reason) = self.over_disk_limit(&instance.instance_id).await else { continue };
+            match self.stop(&instance.instance_id).await {
+                Ok(()) => {
+                    tracing::warn!(instance = %instance.instance_id, "{reason}; stopped");
+                    stopped.push(instance.instance_id.clone());
+                }
+                Err(e) => tracing::warn!(instance = %instance.instance_id, error = %format!("{e:#}"), "over its disk limit, and could not be stopped"),
+            }
+        }
+        stopped
+    }
+
     /// Restart an instance in place, and put it back on the mesh.
     ///
     /// The container is restarted rather than recreated, so the instance keeps
@@ -1378,6 +1420,10 @@ impl Agent {
     /// it would relay links into a closed port for as long as the game took to
     /// come back.
     pub async fn restart(&self, instance_id: &str) -> Result<()> {
+        // Before anything stops: a server over its disk limit stays as it is.
+        if let Some(over) = self.over_disk_limit(instance_id).await {
+            return Err(anyhow!("{over}"));
+        }
         self.mesh.stop(instance_id).await;
         self.docker.restart(instance_id).await?;
         self.crashes.lock().await.stopped_here.remove(instance_id);

@@ -117,6 +117,7 @@ fn test_runtime() -> GameRuntime {
         env: BTreeMap::new(),
         bots: None,
         writable_paths: Vec::new(),
+        writable_limit_bytes: None,
     }
 }
 
