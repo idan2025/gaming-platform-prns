@@ -1,0 +1,98 @@
+name: runner-trial
+
+# A manual trial of a self-hosted runner: the Linux halves of ci, the release's
+# Linux launcher, and the docker image, built from a tag on a runner labelled
+# `lanthorn-local`, to see what a runner of one's own saves. It builds only:
+# no secrets, nothing signed, nothing pushed, no release touched.
+#
+# It is started by hand (`gh workflow run runner-trial.yml -f tag=v0.2.44`)
+# and by nothing else, and no other workflow names the label. The runner is a
+# throwaway container that is only online while a trial runs; on a public
+# repository a self-hosted runner must never be reachable from a pull request
+# (Settings, Actions: approval is required for all outside contributors).
+#
+# What differs from the hosted runners, said here so a result is not misread:
+# Windows and macOS cannot run on it; the unprivileged-user-namespace tests
+# (`lan_adapter`, `lan_no_garbage`, `lan_openttd`) skip themselves in a
+# container; the ARM jobs are not built.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+  # A cache that survives between the runner's throwaway containers: the whole
+  # point of a runner of one's own.
+  CARGO_HOME: /cache/cargo
+  RUSTUP_HOME: /cache/rustup
+  CARGO_BUILD_JOBS: "8"
+
+jobs:
+  ci-linux:
+    name: ci (Linux, local)
+    runs-on: [self-hosted, lanthorn-local]
+    env:
+      CARGO_TARGET_DIR: /cache/target-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: OpenTTD for the real-game LAN test
+        run: |
+          scripts/fetch-openttd.sh "$RUNNER_TEMP/openttd"
+          echo "OPENTTD_DIR=$RUNNER_TEMP/openttd/openttd-15.3-linux-generic-amd64" >> "$GITHUB_ENV"
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+  launcher-linux:
+    name: launcher (Linux, local)
+    runs-on: [self-hosted, lanthorn-local]
+    env:
+      CARGO_TARGET_DIR: /cache/target-launcher
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: Stage the LAN helper
+        run: scripts/stage-lan-helper.sh --release
+      # No signing key and no release config: this makes the installers and
+      # nothing that could be mistaken for a release.
+      - name: Bundle
+        working-directory: launcher/src-tauri
+        run: cargo tauri build
+      - name: What came out
+        run: |
+          find "$CARGO_TARGET_DIR/release/bundle" -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -printf '%s  %p\n'
+
+  image:
+    name: image amd64 (local)
+    runs-on: [self-hosted, lanthorn-local]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: docker/setup-buildx-action@v3
+      # Built, not pushed: no login, no registry.
+      - name: Build
+        run: docker buildx build --platform linux/amd64 --load -t lanthorn-trial:amd64 .
+      - name: What came out
+        run: docker image ls lanthorn-trial:amd64
