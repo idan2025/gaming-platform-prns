@@ -74,6 +74,22 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.45
+
+### A Linux-hosted LAN race no longer ends as it starts
+
+- A race hosted on Linux sometimes fell over the moment it started for a
+  player on Windows, while the same race hosted on Windows always worked.
+  Under Wine a game opens its race sockets when the race starts, and
+  Lanthorn noticed them only at its next look, up to two seconds later.
+  A race packet that arrived in between was refused by the host computer,
+  and on Windows that refusal fails the game's next receive, which Need for
+  Speed takes for the host leaving. That refusal is no longer passed on to
+  the room, and Lanthorn looks again straight away, so the game's next
+  packet already reaches it. Only a refusal for one of the game's own ports
+  is held back; a firewall's refusal still reaches the other player.
+  Contributed by danakoz.
+
 ## v0.2.44
 
 ### The room check: a VPN that takes the route, and a game not started yet
