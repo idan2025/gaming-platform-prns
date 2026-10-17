@@ -202,6 +202,12 @@ impl LanFilter {
         self.policy.declares(proto, port) || (self.any_high && is_allowable(port))
     }
 
+    /// Whether other members may reach this machine's `port` at all — the
+    /// same gate [`LanFilter::inbound`] applies, without a packet.
+    pub fn admits_port(&self, proto: LanProto, port: u16) -> bool {
+        self.admits(proto, port)
+    }
+
     /// Whether this side may send `packet` into the room. A unicast opens (or
     /// refreshes) a flow its replies are admitted on.
     pub fn outbound(&mut self, packet: &[u8], subnet: &RoomSubnet, now: Instant) -> bool {
