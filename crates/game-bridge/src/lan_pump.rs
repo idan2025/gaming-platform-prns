@@ -8,6 +8,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -371,7 +372,6 @@ fn report_refused(new: Option<crate::lan_filter::Refused>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     fn udp_to(dst: Ipv4Addr, dport: u16) -> Vec<u8> {
         let mut p = vec![0u8; 28];
