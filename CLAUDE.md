@@ -1003,6 +1003,17 @@ Rules a later change could quietly break:
     address or a room broadcast). The adapter accepts more than that —
     Linux always, Windows once weak-host — so without this a room packet
     naming the Wi-Fi's address would reach it directly.
+  - **A port refusal from the room address about a game's port is the survey
+    running late, and never reaches the room** (2026-10-17,
+    `lan_pump::own_port_unreachable`). Wine opens NFSU2's race sockets on the
+    Wi-Fi's address when the race starts; a datagram arriving before the next
+    survey (`SURVEY_EVERY`, 2 s) went to the room address, the kernel
+    answered "port unreachable", and on Windows that error fails the game
+    socket's next receive (`WSAECONNRESET`): Linux-hosted races fell over on
+    starting, sometimes, Windows-hosted ones never. The pump drops it and
+    surveys at once (no closer than `RESURVEY_FLOOR`). Only code 3 about UDP
+    to the room address, on a port the filter admits: a firewall's refusal
+    (code 13) and TCP's reset still reach the member.
   - Pinned by `tests/lan_rebind.rs` (real adapters, namespaces, a native
     stand-in game on a second address, both directions: host's game on its
     Wi-Fi, and a member calling out from its own); without the translation
