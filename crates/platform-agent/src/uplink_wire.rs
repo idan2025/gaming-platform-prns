@@ -294,6 +294,7 @@ mod tests {
             bots: None,
             restart_on_crash: false,
             owner: None,
+            options: Default::default(),
         }
     }
 

@@ -249,6 +249,13 @@ function toast(msg) {
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => box.classList.add('hidden'), 5000);
 }
+// A phone runs the same page. What changes is the layout (style.css reads the
+// `phone` class and the screen width) and a few things a phone cannot do: it
+// starts no game itself, so a join ends with an address to copy instead of a
+// Play button.
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+if (IS_ANDROID) document.documentElement.classList.add('phone');
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -775,8 +782,11 @@ function wireMenus() {
     if (!e.target.closest || !e.target.closest('.pop-anchor')) closePopovers();
   });
   window.addEventListener('blur', () => { closeMenu(); });
-  window.addEventListener('resize', closeMenu);
-  document.addEventListener('scroll', closeMenu, true);
+  // A phone's keyboard resizes the window and scrolls the field into view,
+  // so there a menu someone is typing into (the invite field) stays open.
+  const typingInMenu = () => IS_ANDROID && !!document.activeElement?.closest?.('#ctx-menu input');
+  window.addEventListener('resize', () => { if (!typingInMenu()) closeMenu(); });
+  document.addEventListener('scroll', () => { if (!typingInMenu()) closeMenu(); }, true);
   document.addEventListener('keydown', e => {
     // A reload throws away the page while the core keeps running under it.
     const k = (e.key || '').toLowerCase();
@@ -834,6 +844,8 @@ function updateFilterBadge() {
 const VIEWS = ['servers', 'rooms', 'games', 'connections', 'indexes', 'settings'];
 function setView(name) {
   if (!VIEWS.includes(name)) name = 'servers';
+  // A phone hosts nothing and opens no LAN room, so it has neither page.
+  if (IS_ANDROID && (name === 'games' || name === 'rooms')) name = 'servers';
   state.view = name;
   for (const v of VIEWS) {
     const sec = $('view-' + v);
@@ -865,6 +877,9 @@ function openDetail(hash, fallback) {
     joined: hash === state.joinedHash,
     joinMsg: null,
   };
+  // On a phone the detail is a full screen sheet, and Back should close it
+  // rather than leave the app.
+  if (IS_ANDROID) { try { history.pushState({ detail: true }, ''); } catch (_) { /* no history */ } }
   renderList();
   // A room answers no detail probe — it has no such endpoint — so asking
   // would only ever render "No direct response" under a room that is fine.
@@ -894,6 +909,7 @@ function openDetail(hash, fallback) {
 }
 
 function closeDetail() {
+  if (IS_ANDROID && history.state && history.state.detail) { try { history.back(); } catch (_) { /* no history */ } }
   state.detail = null;
   $('detail').hidden = true;
   $('view-servers').classList.remove('has-detail');
@@ -1154,7 +1170,19 @@ function renderJoinActions(foot, d, gameId) {
   // only for a game whose pack can start it. When the game cannot be found on
   // this machine it becomes "Locate game": the launcher never guesses an
   // executable.
-  if (d.joined && d.canLaunch) {
+  if (d.joined && IS_ANDROID && d.listenAddr) {
+    const copy = el('button', 'btn btn-play', 'Copy address');
+    copy.type = 'button';
+    copy.onclick = () => copyText(d.listenAddr);
+    foot.appendChild(copy);
+    // A phone has no tray and no other way out of a join: this is the only
+    // place to end it, and it ends the background service with it.
+    const leave = el('button', 'btn btn-danger', 'Leave server');
+    leave.id = 'detail-leave';
+    leave.type = 'button';
+    leave.onclick = leaveServer;
+    foot.appendChild(leave);
+  } else if (d.joined && d.canLaunch) {
     if (d.launchReady) {
       const play = el('button', 'btn btn-play', d.playing ? 'Starting…' : 'Play');
       play.id = 'detail-play';
@@ -1405,6 +1433,28 @@ function primaryAction(hash) {
   }
 }
 
+// Ends the join the detail pane shows (`Launcher::leave`): the local listener
+// closes and, once nothing is joined, the Android background service stops.
+async function leaveServer() {
+  try {
+    await invoke('leave');
+    hideError();
+  } catch (err) {
+    showError('Could not leave the server: ' + errText(err));
+  }
+  state.joinedHash = null;
+  const d = state.detail;
+  if (d) {
+    d.joined = false;
+    d.joining = false;
+    d.listenAddr = null;
+    d.joinErr = false;
+    d.joinMsg = 'Left the server. Join again whenever you like.';
+  }
+  renderList();
+  if (state.detail) renderDetail();
+}
+
 async function joinServer() {
   const d = state.detail;
   if (!d || d.joining) return;
@@ -1458,7 +1508,9 @@ async function joinServer() {
       renderList();
       return;
     }
-    if (d.canLaunch && d.launchReady) {
+    if (IS_ANDROID) {
+      d.joinMsg = 'Connected. In your game, connect to ' + res.listen_addr + '. Keep Lanthorn open in the background while you play.';
+    } else if (d.canLaunch && d.launchReady) {
       d.joinMsg = 'Connected. Press Play to start the game (listening on ' + res.listen_addr + ').';
     } else if (d.canLaunch) {
       d.joinMsg = 'Connected on ' + res.listen_addr + '. Locate your game once to enable Play, or point your game at that address.';
@@ -1796,6 +1848,8 @@ let pressTarget = null;
 document.addEventListener('pointerdown', e => { pressTarget = e.target; }, true);
 document.addEventListener('pointerup', () => { pressTarget = null; }, true);
 document.addEventListener('pointercancel', () => { pressTarget = null; }, true);
+// Android's Back button walks history; the detail sheet pushed one entry.
+window.addEventListener('popstate', () => { if (IS_ANDROID && state.detail) closeDetail(); });
 function pressedInside(host) { return !!(host && pressTarget && host.contains(pressTarget)); }
 
 async function pollStatus() {
@@ -1810,7 +1864,9 @@ async function pollStatus() {
 async function pollServers() {
   try {
     const rows = await invoke('list_servers', { query: buildQuery() });
-    state.servers = (Array.isArray(rows) ? rows : []).filter(r => !state.removed.has(r.destination_hash));
+    state.servers = (Array.isArray(rows) ? rows : []).filter(r => !state.removed.has(r.destination_hash))
+      // A phone cannot join a LAN room yet, so it does not list one.
+      .filter(r => !(IS_ANDROID && isRoom(r)));
   } catch (err) {
     state.servers = [];
     showError('Could not list servers: ' + errText(err));
@@ -3390,6 +3446,7 @@ async function copyInvite(row) {
 // either way: an address is all a join needs.
 function showInvite(inv) {
   if (!inv || !inv.destination_hash) return;
+  if (IS_ANDROID && inv.room) { showError('That invite is to a LAN room, and LAN rooms work on a computer only for now.'); return; }
   setView('servers');
   const hash = inv.destination_hash;
   if (inv.game_id && !rowByHash(hash)) state.chosenGame.set(hash, inv.game_id);
@@ -3505,6 +3562,11 @@ async function checkUpdate(quiet) {
 async function installUpdate() {
   const u = state.update;
   if (!u || !u.available || state.updateBusy) return;
+  if (IS_ANDROID) {
+    try { await invoke('open_update_download'); }
+    catch (err) { showError('Could not open the browser: ' + errText(err)); }
+    return;
+  }
   if (u.install !== 'in-place') { openReleasePage(); return; }
   state.updateBusy = 'installing';
   renderUpdateBanner();
@@ -3540,6 +3602,7 @@ function renderUpdateBanner() {
   text.appendChild(el('div', 'rb-title', 'Lanthorn ' + u.available + ' is available'));
   text.appendChild(el('div', 'rb-sub', u.install === 'in-place'
     ? 'You have ' + u.current + '. Updating restarts Lanthorn and leaves any room you are in.'
+    : IS_ANDROID ? 'You have ' + u.current + '. Download it and open the file to install it over this one.'
     : 'You have ' + u.current + '. This copy updates from the download page.'));
   b.appendChild(text);
   const notes = el('button', 'btn', 'What\u2019s new');
@@ -3594,7 +3657,8 @@ function renderSettings() {
     }
   };
   you.appendChild(nameForm);
-  you.appendChild(el('p', 'note', 'What LAN rooms show beside your address, and what a game started '
+  you.appendChild(el('p', 'note', IS_ANDROID ? 'What others see beside your address in chat.'
+    : 'What LAN rooms show beside your address, and what a game started '
     + 'with Play calls you if its pack passes a name.'));
   body.appendChild(you);
 
@@ -3616,7 +3680,10 @@ function renderSettings() {
     notes.id = 'update-notes';
     card.appendChild(notes);
   }
-  if (u && u.available && u.install !== 'in-place') {
+  if (u && u.available && IS_ANDROID) {
+    card.appendChild(el('p', 'note', 'Download the new version, then open the file. Android installs it over '
+      + 'this one and keeps your settings. The first time, Android asks you to allow installs from your browser.'));
+  } else if (u && u.available && u.install !== 'in-place') {
     card.appendChild(el('p', 'note', 'This copy is portable, or was installed by your system\u2019s package '
       + 'manager, so it does not replace itself. Download the new version from the release page.'));
   }
@@ -3629,7 +3696,8 @@ function renderSettings() {
   actions.appendChild(check);
   if (u && u.available) {
     const go = el('button', 'btn btn-primary', u.install === 'in-place'
-      ? (state.updateBusy === 'installing' ? 'Updating…' : 'Update and restart') : 'Open the download page');
+      ? (state.updateBusy === 'installing' ? 'Updating…' : 'Update and restart')
+      : IS_ANDROID ? 'Download' : 'Open the download page');
     go.type = 'button';
     go.id = 'update-install';
     go.disabled = !!state.updateBusy;
@@ -3659,7 +3727,8 @@ function renderSettings() {
     try { await invoke('set_notifications_on', { on: nbox.checked }); }
     catch (err) { showError('Could not save that: ' + errText(err)); }
   };
-  notes.append(nbox, el('span', '', 'Desktop notifications: a favorite comes up, someone joins or writes in your room, a room check fails, an update is ready'));
+  notes.append(nbox, el('span', '', IS_ANDROID ? 'Notifications: a favorite comes up, an update is ready'
+    : 'Desktop notifications: a favorite comes up, someone joins or writes in your room, a room check fails, an update is ready'));
   card.appendChild(notes);
   const big = el('label', 'toggle-row');
   const bbox = el('input');
@@ -3668,8 +3737,12 @@ function renderSettings() {
   bbox.checked = !!state.bigScreen;
   bbox.onchange = () => setBigScreen(bbox.checked);
   big.append(bbox, el('span', '', 'Big screen mode: large rows for a TV or a Steam Deck. A controller’s Start button switches it too'));
-  card.appendChild(big);
-  card.appendChild(el('p', 'note', 'Updates are checked against GitHub and every download is verified '
+  // A phone has its own layout, and its controller is for the game.
+  if (!IS_ANDROID) card.appendChild(big);
+  card.appendChild(el('p', 'note', IS_ANDROID
+    ? 'Updates are checked against GitHub. Android installs a new version over this one only if it was '
+      + 'signed with the same key. Without internet, nothing is checked and nothing changes.'
+    : 'Updates are checked against GitHub and every download is verified '
     + 'against Lanthorn\u2019s signing key before it is installed. Without internet, nothing is checked '
     + 'and nothing changes.'));
   body.appendChild(card);
@@ -3705,6 +3778,7 @@ function setBigScreen(on) {
   if (box) box.checked = !!on;
 }
 function initBigScreen() {
+  if (IS_ANDROID) return;
   let saved = false;
   try { saved = localStorage.getItem(BIG_KEY) === '1'; } catch (_) { /* none */ }
   setBigScreen(saved);

@@ -1,0 +1,16 @@
+[package]
+name = "tauri-plugin-keepalive"
+version = "0.1.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Keeps a Lanthorn session alive in the background on Android, with a foreground service."
+build = "build.rs"
+links = "tauri-plugin-keepalive"
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

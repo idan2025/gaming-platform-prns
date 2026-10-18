@@ -91,6 +91,9 @@ fn human_bytes(n: u64) -> String {
     if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
 }
 
+/// How long a backup waits for a running world to finish saving.
+const WORLD_SAVE_WAIT: Duration = Duration::from_secs(30);
+
 pub(crate) fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -152,6 +155,8 @@ pub struct Agent {
     move_timing: std::sync::Mutex<MoveTiming>,
     /// Why a scheduled restart is waiting, by server (`scheduled_restarts`).
     restart_waits: std::sync::Mutex<BTreeMap<String, String>>,
+    /// Minecraft builds the publishers list, cached (`minecraft.rs`).
+    minecraft: crate::minecraft::Catalog,
 }
 
 /// A server being moved, and both its copies: neither is deleted while the
@@ -543,6 +548,7 @@ impl Agent {
             move_log: std::sync::Mutex::new(BTreeMap::new()),
             move_timing: std::sync::Mutex::new(MoveTiming::default()),
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
+            minecraft: crate::minecraft::Catalog::default(),
         })
     }
 
@@ -733,11 +739,12 @@ impl Agent {
             )
         })?;
 
+        check_spec_against_pack(spec, pack)?;
         let content = ContentRef {
             game_id: spec.game_id.clone(),
             version: match version {
                 Some(v) => v.to_string(),
-                None => self.active_version_of(&spec.game_id, &runtime.content_version),
+                None => self.version_for(&spec.game_id, spec.options.content_version.as_deref(), &runtime.content_version),
             },
         };
         let plan = self
@@ -797,6 +804,17 @@ impl Agent {
         }
     }
 
+    /// What the pack demands of a spec (an accepted EULA, Java settings only
+    /// for Minecraft), asked before a create can turn into a download: a
+    /// refused spec must be refused, not answered with gigabytes.
+    pub async fn check_spec(&self, spec: &InstanceSpec) -> Result<()> {
+        let packs = self.packs.read().await;
+        match packs.get(&spec.game_id) {
+            Some(pack) => check_spec_against_pack(spec, pack),
+            None => Ok(()),
+        }
+    }
+
     /// Install a game's content if it is not already there.
     ///
     /// Deliberately **not** part of `create`. Fetching a game is gigabytes over
@@ -806,7 +824,7 @@ impl Agent {
     /// explicit step, run once per game and version, and `create` keeps failing
     /// fast with a sentence naming this one.
     pub async fn ensure_content(&self, game_id: &str) -> Result<Provisioned, ProvisionError> {
-        self.ensure_content_tracked(game_id, None).await
+        self.ensure_content_tracked(game_id, None, None).await
     }
 
     /// [`ensure_content`](Self::ensure_content), reporting progress and
@@ -814,6 +832,7 @@ impl Agent {
     pub async fn ensure_content_tracked(
         &self,
         game_id: &str,
+        version: Option<&str>,
         progress: Option<&crate::content::InstallProgress>,
     ) -> Result<Provisioned, ProvisionError> {
         let packs = self.packs.read().await;
@@ -827,9 +846,12 @@ impl Agent {
                 "this node has no runtime configured for {game_id:?}, so there is no content_version to install into"
             )))
         })?;
+        if version.is_some() && !matches!(pack.content, PackContent::Minecraft {}) {
+            return Err(ProvisionError::Listing(format!("{game_id} has one copy per node; a version cannot be picked")));
+        }
         let content = ContentRef {
             game_id: game_id.to_string(),
-            version: self.active_version_of(game_id, &runtime.content_version),
+            version: self.version_for(game_id, version, &runtime.content_version),
         };
         let provisioned = self
             .content
@@ -918,7 +940,7 @@ impl Agent {
     /// unconfigured runtime is the caller's to fix, and starting a multi-gigabyte
     /// download because somebody fat-fingered a name would be worse than the
     /// error they got.
-    pub async fn content_is_missing(&self, game_id: &str) -> bool {
+    pub async fn content_is_missing(&self, game_id: &str, version: Option<&str>) -> bool {
         let Some(runtime) = self.config.runtime_for(game_id) else {
             return false;
         };
@@ -927,7 +949,7 @@ impl Agent {
         }
         let content = ContentRef {
             game_id: game_id.to_string(),
-            version: self.active_version_of(game_id, &runtime.content_version),
+            version: self.version_for(game_id, version, &runtime.content_version),
         };
         match self.layout.content_dir(&content) {
             Ok(dir) => !dir.is_dir(),
@@ -957,6 +979,10 @@ impl Agent {
         }
 
         let plan = self.plan_and_check_on(&spec, version).await?;
+        let verdict = self.resource_check(&spec.game_id, spec.options.memory, spec.options.cpus).await;
+        if verdict.level == crate::resources::ResourceLevel::Refuse {
+            return Err(anyhow!("{}", verdict.messages.join(" ")));
+        }
         for dir in &plan.host_dirs_to_create {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating {}", dir.display()))?;
@@ -1043,6 +1069,11 @@ impl Agent {
         // would be a worse outcome than a server that starts empty. The retries
         // exist because "the map is loaded" is the condition, and nothing here
         // can observe it directly.
+        if spec.options.stopped {
+            return Ok(self.created_status(spec, published, container_id, InstanceState::Stopped, None));
+        }
+        self.apply_bans_later(&spec.instance_id, &spec.game_id).await;
+
         if let Some(count) = spec.bots {
             // The lines are built here, where the pack is already in hand, so
             // the background task carries data and not a pack lookup — and a
@@ -1116,11 +1147,23 @@ impl Agent {
             }
         }
 
-        Ok(InstanceStatus {
+        Ok(self.created_status(spec, published, container_id, InstanceState::Running, mesh_destination_now))
+    }
+
+    /// What `create` reports for a container it just made.
+    fn created_status(
+        &self,
+        spec: InstanceSpec,
+        published: Vec<PublishedPort>,
+        container_id: String,
+        state: InstanceState,
+        mesh_destination_now: Option<String>,
+    ) -> InstanceStatus {
+        InstanceStatus {
             instance_id: spec.instance_id,
             game_id: spec.game_id,
             name: spec.name,
-            state: InstanceState::Running,
+            state,
             port: published
                 .iter()
                 .find(|p| p.channel == game_bridge::framing::CHANNEL_GAME)
@@ -1148,7 +1191,7 @@ impl Agent {
             crash_restarts: None,
             map_now: None,
             bots: spec.bots,
-        })
+        }
     }
 
     pub async fn stop(&self, instance_id: &str) -> Result<()> {
@@ -1298,6 +1341,234 @@ impl Agent {
         Ok(())
     }
 
+    /// The console protocol of an instance's game, or why there is none.
+    async fn console_of(&self, instance_id: &str) -> Result<(String, ConsoleProtocol)> {
+        let game_id = self
+            .game_of(instance_id)
+            .await
+            .ok_or_else(|| anyhow!("no instance {instance_id:?} on this node"))?;
+        let console = self
+            .packs
+            .read()
+            .await
+            .get(&game_id)
+            .and_then(|p| p.console)
+            .ok_or_else(|| anyhow!("the {game_id:?} pack declares no console, so this node cannot tell its server anything"))?;
+        Ok((game_id, console.into()))
+    }
+
+    /// Which game an instance runs, read off its container.
+    async fn game_of(&self, instance_id: &str) -> Option<String> {
+        self.docker
+            .list_managed()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|c| c.instance_id == instance_id)
+            .and_then(|c| c.game_id)
+    }
+
+    fn instance_dir(&self, instance_id: &str) -> Result<std::path::PathBuf> {
+        self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))
+    }
+
+    /// Kick, ban, unban, op or deop a player (`MINECRAFT.md` §4). The words
+    /// are the game's console protocol's; the target and reason are judged
+    /// there and refused, never rewritten. A ban on a Steam engine is also
+    /// written to the node's record, because the game cannot keep it, and an
+    /// unban is taken out of it; both work on a stopped server too, and reach
+    /// the game at its next start. Loopback API only.
+    pub async fn moderate(
+        &self,
+        instance_id: &str,
+        action: game_bridge::console::PlayerAction,
+        target: &str,
+        reason: Option<&str>,
+    ) -> Result<Vec<String>> {
+        use game_bridge::console::{BanList, PlayerAction};
+        let (_, console) = self.console_of(instance_id).await?;
+        let lines = console.moderation_lines(action, target, reason).map_err(|e| anyhow!("{e}"))?;
+        let running = self.ensure_instance(instance_id).await?.state == InstanceState::Running;
+        if console.ban_list() == BanList::NodeRecord {
+            let dir = self.instance_dir(instance_id)?;
+            match action {
+                PlayerAction::Ban => crate::bans::add(
+                    &dir,
+                    crate::bans::Ban {
+                        target: target.to_string(),
+                        reason: reason.map(str::trim).filter(|r| !r.is_empty()).map(str::to_string),
+                        at: Some(now_unix() as u64),
+                    },
+                )?,
+                PlayerAction::Unban => crate::bans::remove(&dir, target)?,
+                _ => {}
+            }
+        }
+        if running {
+            for line in &lines {
+                self.docker.send_console_line(instance_id, line).await?;
+            }
+        } else if console.ban_list() != BanList::NodeRecord || !matches!(action, PlayerAction::Ban | PlayerAction::Unban) {
+            return Err(anyhow!("start the server first: it is not running, so it cannot be told anything"));
+        }
+        tracing::info!(instance = %instance_id, action = action.as_str(), target = %target, "moderation");
+        Ok(lines)
+    }
+
+    /// What a server's moderation page shows: which actions its game has,
+    /// what names a player for each, the ban list, and the operators.
+    pub async fn moderation_view(&self, instance_id: &str) -> Result<serde_json::Value> {
+        use game_bridge::console::{BanList, PlayerAction};
+        let (_, console) = self.console_of(instance_id).await?;
+        let dir = self.instance_dir(instance_id)?;
+        let server_dir = dir.join("writable").join("server");
+        let (banned, ops) = match console.ban_list() {
+            BanList::NodeRecord => (crate::bans::read(&dir)?, None),
+            BanList::None => (Vec::new(), None),
+            BanList::GameFile => (
+                crate::bans::read_minecraft_list(&server_dir.join("banned-players.json"))?,
+                Some(crate::bans::read_minecraft_list(&server_dir.join("ops.json"))?),
+            ),
+        };
+        let actions: Vec<serde_json::Value> = [
+            PlayerAction::Kick,
+            PlayerAction::Ban,
+            PlayerAction::Unban,
+            PlayerAction::Op,
+            PlayerAction::Deop,
+        ]
+        .into_iter()
+        .filter(|a| console.supports(*a))
+        .map(|a| serde_json::json!({ "action": a, "target": console.target_kind(a) }))
+        .collect();
+        Ok(serde_json::json!({
+            "actions": actions,
+            "ban_list": console.ban_list(),
+            "banned": banned,
+            "ops": ops,
+        }))
+    }
+
+    /// Send a node-kept ban list to a server once it has started, in the
+    /// background, like bots: the console is not listening the moment the
+    /// container starts.
+    async fn apply_bans_later(&self, instance_id: &str, game_id: &str) {
+        let Some(console) = self.packs.read().await.get(game_id).and_then(|p| p.console) else { return };
+        let console: ConsoleProtocol = console.into();
+        let Ok(dir) = self.instance_dir(instance_id) else { return };
+        let ids: Vec<String> = match crate::bans::read(&dir) {
+            Ok(bans) => bans.into_iter().map(|b| b.target).collect(),
+            Err(e) => {
+                tracing::warn!(instance = %instance_id, error = %e, "the ban list could not be read; no bans were sent");
+                return;
+            }
+        };
+        let lines = console.reapply_bans(&ids);
+        if lines.is_empty() {
+            return;
+        }
+        let docker = self.docker.clone();
+        let instance_id = instance_id.to_string();
+        tokio::spawn(async move {
+            for attempt in 1..=BOT_APPLY_ATTEMPTS {
+                tokio::time::sleep(BOT_APPLY_INTERVAL).await;
+                let mut sent = true;
+                for line in &lines {
+                    if docker.send_console_line(&instance_id, line).await.is_err() {
+                        sent = false;
+                        break;
+                    }
+                }
+                if sent {
+                    return;
+                }
+                if attempt == BOT_APPLY_ATTEMPTS {
+                    tracing::warn!(instance = %instance_id, "this server is running but never took its ban list");
+                }
+            }
+        });
+    }
+
+    /// Whether a server's memory and CPU fit this host (`resources.rs`).
+    pub async fn resource_check(
+        &self,
+        game_id: &str,
+        memory: Option<crate::instance::MemorySpec>,
+        cpus: Option<u16>,
+    ) -> crate::resources::ResourceVerdict {
+        let host = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| parse_meminfo(&m)).map(|(total, available)| {
+            crate::resources::HostResources {
+                total_bytes: total,
+                available_bytes: available,
+                cpus: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1),
+            }
+        });
+        let ceiling = self.config.runtime_for(game_id).and_then(|r| r.memory_limit_bytes);
+        crate::resources::judge(host, memory, cpus, ceiling)
+    }
+
+    /// Minecraft builds a person can pick for a server type, newest first.
+    pub async fn minecraft_versions(
+        &self,
+        server: game_bridge::minecraft::MinecraftServer,
+    ) -> Result<Vec<crate::minecraft::VersionChoice>> {
+        self.minecraft.versions(server).await.map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Where a world upload for a **stopped** server is written while it
+    /// arrives, held to the disk reserve like a backup upload.
+    pub async fn world_upload_path(&self, instance_id: &str, bytes: Option<u64>) -> Result<std::path::PathBuf> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state == InstanceState::Running {
+            return Err(anyhow!("stop the server first: a world cannot be swapped while it runs"));
+        }
+        if let Some(bytes) = bytes {
+            self.room_for(bytes.saturating_mul(2)).await.map_err(|e| anyhow!("{e}"))?;
+        }
+        let dir = self.config.data_root.join("staging");
+        std::fs::create_dir_all(&dir)?;
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for an upload name: {e}"))?;
+        Ok(dir.join(format!("world-upload-{}.partial", hex::encode(seed))))
+    }
+
+    /// Swap an uploaded world in (`world.rs`), after backing up what the
+    /// server has: no world is ever deleted by an import. The upload is
+    /// removed either way.
+    pub async fn import_world(&self, instance_id: &str, upload: &std::path::Path) -> Result<serde_json::Value> {
+        let result = self.import_world_inner(instance_id, upload).await;
+        let _ = std::fs::remove_file(upload);
+        result
+    }
+
+    async fn import_world_inner(&self, instance_id: &str, upload: &std::path::Path) -> Result<serde_json::Value> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state == InstanceState::Running {
+            return Err(anyhow!("stop the server first: a world cannot be swapped while it runs"));
+        }
+        let is_minecraft = self
+            .packs
+            .read()
+            .await
+            .get(c.game_id.as_deref().unwrap_or_default())
+            .is_some_and(|p| matches!(p.content, PackContent::Minecraft {}));
+        if !is_minecraft {
+            return Err(anyhow!("only a Minecraft server takes a world"));
+        }
+        let server_dir = self.instance_dir(instance_id)?.join("writable").join("server");
+        let had_world = crate::world::WORLD_DIRS.iter().any(|d| server_dir.join(d).exists());
+        let backup = if had_world { Some(self.create_backup(instance_id).await?.name) } else { None };
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for a staging name: {e}"))?;
+        let staging = self.config.data_root.join("staging").join(format!("world-{}", hex::encode(seed)));
+        let archive = upload.to_path_buf();
+        let placed = tokio::task::spawn_blocking(move || crate::world::import(&archive, &server_dir, &staging))
+            .await?
+            .map_err(|e| anyhow!("{e}"))?;
+        tracing::info!(instance = %instance_id, backup = ?backup, "imported a world");
+        Ok(serde_json::json!({ "placed": placed, "backup": backup }))
+    }
+
     /// Which bot implementation this node can drive for a game, if any.
     ///
     /// The node's config wins over the pack. A pack may only name bots the game
@@ -1427,6 +1698,9 @@ impl Agent {
         self.mesh.stop(instance_id).await;
         self.docker.restart(instance_id).await?;
         self.crashes.lock().await.stopped_here.remove(instance_id);
+        if let Some(game_id) = self.game_of(instance_id).await {
+            self.apply_bans_later(instance_id, &game_id).await;
+        }
 
         let instances = self.list().await?;
         let Some(instance) = instances.iter().find(|i| i.instance_id == instance_id) else {
@@ -1702,7 +1976,8 @@ impl Agent {
             .map(|s| (u32::from(s.info.players), u32::from(s.info.max_players), s.info.map))
     }
 
-    /// One A2S query to a running instance's game, when its pack declares one.
+    /// One query to a running instance's game (A2S or Server List Ping), when
+    /// its pack declares one.
     async fn ask_game(&self, instance: &InstanceStatus) -> Option<game_bridge::a2s::A2sStats> {
         if instance.state != InstanceState::Running {
             return None;
@@ -1710,21 +1985,18 @@ impl Agent {
         let profile = self.packs.read().await.get(&instance.game_id)?.to_profile().ok()?;
         // The pack names an enum this build implements — never a command. A
         // game declaring no query is unknown, which is the honest answer.
-        match profile.query? {
-            game_bridge::profile::QueryProtocol::A2s => {
-                // The same place the mesh bridge reaches the game
-                // (`game_address`). Not `127.0.0.1:<host_port>`: this agent is
-                // meant to run in a container, where that loopback is its own
-                // namespace and the query reaches nothing — every instance
-                // would report "could not ask", and reaping would then never
-                // touch anything because unknown is deliberately never treated
-                // as empty.
-                let host = self.docker.games_gateway().await.ok()?;
-                let reach = crate::mesh::GameReach::from_ports(host, &instance.ports, instance.port)?;
-                let ip: std::net::IpAddr = reach.host.parse().ok()?;
-                game_bridge::a2s::query(std::net::SocketAddr::new(ip, reach.port)).await.ok()
-            }
-        }
+        let protocol = profile.query?;
+        // The same place the mesh bridge reaches the game
+        // (`game_address`). Not `127.0.0.1:<host_port>`: this agent is
+        // meant to run in a container, where that loopback is its own
+        // namespace and the query reaches nothing — every instance
+        // would report "could not ask", and reaping would then never
+        // touch anything because unknown is deliberately never treated
+        // as empty.
+        let host = self.docker.games_gateway().await.ok()?;
+        let reach = crate::mesh::GameReach::from_ports(host, &instance.ports, instance.port)?;
+        let ip: std::net::IpAddr = reach.host.parse().ok()?;
+        protocol.ask(std::net::SocketAddr::new(ip, reach.port)).await.ok()
     }
 
     /// Who is on a server right now, as its game reports it: names, scores and
@@ -1884,7 +2156,7 @@ impl Agent {
     /// game may be writing a file at that moment, which the page says. Held
     /// to the disk reserve like a download, by the files' full size.
     pub async fn create_backup(&self, instance_id: &str) -> Result<crate::backups::Backup> {
-        self.ensure_instance(instance_id).await?;
+        let c = self.ensure_instance(instance_id).await?;
         let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
         let dir = self.backups_dir(instance_id)?;
         let need = {
@@ -1892,10 +2164,57 @@ impl Agent {
             tokio::task::spawn_blocking(move || crate::content::dir_size(&w)).await?
         };
         self.room_for(need).await.map_err(|e| anyhow!("{e}"))?;
+        // A running world is flushed and held still while it is copied
+        // (`MINECRAFT.md` §7), and let go afterwards whatever happened.
+        let console = match c.state {
+            InstanceState::Running => self.console_of(instance_id).await.ok().map(|(_, p)| p),
+            _ => None,
+        };
+        if let Some(console) = console.filter(|p| p.backup_ready().is_some()) {
+            self.hold_world(instance_id, console).await;
+        }
         let name = crate::backups::new_name(&dir, now_unix());
-        let made = tokio::task::spawn_blocking(move || crate::backups::create(&writable, &dir, &name)).await??;
+        let made = tokio::task::spawn_blocking(move || crate::backups::create(&writable, &dir, &name)).await;
+        if let Some(console) = console {
+            for line in console.after_backup() {
+                if let Err(e) = self.docker.send_console_line(instance_id, line).await {
+                    tracing::warn!(instance = %instance_id, error = %format!("{e:#}"), "the world was not let go after a backup; send {line} yourself");
+                }
+            }
+        }
+        let made = made??;
         tracing::info!(instance = %instance_id, backup = %made.name, bytes = made.bytes, "backed up a server's files");
         Ok(made)
+    }
+
+    /// Send a game's before-backup lines and wait, up to `WORLD_SAVE_WAIT`,
+    /// for the server to say it saved. A server that never says so is backed
+    /// up anyway: a copy taken mid-save is still better than none, and the
+    /// log says it happened.
+    async fn hold_world(&self, instance_id: &str, console: ConsoleProtocol) {
+        let Some((poll, marker)) = console.backup_ready() else { return };
+        let saved = |log: &str| log.matches(marker).count();
+        let before = self.logs(instance_id, 200).await.map(|l| saved(&l)).unwrap_or(0);
+        for line in console.before_backup() {
+            if let Err(e) = self.docker.send_console_line(instance_id, line).await {
+                tracing::warn!(instance = %instance_id, error = %format!("{e:#}"), "could not ask the server to save before a backup");
+                return;
+            }
+        }
+        let deadline = Instant::now() + WORLD_SAVE_WAIT;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Bedrock prepares in the background and says it is ready only
+            // when asked.
+            if let Some(line) = poll {
+                let _ = self.docker.send_console_line(instance_id, line).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if self.logs(instance_id, 200).await.map(|l| saved(&l)).unwrap_or(0) > before {
+                return;
+            }
+        }
+        tracing::warn!(instance = %instance_id, "the server did not say it saved; backing up anyway");
     }
 
     /// Put a backup back over a **stopped** server's writable files.
@@ -2291,6 +2610,15 @@ impl Agent {
     pub fn active_version(&self, game_id: &str) -> Option<String> {
         let runtime = self.config.runtime_for(game_id)?;
         Some(self.active_version_of(game_id, &runtime.content_version))
+    }
+
+    /// The copy a server runs: the one its spec picked (a Minecraft build),
+    /// else the node's own.
+    fn version_for(&self, game_id: &str, picked: Option<&str>, config_version: &str) -> String {
+        match picked {
+            Some(v) => v.to_string(),
+            None => self.active_version_of(game_id, config_version),
+        }
     }
 
     fn active_version_of(&self, game_id: &str, config_version: &str) -> String {
@@ -3240,6 +3568,38 @@ pub struct NodeChatLine {
     pub at_unix: u64,
 }
 
+/// What a spec may ask of this pack (`MINECRAFT.md` §8, §9): a game with an
+/// `[eula]` needs the owner's acceptance, and a Java heap, Minecraft settings
+/// and a picked copy belong to a Minecraft game only. Refused, never ignored:
+/// a setting silently dropped is a server that is not what was asked for.
+pub fn check_spec_against_pack(spec: &InstanceSpec, pack: &GamePack) -> Result<()> {
+    let o = &spec.options;
+    if let Some(eula) = &pack.eula {
+        if o.eula_accepted_at.is_none() {
+            return Err(anyhow!(
+                "{} needs its owner to accept the {} ({}) before the server can be created",
+                pack.display_name,
+                eula.name,
+                eula.url
+            ));
+        }
+    }
+    let minecraft = matches!(pack.content, PackContent::Minecraft {});
+    if !minecraft && (o.memory.is_some() || o.content_version.is_some()) {
+        return Err(anyhow!("{} does not take a Java memory size or a picked version", pack.display_name));
+    }
+    // World settings (game mode, difficulty, allowlist) belong to either
+    // Minecraft, Java or Bedrock.
+    let world = matches!(pack.console, Some(game_bridge::pack::PackConsole::Minecraft | game_bridge::pack::PackConsole::Bedrock));
+    if !world && o.minecraft.is_some() {
+        return Err(anyhow!("{} does not take Minecraft settings", pack.display_name));
+    }
+    if let (true, Some(v)) = (minecraft, &o.content_version) {
+        game_bridge::minecraft::MinecraftBuild::parse(v).map_err(|e| anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
 /// `MemTotal` and `MemAvailable` from `/proc/meminfo`, in bytes. Available,
 /// not free: the kernel's own estimate of what new work can use without
 /// swapping, page cache included.
@@ -3252,6 +3612,88 @@ fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
             .map(|kb| kb * 1024)
     };
     Some((field("MemTotal")?, field("MemAvailable")?))
+}
+
+#[cfg(test)]
+mod pack_gate_tests {
+    use super::check_spec_against_pack;
+    use crate::instance::{InstanceOptions, InstanceSpec, MemorySpec};
+    use game_bridge::GamePack;
+
+    fn minecraft_pack() -> GamePack {
+        GamePack::parse(
+            r#"
+schema_version = 1
+id = "minecraft-java"
+display_name = "Minecraft: Java Edition"
+app_name = "minecraft-java"
+default_port = 25565
+transport = "tcp"
+min_link_class = 1
+console = "minecraft"
+writable_paths = ["server"]
+[content]
+driver = "minecraft"
+[eula]
+name = "Minecraft End User License Agreement"
+url = "https://aka.ms/MinecraftEULA"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn spec(options: InstanceOptions) -> InstanceSpec {
+        InstanceSpec {
+            instance_id: "mc1".into(),
+            game_id: "minecraft-java".into(),
+            name: "Friday".into(),
+            max_players: 20,
+            port: None,
+            extra_ports: Default::default(),
+            bots: None,
+            map: None,
+            restart_on_crash: false,
+            owner: None,
+            options,
+        }
+    }
+
+    #[test]
+    fn a_game_with_an_eula_is_never_created_without_the_owners_acceptance() {
+        let pack = minecraft_pack();
+        let err = check_spec_against_pack(&spec(InstanceOptions::default()), &pack).unwrap_err();
+        assert!(err.to_string().contains("accept"), "{err}");
+        let ok = InstanceOptions { eula_accepted_at: Some(1_760_000_000), ..Default::default() };
+        assert!(check_spec_against_pack(&spec(ok), &pack).is_ok());
+    }
+
+    #[test]
+    fn a_picked_build_is_judged_and_java_settings_belong_to_minecraft_only() {
+        let pack = minecraft_pack();
+        let bad = InstanceOptions {
+            eula_accepted_at: Some(1),
+            content_version: Some("paper-26.4-snapshot-4".into()),
+            ..Default::default()
+        };
+        assert!(check_spec_against_pack(&spec(bad), &pack).is_err());
+
+        let bedrock = GamePack::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/minecraft-bedrock.toml")).unwrap();
+        let mut b = spec(InstanceOptions {
+            eula_accepted_at: Some(1),
+            minecraft: Some(crate::instance::MinecraftSettings::default()),
+            ..Default::default()
+        });
+        b.game_id = "minecraft-bedrock".into();
+        assert!(check_spec_against_pack(&b, &bedrock).is_ok(), "Bedrock takes world settings");
+        b.options.memory = Some(MemorySpec { min_mb: 1024, max_mb: 2048 });
+        assert!(check_spec_against_pack(&b, &bedrock).is_err(), "and no Java heap");
+
+        let sven = GamePack::sven_coop();
+        let heap = InstanceOptions { memory: Some(MemorySpec { min_mb: 1024, max_mb: 2048 }), ..Default::default() };
+        let mut s = spec(heap);
+        s.game_id = "sven-coop".into();
+        assert!(check_spec_against_pack(&s, &sven).is_err(), "a heap on a game with no JVM is refused, not ignored");
+    }
 }
 
 #[cfg(test)]

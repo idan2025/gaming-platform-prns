@@ -99,7 +99,13 @@ pub fn list(dir: &Path) -> Vec<Backup> {
 }
 
 /// Pack `writable` into `dir/name`: entries under `writable/`, links kept as
-/// links. Written beside and renamed.
+/// links when restore would take them back. Written beside and renamed.
+///
+/// A link that is absolute or climbs out with `..` is left out: restore
+/// extracts under `content::extract`'s link rules and refuses one, so a backup
+/// holding it could never be restored. The Bedrock image links its server's
+/// own files in from the shared copy that way, and makes the links again at
+/// every start.
 pub fn create(writable: &Path, dir: &Path, name: &str) -> std::io::Result<Backup> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(name);
@@ -110,7 +116,7 @@ pub fn create(writable: &Path, dir: &Path, name: &str) -> std::io::Result<Backup
         let mut tar = tar::Builder::new(gz);
         tar.follow_symlinks(false);
         if writable.is_dir() {
-            tar.append_dir_all("writable", writable)?;
+            append_tree(&mut tar, writable, Path::new("writable"))?;
         } else {
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(tar::EntryType::Directory);
@@ -127,6 +133,31 @@ pub fn create(writable: &Path, dir: &Path, name: &str) -> std::io::Result<Backup
     std::fs::rename(&partial, &path)?;
     let bytes = std::fs::metadata(&path)?.len();
     Ok(Backup { name: name.to_string(), bytes, created_unix: Some(crate::agent::now_unix()) })
+}
+
+/// `append_dir_all`, minus the links restore would refuse.
+fn append_tree<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &Path, name: &Path) -> std::io::Result<()> {
+    tar.append_dir(name, dir)?;
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let path = e.path();
+        let inner = name.join(e.file_name());
+        let kind = e.file_type()?;
+        if kind.is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            let restorable = target.is_relative()
+                && !target.components().any(|c| matches!(c, std::path::Component::ParentDir));
+            if restorable {
+                tar.append_path_with_name(&path, &inner)?;
+            }
+        } else if kind.is_dir() {
+            append_tree(tar, &path, &inner)?;
+        } else if kind.is_file() {
+            tar.append_path_with_name(&path, &inner)?;
+        }
+    }
+    Ok(())
 }
 
 /// Put a backup back: extract into `staging`, then swap it in for
@@ -270,6 +301,28 @@ pub fn path_of(dir: &Path, name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_restore_would_refuse_is_left_out_and_the_backup_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path().join("writable");
+        std::fs::create_dir_all(w.join("server/worlds/world")).unwrap();
+        std::fs::write(w.join("server/worlds/world/level.dat"), b"lvl").unwrap();
+        std::os::unix::fs::symlink("/game/bedrock_server", w.join("server/bedrock_server")).unwrap();
+        std::os::unix::fs::symlink("../escape", w.join("server/up")).unwrap();
+        std::os::unix::fs::symlink("worlds", w.join("server/w")).unwrap();
+        let dir = tmp.path().join("backups");
+        let b = create(&w, &dir, "20261018-000000.tar.gz").unwrap();
+        let back = tmp.path().join("restored");
+        std::fs::create_dir_all(&back).unwrap();
+        restore(&dir.join(&b.name), &back.join("writable"), &tmp.path().join("staging")).unwrap();
+        let r = back.join("writable/server");
+        assert_eq!(std::fs::read(r.join("worlds/world/level.dat")).unwrap(), b"lvl");
+        assert!(r.join("w").symlink_metadata().unwrap().file_type().is_symlink(), "a link inside the tree is kept");
+        assert!(r.join("bedrock_server").symlink_metadata().is_err() && r.join("up").symlink_metadata().is_err());
+    }
+
     use super::*;
 
     #[test]

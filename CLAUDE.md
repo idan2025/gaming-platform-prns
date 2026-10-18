@@ -458,6 +458,69 @@ quietly break:
   outside its folder. Single-instance is what hands a clicked link to the
   running launcher instead of starting a second mesh node.
 
+**The launcher builds for Android** (2026-10-18, branch `feat/android-preview`,
+prereleases tagged `android-preview-*`, never `v*`). A phone joins servers and
+shows the address to point a game at; it hosts nothing, opens no LAN room and
+starts no game. Rules a later change could quietly break:
+- **The desktop layout never changes for the phone.** Every phone rule in
+  `style.css` sits under `html.phone`, which only `IS_ANDROID` sets, and every
+  behaviour change in `app.js` is gated on it.
+- **An Android app has no `$HOME` and its resources are APK assets.** The
+  shell passes a settings path inside the app's own folder
+  (`Launcher::from_pack_dir_at`) and writes the shipped packs, compiled in by
+  `build.rs`, out to it at start. Deriving either the desktop way failed with
+  "Permission denied".
+- **HTTPS on Android checks against Mozilla's roots**
+  (`game_bridge::repo::http_client`): reqwest's platform verifier needs the
+  JVM handed to it first, and without that every fetch fails.
+- **The Android update check reads asset names**: an APK must be published
+  as `lanthorn-<version>-android-arm64-<versionCode>.apk` on an `android-*`
+  tag, or no installed phone sees it (`update::android`). The versionCode in
+  `tauri.conf.json` is the one source; `build.rs` reads it. The page only
+  opens the APK; Android installs it only over a copy signed by the same key
+  (`~/.config/lanthorn-android/`, not in the repo).
+
+**Minecraft is hosted, and every console game has kick and ban** (2026-10-18,
+`MINECRAFT.md`, branch `feat/minecraft`). Rules a later change could quietly
+break:
+- **A Minecraft build is a content version picked per server**
+  (`InstanceSpec.options.content_version`, `paper-26.3`), and its id is an
+  allowlist (`game_bridge::minecraft::MinecraftBuild::parse`): a known type,
+  release versions of digits and dots, **nothing older than 1.18.1**
+  (Log4Shell). Refused, never repaired.
+- **Fetched only from `minecraft::HOSTS`, over https, redirects included,
+  and checked against the publisher's own digest** (SHA-1 for Mojang,
+  SHA-256 elsewhere) before it is renamed into place
+  (`platform-agent/src/minecraft.rs`).
+- **A pack with `[eula]` is never created without `eula_accepted_at`**, and
+  that is checked before a missing copy can turn the create into a download
+  (`Agent::check_spec`; `a_spec_without_the_eula_is_refused_and_starts_no_download`).
+  The image writes `eula=true` only with the agent's value.
+- **One resource judgement, asked twice** (`resources.rs`): refuse below the
+  reserve (1 GiB or 10%), warn above half of free memory; the container gets
+  a hard limit of heap × 1.25 + 512 MiB. Java settings on a non-Minecraft
+  game are refused, never ignored.
+- **Moderation words live in `console.rs`**, targets validated per engine (a
+  Minecraft name, an in-game name for a GoldSrc/Source kick, a Steam ID for
+  their ban). **GoldSrc and Source bans are the node's** (`bans.json`, sent
+  again after every start: the game would write them into the read-only
+  copy); pinned by `tests/moderation.rs`, which fails without the re-send.
+  Loopback API only, like the console.
+- **A world import changes nothing until it has passed**: zip or tar under
+  the content path rules, no links, one world (or Paper's three folders), the
+  old world backed up first (`world.rs`).
+
+**Bedrock Edition is a pack too** (2026-10-18, `MINECRAFT.md` §16). Rules:
+- **NetherNet only, and the UDP side names the client's loopback**
+  (`server-udp-ports=127.0.0.1:19133-19136:…`): TCP 19132 is the handshake,
+  UDP channels 1–4 the game. RakNet is refused by this release's players.
+- **The download is pinned in the pack** (`archive` driver; Mojang publishes
+  no digest). A new Bedrock release is a new pack version.
+- **The image owns the server's console** through a pipe and turns SIGTERM
+  into `stop`; the server ignores SIGTERM on its own.
+- **Backups leave out links restore would refuse** (`backups::append_tree`);
+  the Bedrock image links its files in by absolute path.
+
 **The server list is what is live, never history** (2026-10-10, the user's
 call). `list_servers` does not list remembered servers; a heard row drops off
 after `STALE_AFTER` (180 s) unless the query sets `max_age_secs`. Because a

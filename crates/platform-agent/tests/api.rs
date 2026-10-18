@@ -152,6 +152,11 @@ async fn without_the_token_every_route_is_refused() {
         (reqwest::Method::GET, "/packs/repository?url=https://example.org/"),
         (reqwest::Method::POST, "/content/sven-coop/test/use"),
         (reqwest::Method::POST, "/instances/anything/console"),
+        (reqwest::Method::POST, "/instances/anything/moderation"),
+        (reqwest::Method::GET, "/instances/anything/moderation"),
+        (reqwest::Method::POST, "/instances/anything/world"),
+        (reqwest::Method::GET, "/resources/check?game=sven-coop"),
+        (reqwest::Method::GET, "/minecraft/versions?server=paper"),
         (reqwest::Method::PUT, "/instances/anything/restart-schedule"),
         (reqwest::Method::POST, "/instances/anything/backups"),
         (reqwest::Method::POST, "/instances/anything/backups/20261014-051002.tar.gz/restore"),
@@ -526,6 +531,42 @@ async fn a_hostile_instance_id_is_refused() {
             .unwrap();
         assert_eq!(res.status(), 400, "instance_id {bad:?} should have been refused");
     }
+}
+
+/// A game with an `[eula]` refuses a spec without the owner's acceptance, and
+/// says so: the missing copy must not turn the refusal into a download.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spec_without_the_eula_is_refused_and_starts_no_download() {
+    let Some(dir) = tempfile::tempdir().ok() else { return };
+    let toml = config_toml(dir.path()).replace("max_instances = 2", "max_instances = 2\nallow_content_fetch = true").replace(
+        "[games.sven-coop]",
+        "[games.minecraft-java]\nimage = \"gpp-test-sleeper:latest\"\ncontent_root = \"/game\"\ncontent_version = \"paper-26.3\"\n\n[games.sven-coop]",
+    );
+    let pack = game_bridge::GamePack::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/minecraft-java.toml")).unwrap();
+    let Ok(agent) = Agent::new(AgentConfig::parse(&toml).unwrap(), vec![pack]).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let agent = Arc::new(agent);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = api::router(agent.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let res = reqwest::Client::new()
+        .post(format!("http://{addr}/instances"))
+        .json(&serde_json::json!({
+            "instance_id": "mc1", "game_id": "minecraft-java", "name": "No EULA", "max_players": 20
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("End User License Agreement"), "{body}");
+    let status: serde_json::Value = reqwest::get(format!("http://{addr}/content/minecraft-java")).await.unwrap().json().await.unwrap();
+    assert_eq!(status["status"]["state"], "idle", "no download was started: {status}");
 }
 
 /// Stopping something that is not there is the caller's problem, and must not

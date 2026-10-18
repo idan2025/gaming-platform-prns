@@ -15,12 +15,15 @@ use std::path::PathBuf;
 
 use launcher_core::invite::Invite;
 use launcher_core::lan::{LanHelperView, RoomCheckView, RoomView};
-use launcher_core::update::{install_mode, InstallFacts, InstallMode, UpdateView};
+use launcher_core::update::UpdateView;
+#[cfg(desktop)]
+use launcher_core::update::{install_mode, InstallFacts, InstallMode};
 use launcher_core::{
     error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
     GameSummary, JoinResult, Launcher, PathTraceView, PlayResult, ServerDetailsView, ServerRow,
 };
 use tauri::{Emitter, Manager};
+#[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
 
 struct AppState {
@@ -29,7 +32,11 @@ struct AppState {
     /// until the page takes it (`take_invite`).
     pending_invite: std::sync::Mutex<Option<Invite>>,
     /// The update the last check found, kept for `install_update`.
+    #[cfg(desktop)]
     update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// The APK the last Android check found, for `open_release_page`.
+    #[cfg(target_os = "android")]
+    android_apk: std::sync::Mutex<Option<String>>,
     /// Whether the tray icon came up. Without one (a Linux desktop with no
     /// tray, say) closing the window quits as it always did: a hidden window
     /// with no icon to bring it back would be a launcher nobody can reach.
@@ -89,18 +96,32 @@ async fn server_details(
 /// and it is remembered per game. It exists because the pack's default is the
 /// port the game's *own* dedicated server uses, so a machine already running
 /// one owns it and the join fails on a number the player never picked.
+/// Keep the phone's session alive while a server or room is open: the foreground
+/// service runs exactly while `keeps_running` says something is joined or
+/// hosted. A failed start is logged, not returned: the session itself is fine,
+/// it just may be killed in the background.
+async fn sync_keepalive(app: &tauri::AppHandle, state: &AppState) {
+    let on = state.launcher.keeps_running().await.is_some();
+    if let Err(e) = tauri_plugin_keepalive::set(app, on) {
+        tracing::warn!(error = %e, "background service");
+    }
+}
+
 #[tauri::command]
 async fn join_server(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     destination_hash: String,
     game_id: Option<String>,
     listen_port: Option<u16>,
 ) -> Result<JoinResult, String> {
-    state
+    let joined = state
         .launcher
         .join_server(&destination_hash, game_id.as_deref(), listen_port)
         .await
-        .map_err(fmt_err)
+        .map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    joined
 }
 
 /// The local port a join for this game would bind right now — what the player
@@ -189,6 +210,50 @@ async fn check_update(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<UpdateView, String> {
+    #[cfg(target_os = "android")]
+    return check_update_android(app, state).await;
+    #[cfg(all(mobile, not(target_os = "android")))]
+    {
+        let _ = (app, state);
+        return Err("this build updates from the release page".into());
+    }
+    #[cfg(desktop)]
+    check_update_desktop(app, state).await
+}
+
+/// The Android build's check (`launcher_core::update::android`): the newest
+/// Android release with a higher `versionCode` than this APK's. It is never
+/// installed from here; the page offers its APK to download and open.
+#[cfg(target_os = "android")]
+async fn check_update_android(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UpdateView, String> {
+    use launcher_core::update::{android, InstallMode};
+    let code: u32 = env!("LANTHORN_ANDROID_VERSION_CODE").parse().map_err(|_| "no versionCode in this build")?;
+    let current = format!("{} (build {})", app.package_info().version, code % 1000);
+    let auto = state.launcher.auto_check_updates().await;
+    let found = android::check(code).await.map_err(|e| format!("could not check for updates: {e}"))?;
+    let mut view = UpdateView::none(&current, InstallMode::LinkOnly, auto);
+    view.page = ANDROID_RELEASES_PAGE.to_string();
+    if let Some(release) = &found {
+        view.available = Some(release.label());
+        view.notes = release.notes.clone();
+    }
+    *state.android_apk.lock().unwrap() = found.map(|r| r.apk_url);
+    Ok(view)
+}
+
+/// Every release, because the Android builds are prereleases and
+/// `/releases/latest` never shows one.
+#[cfg(target_os = "android")]
+const ANDROID_RELEASES_PAGE: &str = "https://github.com/idan2025/gaming-platform-prns/releases";
+
+#[cfg(desktop)]
+async fn check_update_desktop(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UpdateView, String> {
     let current = app.package_info().version.to_string();
     let mode = install_mode(InstallFacts::here(state.launcher.is_portable()));
     let auto = state.launcher.auto_check_updates().await;
@@ -211,6 +276,17 @@ async fn check_update(
 /// it and restart. Only where this copy can replace itself.
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    #[cfg(mobile)]
+    {
+        let _ = (app, state);
+        return Err("this build updates from the release page".into());
+    }
+    #[cfg(desktop)]
+    install_update_desktop(app, state).await
+}
+
+#[cfg(desktop)]
+async fn install_update_desktop(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if install_mode(InstallFacts::here(state.launcher.is_portable())) != InstallMode::InPlace {
         return Err("this copy of Lanthorn updates from the release page, not by itself".into());
     }
@@ -263,15 +339,19 @@ fn send_notification(app: &tauri::AppHandle, title: &str, body: &str) -> bool {
 
 #[tauri::command]
 async fn host_server(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     request: launcher_core::host::HostRequest,
 ) -> Result<launcher_core::host::HostView, String> {
-    state.launcher.host_server(request).await.map_err(fmt_err)
+    let hosted = state.launcher.host_server(request).await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    hosted
 }
 
 #[tauri::command]
-async fn stop_hosting(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn stop_hosting(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.launcher.stop_hosting().await;
+    sync_keepalive(&app, &state).await;
     Ok(())
 }
 
@@ -300,6 +380,7 @@ async fn set_notifications_on(state: tauri::State<'_, AppState>, on: bool) -> Re
     state.launcher.set_notifications_on(on).await.map_err(fmt_err)
 }
 
+#[cfg(desktop)]
 /// Bring the window back from the tray, or from behind other windows.
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -313,6 +394,7 @@ fn show_main(app: &tauri::AppHandle) {
 /// Quit is a real quit, exactly like closing the window used to be, so a
 /// room ends with it (`CLAUDE.md`, Mode 3: nothing a room creates outlives
 /// the launcher).
+#[cfg(desktop)]
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -373,9 +455,28 @@ fn invite_link(
 #[tauri::command]
 fn open_release_page(app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(launcher_core::update::RELEASES_PAGE, None::<&str>)
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "android")]
+    let url = ANDROID_RELEASES_PAGE;
+    #[cfg(not(target_os = "android"))]
+    let url = launcher_core::update::RELEASES_PAGE;
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+/// Android: open the APK the last check found, which the browser downloads
+/// and the system installs over this one only if the same key signed it. It
+/// was checked to be one of this repository's downloads
+/// (`update::android::DOWNLOAD_PREFIX`); without one, the release page.
+#[tauri::command]
+fn open_update_download(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        let found = app.state::<AppState>().android_apk.lock().unwrap().clone();
+        let url = found.unwrap_or_else(|| ANDROID_RELEASES_PAGE.to_string());
+        return app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    open_release_page(app)
 }
 
 /// An invite link reached this launcher — at start, from a second launch, or
@@ -391,6 +492,7 @@ fn receive_invite(app: &tauri::AppHandle, url: &str) {
             }
             let _ = app.emit("invite", invite);
             if let Some(w) = app.get_webview_window("main") {
+                #[cfg(desktop)]
                 let _ = w.unminimize();
                 let _ = w.set_focus();
             }
@@ -427,8 +529,10 @@ async fn remove_index(
 }
 
 #[tauri::command]
-async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.launcher.leave().await.map_err(fmt_err)
+async fn leave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let left = state.launcher.leave().await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    left
 }
 
 /// Start the game for the current join — the Play button (`PLAN.md` §13.3). All
@@ -574,25 +678,33 @@ async fn revoke_lan_helper(state: tauri::State<'_, AppState>) -> Result<LanHelpe
 
 #[tauri::command]
 async fn host_room(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     game_id: String,
     name: Option<String>,
 ) -> Result<RoomView, String> {
-    state.launcher.host_room(&game_id, name).await.map_err(fmt_err)
+    let hosted = state.launcher.host_room(&game_id, name).await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    hosted
 }
 
 #[tauri::command]
 async fn join_room(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     destination_hash: String,
     game_id: String,
 ) -> Result<RoomView, String> {
-    state.launcher.join_room(&destination_hash, &game_id).await.map_err(fmt_err)
+    let joined = state.launcher.join_room(&destination_hash, &game_id).await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    joined
 }
 
 #[tauri::command]
-async fn leave_room(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.launcher.leave_room().await.map_err(fmt_err)
+async fn leave_room(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let left = state.launcher.leave_room().await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    left
 }
 
 #[tauri::command]
@@ -757,6 +869,7 @@ async fn unblock_room_programs(state: tauri::State<'_, AppState>) -> Result<Room
     state.launcher.unblock_room_programs().await.map_err(fmt_err)
 }
 
+#[cfg(not(target_os = "android"))]
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     // Beside the executable first: that is the portable layout, and on Linux
     // `resource_dir` never points there outside a cargo `target/` — it resolves
@@ -777,6 +890,30 @@ fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs"))
 }
 
+#[cfg(target_os = "android")]
+mod bundled {
+    include!(concat!(env!("OUT_DIR"), "/bundled_packs.rs"));
+}
+
+/// Where an Android launcher keeps its packs and its settings: the app's own
+/// folder, the only place it may write. There is no `$HOME` to derive one
+/// from (writing under `/` is what failed with "Permission denied"), and the
+/// shipped packs are APK assets no file call can read, so they are written
+/// out from the binary on every start, replacing the last start's copy.
+/// Packs from a repository live beside the settings file, as on desktop.
+#[cfg(target_os = "android")]
+fn android_dirs(app: &tauri::AppHandle) -> Result<(PathBuf, Option<PathBuf>), Box<dyn std::error::Error>> {
+    let root = app.path().app_data_dir()?;
+    let packs = root.join("bundled-packs");
+    let _ = std::fs::remove_dir_all(&packs);
+    std::fs::create_dir_all(&packs)?;
+    for (name, bytes) in bundled::BUNDLED_PACKS {
+        std::fs::write(packs.join(name), bytes)?;
+    }
+    Ok((packs, Some(root.join("gaming-platform-prns").join("launcher.json"))))
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Portable mode (`launcher-core/src/portable.rs`): every per-user
     // directory is pointed inside the portable folder *before* anything else
@@ -794,24 +931,32 @@ pub fn run() {
         .try_init();
 
     let is_portable = portable.is_some();
-    tauri::Builder::default()
-        // First, so a second launch — which is how Windows and Linux hand a
-        // clicked invite link to an app — passes its link here and exits
-        // instead of starting a second launcher with a second mesh node.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            for arg in argv.iter().filter(|a| a.starts_with("lanthorn://")) {
-                receive_invite(app, arg);
-            }
-            show_main(app);
-        }))
+    let builder = tauri::Builder::default();
+    // First, so a second launch — which is how Windows and Linux hand a
+    // clicked invite link to an app — passes its link here and exits
+    // instead of starting a second launcher with a second mesh node. Phones
+    // have no second launch to speak of, so this is desktop only.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        for arg in argv.iter().filter(|a| a.starts_with("lanthorn://")) {
+            receive_invite(app, arg);
+        }
+        show_main(app);
+    }));
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
+        .plugin(tauri_plugin_keepalive::init())
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            let packs = pack_dir(app.handle());
-            let launcher = Launcher::from_pack_dir(&packs).with_portable(portable.is_some());
+            #[cfg(not(target_os = "android"))]
+            let (packs, settings) = (pack_dir(app.handle()), launcher_core::settings::default_settings_path());
+            #[cfg(target_os = "android")]
+            let (packs, settings) = android_dirs(app.handle())?;
+            let launcher = Launcher::from_pack_dir_at(&packs, settings).with_portable(portable.is_some());
             tracing::info!(
                 packs = %packs.display(),
                 games = launcher.list_games().len(),
@@ -821,7 +966,10 @@ pub fn run() {
             app.manage(AppState {
                 launcher,
                 pending_invite: std::sync::Mutex::new(None),
+                #[cfg(desktop)]
                 update: tokio::sync::Mutex::new(None),
+                #[cfg(target_os = "android")]
+                android_apk: std::sync::Mutex::new(None),
                 tray: std::sync::atomic::AtomicBool::new(false),
                 told_tray: std::sync::atomic::AtomicBool::new(false),
             });
@@ -837,11 +985,14 @@ pub fn run() {
             // On Linux the tray loads libayatana-appindicator at run time and
             // panics when the desktop has none; that must cost the tray, not
             // the launcher.
-            let handle = app.handle().clone();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(&handle))) {
-                Ok(Ok(())) => app.state::<AppState>().tray.store(true, std::sync::atomic::Ordering::Relaxed),
-                Ok(Err(e)) => tracing::info!(error = %e, "no tray icon; closing the window quits"),
-                Err(_) => tracing::info!("no tray library on this desktop; closing the window quits"),
+            #[cfg(desktop)]
+            {
+                let handle = app.handle().clone();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(&handle))) {
+                    Ok(Ok(())) => app.state::<AppState>().tray.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Ok(Err(e)) => tracing::info!(error = %e, "no tray icon; closing the window quits"),
+                    Err(_) => tracing::info!("no tray library on this desktop; closing the window quits"),
+                }
             }
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -943,6 +1094,7 @@ pub fn run() {
             parse_invite,
             invite_link,
             open_release_page,
+            open_update_download,
             indexes,
             add_index,
             remove_index,

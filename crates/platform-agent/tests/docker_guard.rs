@@ -143,6 +143,7 @@ fn spec(id: &str) -> InstanceSpec {
         bots: None,
         restart_on_crash: false,
         owner: None,
+        options: Default::default(),
     }
 }
 

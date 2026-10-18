@@ -138,6 +138,14 @@ pub fn router_full(
         .route("/backups", get(all_backups))
         .route("/backups/:id", delete(delete_removed_backups))
         .route("/instances/:id/bots", post(set_bots))
+        // Moderation (MINECRAFT.md §4): loopback only, like the console.
+        .route("/instances/:id/moderation", get(moderation_view).post(moderate))
+        .route(
+            "/instances/:id/world",
+            post(import_world).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/resources/check", get(resource_check))
+        .route("/minecraft/versions", get(minecraft_versions))
         .route("/instances/:id", delete(remove))
         .route("/orphans", get(orphans))
         .route("/content", get(installed))
@@ -294,6 +302,17 @@ struct GameOption {
     signer: Option<String>,
     /// Where the game's files stand on this node, `None` without a runtime.
     content: Option<crate::agent::ContentState>,
+    /// The licence a server's owner must accept, if the pack names one.
+    eula: Option<game_bridge::pack::PackEula>,
+    /// A Minecraft game: the create form asks for a server type and version,
+    /// memory and settings (`MINECRAFT.md`).
+    minecraft: bool,
+    /// For a Minecraft game, the build a server gets when none is picked: the
+    /// node's own `content_version`.
+    default_build: Option<String>,
+    /// The game takes Minecraft's world settings (game mode, difficulty,
+    /// allowlist): Java or Bedrock. The create form offers them.
+    world_settings: bool,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -645,6 +664,15 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 signer: trust.as_ref().and_then(|t| t.signer()).map(|s| hex::encode(s.as_bytes())),
                 trust: trust.map(|t| t.label().to_string()),
                 content: contents.remove(&pack.id).flatten(),
+                eula: pack.eula.clone(),
+                minecraft: matches!(pack.content, game_bridge::content::PackContent::Minecraft {}),
+                world_settings: matches!(
+                    pack.console,
+                    Some(game_bridge::pack::PackConsole::Minecraft | game_bridge::pack::PackConsole::Bedrock)
+                ),
+                default_build: matches!(pack.content, game_bridge::content::PackContent::Minecraft {})
+                    .then(|| runtime.map(|r| r.content_version.clone()))
+                    .flatten(),
             }
         })
         .collect();
@@ -791,6 +819,8 @@ async fn create(
     // content. Caught by `a_hostile_instance_id_is_refused`.
     spec.validate()
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    // The pack's own demands, before a missing copy can start a download.
+    state.agent.check_spec(&spec).await.map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
 
     match state.agent.create(spec.clone()).await {
         Ok(status) => Ok((
@@ -802,13 +832,15 @@ async fn create(
             // unconfigured game or a mistyped id is the caller's to fix, and
             // starting a multi-gigabyte download over a typo would be worse
             // than the error they got.
-            if !state.agent.content_is_missing(&spec.game_id).await {
+            let version = spec.options.content_version.clone();
+            if !state.agent.content_is_missing(&spec.game_id, version.as_deref()).await {
                 return Err(fail(StatusCode::BAD_REQUEST, e));
             }
-            let started = crate::install::spawn(
+            let started = crate::install::spawn_version(
                 state.installs.clone(),
                 state.agent.clone(),
                 spec.game_id.clone(),
+                version,
             )
             .await;
             Ok((
@@ -1120,6 +1152,117 @@ struct ConsoleReq {
     line: String,
 }
 
+#[derive(Deserialize)]
+struct ModerateReq {
+    action: game_bridge::console::PlayerAction,
+    target: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Kick, ban, unban, op or deop (`Agent::moderate`).
+async fn moderate(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ModerateReq>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .moderate(&id, req.action, &req.target, req.reason.as_deref())
+        .await
+        .map(|lines| Json(json!({ "instance_id": id, "sent": lines })))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+async fn moderation_view(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {
+    state.agent.moderation_view(&id).await.map(Json).map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+#[derive(Deserialize)]
+struct ResourceQuery {
+    game: String,
+    #[serde(default)]
+    min_mb: Option<u32>,
+    #[serde(default)]
+    max_mb: Option<u32>,
+    #[serde(default)]
+    cpus: Option<u16>,
+}
+
+/// Whether a size fits this host (`resources.rs`), for the create form to ask
+/// while a person picks; `create` asks the same question again.
+async fn resource_check(
+    State(state): State<ApiState>,
+    Query(q): Query<ResourceQuery>,
+) -> Json<crate::resources::ResourceVerdict> {
+    let memory = match (q.min_mb, q.max_mb) {
+        (Some(min_mb), Some(max_mb)) => Some(crate::instance::MemorySpec { min_mb, max_mb }),
+        (None, Some(max_mb)) => Some(crate::instance::MemorySpec { min_mb: max_mb, max_mb }),
+        _ => None,
+    };
+    Json(state.agent.resource_check(&q.game, memory, q.cpus).await)
+}
+
+#[derive(Deserialize)]
+struct VersionsQuery {
+    server: String,
+}
+
+async fn minecraft_versions(
+    State(state): State<ApiState>,
+    Query(q): Query<VersionsQuery>,
+) -> ApiResult<Vec<crate::minecraft::VersionChoice>> {
+    let server = game_bridge::minecraft::MinecraftServer::from_word(&q.server)
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, anyhow::anyhow!("{:?} is not a Minecraft server type", q.server)))?;
+    state.agent.minecraft_versions(server).await.map(Json).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
+}
+
+/// A world upload for a stopped Minecraft server (`Agent::import_world`),
+/// streamed like a backup upload and held to the same limits.
+async fn import_world(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<serde_json::Value> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| fail(StatusCode::LENGTH_REQUIRED, anyhow::anyhow!("send the file with its length")))?;
+    if declared > MAX_BACKUP_UPLOAD {
+        return Err(fail(StatusCode::PAYLOAD_TOO_LARGE, anyhow::anyhow!("a world is at most 4 GB")));
+    }
+    let upload = state
+        .agent
+        .world_upload_path(&id, Some(declared))
+        .await
+        .map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    let written = async {
+        let mut file = tokio::fs::File::create(&upload).await?;
+        let mut stream = body.into_data_stream();
+        let mut total = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            total += chunk.len() as u64;
+            if total > declared {
+                return Err(std::io::Error::other("the upload is longer than it said"));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok::<_, std::io::Error>(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&upload);
+        return Err(fail(StatusCode::BAD_REQUEST, anyhow::anyhow!("the upload did not arrive: {e}")));
+    }
+    state.agent.import_world(&id, &upload).await.map(Json).map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
 /// Type one line at a running server's console (`Agent::send_console`). The
 /// answer, if the game gives one, shows in the server's log.
 async fn send_console(
@@ -1251,6 +1394,10 @@ struct InstallRequest {
     verify: bool,
     #[serde(default)]
     remove_old: bool,
+    /// For a game whose copies are picked per server: which one (a
+    /// Minecraft build id).
+    #[serde(default)]
+    version: Option<String>,
 }
 
 async fn install_content(
@@ -1276,7 +1423,10 @@ async fn install_content(
         crate::install::spawn_update(state.installs.clone(), state.agent.clone(), game.clone(), req.remove_old)
             .await
     } else {
-        crate::install::spawn(state.installs.clone(), state.agent.clone(), game.clone()).await
+        if let Some(v) = &req.version {
+            crate::instance::validate_id(v).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        }
+        crate::install::spawn_version(state.installs.clone(), state.agent.clone(), game.clone(), req.version.clone()).await
     };
     Ok(Json(json!({
         "game": game,

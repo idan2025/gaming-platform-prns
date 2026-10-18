@@ -694,6 +694,13 @@ impl Launcher {
     /// signature is an error and never a demotion to unsigned; that rule holds
     /// wherever packs are read.
     pub fn from_pack_dir(dir: &std::path::Path) -> Self {
+        Self::from_pack_dir_at(dir, settings::default_settings_path())
+    }
+
+    /// [`from_pack_dir`](Self::from_pack_dir) with the settings file named by
+    /// the caller: an Android app has no `$HOME` to derive one from, only the
+    /// private folder the system gives it, which the shell knows.
+    pub fn from_pack_dir_at(dir: &std::path::Path, settings_path: Option<PathBuf>) -> Self {
         let policy = trust_policy();
         let launcher = match GamePack::load_dir_verified(dir, &policy, std::time::SystemTime::now()) {
             Ok(loaded) => {
@@ -710,7 +717,7 @@ impl Launcher {
         // Bolt persisted settings onto whatever set of packs we ended up with.
         // A machine with no config directory (`None`) runs with in-memory
         // settings rather than failing to start.
-        match settings::default_settings_path() {
+        match settings_path {
             Some(path) => launcher.with_settings_file(path),
             None => launcher,
         }

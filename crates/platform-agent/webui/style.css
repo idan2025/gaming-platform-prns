@@ -464,3 +464,27 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .official-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 10px 14px; margin: 0 0 14px; border: 1px solid var(--line); border-radius: 10px; }
 .official-row.hidden { display: none; }
 .official-actions { display: flex; gap: 8px; }
+
+/* Minecraft create form and moderation (MINECRAFT.md) */
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip-btn { height: 30px; padding: 0 12px; background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 999px; font-weight: 550; color: var(--text-2); cursor: pointer; }
+.chip-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.mc-mem { display: grid; gap: 6px; padding: 8px 10px; background: var(--surface-2); border-radius: var(--radius); }
+.verdict { padding: 8px 10px; border-radius: var(--radius); font-size: 12.5px; line-height: 1.45; background: var(--surface-2); }
+.verdict.ok { background: var(--ok-soft); }
+.verdict.warn { background: var(--warn-soft); }
+.verdict.bad { background: var(--bad-soft); }
+.verdict strong { font-weight: 650; }
+.warn-text { color: var(--warn); }
+.check.eula { align-items: flex-start; margin-top: 6px; padding: 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.check.eula input { margin-top: 2px; }
+.moderation { display: flex; flex-direction: column; gap: 8px; }
+.moderation h4 { font-size: 13px; font-weight: 650; margin-top: 6px; }
+.mod-list { display: grid; gap: 6px; max-height: 220px; overflow: auto; }
+.mod-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; background: var(--surface-2); border-radius: var(--radius); }
+.mod-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mod-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.mod-form { display: grid; grid-template-columns: 150px 1fr; gap: 6px; }
+.mod-form .field:nth-child(3), .mod-form .btn { grid-column: 1 / -1; }
+.modal select.field { height: 36px; }
+

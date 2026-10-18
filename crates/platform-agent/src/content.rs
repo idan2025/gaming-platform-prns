@@ -259,6 +259,9 @@ pub enum ProvisionError {
     NotUpdatable { driver: &'static str },
     /// The copy to update from is not installed.
     NothingToUpdate { dir: PathBuf },
+    /// A publisher's listing could not be used, or does not have what was
+    /// asked for (`minecraft.rs`).
+    Listing(String),
     Io(io::Error),
 }
 
@@ -304,7 +307,7 @@ impl core::fmt::Display for ProvisionError {
             }
             Self::DigestMismatch { expected, actual } => write!(
                 f,
-                "downloaded content has sha256 {actual}, but the pack pins {expected}. The \
+                "downloaded content hashes to {actual}, but {expected} was expected. The \
                  download was discarded: the digest is what decides, not the URL"
             ),
             Self::UnsafeEntry { entry, reason } => write!(
@@ -320,6 +323,7 @@ impl core::fmt::Display for ProvisionError {
             Self::NothingToUpdate { dir } => {
                 write!(f, "there is no installed copy at {} to update", dir.display())
             }
+            Self::Listing(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -535,6 +539,34 @@ impl Provisioner {
                 fs::rename(staging.join("unpacked"), &dir)?;
                 let _ = fs::remove_dir_all(&staging);
                 Ok(Provisioned::Installed { dir, bytes: written })
+            }
+            PackContent::Minecraft {} => {
+                let build = game_bridge::minecraft::MinecraftBuild::parse(&content.version)
+                    .map_err(|e| ProvisionError::Listing(e.to_string()))?;
+                if !self.allow_fetch {
+                    return Err(ProvisionError::FetchNotPermitted { url: format!("Minecraft {build}") });
+                }
+                let staging = self.staging_root()?;
+                if let Some(p) = progress {
+                    p.set_staging(&staging);
+                }
+                let installed = staging.join("unpacked");
+                let bytes = match crate::minecraft::provision(&build, &installed, progress).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&staging);
+                        return Err(e);
+                    }
+                };
+                if is_cancelled() {
+                    return Err(cancelled(&staging));
+                }
+                if let Some(parent) = dir.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&installed, &dir)?;
+                let _ = fs::remove_dir_all(&staging);
+                Ok(Provisioned::Installed { dir, bytes })
             }
             PackContent::Steamcmd { app_id, mod_dir, platform } => {
                 if !self.allow_fetch {
@@ -1040,7 +1072,11 @@ async fn fetch(
     dest: &Path,
     progress: Option<&InstallProgress>,
 ) -> Result<u64, ProvisionError> {
+    // minecraft.net holds a request until it times out when it has no
+    // User-Agent, or one carrying a URL (measured 2026-10-18), so this is a
+    // bare product name.
     let client = reqwest::Client::builder()
+        .user_agent(concat!("Lanthorn/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| ProvisionError::Http { url: url.to_string(), detail: e.to_string() })?;
     let mut response = client
@@ -1109,6 +1145,11 @@ pub fn extract(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64,
     };
     let magic = &magic[..read];
 
+    // A zip (Minecraft: Bedrock Edition's server ships as one) is judged
+    // entry by entry under the same rules as a tar.
+    if magic.starts_with(b"PK\x03\x04") {
+        return extract_zip_stripped(archive, dest, strip_components);
+    }
     if magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         // lzma-rs has no streaming reader, so xz is decompressed to a file
         // beside the download rather than into memory: game content is
@@ -1134,6 +1175,59 @@ pub fn extract(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64,
     } else {
         unpack(fs::File::open(archive)?, dest, strip_components)
     }
+}
+
+/// Extract a zip into `dest`, under the same rules as a tar: every entry's path
+/// judged by [`safe_relative`], the same size ceiling, and no links at all — a
+/// zip that needs one is not a world or a backup.
+pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    extract_zip_stripped(archive, dest, 0)
+}
+
+fn extract_zip_stripped(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64, ProvisionError> {
+    let file = fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("not a zip: {e}")))?;
+    let mut written: u64 = 0;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip entry {i}: {e}")))?;
+        let name = entry.name().to_string();
+        let relative = safe_relative(Path::new(&name), &name)?;
+        if entry.is_symlink() {
+            return Err(ProvisionError::UnsafeEntry { entry: name, reason: "a link" });
+        }
+        let Some(relative) = strip(&relative, strip_components) else { continue };
+        let target = dest.join(&relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        written = written.checked_add(entry.size()).ok_or(ProvisionError::TooLarge { limit: MAX_EXTRACTED_BYTES })?;
+        if written > MAX_EXTRACTED_BYTES {
+            return Err(ProvisionError::TooLarge { limit: MAX_EXTRACTED_BYTES });
+        }
+        let mut out = LimitedWriter::new(fs::File::create(&target)?, MAX_EXTRACTED_BYTES);
+        io::copy(&mut entry, &mut out)?;
+        out.inner.flush()?;
+        // A program in the zip stays runnable (the Bedrock server is one).
+        // Only the execute bits are carried over, never setuid or the like.
+        #[cfg(unix)]
+        if entry.unix_mode().is_some_and(|m| m & 0o111 != 0) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(written)
+}
+
+/// A zip or a tar (plain, gzip or xz), told apart by its first bytes.
+pub fn extract_any(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    extract(archive, dest, 0)
 }
 
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
@@ -1463,6 +1557,38 @@ Unloading Steam API...OK
         fs::create_dir_all(&dest).unwrap();
         extract(&archive, &dest, 1).unwrap();
         assert_eq!(fs::read(dest.join("svencoop/maps/one.bsp")).unwrap(), b"map");
+    }
+
+    #[test]
+    fn a_zip_extracts_under_the_same_rules_and_keeps_only_execute_bits() {
+        use std::io::Write as _;
+        let zip_of = |entries: &[(&str, &[u8], u32)]| {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut z = zip::ZipWriter::new(&mut buf);
+            for (name, body, mode) in entries {
+                z.start_file(*name, zip::write::SimpleFileOptions::default().unix_permissions(*mode)).unwrap();
+                z.write_all(body).unwrap();
+            }
+            z.finish().unwrap();
+            buf.into_inner()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let a = write(tmp.path(), "server.zip", &zip_of(&[("wrap/bedrock_server", b"elf", 0o4755), ("wrap/server.properties", b"x=1", 0o644)]));
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        extract(&a, &out, 1).unwrap();
+        assert_eq!(fs::read(out.join("server.properties")).unwrap(), b"x=1", "the wrapper was stripped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(out.join("bedrock_server")).unwrap().permissions().mode() & 0o7777, 0o755, "runnable, and never setuid");
+            assert_eq!(fs::metadata(out.join("server.properties")).unwrap().permissions().mode() & 0o111, 0);
+        }
+        let evil = write(tmp.path(), "evil.zip", &zip_of(&[("../escape", b"x", 0o644)]));
+        let out2 = tmp.path().join("out2");
+        fs::create_dir_all(&out2).unwrap();
+        assert!(matches!(extract(&evil, &out2, 0), Err(ProvisionError::UnsafeEntry { .. })));
+        assert!(!tmp.path().join("escape").exists());
     }
 
     #[test]

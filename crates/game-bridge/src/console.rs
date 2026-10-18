@@ -49,18 +49,70 @@ pub enum ConsoleProtocol {
     Goldsrc,
     /// Source engine: Team Fortress 2 and its siblings.
     Source,
+    /// Minecraft: Java Edition's server console (`MINECRAFT.md` §4). It reads
+    /// commands from standard input, one per line, like the others.
+    Minecraft,
+    /// Minecraft: Bedrock Edition's dedicated server (`MINECRAFT.md` §16):
+    /// the phone, console and Windows edition. Also stdin, with fewer
+    /// commands: it has no ban.
+    Bedrock,
 }
 
 impl ConsoleProtocol {
     /// The console line that changes the map, or why the name was refused.
     pub fn change_map(&self, map: &str) -> Result<String, MapNameError> {
+        if !self.has_maps() {
+            return Err(MapNameError::NoMaps);
+        }
         validate_map_name(map)?;
         Ok(match self {
             // `changelevel`, not `map`: `map` restarts the server and drops
             // every player, which is the opposite of changing the map on a
             // live server. Both engines spell it the same way.
             Self::Goldsrc | Self::Source => format!("changelevel {map}"),
+            Self::Minecraft | Self::Bedrock => unreachable!("refused above"),
         })
+    }
+
+    /// Whether this game has maps a console can change between. A Minecraft
+    /// server has one world.
+    pub fn has_maps(&self) -> bool {
+        !matches!(self, Self::Minecraft | Self::Bedrock)
+    }
+
+    /// Lines to send before copying a running server's files, so what is on
+    /// disk is whole (`MINECRAFT.md` §7). Empty for a game with no world that
+    /// is written while it runs.
+    pub fn before_backup(&self) -> &'static [&'static str] {
+        match self {
+            // Saving off stops the server writing chunks under the copy;
+            // `flush` makes the save it does now finish before it answers.
+            Self::Minecraft => &["save-off", "save-all flush"],
+            // Asynchronous: the server prepares, and says so to `save query`
+            // ([`backup_poll`](Self::backup_poll)).
+            Self::Bedrock => &["save hold"],
+            Self::Goldsrc | Self::Source => &[],
+        }
+    }
+
+    /// Lines to send after the copy, whether it succeeded or not.
+    pub fn after_backup(&self) -> &'static [&'static str] {
+        match self {
+            Self::Minecraft => &["save-on"],
+            Self::Bedrock => &["save resume"],
+            Self::Goldsrc | Self::Source => &[],
+        }
+    }
+
+    /// A line to send again while waiting for the server to be ready to be
+    /// copied, if the game needs one asked, and the log text that says it is
+    /// ready.
+    pub fn backup_ready(&self) -> Option<(Option<&'static str>, &'static str)> {
+        match self {
+            Self::Minecraft => Some((None, "Saved the game")),
+            Self::Bedrock => Some((Some("save query"), "Data saved")),
+            Self::Goldsrc | Self::Source => None,
+        }
     }
 
     /// The console line that shows `message` to everyone on the server. Its
@@ -70,9 +122,9 @@ impl ConsoleProtocol {
     pub fn say(&self, message: &str) -> Result<String, ServerNameError> {
         validate_server_name(message)?;
         Ok(match self {
-            // A server console's `say` reaches every player's chat on both
-            // engines.
-            Self::Goldsrc | Self::Source => format!("say {message}"),
+            // A server console's `say` reaches every player's chat on every
+            // game here.
+            Self::Goldsrc | Self::Source | Self::Minecraft | Self::Bedrock => format!("say {message}"),
         })
     }
 }
@@ -166,6 +218,8 @@ pub enum MapNameError {
     NotAllowed(char),
     /// `..` anywhere, or a name that starts with `/` or `.`.
     Traversal,
+    /// The game has no maps to change between.
+    NoMaps,
 }
 
 impl core::fmt::Display for MapNameError {
@@ -184,6 +238,7 @@ impl core::fmt::Display for MapNameError {
                 "map name must not begin with '/' or '.', or contain '..': it is resolved \
                  against the game's own content directory"
             ),
+            Self::NoMaps => write!(f, "this game has one world and no map to change to"),
         }
     }
 }
@@ -256,6 +311,242 @@ pub fn validate_console_line(line: &str) -> Result<(), ConsoleLineError> {
     Ok(())
 }
 
+/// Something a server's owner does to a player (`MINECRAFT.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayerAction {
+    Kick,
+    Ban,
+    Unban,
+    /// Make a player a server operator. Minecraft only.
+    Op,
+    /// Take operator away. Minecraft only.
+    Deop,
+}
+
+impl PlayerAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kick => "kick",
+            Self::Ban => "ban",
+            Self::Unban => "unban",
+            Self::Op => "op",
+            Self::Deop => "deop",
+        }
+    }
+}
+
+/// What names the player an action is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetKind {
+    /// A Minecraft account name.
+    MinecraftName,
+    /// An Xbox gamertag, the name a Bedrock player has. It may hold spaces.
+    Gamertag,
+    /// The name a player shows in a GoldSrc or Source game.
+    PlayerName,
+    /// A Steam ID: `STEAM_0:1:123` or `[U:1:246]`.
+    SteamId,
+}
+
+/// Where a game's ban list lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BanList {
+    /// The game keeps it in its own server directory (Minecraft's
+    /// `banned-players.json`), and the node reads it.
+    GameFile,
+    /// The game would write it into the shared, read-only copy, so the node
+    /// keeps it and sends it again after every start.
+    NodeRecord,
+    /// The game's server has no ban at all (Bedrock). Its allowlist is the
+    /// way to keep someone out.
+    None,
+}
+
+/// Longest kick or ban reason. A sentence, not a paragraph.
+pub const MAX_REASON_LEN: usize = 120;
+/// Longest in-game name accepted as a kick target on a Steam engine.
+pub const MAX_PLAYER_NAME_LEN: usize = 64;
+
+/// Why a moderation request was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModerationError {
+    /// This game has no such action (operators on a Steam engine).
+    NotSupported(PlayerAction),
+    /// The target is not a valid name or Steam ID for this action.
+    BadTarget { kind: TargetKind, target: String },
+    BadReason(String),
+}
+
+impl core::fmt::Display for ModerationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotSupported(a) => write!(f, "this game has no {} command", a.as_str()),
+            Self::BadTarget { kind, target } => match kind {
+                TargetKind::MinecraftName => write!(
+                    f,
+                    "{target:?} is not a Minecraft name: 1 to 16 letters, digits or '_'"
+                ),
+                TargetKind::Gamertag => write!(
+                    f,
+                    "{target:?} is not a gamertag: 1 to 16 letters, digits or spaces, not starting or ending with a space"
+                ),
+                TargetKind::PlayerName => write!(
+                    f,
+                    "{target:?} cannot be used as a player name here: no ';', '\"', '+' or control \
+                     characters, at most {MAX_PLAYER_NAME_LEN} characters"
+                ),
+                TargetKind::SteamId => write!(
+                    f,
+                    "{target:?} is not a Steam ID; write it as STEAM_0:1:12345 or [U:1:24691]"
+                ),
+            },
+            Self::BadReason(why) => write!(f, "the reason cannot be sent: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ModerationError {}
+
+/// A Minecraft account name: 1 to 16 ASCII letters, digits or `_`.
+pub fn is_minecraft_name(s: &str) -> bool {
+    (1..=16).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// An Xbox gamertag: 1 to 16 ASCII letters, digits or single spaces, with no
+/// space at either end. It reaches a console line in quotes, which it cannot
+/// close.
+pub fn is_gamertag(s: &str) -> bool {
+    (1..=16).contains(&s.len())
+        && !s.starts_with(' ')
+        && !s.ends_with(' ')
+        && !s.contains("  ")
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b' ')
+}
+
+/// A Steam ID in the text form a GoldSrc or Source console takes:
+/// `STEAM_X:Y:Z` (X 0 to 5, Y 0 or 1, Z digits) or `[U:1:Z]`.
+pub fn is_steam_id(s: &str) -> bool {
+    let digits = |p: &str| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = s.strip_prefix("STEAM_") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        return parts.len() == 3
+            && matches!(parts[0], "0" | "1" | "2" | "3" | "4" | "5")
+            && matches!(parts[1], "0" | "1")
+            && digits(parts[2]);
+    }
+    s.strip_prefix("[U:1:").and_then(|r| r.strip_suffix(']')).is_some_and(digits)
+}
+
+impl ConsoleProtocol {
+    /// Whether this game's console can do `action`.
+    pub fn supports(&self, action: PlayerAction) -> bool {
+        match self {
+            Self::Minecraft => true,
+            Self::Bedrock => matches!(action, PlayerAction::Kick | PlayerAction::Op | PlayerAction::Deop),
+            Self::Goldsrc | Self::Source => !matches!(action, PlayerAction::Op | PlayerAction::Deop),
+        }
+    }
+
+    /// What names the player for `action` on this game. On a Steam engine a
+    /// kick takes the in-game name; a ban takes the Steam ID, because a name
+    /// can be anything and a ban is the action a wrong match makes permanent.
+    pub fn target_kind(&self, action: PlayerAction) -> TargetKind {
+        match (self, action) {
+            (Self::Minecraft, _) => TargetKind::MinecraftName,
+            (Self::Bedrock, _) => TargetKind::Gamertag,
+            (_, PlayerAction::Kick) => TargetKind::PlayerName,
+            _ => TargetKind::SteamId,
+        }
+    }
+
+    pub fn ban_list(&self) -> BanList {
+        match self {
+            Self::Minecraft => BanList::GameFile,
+            Self::Bedrock => BanList::None,
+            Self::Goldsrc | Self::Source => BanList::NodeRecord,
+        }
+    }
+
+    /// The console lines for one moderation action, or why it was refused.
+    /// Every part that came from a caller is validated as data first; nothing
+    /// is rewritten. A reason is sent only where the game's command takes one.
+    pub fn moderation_lines(
+        &self,
+        action: PlayerAction,
+        target: &str,
+        reason: Option<&str>,
+    ) -> Result<Vec<String>, ModerationError> {
+        if !self.supports(action) {
+            return Err(ModerationError::NotSupported(action));
+        }
+        let kind = self.target_kind(action);
+        let valid = match kind {
+            TargetKind::MinecraftName => is_minecraft_name(target),
+            TargetKind::Gamertag => is_gamertag(target),
+            TargetKind::SteamId => is_steam_id(target),
+            TargetKind::PlayerName => {
+                !target.trim().is_empty()
+                    && target.len() <= MAX_PLAYER_NAME_LEN
+                    && validate_server_name(target).is_ok()
+            }
+        };
+        if !valid {
+            return Err(ModerationError::BadTarget { kind, target: target.to_string() });
+        }
+        let reason = match reason.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => {
+                if r.len() > MAX_REASON_LEN {
+                    return Err(ModerationError::BadReason(format!("it is over {MAX_REASON_LEN} characters")));
+                }
+                validate_server_name(r).map_err(|e| ModerationError::BadReason(e.to_string()))?;
+                Some(r)
+            }
+            None => None,
+        };
+        let with_reason = |cmd: &str| match reason {
+            Some(r) => format!("{cmd} {target} {r}"),
+            None => format!("{cmd} {target}"),
+        };
+        Ok(match (self, action) {
+            (Self::Minecraft, PlayerAction::Kick) => vec![with_reason("kick")],
+            (Self::Minecraft, PlayerAction::Ban) => vec![with_reason("ban")],
+            (Self::Minecraft, PlayerAction::Unban) => vec![format!("pardon {target}")],
+            (Self::Minecraft, PlayerAction::Op) => vec![format!("op {target}")],
+            (Self::Minecraft, PlayerAction::Deop) => vec![format!("deop {target}")],
+            // Quoted: a gamertag may hold spaces, and cannot hold a quote.
+            (Self::Bedrock, PlayerAction::Kick) => vec![match reason {
+                Some(r) => format!("kick \"{target}\" {r}"),
+                None => format!("kick \"{target}\""),
+            }],
+            (Self::Bedrock, PlayerAction::Op) => vec![format!("op \"{target}\"")],
+            (Self::Bedrock, PlayerAction::Deop) => vec![format!("deop \"{target}\"")],
+            (Self::Bedrock, PlayerAction::Ban | PlayerAction::Unban) => unreachable!("refused by supports()"),
+            // The name is quoted because a name may hold spaces; it can hold
+            // no quote (`validate_server_name`), so it cannot close one.
+            (_, PlayerAction::Kick) => vec![format!("kick \"{target}\"")],
+            // `0` is a permanent ban; `kick` removes them now if they are on.
+            (_, PlayerAction::Ban) => vec![format!("banid 0 {target} kick")],
+            (_, PlayerAction::Unban) => vec![format!("removeid {target}")],
+            (_, PlayerAction::Op | PlayerAction::Deop) => unreachable!("refused by supports()"),
+        })
+    }
+
+    /// The lines that put a node-kept ban list back after a start. Entries
+    /// that are not Steam IDs are skipped: the record is the node's own file,
+    /// but a hand-edited line must still not become a console command.
+    pub fn reapply_bans(&self, steam_ids: &[String]) -> Vec<String> {
+        match self.ban_list() {
+            BanList::GameFile | BanList::None => Vec::new(),
+            BanList::NodeRecord => {
+                steam_ids.iter().filter(|id| is_steam_id(id)).map(|id| format!("banid 0 {id}")).collect()
+            }
+        }
+    }
+}
+
 /// Why a server name was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerNameError {
@@ -317,6 +608,85 @@ pub fn validate_server_name(name: &str) -> Result<(), ServerNameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_minecraft_console_moderates_by_account_name() {
+        let mc = ConsoleProtocol::Minecraft;
+        assert_eq!(mc.moderation_lines(PlayerAction::Kick, "Steve_1", Some("spam")).unwrap(), ["kick Steve_1 spam"]);
+        assert_eq!(mc.moderation_lines(PlayerAction::Ban, "Steve_1", None).unwrap(), ["ban Steve_1"]);
+        assert_eq!(mc.moderation_lines(PlayerAction::Unban, "Steve_1", None).unwrap(), ["pardon Steve_1"]);
+        assert_eq!(mc.moderation_lines(PlayerAction::Op, "Alex", None).unwrap(), ["op Alex"]);
+        assert_eq!(mc.moderation_lines(PlayerAction::Deop, "Alex", None).unwrap(), ["deop Alex"]);
+        for bad in ["", "a b", "x\nstop", "toolongname_12345", "@a", "Steve;op", "Steve-1"] {
+            assert!(mc.moderation_lines(PlayerAction::Op, bad, None).is_err(), "{bad:?}");
+        }
+        assert_eq!(mc.ban_list(), BanList::GameFile);
+        assert!(!mc.has_maps() && mc.change_map("world").is_err());
+        assert_eq!(mc.before_backup(), ["save-off", "save-all flush"]);
+    }
+
+    #[test]
+    fn a_bedrock_console_kicks_and_ops_by_gamertag_and_has_no_ban() {
+        let b = ConsoleProtocol::Bedrock;
+        assert_eq!(b.moderation_lines(PlayerAction::Kick, "Cool Gamer 42", Some("spam")).unwrap(), ["kick \"Cool Gamer 42\" spam"]);
+        assert_eq!(b.moderation_lines(PlayerAction::Op, "Steve", None).unwrap(), ["op \"Steve\""]);
+        assert_eq!(b.moderation_lines(PlayerAction::Ban, "Steve", None), Err(ModerationError::NotSupported(PlayerAction::Ban)));
+        for bad in ["", " lead", "trail ", "two  spaces", "quo\"te", "semi;colon", "x\nstop", "a_b", &"x".repeat(17)] {
+            assert!(b.moderation_lines(PlayerAction::Kick, bad, None).is_err(), "{bad:?}");
+        }
+        assert_eq!(b.ban_list(), BanList::None);
+        assert!(b.reapply_bans(&["STEAM_0:1:1".into()]).is_empty());
+        assert_eq!(b.before_backup(), ["save hold"]);
+        assert_eq!(b.backup_ready(), Some((Some("save query"), "Data saved")));
+        assert!(b.change_map("x").is_err());
+    }
+
+    #[test]
+    fn a_reason_or_target_can_never_carry_a_second_command() {
+        for engine in [ConsoleProtocol::Minecraft, ConsoleProtocol::Bedrock, ConsoleProtocol::Goldsrc, ConsoleProtocol::Source] {
+            for reason in ["bye\nstop", "bye; quit", "bye\" ; quit", "+quit", "a\rb"] {
+                assert!(
+                    engine.moderation_lines(PlayerAction::Kick, "Bob", Some(reason)).is_err(),
+                    "{engine:?} sent reason {reason:?}"
+                );
+            }
+        }
+        let gs = ConsoleProtocol::Goldsrc;
+        for name in ["Bob\" ; quit", "Bob\nquit", "a;b", "+x", ""] {
+            assert!(gs.moderation_lines(PlayerAction::Kick, name, None).is_err(), "{name:?}");
+        }
+        assert!(gs.moderation_lines(PlayerAction::Kick, &"x".repeat(MAX_PLAYER_NAME_LEN + 1), None).is_err());
+        let long = "x".repeat(MAX_REASON_LEN + 1);
+        assert!(ConsoleProtocol::Minecraft.moderation_lines(PlayerAction::Ban, "Bob", Some(&long)).is_err());
+    }
+
+    #[test]
+    fn a_steam_engine_kicks_by_name_bans_by_steam_id_and_has_no_operators() {
+        for engine in [ConsoleProtocol::Goldsrc, ConsoleProtocol::Source] {
+            assert_eq!(engine.moderation_lines(PlayerAction::Kick, "Big Bob", None).unwrap(), ["kick \"Big Bob\""]);
+            assert_eq!(
+                engine.moderation_lines(PlayerAction::Ban, "STEAM_0:1:12345", None).unwrap(),
+                ["banid 0 STEAM_0:1:12345 kick"]
+            );
+            assert_eq!(engine.moderation_lines(PlayerAction::Unban, "[U:1:24691]", None).unwrap(), ["removeid [U:1:24691]"]);
+            assert!(engine.moderation_lines(PlayerAction::Ban, "Big Bob", None).is_err(), "a ban needs the Steam ID");
+            for action in [PlayerAction::Op, PlayerAction::Deop] {
+                assert_eq!(
+                    engine.moderation_lines(action, "STEAM_0:1:1", None),
+                    Err(ModerationError::NotSupported(action))
+                );
+            }
+            assert_eq!(engine.ban_list(), BanList::NodeRecord);
+            assert_eq!(
+                engine.reapply_bans(&["STEAM_0:1:1".into(), "x; quit".into()]),
+                ["banid 0 STEAM_0:1:1"],
+                "a line in the record that is not a Steam ID never reaches the console"
+            );
+        }
+        for bad in ["STEAM_6:1:1", "STEAM_0:2:1", "STEAM_0:1:", "STEAM_0:1:1a", "[U:1:]", "[U:2:5]", "STEAM_0:1:1 kick"] {
+            assert!(!is_steam_id(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn an_operators_console_line_is_one_line_and_nothing_more() {

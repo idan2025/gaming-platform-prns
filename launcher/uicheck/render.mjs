@@ -175,6 +175,7 @@ function makeInvoke(scenario) {
         return scenario.update ?? { current: '1.0.0', available: null, notes: null, install: 'in-place', page: 'x', auto_check: true };
       case 'install_update':
       case 'open_release_page':
+      case 'open_update_download':
         return null;
       case 'trace_path':
         return { destination_hash: args.destinationHash, found: true, hops: 2, millis: 140, error: null };
@@ -1981,6 +1982,248 @@ await run('a copy that cannot replace itself links to the download page', {
   check('a picture loaded once is not faded in again', fresh && fresh.classList.contains('loaded'));
   w.__installed().timer && w.clearTimeout(w.__installed().timer);
   w.close();
+}
+
+// A phone starts no game itself: a join ends with the address to point the game
+// at and a button to copy it, never Play, even for a pack that can launch.
+await run('on Android a join ends with an address to copy, never Play', {
+  status: running,
+  rows: () => [row()],
+  join: { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: true, can_launch: true, launch_ready: true },
+  beforeApp: win => Object.defineProperty(win.navigator, 'userAgent', { value: 'Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36', configurable: true }),
+}, async (win, doc) => {
+  check('the page knows it is on a phone', doc.documentElement.classList.contains('phone'));
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  doc.querySelector('#detail-join').click();
+  await settle();
+  const detail = doc.querySelector('#detail');
+  check('the message says where to point the game', /connect to 127\.0\.0\.1:27015/.test(detail.textContent), detail.textContent.slice(-200));
+  check('there is no Play button', !doc.querySelector('#detail-play') && !detail.querySelector('.btn-locate'));
+  check('there is a Copy address button', [...detail.querySelectorAll('button')].some(b => b.textContent === 'Copy address'));
+});
+
+const ANDROID_UA = win => Object.defineProperty(win.navigator, 'userAgent', { value: 'Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36', configurable: true });
+
+await run('on Android the invite field survives the keyboard, and Games and LAN rooms are not pages', {
+  status: running,
+  rows: () => [row()],
+  beforeApp: ANDROID_UA,
+}, async (win, doc) => {
+  doc.querySelector('#invite-btn').click();
+  await settle();
+  const input = doc.querySelector('#invite-input');
+  check('the invite field is focused', doc.activeElement === input);
+  // The keyboard coming up resizes the window and scrolls the field into view.
+  win.dispatchEvent(new win.Event('resize'));
+  doc.dispatchEvent(new win.Event('scroll'));
+  check('the invite field is still open after the keyboard', !doc.querySelector('#ctx-menu').hidden && doc.querySelector('#invite-input'));
+  doc.querySelector('#nav-games').click();
+  await settle();
+  check('the Games page never opens on a phone', doc.querySelector('#view-games').hidden && !doc.querySelector('#view-servers').hidden);
+});
+
+await run('on Android an update is a download, never an install', {
+  status: running,
+  rows: () => [],
+  autoUpdate: true,
+  update: { current: '0.2.45 (build 3)', available: '0.2.46 (build 1)', notes: 'notes', install: 'link-only', page: 'x', auto_check: true },
+  beforeApp: ANDROID_UA,
+}, async (win, doc) => {
+  doc.querySelector('#nav-settings').click();
+  await settle();
+  doc.querySelector('#update-check').click();
+  await settle();
+  const go = doc.querySelector('#update-install');
+  const before = calls.length;
+  check('the button says Download', go && go.textContent === 'Download', go && go.textContent);
+  go.click();
+  await settle();
+  check('it opens the download, not the installer', calls.slice(before).includes('open_update_download') && !calls.slice(before).includes('install_update'));
+  check('there is no big screen switch on a phone', !doc.querySelector('#bigscreen-on'));
+});
+
+await run('on Android a joined server can be left from the detail pane', {
+  status: running,
+  rows: () => [row()],
+  join: { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: true, can_launch: true, launch_ready: true },
+  beforeApp: ANDROID_UA,
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  doc.querySelector('#detail-join').click();
+  await settle();
+  const leave = doc.querySelector('#detail-leave');
+  check('a Leave server button is there while joined', !!leave);
+  const before = calls.length;
+  leave && leave.click();
+  await settle();
+  check('leaving calls the core', calls.slice(before).includes('leave'));
+  check('the detail says it left', /Left the server/.test(doc.querySelector('#detail').textContent));
+  check('the Leave button is gone', !doc.querySelector('#detail-leave'));
+});
+
+// Lanthorn Host's Minecraft form (MINECRAFT.md): nothing is created before the
+// owner ticks the EULA, a size the host refuses cannot be submitted, and what
+// is sent carries the build, the heap and the acceptance.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  let verdict = { level: 'ok', messages: [], total_mb: 32000, available_mb: 24000, reserve_mb: 3200, limit_mb: 5632, host_cpus: 8 };
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' },
+    '/capacity': { max_instances: 4, running: 0 },
+    '/instances': [],
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 },
+    '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 },
+    '/content': { copies: [], downloads: [] },
+    '/games': [{ id: 'minecraft-java', display_name: 'Minecraft: Java Edition', runnable: true, transport: 'tcp', default_port: 25565,
+      extra_ports: 0, console: true, minecraft: true, default_build: 'paper-26.3',
+      eula: { name: 'Minecraft End User License Agreement', url: 'https://aka.ms/MinecraftEULA' } }],
+    '/minecraft/versions': [{ build: 'paper-26.3', game_version: '26.3', loader: null, recommended: false },
+      { build: 'paper-1.21.11', game_version: '1.21.11', loader: null, recommended: false }],
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ path: route, body: opts.body ? JSON.parse(opts.body) : null });
+      const out = route === '/instances' ? { instance_id: 'x', state: 'running' } : {};
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' }, json: async () => out, text: async () => '{}' };
+    }
+    const body = route === '/resources/check' ? verdict : routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
+      headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__mod = onModeration;');
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  w.__start('minecraft-java');
+  await settle();
+  const d = w.document;
+  const create = d.getElementById('mc-create');
+  check('the Minecraft form opens instead of the plain one', !!create && !!d.getElementById('mc-version'));
+  check('it offers the versions the node lists', d.getElementById('mc-version').options.length === 2 && d.getElementById('mc-version').value === 'paper-26.3');
+  check('Create stays off until the EULA is ticked', create.disabled && /EULA/.test(create.title), create.title);
+  const eula = d.getElementById('mc-eula');
+  eula.checked = true;
+  eula.dispatchEvent(new w.Event('change'));
+  check('ticking the EULA turns Create on', !create.disabled, create.title);
+  check('the EULA links to the licence', d.querySelector('.eula a').href === 'https://aka.ms/MinecraftEULA');
+
+  verdict = { level: 'refuse', messages: ['Not enough free memory.'], total_mb: 8000, available_mb: 3000, reserve_mb: 1024, limit_mb: 7680, host_cpus: 4 };
+  [...d.querySelectorAll('.chip-btn')].find(b => b.textContent === 'Large').click();
+  await settle();
+  check('a size the host refuses cannot be submitted', create.disabled && d.querySelector('.verdict').classList.contains('bad'));
+  verdict = { level: 'ok', messages: [], total_mb: 32000, available_mb: 24000, reserve_mb: 3200, limit_mb: 5632, host_cpus: 8 };
+  [...d.querySelectorAll('.chip-btn')].find(b => b.textContent === 'Medium').click();
+  [...d.querySelectorAll('.chip-btn')].find(b => b.textContent === '50').click();
+  await settle();
+  d.getElementById('mc-name').value = 'Friday';
+  d.querySelector('.mc-form').dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  const sent = posts.find(p => p.path === '/instances');
+  check('the create carries the build, heap, slots and the acceptance',
+    sent && sent.body.content_version === 'paper-26.3' && sent.body.memory.max_mb === 4096 && sent.body.memory.min_mb === 2048
+      && sent.body.max_players === 50 && Number.isInteger(sent.body.eula_accepted_at) && sent.body.minecraft.online_mode === true,
+    JSON.stringify(sent && sent.body));
+  check('a daily backup is set by default', posts.some(p => p.path.endsWith('/backup-schedule') && p.body.schedule.every_hours === 24));
+
+  // Kick, ban and operators: online players get buttons, the ban list gets
+  // Unban, and a button sends exactly that action.
+  routes['/instances'] = [{ instance_id: 'mc1', game_id: 'minecraft-java', name: 'Friday', state: 'running', port: 27300, ports: [] }];
+  routes['/instances/mc1/moderation'] = {
+    actions: ['kick', 'ban', 'unban', 'op', 'deop'].map(a => ({ action: a, target: 'minecraft-name' })),
+    ban_list: 'game-file', banned: [{ target: 'Griefer', reason: 'broke spawn' }], ops: [{ target: 'Notch' }],
+  };
+  routes['/instances/mc1/players'] = [{ name: 'Alex', score: 0, connected_secs: 0 }];
+  await w.__nodePoll();
+  await settle();
+  w.__mod('mc1');
+  await settle();
+  const m = d.getElementById('moderation-dialog');
+  const rows = m ? [...m.querySelectorAll('.mod-row')].map(r => r.textContent) : [];
+  check('the dialog lists who is on, the banned and the operators',
+    rows.some(t => t.startsWith('Alex')) && rows.some(t => t.includes('Griefer')) && rows.some(t => t.startsWith('Notch')), JSON.stringify(rows));
+  posts.length = 0;
+  [...m.querySelectorAll('.mod-row')].find(r => r.textContent.startsWith('Alex')).querySelector('button').click();
+  await settle();
+  const kick = posts.find(p => p.path === '/instances/mc1/moderation');
+  check('a player\'s Kick button sends a kick for that name', kick && kick.body.action === 'kick' && kick.body.target === 'Alex', JSON.stringify(kick));
+  w.close();
+}
+
+// A Bedrock server (a pack with an [eula] and world settings, without the
+// Java form): the plain form asks for the EULA and sends the acceptance.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' }, '/capacity': { max_instances: 4, running: 0 }, '/instances': [],
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 }, '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 }, '/content': { copies: [], downloads: [] },
+    '/games': [{ id: 'minecraft-bedrock', display_name: 'Minecraft: Bedrock Edition', runnable: true, transport: 'tcp', default_port: 19132,
+      extra_ports: 4, console: true, minecraft: false, world_settings: true,
+      eula: { name: 'Minecraft End User License Agreement', url: 'https://aka.ms/MinecraftEULA' } }],
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v) };
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ path: route, body: opts.body ? JSON.parse(opts.body) : null });
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' }, json: async () => ({ instance_id: 'b', state: 'running' }), text: async () => '{}' };
+    }
+    const body = routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '', headers: { get: () => 'application/json' },
+      json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs + '\n;window.__start = openStartDialog;');
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  w.__start('minecraft-bedrock');
+  await settle();
+  const d = w.document;
+  const go = d.getElementById('sf-start');
+  check('a Bedrock server cannot be started before the EULA is ticked', go && go.disabled);
+  check('the plain form offers world settings for Bedrock', !!d.getElementById('sf-mode') && !d.getElementById('mc-version'));
+  d.getElementById('sf-eula').checked = true;
+  d.getElementById('sf-eula').dispatchEvent(new w.Event('change'));
+  d.getElementById('sf-name').value = 'Phones welcome';
+  d.getElementById('sf-mode').value = 'creative';
+  go.closest('form').dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  const sent = posts.find(p => p.path === '/instances');
+  check('the Bedrock create carries the acceptance and the settings',
+    sent && Number.isInteger(sent.body.eula_accepted_at) && sent.body.minecraft.gamemode === 'creative' && !sent.body.memory,
+    JSON.stringify(sent && sent.body));
+  w.close();
+}
+
+// On a phone a banner's text keeps the width and its buttons wrap below: in
+// one row, three buttons squeezed an update notice to one word per line. No
+// layout here, so this pins the rule (measured in headless Chrome at 412 px
+// when it was written: 70 px of text before, the full width after).
+{
+  const css = fs.readFileSync(new URL('../dist/style.css', import.meta.url), 'utf8');
+  check('phone banners wrap their buttons below the text',
+    /html\.phone \.room-banner, html\.phone \.notice \{ flex-wrap: wrap;/.test(css) && /html\.phone \.room-banner \.rb-text \{ flex: 1 1 calc\(100% - 34px\);/.test(css));
+  check('rows with text beside buttons wrap on a phone too',
+    /html\.phone \.item, html\.phone \.fav-off-row \{ flex-wrap: wrap;/.test(css));
 }
 
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);

@@ -11,7 +11,7 @@ description = "Game-agnostic Reticulum bridge. Generalizes the Sven Co-op bridge
 [dependencies]
 personal-rns = { workspace = true, features = ["tokio-host", "tcp", "udp", "backbone", "wifi-auto", "shared-instance"] }
 prns-core = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
 anyhow = "1"
 hex = "0.4"
 tracing = "0.1"
@@ -31,6 +31,11 @@ getrandom = "0.2"
 # For the `game-bridge` binary's logging only. The library never installs a
 # subscriber — a launcher that links this crate owns that decision.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Android has no system root store reqwest can reach without the JVM, so an
+# Android build carries Mozilla's roots instead (`repo::http_client`).
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1"
 
 # The Mode 3 adapter (`src/lan_adapter.rs`) is TUN ioctls, Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]

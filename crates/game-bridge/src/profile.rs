@@ -32,6 +32,20 @@ pub const MAX_GAME_ID_LEN: usize = 24;
 pub enum QueryProtocol {
     /// Valve's A2S, on the same UDP port the game runs on. GoldSrc and Source.
     A2s,
+    /// Minecraft's Server List Ping, on the game's own TCP port
+    /// (`mc_ping.rs`).
+    Minecraft,
+}
+
+impl QueryProtocol {
+    /// Ask a game this host runs how many players it has, in A2S's shape
+    /// whatever the protocol. An error is "could not ask", never zero.
+    pub async fn ask(self, addr: std::net::SocketAddr) -> anyhow::Result<crate::a2s::A2sStats> {
+        match self {
+            Self::A2s => crate::a2s::query(addr).await,
+            Self::Minecraft => crate::mc_ping::query_as_a2s(addr).await,
+        }
+    }
 }
 
 /// How the bridge moves the game's traffic.
