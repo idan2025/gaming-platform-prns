@@ -143,6 +143,7 @@ content_version = "test"
             bots: None,
             restart_on_crash: false,
             owner: None,
+            options: Default::default(),
         })
         .await
         .unwrap();

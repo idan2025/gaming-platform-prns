@@ -238,6 +238,7 @@ async fn an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent() {
             bots: None,
             restart_on_crash: false,
             owner: None,
+            options: Default::default(),
         };
 
         // Create over the uplink. Retries cover the interface/path race.

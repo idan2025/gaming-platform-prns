@@ -7,6 +7,7 @@
 pub mod active;
 pub mod agent;
 pub mod backups;
+pub mod bans;
 pub mod api;
 pub mod config;
 pub mod content;
@@ -20,8 +21,10 @@ pub mod official;
 pub mod pack_import;
 pub mod packs;
 pub mod ports;
+pub mod resources;
 pub mod schedule;
 pub mod store;
 pub mod uplink;
 pub mod uplink_wire;
 pub mod updates;
+pub mod world;

@@ -90,6 +90,7 @@ fn spec(id: &str) -> InstanceSpec {
         map: None,
         restart_on_crash: false,
         owner: None,
+        options: Default::default(),
     }
 }
 

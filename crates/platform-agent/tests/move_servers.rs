@@ -107,6 +107,7 @@ fn spec(id: &str) -> InstanceSpec {
         bots: None,
         restart_on_crash: false,
         owner: Some("abcd".to_string()),
+        options: Default::default(),
     }
 }
 

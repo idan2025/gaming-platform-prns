@@ -448,6 +448,7 @@ impl Hosting {
                 bots: None,
                 restart_on_crash: false,
                 owner: None,
+                options: Default::default(),
             };
             let created = client
                 .create(dest, spec, Some(account.0.clone()))

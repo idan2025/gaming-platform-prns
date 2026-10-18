@@ -1168,6 +1168,53 @@ pub fn extract(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64,
     }
 }
 
+/// Extract a zip into `dest`, under the same rules as a tar: every entry's path
+/// judged by [`safe_relative`], the same size ceiling, and no links at all — a
+/// zip that needs one is not a world or a backup.
+pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    let file = fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("not a zip: {e}")))?;
+    let mut written: u64 = 0;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip entry {i}: {e}")))?;
+        let name = entry.name().to_string();
+        let relative = safe_relative(Path::new(&name), &name)?;
+        if entry.is_symlink() {
+            return Err(ProvisionError::UnsafeEntry { entry: name, reason: "a link" });
+        }
+        let target = dest.join(&relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        written = written.checked_add(entry.size()).ok_or(ProvisionError::TooLarge { limit: MAX_EXTRACTED_BYTES })?;
+        if written > MAX_EXTRACTED_BYTES {
+            return Err(ProvisionError::TooLarge { limit: MAX_EXTRACTED_BYTES });
+        }
+        let mut out = LimitedWriter::new(fs::File::create(&target)?, MAX_EXTRACTED_BYTES);
+        io::copy(&mut entry, &mut out)?;
+        out.inner.flush()?;
+    }
+    Ok(written)
+}
+
+/// A zip or a tar (plain, gzip or xz), told apart by its first bytes.
+pub fn extract_any(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    let mut magic = [0u8; 4];
+    let n = read_up_to(&mut fs::File::open(archive)?, &mut magic)?;
+    if n == 4 && magic == *b"PK\x03\x04" {
+        extract_zip(archive, dest)
+    } else {
+        extract(archive, dest, 0)
+    }
+}
+
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {

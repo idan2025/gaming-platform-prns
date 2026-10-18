@@ -120,6 +120,7 @@ content_version = "test"
             map: None,
             restart_on_crash: false,
             owner: None,
+            options: Default::default(),
         })
         .await
         .expect("create");

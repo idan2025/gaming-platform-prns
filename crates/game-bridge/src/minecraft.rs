@@ -14,6 +14,12 @@
 //! snapshot, pre-release and release candidate, on purpose: v1 hosts releases.
 //! A failing id is refused, never repaired.
 //!
+//! **Nothing older than [`OLDEST_RELEASE`].** Every release from 1.7 to 1.18.0
+//! ships a Log4j that runs lookups in chat messages (Log4Shell, CVE-2021-44228):
+//! any player could make the server fetch and run code. Mojang fixed it from
+//! 1.18.1; older ones need a logging configuration per version range, which
+//! this build does not carry and has not tested, so it does not host them.
+//!
 //! # Where builds come from
 //!
 //! Each type's publisher lists its versions and the digest of each download.
@@ -50,8 +56,12 @@ pub const FABRIC_INSTALLERS: &str = "https://meta.fabricmc.net/v2/versions/insta
 /// Forge's recommended and latest build for each Minecraft version.
 pub const FORGE_PROMOTIONS: &str = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
 
-/// The Java runtimes the `images/minecraft` image carries.
-pub const JAVA_RUNTIMES: [u32; 4] = [8, 17, 21, 25];
+/// The Java runtimes the `images/minecraft` image carries. 17 runs 1.18 to
+/// 1.20.4, 21 runs 1.20.5 to 1.21.x, 25 runs 26.x.
+pub const JAVA_RUNTIMES: [u32; 3] = [17, 21, 25];
+
+/// The oldest Minecraft release a node hosts. See the module docs.
+pub const OLDEST_RELEASE: &str = "1.18.1";
 
 /// Longest version string accepted. Real ones are under 12 characters.
 const MAX_VERSION_LEN: usize = 24;
@@ -115,6 +125,8 @@ pub enum BuildError {
     Shape(String),
     /// A version that is not digits and dots.
     Version(String),
+    /// A release older than [`OLDEST_RELEASE`].
+    TooOld(String),
 }
 
 impl fmt::Display for BuildError {
@@ -130,6 +142,11 @@ impl fmt::Display for BuildError {
             Self::Version(v) => {
                 write!(f, "{v:?} is not a release version: only digits and dots, like 1.21.11 or 26.3")
             }
+            Self::TooOld(v) => write!(
+                f,
+                "Minecraft {v} is older than {OLDEST_RELEASE}: releases before it let any player run code on \
+                 the server through its logging (Log4Shell), so this node does not host them"
+            ),
         }
     }
 }
@@ -162,6 +179,9 @@ impl MinecraftBuild {
             if !is_release_version(v) {
                 return Err(BuildError::Version(v.to_string()));
             }
+        }
+        if version_key(parts[1]) < version_key(OLDEST_RELEASE) {
+            return Err(BuildError::TooOld(parts[1].to_string()));
         }
         Ok(Self {
             server,
@@ -323,7 +343,7 @@ pub fn paper_versions(project: &str) -> Result<Vec<String>, ListingError> {
         .filter(|v| is_release_version(v))
         .map(str::to_string)
         .collect();
-    out.sort_by(|a, b| version_key(b).cmp(&version_key(a)));
+    out.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
     out.dedup();
     Ok(out)
 }
@@ -469,6 +489,9 @@ mod tests {
             "paper-1",
             "Paper-1.21",
             "paper-1.21\n",
+            "vanilla-1.18",
+            "paper-1.16.5",
+            "forge-1.12.2-14.23.5.2860",
         ] {
             assert!(MinecraftBuild::parse(bad).is_err(), "{bad:?} was accepted");
         }
@@ -543,8 +566,8 @@ mod tests {
 
     #[test]
     fn each_version_gets_a_java_the_image_carries() {
-        assert_eq!(java_runtime_for(8), 8);
-        assert_eq!(java_runtime_for(16), 17);
+        assert_eq!(java_runtime_for(8), 17);
+        assert_eq!(java_runtime_for(17), 17);
         assert_eq!(java_runtime_for(21), 21);
         assert_eq!(java_runtime_for(25), 25);
         assert_eq!(java_runtime_for(30), 25);
