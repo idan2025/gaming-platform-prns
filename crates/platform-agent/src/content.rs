@@ -259,6 +259,9 @@ pub enum ProvisionError {
     NotUpdatable { driver: &'static str },
     /// The copy to update from is not installed.
     NothingToUpdate { dir: PathBuf },
+    /// A publisher's listing could not be used, or does not have what was
+    /// asked for (`minecraft.rs`).
+    Listing(String),
     Io(io::Error),
 }
 
@@ -304,7 +307,7 @@ impl core::fmt::Display for ProvisionError {
             }
             Self::DigestMismatch { expected, actual } => write!(
                 f,
-                "downloaded content has sha256 {actual}, but the pack pins {expected}. The \
+                "downloaded content hashes to {actual}, but {expected} was expected. The \
                  download was discarded: the digest is what decides, not the URL"
             ),
             Self::UnsafeEntry { entry, reason } => write!(
@@ -320,6 +323,7 @@ impl core::fmt::Display for ProvisionError {
             Self::NothingToUpdate { dir } => {
                 write!(f, "there is no installed copy at {} to update", dir.display())
             }
+            Self::Listing(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -535,6 +539,34 @@ impl Provisioner {
                 fs::rename(staging.join("unpacked"), &dir)?;
                 let _ = fs::remove_dir_all(&staging);
                 Ok(Provisioned::Installed { dir, bytes: written })
+            }
+            PackContent::Minecraft {} => {
+                let build = game_bridge::minecraft::MinecraftBuild::parse(&content.version)
+                    .map_err(|e| ProvisionError::Listing(e.to_string()))?;
+                if !self.allow_fetch {
+                    return Err(ProvisionError::FetchNotPermitted { url: format!("Minecraft {build}") });
+                }
+                let staging = self.staging_root()?;
+                if let Some(p) = progress {
+                    p.set_staging(&staging);
+                }
+                let installed = staging.join("unpacked");
+                let bytes = match crate::minecraft::provision(&build, &installed, progress).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&staging);
+                        return Err(e);
+                    }
+                };
+                if is_cancelled() {
+                    return Err(cancelled(&staging));
+                }
+                if let Some(parent) = dir.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&installed, &dir)?;
+                let _ = fs::remove_dir_all(&staging);
+                Ok(Provisioned::Installed { dir, bytes })
             }
             PackContent::Steamcmd { app_id, mod_dir, platform } => {
                 if !self.allow_fetch {

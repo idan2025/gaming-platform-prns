@@ -111,6 +111,12 @@ pub enum PackContent {
         #[serde(default, skip_serializing_if = "SteamPlatform::is_linux")]
         platform: SteamPlatform,
     },
+    /// Minecraft: Java Edition (`minecraft.rs`, `MINECRAFT.md` §3). No
+    /// parameters: which server type and version is the player's choice per
+    /// server, carried as the content version. The node resolves it against
+    /// the publishers' own listings, on a fixed host list, and checks every
+    /// download against the digest those listings give.
+    Minecraft {},
 }
 
 /// Which build of a Steam app a node fetches.
@@ -231,6 +237,7 @@ impl PackContent {
                 }
                 Ok(())
             }
+            Self::Minecraft {} => Ok(()),
             Self::Steamcmd { app_id, mod_dir, .. } => {
                 if *app_id == 0 {
                     return Err(ContentError::BadAppId(*app_id));
@@ -247,7 +254,7 @@ impl PackContent {
     /// which is why an agent must tell an operator what is missing rather than
     /// wait for it to appear.
     pub fn is_automatic(&self) -> bool {
-        matches!(self, Self::Archive { .. } | Self::Steamcmd { .. })
+        matches!(self, Self::Archive { .. } | Self::Steamcmd { .. } | Self::Minecraft {})
     }
 
     /// Driver name as it appears in the pack, for messages a human reads.
@@ -256,6 +263,7 @@ impl PackContent {
             Self::Manual { .. } => "manual",
             Self::Archive { .. } => "archive",
             Self::Steamcmd { .. } => "steamcmd",
+            Self::Minecraft {} => "minecraft",
         }
     }
 }

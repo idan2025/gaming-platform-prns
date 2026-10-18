@@ -1702,7 +1702,8 @@ impl Agent {
             .map(|s| (u32::from(s.info.players), u32::from(s.info.max_players), s.info.map))
     }
 
-    /// One A2S query to a running instance's game, when its pack declares one.
+    /// One query to a running instance's game (A2S or Server List Ping), when
+    /// its pack declares one.
     async fn ask_game(&self, instance: &InstanceStatus) -> Option<game_bridge::a2s::A2sStats> {
         if instance.state != InstanceState::Running {
             return None;
@@ -1710,21 +1711,18 @@ impl Agent {
         let profile = self.packs.read().await.get(&instance.game_id)?.to_profile().ok()?;
         // The pack names an enum this build implements — never a command. A
         // game declaring no query is unknown, which is the honest answer.
-        match profile.query? {
-            game_bridge::profile::QueryProtocol::A2s => {
-                // The same place the mesh bridge reaches the game
-                // (`game_address`). Not `127.0.0.1:<host_port>`: this agent is
-                // meant to run in a container, where that loopback is its own
-                // namespace and the query reaches nothing — every instance
-                // would report "could not ask", and reaping would then never
-                // touch anything because unknown is deliberately never treated
-                // as empty.
-                let host = self.docker.games_gateway().await.ok()?;
-                let reach = crate::mesh::GameReach::from_ports(host, &instance.ports, instance.port)?;
-                let ip: std::net::IpAddr = reach.host.parse().ok()?;
-                game_bridge::a2s::query(std::net::SocketAddr::new(ip, reach.port)).await.ok()
-            }
-        }
+        let protocol = profile.query?;
+        // The same place the mesh bridge reaches the game
+        // (`game_address`). Not `127.0.0.1:<host_port>`: this agent is
+        // meant to run in a container, where that loopback is its own
+        // namespace and the query reaches nothing — every instance
+        // would report "could not ask", and reaping would then never
+        // touch anything because unknown is deliberately never treated
+        // as empty.
+        let host = self.docker.games_gateway().await.ok()?;
+        let reach = crate::mesh::GameReach::from_ports(host, &instance.ports, instance.port)?;
+        let ip: std::net::IpAddr = reach.host.parse().ok()?;
+        protocol.ask(std::net::SocketAddr::new(ip, reach.port)).await.ok()
     }
 
     /// Who is on a server right now, as its game reports it: names, scores and
