@@ -1,0 +1,3 @@
+[default]
+description = "Allows the launcher to start and stop its background service."
+permissions = ["allow-start", "allow-stop"]

@@ -15,12 +15,15 @@ use std::path::PathBuf;
 
 use launcher_core::invite::Invite;
 use launcher_core::lan::{LanHelperView, RoomCheckView, RoomView};
-use launcher_core::update::{install_mode, InstallFacts, InstallMode, UpdateView};
+use launcher_core::update::UpdateView;
+#[cfg(desktop)]
+use launcher_core::update::{install_mode, InstallFacts, InstallMode};
 use launcher_core::{
     error_text as fmt_err, BrowseOpts, BrowseQueryInput, BrowseStatus, GameLocationView,
     GameSummary, JoinResult, Launcher, PathTraceView, PlayResult, ServerDetailsView, ServerRow,
 };
 use tauri::{Emitter, Manager};
+#[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
 
 struct AppState {
@@ -29,6 +32,7 @@ struct AppState {
     /// until the page takes it (`take_invite`).
     pending_invite: std::sync::Mutex<Option<Invite>>,
     /// The update the last check found, kept for `install_update`.
+    #[cfg(desktop)]
     update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
     /// Whether the tray icon came up. Without one (a Linux desktop with no
     /// tray, say) closing the window quits as it always did: a hidden window
@@ -89,18 +93,32 @@ async fn server_details(
 /// and it is remembered per game. It exists because the pack's default is the
 /// port the game's *own* dedicated server uses, so a machine already running
 /// one owns it and the join fails on a number the player never picked.
+/// Keep the phone's session alive while a server or room is open: the foreground
+/// service runs exactly while `keeps_running` says something is joined or
+/// hosted. A failed start is logged, not returned: the session itself is fine,
+/// it just may be killed in the background.
+async fn sync_keepalive(app: &tauri::AppHandle, state: &AppState) {
+    let on = state.launcher.keeps_running().await.is_some();
+    if let Err(e) = tauri_plugin_keepalive::set(app, on) {
+        tracing::warn!(error = %e, "background service");
+    }
+}
+
 #[tauri::command]
 async fn join_server(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     destination_hash: String,
     game_id: Option<String>,
     listen_port: Option<u16>,
 ) -> Result<JoinResult, String> {
-    state
+    let joined = state
         .launcher
         .join_server(&destination_hash, game_id.as_deref(), listen_port)
         .await
-        .map_err(fmt_err)
+        .map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    joined
 }
 
 /// The local port a join for this game would bind right now — what the player
@@ -189,6 +207,20 @@ async fn check_update(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<UpdateView, String> {
+    #[cfg(mobile)]
+    {
+        let _ = (app, state);
+        return Err("this build updates from the release page".into());
+    }
+    #[cfg(desktop)]
+    check_update_desktop(app, state).await
+}
+
+#[cfg(desktop)]
+async fn check_update_desktop(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UpdateView, String> {
     let current = app.package_info().version.to_string();
     let mode = install_mode(InstallFacts::here(state.launcher.is_portable()));
     let auto = state.launcher.auto_check_updates().await;
@@ -211,6 +243,17 @@ async fn check_update(
 /// it and restart. Only where this copy can replace itself.
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    #[cfg(mobile)]
+    {
+        let _ = (app, state);
+        return Err("this build updates from the release page".into());
+    }
+    #[cfg(desktop)]
+    install_update_desktop(app, state).await
+}
+
+#[cfg(desktop)]
+async fn install_update_desktop(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if install_mode(InstallFacts::here(state.launcher.is_portable())) != InstallMode::InPlace {
         return Err("this copy of Lanthorn updates from the release page, not by itself".into());
     }
@@ -263,15 +306,19 @@ fn send_notification(app: &tauri::AppHandle, title: &str, body: &str) -> bool {
 
 #[tauri::command]
 async fn host_server(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     request: launcher_core::host::HostRequest,
 ) -> Result<launcher_core::host::HostView, String> {
-    state.launcher.host_server(request).await.map_err(fmt_err)
+    let hosted = state.launcher.host_server(request).await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    hosted
 }
 
 #[tauri::command]
-async fn stop_hosting(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn stop_hosting(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.launcher.stop_hosting().await;
+    sync_keepalive(&app, &state).await;
     Ok(())
 }
 
@@ -300,6 +347,7 @@ async fn set_notifications_on(state: tauri::State<'_, AppState>, on: bool) -> Re
     state.launcher.set_notifications_on(on).await.map_err(fmt_err)
 }
 
+#[cfg(desktop)]
 /// Bring the window back from the tray, or from behind other windows.
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -313,6 +361,7 @@ fn show_main(app: &tauri::AppHandle) {
 /// Quit is a real quit, exactly like closing the window used to be, so a
 /// room ends with it (`CLAUDE.md`, Mode 3: nothing a room creates outlives
 /// the launcher).
+#[cfg(desktop)]
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -391,6 +440,7 @@ fn receive_invite(app: &tauri::AppHandle, url: &str) {
             }
             let _ = app.emit("invite", invite);
             if let Some(w) = app.get_webview_window("main") {
+                #[cfg(desktop)]
                 let _ = w.unminimize();
                 let _ = w.set_focus();
             }
@@ -427,8 +477,10 @@ async fn remove_index(
 }
 
 #[tauri::command]
-async fn leave(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.launcher.leave().await.map_err(fmt_err)
+async fn leave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let left = state.launcher.leave().await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    left
 }
 
 /// Start the game for the current join — the Play button (`PLAN.md` §13.3). All
@@ -574,25 +626,33 @@ async fn revoke_lan_helper(state: tauri::State<'_, AppState>) -> Result<LanHelpe
 
 #[tauri::command]
 async fn host_room(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     game_id: String,
     name: Option<String>,
 ) -> Result<RoomView, String> {
-    state.launcher.host_room(&game_id, name).await.map_err(fmt_err)
+    let hosted = state.launcher.host_room(&game_id, name).await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    hosted
 }
 
 #[tauri::command]
 async fn join_room(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     destination_hash: String,
     game_id: String,
 ) -> Result<RoomView, String> {
-    state.launcher.join_room(&destination_hash, &game_id).await.map_err(fmt_err)
+    let joined = state.launcher.join_room(&destination_hash, &game_id).await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    joined
 }
 
 #[tauri::command]
-async fn leave_room(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.launcher.leave_room().await.map_err(fmt_err)
+async fn leave_room(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let left = state.launcher.leave_room().await.map_err(fmt_err);
+    sync_keepalive(&app, &state).await;
+    left
 }
 
 #[tauri::command]
@@ -777,6 +837,7 @@ fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs"))
 }
 
+#[tauri::mobile_entry_point]
 pub fn run() {
     // Portable mode (`launcher-core/src/portable.rs`): every per-user
     // directory is pointed inside the portable folder *before* anything else
@@ -794,18 +855,23 @@ pub fn run() {
         .try_init();
 
     let is_portable = portable.is_some();
-    tauri::Builder::default()
-        // First, so a second launch — which is how Windows and Linux hand a
-        // clicked invite link to an app — passes its link here and exits
-        // instead of starting a second launcher with a second mesh node.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            for arg in argv.iter().filter(|a| a.starts_with("lanthorn://")) {
-                receive_invite(app, arg);
-            }
-            show_main(app);
-        }))
+    let builder = tauri::Builder::default();
+    // First, so a second launch — which is how Windows and Linux hand a
+    // clicked invite link to an app — passes its link here and exits
+    // instead of starting a second launcher with a second mesh node. Phones
+    // have no second launch to speak of, so this is desktop only.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        for arg in argv.iter().filter(|a| a.starts_with("lanthorn://")) {
+            receive_invite(app, arg);
+        }
+        show_main(app);
+    }));
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
+        .plugin(tauri_plugin_keepalive::init())
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -821,6 +887,7 @@ pub fn run() {
             app.manage(AppState {
                 launcher,
                 pending_invite: std::sync::Mutex::new(None),
+                #[cfg(desktop)]
                 update: tokio::sync::Mutex::new(None),
                 tray: std::sync::atomic::AtomicBool::new(false),
                 told_tray: std::sync::atomic::AtomicBool::new(false),
@@ -837,11 +904,14 @@ pub fn run() {
             // On Linux the tray loads libayatana-appindicator at run time and
             // panics when the desktop has none; that must cost the tray, not
             // the launcher.
-            let handle = app.handle().clone();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(&handle))) {
-                Ok(Ok(())) => app.state::<AppState>().tray.store(true, std::sync::atomic::Ordering::Relaxed),
-                Ok(Err(e)) => tracing::info!(error = %e, "no tray icon; closing the window quits"),
-                Err(_) => tracing::info!("no tray library on this desktop; closing the window quits"),
+            #[cfg(desktop)]
+            {
+                let handle = app.handle().clone();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(&handle))) {
+                    Ok(Ok(())) => app.state::<AppState>().tray.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Ok(Err(e)) => tracing::info!(error = %e, "no tray icon; closing the window quits"),
+                    Err(_) => tracing::info!("no tray library on this desktop; closing the window quits"),
+                }
             }
             {
                 use tauri_plugin_deep_link::DeepLinkExt;

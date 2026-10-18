@@ -21,13 +21,18 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros",
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tauri-plugin-updater = "2"
 tauri-plugin-deep-link = "2"
-tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-keepalive = { path = "../plugins/keepalive" }
 serde_json = "1"
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
+
+# Updating and a second launch are desktop ideas: an app store owns the first on
+# a phone, and the OS owns the second.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [features]
 # Used for production builds or when no dev server is specified. Do not remove.
