@@ -395,6 +395,46 @@ Other Source games can run in this image too, but only these twelve are measured
 Set `SRCDS_GAME` to the game directory, `SRCDS_APP_ID` to the `appID` line of
 its `steam.inf`, and pick a starting map — the image refuses to guess.
 
+## Minecraft: Java Edition
+
+`images/minecraft` runs vanilla, Paper, Fabric and Forge servers on Java 17,
+21 or 25, whichever the version needs (`MINECRAFT.md`). Unlike every other
+game, the server type and version are picked per server in the create form;
+the node downloads each build once, from the publisher's own site, and checks
+it against the digest the publisher lists.
+
+```
+docker build -t gpp/minecraft:1 images/minecraft
+```
+
+```toml
+allow_content_fetch = true
+
+[games.minecraft-java]
+image = "gpp/minecraft:1"
+content_root = "/game"
+content_version = "paper-26.3"   # the build a server gets when none is picked
+memory_limit_bytes = 8589934592  # optional: the most any one server may ask for
+```
+
+What to know:
+
+- **The owner accepts Mojang's EULA in the create form.** The node refuses a
+  server without that acceptance, and the image will not start one.
+- **Releases from 1.18.1 on.** Older ones let any player run code on the
+  server through its logging (Log4Shell), so a node does not host them.
+- **No mods or plugins yet.** Fabric and Forge run as they come.
+- **Memory is checked against the host.** A size that would leave less than
+  1 GB (or a tenth of the machine) free is refused; more than half of what is
+  free is a warning. Each server gets a hard memory limit of its heap plus a
+  quarter plus 512 MB.
+- **The first start needs the internet once**: Paper, Fabric and Forge fetch
+  their libraries into the server's own folder.
+- **A backup holds the whole server folder**, libraries included (about
+  200 MB for Paper), so the daily backup keeps seven of those.
+- **Players connect with their own Minecraft launcher** to the address
+  Lanthorn shows after Join.
+
 ## Server names
 
 A server's name reaches the game's own console at start, so a node refuses

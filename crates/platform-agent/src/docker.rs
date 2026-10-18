@@ -516,12 +516,26 @@ impl DockerRuntime {
         if let Some(bots) = spec.bots {
             env.push(format!("GPP_BOTS={bots}"));
         }
+        // `MINECRAFT.md`: every value below is a number, a timestamp, a word
+        // from a closed set, or a build id `InstanceSpec::validate` judged.
+        env.extend(options_env(&spec.options));
 
         let host_config = HostConfig {
             binds: Some(binds),
             port_bindings: Some(port_bindings),
-            memory: runtime.memory_limit_bytes,
-            nano_cpus: runtime.cpus.map(|c| (c * 1_000_000_000.0) as i64),
+            // A spec's own heap sets a tighter limit than the operator's; the
+            // agent has already refused one past the operator's
+            // (`Agent::resource_check`).
+            memory: spec
+                .options
+                .memory
+                .map(|m| m.container_limit_bytes() as i64)
+                .or(runtime.memory_limit_bytes),
+            nano_cpus: spec
+                .options
+                .cpus
+                .map(|c| i64::from(c) * 1_000_000_000)
+                .or(runtime.cpus.map(|c| (c * 1_000_000_000.0) as i64)),
             // Isolated from every other container (`GAMES_NETWORK`), and held
             // to what a game server needs: it runs as an ordinary user, so it
             // needs no Linux capability and never gains one, and a process
@@ -568,10 +582,13 @@ impl DockerRuntime {
             .await
             .with_context(|| format!("creating container {name}"))?;
 
-        self.docker
-            .start_container::<String>(&name, None)
-            .await
-            .with_context(|| format!("starting container {name}"))?;
+        // A server created stopped waits for its world (`MINECRAFT.md` §6).
+        if !spec.options.stopped {
+            self.docker
+                .start_container::<String>(&name, None)
+                .await
+                .with_context(|| format!("starting container {name}"))?;
+        }
 
         Ok(created.id)
     }
@@ -1139,7 +1156,69 @@ fn spec_from_parts(
         map: env.get("GPP_MAP").cloned(),
         restart_on_crash: false,
         owner: labels.get(OWNER_LABEL).cloned(),
+        options: options_from_env(env),
     })
+}
+
+/// The environment a spec's [`InstanceOptions`] reach a container as.
+pub fn options_env(o: &crate::instance::InstanceOptions) -> Vec<String> {
+    let mut env = Vec::new();
+    if let Some(v) = &o.content_version {
+        env.push(format!("GPP_BUILD={v}"));
+    }
+    if let Some(m) = o.memory {
+        env.push(format!("GPP_MEMORY_MIN_MB={}", m.min_mb));
+        env.push(format!("GPP_MEMORY_MAX_MB={}", m.max_mb));
+    }
+    if let Some(c) = o.cpus {
+        // Recorded on the container so a recreate keeps it; the limit itself
+        // is `NanoCpus`.
+        env.push(format!("GPP_CPUS={c}"));
+    }
+    if let Some(at) = o.eula_accepted_at {
+        env.push(format!("GPP_EULA_ACCEPTED_AT={at}"));
+    }
+    if let Some(mc) = &o.minecraft {
+        env.push(format!("GPP_MC_GAMEMODE={}", mc.gamemode.as_str()));
+        env.push(format!("GPP_MC_DIFFICULTY={}", mc.difficulty.as_str()));
+        env.push(format!("GPP_MC_PVP={}", mc.pvp));
+        env.push(format!("GPP_MC_WHITELIST={}", mc.whitelist));
+        env.push(format!("GPP_MC_ONLINE_MODE={}", mc.online_mode));
+        if let Some(seed) = &mc.seed {
+            env.push(format!("GPP_MC_SEED={seed}"));
+        }
+    }
+    env
+}
+
+/// [`options_env`] read back, for a recreate. A value that does not parse is
+/// left out rather than guessed.
+fn options_from_env(env: &HashMap<String, String>) -> crate::instance::InstanceOptions {
+    use crate::instance::{Difficulty, Gamemode, MemorySpec, MinecraftSettings};
+    let num = |k: &str| env.get(k).and_then(|v| v.parse::<u32>().ok());
+    let flag = |k: &str, default: bool| env.get(k).map(|v| v == "true").unwrap_or(default);
+    let word = |k: &str| env.get(k).map(|v| serde_json::Value::String(v.clone()));
+    let minecraft = env.contains_key("GPP_MC_GAMEMODE").then(|| MinecraftSettings {
+        gamemode: word("GPP_MC_GAMEMODE").and_then(|v| serde_json::from_value::<Gamemode>(v).ok()).unwrap_or_default(),
+        difficulty: word("GPP_MC_DIFFICULTY")
+            .and_then(|v| serde_json::from_value::<Difficulty>(v).ok())
+            .unwrap_or_default(),
+        pvp: flag("GPP_MC_PVP", true),
+        whitelist: flag("GPP_MC_WHITELIST", false),
+        online_mode: flag("GPP_MC_ONLINE_MODE", true),
+        seed: env.get("GPP_MC_SEED").cloned(),
+    });
+    crate::instance::InstanceOptions {
+        content_version: env.get("GPP_BUILD").cloned(),
+        memory: match (num("GPP_MEMORY_MIN_MB"), num("GPP_MEMORY_MAX_MB")) {
+            (Some(min_mb), Some(max_mb)) => Some(MemorySpec { min_mb, max_mb }),
+            _ => None,
+        },
+        cpus: env.get("GPP_CPUS").and_then(|v| v.parse().ok()),
+        eula_accepted_at: env.get("GPP_EULA_ACCEPTED_AT").and_then(|v| v.parse().ok()),
+        minecraft,
+        stopped: false,
+    }
 }
 
 /// `uid:gid` for a provisioning task: whoever runs the agent.
@@ -1280,6 +1359,35 @@ mod tests {
         let mut old = labels.clone();
         old.remove(PORTS_LABEL);
         assert!(spec_from_parts("tf", &old, &env).is_err(), "a container with no port label is not guessed at");
+    }
+
+    /// A Minecraft server's options reach its container and come back the
+    /// same, so a recreate keeps its build, heap, EULA and settings.
+    #[test]
+    fn minecraft_options_round_trip_through_the_environment() {
+        use crate::instance::{Difficulty, Gamemode, InstanceOptions, MemorySpec, MinecraftSettings};
+        let options = InstanceOptions {
+            content_version: Some("paper-26.3".into()),
+            memory: Some(MemorySpec { min_mb: 2048, max_mb: 4096 }),
+            cpus: Some(2),
+            eula_accepted_at: Some(1_760_000_000),
+            minecraft: Some(MinecraftSettings {
+                gamemode: Gamemode::Creative,
+                difficulty: Difficulty::Hard,
+                pvp: false,
+                whitelist: true,
+                online_mode: true,
+                seed: Some("-42".into()),
+            }),
+            stopped: false,
+        };
+        let env: HashMap<String, String> = options_env(&options)
+            .into_iter()
+            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        assert_eq!(env["GPP_MEMORY_MAX_MB"], "4096");
+        assert_eq!(options_from_env(&env), options);
+        assert_eq!(options_from_env(&HashMap::new()), InstanceOptions::default(), "an older container reads as no options");
     }
 
     /// The label is how a restarted agent learns which port is the game and

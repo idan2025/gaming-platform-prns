@@ -259,6 +259,9 @@ pub enum ProvisionError {
     NotUpdatable { driver: &'static str },
     /// The copy to update from is not installed.
     NothingToUpdate { dir: PathBuf },
+    /// A publisher's listing could not be used, or does not have what was
+    /// asked for (`minecraft.rs`).
+    Listing(String),
     Io(io::Error),
 }
 
@@ -304,7 +307,7 @@ impl core::fmt::Display for ProvisionError {
             }
             Self::DigestMismatch { expected, actual } => write!(
                 f,
-                "downloaded content has sha256 {actual}, but the pack pins {expected}. The \
+                "downloaded content hashes to {actual}, but {expected} was expected. The \
                  download was discarded: the digest is what decides, not the URL"
             ),
             Self::UnsafeEntry { entry, reason } => write!(
@@ -320,6 +323,7 @@ impl core::fmt::Display for ProvisionError {
             Self::NothingToUpdate { dir } => {
                 write!(f, "there is no installed copy at {} to update", dir.display())
             }
+            Self::Listing(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -535,6 +539,34 @@ impl Provisioner {
                 fs::rename(staging.join("unpacked"), &dir)?;
                 let _ = fs::remove_dir_all(&staging);
                 Ok(Provisioned::Installed { dir, bytes: written })
+            }
+            PackContent::Minecraft {} => {
+                let build = game_bridge::minecraft::MinecraftBuild::parse(&content.version)
+                    .map_err(|e| ProvisionError::Listing(e.to_string()))?;
+                if !self.allow_fetch {
+                    return Err(ProvisionError::FetchNotPermitted { url: format!("Minecraft {build}") });
+                }
+                let staging = self.staging_root()?;
+                if let Some(p) = progress {
+                    p.set_staging(&staging);
+                }
+                let installed = staging.join("unpacked");
+                let bytes = match crate::minecraft::provision(&build, &installed, progress).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&staging);
+                        return Err(e);
+                    }
+                };
+                if is_cancelled() {
+                    return Err(cancelled(&staging));
+                }
+                if let Some(parent) = dir.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&installed, &dir)?;
+                let _ = fs::remove_dir_all(&staging);
+                Ok(Provisioned::Installed { dir, bytes })
             }
             PackContent::Steamcmd { app_id, mod_dir, platform } => {
                 if !self.allow_fetch {
@@ -1133,6 +1165,53 @@ pub fn extract(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64,
         )
     } else {
         unpack(fs::File::open(archive)?, dest, strip_components)
+    }
+}
+
+/// Extract a zip into `dest`, under the same rules as a tar: every entry's path
+/// judged by [`safe_relative`], the same size ceiling, and no links at all — a
+/// zip that needs one is not a world or a backup.
+pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    let file = fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("not a zip: {e}")))?;
+    let mut written: u64 = 0;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip entry {i}: {e}")))?;
+        let name = entry.name().to_string();
+        let relative = safe_relative(Path::new(&name), &name)?;
+        if entry.is_symlink() {
+            return Err(ProvisionError::UnsafeEntry { entry: name, reason: "a link" });
+        }
+        let target = dest.join(&relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        written = written.checked_add(entry.size()).ok_or(ProvisionError::TooLarge { limit: MAX_EXTRACTED_BYTES })?;
+        if written > MAX_EXTRACTED_BYTES {
+            return Err(ProvisionError::TooLarge { limit: MAX_EXTRACTED_BYTES });
+        }
+        let mut out = LimitedWriter::new(fs::File::create(&target)?, MAX_EXTRACTED_BYTES);
+        io::copy(&mut entry, &mut out)?;
+        out.inner.flush()?;
+    }
+    Ok(written)
+}
+
+/// A zip or a tar (plain, gzip or xz), told apart by its first bytes.
+pub fn extract_any(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    let mut magic = [0u8; 4];
+    let n = read_up_to(&mut fs::File::open(archive)?, &mut magic)?;
+    if n == 4 && magic == *b"PK\x03\x04" {
+        extract_zip(archive, dest)
+    } else {
+        extract(archive, dest, 0)
     }
 }
 

@@ -1,0 +1,47 @@
+# Minecraft: Java Edition (MINECRAFT.md). The first pack whose server type and
+# version are picked per server rather than per node: vanilla, Paper, Fabric
+# or Forge, any release from 1.18.1 up. The pack names none of that; the
+# `minecraft` content driver resolves a build against its publisher's own
+# listing and checks every download against the digest the listing gives.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "minecraft-java"
+display_name = "Minecraft: Java Edition"
+app_name = "minecraft-java"
+default_port = 25565
+# One TCP port. It rides a link's channel as a byte stream (`stream.rs`).
+transport = "tcp"
+min_link_class = 1
+
+# Server List Ping, on the game's own port: a player count for the list,
+# reaping and "restart when empty".
+query = "minecraft"
+
+# The server reads commands on stdin. `minecraft` selects words this build
+# carries (crates/game-bridge/src/console.rs): say, kick, ban, pardon, op,
+# deop, and save-off/save-all/save-on around a backup. The pack cannot write a
+# console line.
+console = "minecraft"
+
+# The whole server directory is the server's own: the world, its settings,
+# the operator and ban lists, and the libraries a loader fetches on first
+# start. The shared copy holds only the verified jar or installer.
+writable_paths = ["server"]
+
+art = "https://upload.wikimedia.org/wikipedia/en/b/be/Minecraft_game_logo_2023.png"
+
+notes = "Players connect with their own Minecraft launcher to the address Lanthorn shows. No mods or plugins in v1: a mod is code running on someone else's node."
+
+# No parameters: which type and version is the player's choice per server.
+[content]
+driver = "minecraft"
+
+# Mojang requires every server's owner to accept this. A node never starts a
+# server without the owner's recorded acceptance, and never accepts for them.
+[eula]
+name = "Minecraft End User License Agreement"
+url = "https://aka.ms/MinecraftEULA"

@@ -281,6 +281,18 @@ pub async fn spawn(
     agent: Arc<crate::agent::Agent>,
     game_id: String,
 ) -> bool {
+    spawn_version(installs, agent, game_id, None).await
+}
+
+/// [`spawn`] for one picked copy of a game whose copies are picked per server
+/// (a Minecraft build). The download is still tracked under the game's id:
+/// one download per game at a time, like every other.
+pub async fn spawn_version(
+    installs: Arc<Installs>,
+    agent: Arc<crate::agent::Agent>,
+    game_id: String,
+    version: Option<String>,
+) -> bool {
     let Some(progress) = installs.begin(&game_id).await else {
         return false;
     };
@@ -292,14 +304,14 @@ pub async fn spawn(
         // A fresh install's size is not known (`ROADMAP.md` §12.2), so it is
         // held to the reserve alone; the watch below is what protects the
         // disk. Content already there needs no room.
-        if agent.content_is_missing(&game_id).await {
+        if agent.content_is_missing(&game_id, version.as_deref()).await {
             if let Err(error) = agent.room_for(0).await {
                 tracing::warn!(game = %game_id, error = %error, "content install not started");
                 installs.finish(&game_id, InstallState::Failed { error }).await;
                 return;
             }
         }
-        let outcome = watched(&agent, &progress, agent.ensure_content_tracked(&game_id, Some(&progress))).await;
+        let outcome = watched(&agent, &progress, agent.ensure_content_tracked(&game_id, version.as_deref(), Some(&progress))).await;
         let state = match outcome {
             Ok(crate::content::Provisioned::AlreadyInstalled(_)) => {
                 InstallState::Done { bytes: 0, already_installed: true, update: None, verify: None }

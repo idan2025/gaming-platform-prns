@@ -69,6 +69,7 @@ fn spec(id: &str, restart_on_crash: bool) -> InstanceSpec {
         bots: None,
         restart_on_crash,
         owner: None,
+        options: Default::default(),
     }
 }
 

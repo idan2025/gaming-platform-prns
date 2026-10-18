@@ -480,6 +480,36 @@ starts no game. Rules a later change could quietly break:
   opens the APK; Android installs it only over a copy signed by the same key
   (`~/.config/lanthorn-android/`, not in the repo).
 
+**Minecraft is hosted, and every console game has kick and ban** (2026-10-18,
+`MINECRAFT.md`, branch `feat/minecraft`). Rules a later change could quietly
+break:
+- **A Minecraft build is a content version picked per server**
+  (`InstanceSpec.options.content_version`, `paper-26.3`), and its id is an
+  allowlist (`game_bridge::minecraft::MinecraftBuild::parse`): a known type,
+  release versions of digits and dots, **nothing older than 1.18.1**
+  (Log4Shell). Refused, never repaired.
+- **Fetched only from `minecraft::HOSTS`, over https, redirects included,
+  and checked against the publisher's own digest** (SHA-1 for Mojang,
+  SHA-256 elsewhere) before it is renamed into place
+  (`platform-agent/src/minecraft.rs`).
+- **A pack with `[eula]` is never created without `eula_accepted_at`**, and
+  that is checked before a missing copy can turn the create into a download
+  (`Agent::check_spec`; `a_spec_without_the_eula_is_refused_and_starts_no_download`).
+  The image writes `eula=true` only with the agent's value.
+- **One resource judgement, asked twice** (`resources.rs`): refuse below the
+  reserve (1 GiB or 10%), warn above half of free memory; the container gets
+  a hard limit of heap × 1.25 + 512 MiB. Java settings on a non-Minecraft
+  game are refused, never ignored.
+- **Moderation words live in `console.rs`**, targets validated per engine (a
+  Minecraft name, an in-game name for a GoldSrc/Source kick, a Steam ID for
+  their ban). **GoldSrc and Source bans are the node's** (`bans.json`, sent
+  again after every start: the game would write them into the read-only
+  copy); pinned by `tests/moderation.rs`, which fails without the re-send.
+  Loopback API only, like the console.
+- **A world import changes nothing until it has passed**: zip or tar under
+  the content path rules, no links, one world (or Paper's three folders), the
+  old world backed up first (`world.rs`).
+
 **The server list is what is live, never history** (2026-10-10, the user's
 call). `list_servers` does not list remembered servers; a heard row drops off
 after `STALE_AFTER` (180 s) unless the query sets `max_age_secs`. Because a

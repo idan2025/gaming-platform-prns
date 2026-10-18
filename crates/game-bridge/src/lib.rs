@@ -28,6 +28,8 @@ pub mod lan_rebind;
 pub mod lan_relay;
 pub mod lan_session;
 pub mod launch;
+pub mod mc_ping;
+pub mod minecraft;
 pub mod pack;
 pub mod profile;
 pub mod relay;

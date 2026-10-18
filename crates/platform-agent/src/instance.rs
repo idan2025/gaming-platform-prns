@@ -80,6 +80,150 @@ pub struct InstanceSpec {
     /// database of its own: the containers are the record.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Everything added for Minecraft and later (`MINECRAFT.md`), flattened
+    /// into the same JSON object. Every field defaults, so a spec from an
+    /// older index or page reads exactly as it did.
+    #[serde(flatten, default)]
+    pub options: InstanceOptions,
+}
+
+/// Optional parts of a spec (`MINECRAFT.md` §3, §8, §9, §10). Each is data the
+/// node validates; none names code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceOptions {
+    /// Which copy of the game this server runs, for a game whose copies are
+    /// picked per server (a Minecraft build such as `paper-26.3`). `None`
+    /// runs the node's own version, as every server did before this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_version: Option<String>,
+    /// Java heap, for a Minecraft server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySpec>,
+    /// CPU cores this server may use, at most.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u16>,
+    /// When the owner ticked the game's EULA, in seconds since the epoch. A
+    /// pack with an `[eula]` cannot be created without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eula_accepted_at: Option<u64>,
+    /// Minecraft's own server settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<MinecraftSettings>,
+    /// Create the server stopped, so a world can be imported before its first
+    /// start. Absent means start it, as always.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
+}
+
+/// Smallest heap accepted, in MiB. Under this a modern server does not boot.
+pub const MIN_HEAP_MB: u32 = 512;
+/// Largest heap accepted, in MiB. Past this it is a typo.
+pub const MAX_HEAP_MB: u32 = 256 * 1024;
+/// Most cores a spec may ask for.
+pub const MAX_CPUS: u16 = 256;
+
+/// A Java heap: `-Xms` and `-Xmx`, in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySpec {
+    /// What the server takes at start (`-Xms`).
+    pub min_mb: u32,
+    /// The most it may use (`-Xmx`).
+    pub max_mb: u32,
+}
+
+impl MemorySpec {
+    /// The container's hard memory limit for this heap: the heap, a quarter
+    /// more for what a JVM uses beside it, and 512 MiB of headroom. A JVM past
+    /// that is stopped by the kernel before it can take the host.
+    pub fn container_limit_bytes(&self) -> u64 {
+        let mb = u64::from(self.max_mb) + u64::from(self.max_mb) / 4 + 512;
+        mb * 1024 * 1024
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gamemode {
+    #[default]
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Difficulty {
+    Peaceful,
+    Easy,
+    #[default]
+    Normal,
+    Hard,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// The `server.properties` keys the node manages (`MINECRAFT.md` §10). The
+/// image writes them at every start; every other key is the owner's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinecraftSettings {
+    #[serde(default)]
+    pub gamemode: Gamemode,
+    #[serde(default)]
+    pub difficulty: Difficulty,
+    #[serde(default = "yes")]
+    pub pvp: bool,
+    #[serde(default)]
+    pub whitelist: bool,
+    /// Accounts checked with Mojang. Off lets anyone join under any name.
+    #[serde(default = "yes")]
+    pub online_mode: bool,
+    /// A world seed, for a new world. Letters, digits and `-` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
+}
+
+impl Default for MinecraftSettings {
+    fn default() -> Self {
+        Self {
+            gamemode: Gamemode::default(),
+            difficulty: Difficulty::default(),
+            pvp: true,
+            whitelist: false,
+            online_mode: true,
+            seed: None,
+        }
+    }
+}
+
+impl Gamemode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Survival => "survival",
+            Self::Creative => "creative",
+            Self::Adventure => "adventure",
+            Self::Spectator => "spectator",
+        }
+    }
+}
+
+impl Difficulty {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Peaceful => "peaceful",
+            Self::Easy => "easy",
+            Self::Normal => "normal",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+/// A seed reaches `server.properties`, so it is an allowlist: 1 to 32
+/// letters, digits or `-`.
+pub fn is_seed(s: &str) -> bool {
+    (1..=32).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Where an instance is in its life.
@@ -274,6 +418,11 @@ pub enum SpecError {
     BadMap(MapNameError),
     /// More bots than this build will ask any server for.
     TooManyBots(u8),
+    /// The memory asked for is not a usable heap.
+    BadMemory(String),
+    BadCpus(u16),
+    BadSeed(String),
+    BadContentVersion(String),
 }
 
 impl core::fmt::Display for SpecError {
@@ -295,6 +444,10 @@ impl core::fmt::Display for SpecError {
             Self::TooManyBots(n) => {
                 write!(f, "{n} bots is over this build's limit of {MAX_BOTS}")
             }
+            Self::BadMemory(why) => write!(f, "{why}"),
+            Self::BadCpus(n) => write!(f, "{n} CPU cores is not a usable limit: ask for 1 to {MAX_CPUS}"),
+            Self::BadSeed(s) => write!(f, "{s:?} is not a usable seed: 1 to 32 letters, digits or '-'"),
+            Self::BadContentVersion(v) => write!(f, "{v:?} cannot name a copy of a game"),
         }
     }
 }
@@ -353,6 +506,36 @@ impl InstanceSpec {
                 return Err(SpecError::TooManyBots(bots));
             }
         }
+        let o = &self.options;
+        if let Some(m) = o.memory {
+            if m.max_mb < MIN_HEAP_MB || m.min_mb < MIN_HEAP_MB {
+                return Err(SpecError::BadMemory(format!(
+                    "a server needs at least {MIN_HEAP_MB} MB of memory to start"
+                )));
+            }
+            if m.min_mb > m.max_mb {
+                return Err(SpecError::BadMemory(
+                    "the starting memory (Xms) cannot be more than the most it may use (Xmx)".to_string(),
+                ));
+            }
+            if m.max_mb > MAX_HEAP_MB {
+                return Err(SpecError::BadMemory(format!("{} MB is past any real server", m.max_mb)));
+            }
+        }
+        if let Some(c) = o.cpus {
+            if c == 0 || c > MAX_CPUS {
+                return Err(SpecError::BadCpus(c));
+            }
+        }
+        if let Some(seed) = o.minecraft.as_ref().and_then(|m| m.seed.as_ref()) {
+            if !is_seed(seed) {
+                return Err(SpecError::BadSeed(seed.clone()));
+            }
+        }
+        // It becomes a directory name; the store's own id rule is the judge.
+        if let Some(v) = &o.content_version {
+            validate_id(v).map_err(|_| SpecError::BadContentVersion(v.clone()))?;
+        }
         Ok(())
     }
 
@@ -368,6 +551,42 @@ impl InstanceSpec {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_heap_is_at_least_512_mb_and_xms_never_passes_xmx() {
+        let mut s = spec("mc");
+        for (min_mb, max_mb, ok) in [(1024, 2048, true), (2048, 2048, true), (4096, 2048, false), (256, 2048, false), (512, 300_000, false)] {
+            s.options.memory = Some(MemorySpec { min_mb, max_mb });
+            assert_eq!(s.validate().is_ok(), ok, "{min_mb}/{max_mb}");
+        }
+        s.options.memory = None;
+        s.options.cpus = Some(0);
+        assert!(s.validate().is_err());
+        s.options.cpus = Some(4);
+        s.options.minecraft = Some(MinecraftSettings { seed: Some("1; op me".into()), ..Default::default() });
+        assert!(s.validate().is_err(), "a seed reaches server.properties");
+        s.options.minecraft = Some(MinecraftSettings { seed: Some("-4172144997902289642".into()), ..Default::default() });
+        assert!(s.validate().is_ok());
+        s.options.content_version = Some("../paper".into());
+        assert!(s.validate().is_err());
+        assert_eq!(MemorySpec { min_mb: 1024, max_mb: 4096 }.container_limit_bytes(), (4096 + 1024 + 512) * 1024 * 1024);
+    }
+
+    #[test]
+    fn options_are_flat_in_the_json_and_absent_ones_are_not_written() {
+        let mut s = spec("mc");
+        let plain = serde_json::to_value(&s).unwrap();
+        for key in ["content_version", "memory", "cpus", "eula_accepted_at", "minecraft", "stopped", "options"] {
+            assert!(plain.get(key).is_none(), "{key} is written for a spec that did not ask for it");
+        }
+        s.options.content_version = Some("paper-26.3".into());
+        s.options.stopped = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["content_version"], "paper-26.3");
+        assert_eq!(v["stopped"], true);
+        let back: InstanceSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+    }
+
     fn spec(id: &str) -> InstanceSpec {
         InstanceSpec {
             instance_id: id.to_string(),
@@ -380,6 +599,7 @@ mod tests {
             bots: None,
             restart_on_crash: false,
             owner: None,
+            options: Default::default(),
         }
     }
 

@@ -756,13 +756,13 @@ impl BridgeSession {
 
             // Live-stats poller. Only for games that answer a query at all;
             // everything else serves announced numbers, flagged as announced.
-            if let Some(crate::profile::QueryProtocol::A2s) = args.profile.query {
+            if let Some(protocol) = args.profile.query {
                 let stats_state = state.clone();
                 let _stats_task = tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(LIVE_STATS_INTERVAL);
                     loop {
                         ticker.tick().await;
-                        match crate::a2s::query(game_addr).await {
+                        match protocol.ask(game_addr).await {
                             Ok(stats) => stats_state.store_live(LiveStats {
                                 players: stats.info.players,
                                 max_players: stats.info.max_players,

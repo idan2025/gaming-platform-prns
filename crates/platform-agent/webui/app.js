@@ -96,6 +96,8 @@ const ICON = {
   link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
   log: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
   users: '<circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M16 4.5a3.2 3.2 0 010 6.2M18 14.5c1.8.8 3 2.7 3 5"/>',
+  shield: '<path d="M12 3l7 3v6c0 4.2-3 7.6-7 9-4-1.4-7-4.8-7-9V6z"/>',
+  globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.6 2.5 14.4 0 17M12 3.5c-2.5 2.6-2.5 14.4 0 17"/>',
 };
 function icon(name) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -678,12 +680,14 @@ function capabilities(inst) {
   const game = gameOf(inst.game_id);
   const running = inst.state === "running";
   const speaks = !game || game.console !== false;
+  const oneWorld = !!(game && game.minecraft);
   const hasBots = !!(game && game.bots);
   return {
     running,
     canStop: !(inst.state === "stopped" || inst.state === "missing"),
-    canMap: running && speaks,
-    mapWhy: !running ? "The server has to be running to be told anything."
+    canMap: running && speaks && !oneWorld,
+    mapWhy: oneWorld ? "A Minecraft server has one world. Upload a different one with Upload a world."
+      : !running ? "The server has to be running to be told anything."
       : (!speaks ? "The " + inst.game_id + " pack declares no console, so the map cannot change without a restart."
         : "Change the map without restarting — players stay connected."),
     hasBots,
@@ -890,6 +894,18 @@ function openInstanceMenu(id, x, y) {
   items.push({ label: "Players…", icon: "users", disabled: !cap.running,
     title: cap.running ? "Who is on this server, as the game reports it." : "The server has to be running.",
     action: () => onShowPlayers(id) });
+  if (hasConsole) {
+    items.push({ label: "Kick, ban and operators…", icon: "shield",
+      title: "Kick or ban a player, see the ban list, and choose who runs commands in game.",
+      action: () => onModeration(id) });
+  }
+  const isMinecraft = state.games.some(g => g.id === inst.game_id && g.minecraft);
+  if (isMinecraft) {
+    items.push({ label: "Upload a world…", icon: "globe", disabled: cap.running,
+      title: cap.running ? "Stop the server first: its world cannot be swapped while it runs."
+        : "Replace this server's world with one from a file. The current world is backed up first.",
+      action: () => onUploadWorld(id) });
+  }
   if (inst.restart_on_crash != null) {
     items.push({ label: (inst.restart_on_crash ? "✓ " : "") + "Restart if it crashes", icon: "restart",
       title: "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone.",
@@ -1337,6 +1353,7 @@ function field(parent, id, label, attrs) {
 function openStartDialog(gameId) {
   const game = gameOf(gameId);
   if (!game) return;
+  if (game.minecraft) { openMinecraftDialog(gameId); return; }
   openModal("start-dialog", gameId, (body, close) => {
     body.appendChild(el("h3", null, "New " + game.display_name + " server"));
     const form = el("form", "advanced-wrap");
@@ -1551,6 +1568,559 @@ async function onInstall(gameId) {
     state.installing.delete(gameId);
     renderGames();
   }
+}
+
+// ---------- Minecraft (MINECRAFT.md) ----------
+//
+// A Minecraft server is picked by type and version, sized in plain words, and
+// created only with its owner's EULA acceptance. The node judges the size
+// against its own memory (`/resources/check`) and refuses what would starve
+// it; this page asks the same question first so nobody is surprised.
+
+const MC_TYPES = [
+  { id: "paper", name: "Paper", line: "Recommended. Vanilla gameplay, runs faster, handles more players." },
+  { id: "vanilla", name: "Vanilla", line: "Mojang's own server, exactly as released." },
+  { id: "fabric", name: "Fabric", line: "The Fabric loader. No mods yet: this node runs it as it comes." },
+  { id: "forge", name: "Forge", line: "The Forge loader. No mods yet: this node runs it as it comes." },
+];
+const MC_MEMORY = [
+  { id: "small", name: "Small", min: 1024, max: 2048, line: "2 GB. A few friends on Vanilla or Paper." },
+  { id: "medium", name: "Medium", min: 2048, max: 4096, line: "4 GB. Up to about 20 players. A good default." },
+  { id: "large", name: "Large", min: 4096, max: 6144, line: "6 GB. Bigger groups, or a Fabric or Forge server." },
+  { id: "custom", name: "Custom", line: "Pick the numbers yourself." },
+];
+const MC_SLOTS = [10, 20, 50, 100];
+const MC_VERSIONS = new Map();
+
+function chips(options, current, onPick) {
+  const wrap = el("div", "chip-row");
+  for (const o of options) {
+    const b = el("button", "chip-btn" + (o.id === current ? " active" : ""), o.name);
+    b.type = "button";
+    b.dataset.id = o.id;
+    b.addEventListener("click", () => {
+      for (const x of wrap.children) x.classList.toggle("active", x === b);
+      onPick(o.id);
+    });
+    wrap.appendChild(b);
+  }
+  return wrap;
+}
+
+function gbText(mb) { return (mb / 1024).toFixed(mb % 1024 ? 1 : 0) + " GB"; }
+
+async function mcVersions(server) {
+  if (MC_VERSIONS.has(server)) return MC_VERSIONS.get(server);
+  const list = await api("GET", "/minecraft/versions?server=" + encodeURIComponent(server));
+  MC_VERSIONS.set(server, list || []);
+  return list || [];
+}
+
+function selectField(parent, id, label, options, value) {
+  const l = el("label", null, label);
+  l.htmlFor = id;
+  const sel = el("select", "field");
+  sel.id = id;
+  for (const [v, text] of options) { const o = el("option", null, text); o.value = v; sel.appendChild(o); }
+  if (value != null) sel.value = value;
+  parent.append(l, sel);
+  return sel;
+}
+
+function checkField(parent, id, text, checked) {
+  const wrap = el("label", "check");
+  const box = el("input");
+  box.type = "checkbox";
+  box.id = id;
+  box.checked = !!checked;
+  wrap.append(box, el("span", null, text));
+  parent.appendChild(wrap);
+  return box;
+}
+
+// Local hour to the UTC hour a restart schedule stores.
+function utcHourOf(localHourValue) {
+  const offset = -new Date().getTimezoneOffset() / 60;
+  return ((Math.round(localHourValue - offset) % 24) + 24) % 24;
+}
+
+function openMinecraftDialog(gameId) {
+  const game = gameOf(gameId);
+  const back = openModal("start-dialog", gameId, (body, close) => {
+    body.appendChild(el("h3", null, "New " + game.display_name + " server"));
+    const form = el("form", "advanced-wrap mc-form");
+    form.autocomplete = "off";
+    const name = field(form, "mc-name", "Server name", { type: "text", required: true, placeholder: "My Minecraft server", maxLength: 60 });
+    form.appendChild(el("p", "muted small", "Shown in Lanthorn's server list and as the server's message in Minecraft."));
+
+    // Server software and version.
+    const defaultType = ((game.default_build || "paper-").split("-")[0]) || "paper";
+    let type = MC_TYPES.some(t => t.id === defaultType) ? defaultType : "paper";
+    form.appendChild(el("label", null, "Server software"));
+    const typeLine = el("p", "muted small");
+    form.appendChild(chips(MC_TYPES, type, (id) => { type = id; typeLine.textContent = MC_TYPES.find(t => t.id === id).line; loadVersions(); judge(); }));
+    typeLine.textContent = MC_TYPES.find(t => t.id === type).line;
+    form.appendChild(typeLine);
+    const version = selectField(form, "mc-version", "Minecraft version", [["", "Loading versions…"]], "");
+    const versionNote = el("p", "muted small", "Releases from 1.18.1 on. Older ones let any player run code on the server (Log4Shell), so this node does not host them.");
+    form.appendChild(versionNote);
+    async function loadVersions() {
+      version.disabled = true;
+      version.textContent = "";
+      const loading = el("option", null, "Loading versions…");
+      loading.value = "";
+      version.appendChild(loading);
+      try {
+        const list = await mcVersions(type);
+        version.textContent = "";
+        for (const v of list) {
+          const label = v.game_version + (v.loader ? " · " + (type === "forge" ? "Forge " : "loader ") + v.loader : "") + (v.recommended && type === "forge" ? " (recommended)" : "");
+          const o = el("option", null, label);
+          o.value = v.build;
+          version.appendChild(o);
+        }
+        const pick = list.find(v => v.build === game.default_build) || list.find(v => v.recommended && type === "forge") || list[0];
+        if (pick) version.value = pick.build;
+        version.disabled = list.length === 0;
+        if (!list.length) versionNote.textContent = "The publisher lists no version this node can host right now.";
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        version.textContent = "";
+        const o = el("option", null, "Could not load versions");
+        o.value = "";
+        version.appendChild(o);
+        versionNote.textContent = (e && e.error) || "The version list could not be read. Is this node online?";
+      }
+      refresh();
+    }
+
+    // Player slots.
+    let slots = 20;
+    form.appendChild(el("label", null, "Player slots"));
+    const slotOpts = MC_SLOTS.map(n => ({ id: String(n), name: String(n) })).concat([{ id: "custom", name: "Custom" }]);
+    const slotCustom = el("input");
+    slotCustom.type = "number"; slotCustom.min = "1"; slotCustom.max = "255"; slotCustom.value = "20";
+    slotCustom.className = "hidden";
+    slotCustom.setAttribute("aria-label", "Player slots");
+    form.appendChild(chips(slotOpts, "20", (id) => {
+      slotCustom.classList.toggle("hidden", id !== "custom");
+      if (id !== "custom") slots = parseInt(id, 10);
+      else { slots = parseInt(slotCustom.value, 10); slotCustom.focus(); }
+    }));
+    slotCustom.addEventListener("input", () => { slots = parseInt(slotCustom.value, 10); });
+    form.appendChild(slotCustom);
+
+    // Memory.
+    let mem = "medium";
+    form.appendChild(el("label", null, "Memory"));
+    const memLine = el("p", "muted small");
+    const custom = el("div", "mc-mem hidden");
+    const xms = field(custom, "mc-xms", "Starting memory (Xms), GB", { type: "number", min: "0.5", max: "256", step: "0.5", value: "2" });
+    const xmx = field(custom, "mc-xmx", "Most it may use (Xmx), GB", { type: "number", min: "0.5", max: "256", step: "0.5", value: "4" });
+    form.appendChild(chips(MC_MEMORY, mem, (id) => {
+      mem = id;
+      memLine.textContent = MC_MEMORY.find(m => m.id === id).line;
+      custom.classList.toggle("hidden", id !== "custom");
+      judge();
+    }));
+    memLine.textContent = MC_MEMORY.find(m => m.id === mem).line;
+    form.appendChild(memLine);
+    custom.appendChild(el("p", "muted small", "Xmx is the most memory the server may ever use. Xms is what it takes the moment it starts; " +
+      "keep it at or below Xmx. The node adds room for Java itself on top, and stops the server if it goes past that."));
+    form.appendChild(custom);
+    xms.addEventListener("input", judge);
+    xmx.addEventListener("input", judge);
+    const verdict = el("div", "verdict");
+    form.appendChild(verdict);
+    function heap() {
+      if (mem !== "custom") { const m = MC_MEMORY.find(x => x.id === mem); return { min_mb: m.min, max_mb: m.max }; }
+      return { min_mb: Math.round(parseFloat(xms.value) * 1024), max_mb: Math.round(parseFloat(xmx.value) * 1024) };
+    }
+    let refused = false;
+    let judgeSeq = 0;
+    async function judge() {
+      const h = heap();
+      const seq = ++judgeSeq;
+      if (!(h.min_mb > 0 && h.max_mb > 0)) { verdict.className = "verdict bad"; verdict.textContent = "Enter both numbers."; refused = true; refresh(); return; }
+      if (h.min_mb > h.max_mb) { verdict.className = "verdict bad"; verdict.textContent = "Starting memory cannot be more than the most it may use."; refused = true; refresh(); return; }
+      try {
+        const v = await api("GET", "/resources/check?game=" + encodeURIComponent(gameId) + "&min_mb=" + h.min_mb + "&max_mb=" + h.max_mb);
+        if (seq !== judgeSeq) return;
+        refused = v.level === "refuse";
+        verdict.className = "verdict " + (v.level === "ok" ? "ok" : v.level === "warn" ? "warn" : "bad");
+        verdict.textContent = "";
+        const head = v.level === "ok" ? "Fits this host." : v.level === "warn" ? "It fits, with a warning." : "Too big for this host.";
+        verdict.appendChild(el("strong", null, head + " "));
+        verdict.appendChild(document.createTextNode((v.messages || []).join(" ")));
+        if (v.available_mb != null) {
+          verdict.appendChild(el("div", "muted small", "This server: up to " + gbText(v.limit_mb) + " with Java's overhead. Host: " +
+            gbText(v.available_mb) + " free of " + gbText(v.total_mb) + ", " + gbText(v.reserve_mb) + " always kept for itself."));
+        }
+      } catch (e) {
+        if (seq !== judgeSeq) return;
+        verdict.className = "verdict warn";
+        verdict.textContent = "Could not check this size against the host. The node checks again when you create it.";
+        refused = false;
+      }
+      refresh();
+    }
+
+    // The world.
+    form.appendChild(el("label", null, "World"));
+    const worldNew = el("label", "check");
+    const rNew = el("input"); rNew.type = "radio"; rNew.name = "mc-world"; rNew.checked = true;
+    worldNew.append(rNew, el("span", null, "A new world"));
+    const worldImport = el("label", "check");
+    const rImport = el("input"); rImport.type = "radio"; rImport.name = "mc-world";
+    worldImport.append(rImport, el("span", null, "Bring a world I already have"));
+    form.append(worldNew, worldImport);
+    const seed = field(form, "mc-seed", "Seed (optional)", { type: "text", placeholder: "random", maxLength: 32 });
+    const file = el("input");
+    file.type = "file";
+    file.accept = ".zip,.tar.gz,.tgz,.tar,application/zip,application/gzip";
+    file.className = "hidden";
+    const fileNote = el("p", "muted small hidden", "A zip or tar.gz of the world folder: the one with level.dat in it, from your saves folder or another server. Up to 4 GB.");
+    form.append(file, fileNote);
+    const syncWorld = () => {
+      const imp = rImport.checked;
+      file.classList.toggle("hidden", !imp);
+      fileNote.classList.toggle("hidden", !imp);
+      seed.classList.toggle("hidden", imp);
+      seed.previousSibling.classList.toggle("hidden", imp);
+      refresh();
+    };
+    rNew.addEventListener("change", syncWorld);
+    rImport.addEventListener("change", syncWorld);
+    file.addEventListener("change", refresh);
+
+    // Game settings.
+    const adv = el("details");
+    adv.appendChild(el("summary", "muted", "Game settings"));
+    const g = el("div", "advanced-wrap");
+    g.style.marginTop = "8px";
+    const mode = selectField(g, "mc-mode", "Game mode", [["survival", "Survival"], ["creative", "Creative"], ["adventure", "Adventure"], ["spectator", "Spectator"]], "survival");
+    const diff = selectField(g, "mc-diff", "Difficulty", [["peaceful", "Peaceful"], ["easy", "Easy"], ["normal", "Normal"], ["hard", "Hard"]], "normal");
+    const pvp = checkField(g, "mc-pvp", "Players can hurt each other (PvP)", true);
+    const wl = checkField(g, "mc-wl", "Only players on the whitelist can join", false);
+    const online = checkField(g, "mc-online", "Check accounts with Mojang (online mode)", true);
+    const onlineWarn = el("p", "muted small warn-text hidden", "Off, anyone can join under any name, including an operator's. Leave it on unless you know why not.");
+    g.appendChild(onlineWarn);
+    online.addEventListener("change", () => onlineWarn.classList.toggle("hidden", online.checked));
+    adv.appendChild(g);
+    form.appendChild(adv);
+
+    // Upkeep.
+    form.appendChild(el("label", null, "Looking after it"));
+    const crash = checkField(form, "mc-crash", "Start it again if it crashes", true);
+    const backups = checkField(form, "mc-backups", "Back it up every day, keeping the last 7", true);
+    const restart = checkField(form, "mc-restart", "Restart it daily between 4 and 6 in the morning, when nobody is playing", false);
+
+    // EULA.
+    const eula = game.eula || { name: "Minecraft End User License Agreement", url: "https://aka.ms/MinecraftEULA" };
+    const eulaWrap = el("label", "check eula");
+    const eulaBox = el("input");
+    eulaBox.type = "checkbox";
+    eulaBox.id = "mc-eula";
+    const eulaText = el("span");
+    eulaText.append("I accept the ");
+    const a = el("a", null, eula.name);
+    a.href = eula.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    eulaText.append(a, ". Mojang requires it of every server's owner, and the server will not start without it.");
+    eulaWrap.append(eulaBox, eulaText);
+    form.appendChild(eulaWrap);
+    eulaBox.addEventListener("change", refresh);
+
+    const actions = el("div", "form-actions");
+    actions.style.marginTop = "8px";
+    const cancel = el("button", "btn", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = close;
+    const go = el("button", "btn btn-primary", "Create server");
+    go.type = "submit";
+    go.id = "mc-create";
+    actions.append(cancel, go);
+    form.appendChild(actions);
+    function refresh() {
+      const why = !eulaBox.checked ? "Accept the EULA first."
+        : refused ? "Pick a size this host can give."
+        : !version.value ? "Pick a version."
+        : (rImport.checked && !(file.files && file.files[0])) ? "Choose the world file."
+        : "";
+      go.disabled = !!why;
+      go.title = why;
+    }
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      if (go.disabled) return;
+      onMinecraftSubmit(gameId, {
+        name: name.value, build: version.value, slots, heap: heap(), seed: rImport.checked ? "" : seed.value.trim(),
+        world: rImport.checked ? file.files[0] : null,
+        settings: { gamemode: mode.value, difficulty: diff.value, pvp: pvp.checked, whitelist: wl.checked, online_mode: online.checked },
+        crash: crash.checked, backups: backups.checked, restart: restart.checked,
+      }, go, close);
+    });
+    body.appendChild(form);
+    refresh();
+    loadVersions();
+    judge();
+    name.focus();
+  });
+  back.querySelector(".modal").classList.add("modal-mid");
+}
+
+async function uploadWorld(instanceId, file) {
+  const resp = await withInFlight(fetch("/instances/" + encodeURIComponent(instanceId) + "/world", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + (state.token || ""), "Content-Type": "application/octet-stream" },
+    body: file,
+  }));
+  if (resp.status === 401) { setToken(null); showTokenScreen(); throw { __auth: true, error: "The token is wrong or no longer valid." }; }
+  let data = null;
+  try { data = await resp.json(); } catch (_) {}
+  if (!resp.ok) throw { error: (data && data.error) || "The world was not imported." };
+  return data;
+}
+
+async function onMinecraftSubmit(gameId, f, go, close) {
+  const name = (f.name || "").trim();
+  if (!name) { showError("A server needs a name."); return; }
+  if (!(f.slots >= 1 && f.slots <= 255)) { showError("Player slots must be between 1 and 255."); return; }
+  if (f.seed && !/^[A-Za-z0-9-]{1,32}$/.test(f.seed)) { showError("A seed may only hold letters, digits and '-', up to 32."); return; }
+  if (!roomForDownload()) return;
+  const instance_id = randomInstanceId(gameId);
+  const settings = Object.assign({}, f.settings);
+  if (f.seed) settings.seed = f.seed;
+  const body = {
+    instance_id, game_id: gameId, name, max_players: f.slots, port: null, extra_ports: {}, map: null, bots: null, owner: null,
+    restart_on_crash: !!f.crash, content_version: f.build, memory: f.heap,
+    eula_accepted_at: Math.floor(Date.now() / 1000), minecraft: settings,
+  };
+  if (f.world) body.stopped = true;
+  go.disabled = true;
+  go.textContent = "Creating…";
+  const id = encodeURIComponent(instance_id);
+  try {
+    let result = await withInFlight(api("POST", "/instances", body));
+    close();
+    clearError();
+    if (result && result.installing) {
+      setActiveTab("games");
+      state.installingMsg.set(gameId, "Downloading Minecraft " + f.build + "…");
+      renderGames();
+      if (!(await watchInstall(gameId))) return;
+      result = await withInFlight(api("POST", "/instances", body));
+    }
+    if (f.world) {
+      toast("Uploading the world…");
+      await uploadWorld(instance_id, f.world);
+      await withInFlight(api("POST", "/instances/" + id + "/start"));
+    }
+    // The schedules are the node's own features; a failure here leaves a
+    // running server and says which part did not take.
+    if (f.backups) {
+      try { await api("PUT", "/instances/" + id + "/backup-schedule", { schedule: { every_hours: 24, keep: 7 } }); }
+      catch (e) { showError("The server runs, but its daily backup was not set: " + ((e && e.error) || "")); }
+    }
+    if (f.restart) {
+      try { await api("PUT", "/instances/" + id + "/restart-schedule", { schedule: { start_utc: utcHourOf(4), end_utc: utcHourOf(6), with_players: false } }); }
+      catch (e) { showError("The server runs, but its daily restart was not set: " + ((e && e.error) || "")); }
+    }
+    setActiveTab("servers");
+    toast("“" + name + "” is starting. The first start takes a minute while it sets itself up.");
+    poll();
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "The server was not created.");
+    go.disabled = false;
+    go.textContent = "Create server";
+  }
+}
+
+async function onUploadWorld(instanceId) {
+  const inst = instById(instanceId);
+  const name = (inst && inst.name) || instanceId;
+  openModal("world-dialog", inst && inst.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Upload a world · " + name));
+    body.appendChild(el("p", "muted small", "A zip or tar.gz of a world folder (the one with level.dat in it). The server's current world is " +
+      "backed up first, so nothing is lost; restore it from Backups if you change your mind."));
+    const file = el("input");
+    file.type = "file";
+    file.accept = ".zip,.tar.gz,.tgz,.tar,application/zip,application/gzip";
+    body.appendChild(file);
+    const actions = el("div", "form-actions");
+    const cancel = el("button", "btn", "Cancel");
+    cancel.type = "button";
+    cancel.onclick = close;
+    const go = el("button", "btn btn-primary", "Upload and replace");
+    go.type = "button";
+    go.disabled = true;
+    file.addEventListener("change", () => { go.disabled = !(file.files && file.files[0]); });
+    go.addEventListener("click", async () => {
+      go.disabled = true; go.textContent = "Uploading…";
+      try {
+        const res = await uploadWorld(instanceId, file.files[0]);
+        clearError();
+        close();
+        toast("World uploaded" + (res && res.backup ? "; the old one is backup " + res.backup : "") + ". Start the server to play it.");
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "The world was not imported.");
+        go.disabled = false; go.textContent = "Upload and replace";
+      }
+    });
+    actions.append(cancel, go);
+    body.appendChild(actions);
+  });
+}
+
+// ---------- kick, ban and operators (MINECRAFT.md §4) ----------
+
+const TARGET_HINT = {
+  "minecraft-name": "Minecraft name",
+  "player-name": "Name in game",
+  "steam-id": "Steam ID, like STEAM_0:1:12345",
+};
+const ACTION_WORD = { kick: "Kick", ban: "Ban", unban: "Unban", op: "Make operator", deop: "Remove operator" };
+
+async function onModeration(instanceId) {
+  const inst = instById(instanceId);
+  const name = (inst && inst.name) || instanceId;
+  const path = "/instances/" + encodeURIComponent(instanceId);
+  openModal("moderation-dialog", inst && inst.game_id, (body, close) => {
+    body.appendChild(el("h3", null, "Kick, ban and operators · " + name));
+    const content = el("div", "moderation");
+    body.appendChild(content);
+    const actions = el("div", "form-actions");
+    const done = el("button", "btn", "Close");
+    done.type = "button";
+    done.onclick = close;
+    actions.appendChild(done);
+    body.appendChild(actions);
+
+    async function act(action, target, reason) {
+      try {
+        await withInFlight(api("POST", path + "/moderation", { action, target, reason: reason || null }));
+        clearError();
+        toast(ACTION_WORD[action] + ": " + target + ".");
+        await load();
+      } catch (e) {
+        if (e && e.__auth) { close(); return; }
+        showError((e && e.error) || "That did not go through.");
+      }
+    }
+
+    async function load() {
+      let view;
+      try { view = await api("GET", path + "/moderation"); }
+      catch (e) {
+        if (e && e.__auth) { close(); return; }
+        content.textContent = "";
+        content.appendChild(el("p", "muted", (e && e.error) || "This node's agent has no moderation. Update the agent."));
+        return;
+      }
+      const running = (instById(instanceId) || {}).state === "running";
+      let players = null;
+      if (running) { try { players = await api("GET", path + "/players"); } catch (_) { players = null; } }
+      const can = new Map((view.actions || []).map(a => [a.action, a.target]));
+      content.textContent = "";
+
+      // Who is on now, with a button per action that takes their name.
+      content.appendChild(el("h4", null, "Online now"));
+      if (!running) content.appendChild(el("p", "muted small", "The server is stopped. Bans still change and reach it when it starts."));
+      else if (!players || !players.length) content.appendChild(el("p", "muted small", players ? "Nobody is on." : "This game does not say who is on."));
+      else {
+        const list = el("div", "mod-list");
+        for (const p of players) {
+          const row = el("div", "mod-row");
+          row.appendChild(el("span", "mod-name", p.name || "(no name)"));
+          const btns = el("div", "mod-actions");
+          for (const a of ["kick", "ban", "op"]) {
+            const kind = can.get(a);
+            if (!kind || kind === "steam-id") continue;
+            const b = el("button", "btn btn-sm" + (a === "ban" ? " btn-danger" : ""), ACTION_WORD[a]);
+            b.type = "button";
+            b.onclick = () => act(a, p.name, null);
+            btns.appendChild(b);
+          }
+          row.appendChild(btns);
+          list.appendChild(row);
+        }
+        content.appendChild(list);
+      }
+
+      // Act on anyone by name or Steam ID.
+      content.appendChild(el("h4", null, "Act on a player"));
+      const form = el("div", "mod-form");
+      const action = el("select", "field");
+      for (const [a] of can) { const o = el("option", null, ACTION_WORD[a]); o.value = a; action.appendChild(o); }
+      const target = el("input", "field");
+      target.type = "text";
+      const reason = el("input", "field");
+      reason.type = "text";
+      reason.placeholder = "Reason (optional)";
+      reason.maxLength = 120;
+      const go = el("button", "btn btn-primary", "Go");
+      go.type = "button";
+      const sync = () => {
+        target.placeholder = TARGET_HINT[can.get(action.value)] || "Player";
+        reason.classList.toggle("hidden", !["kick", "ban"].includes(action.value));
+      };
+      action.addEventListener("change", sync);
+      sync();
+      go.onclick = () => { if (target.value.trim()) act(action.value, target.value.trim(), reason.value.trim()); };
+      form.append(action, target, reason, go);
+      content.appendChild(form);
+      if (view.ban_list === "node-record") {
+        content.appendChild(el("p", "muted small", "A kick takes the name shown in game. A ban takes the player's Steam ID, because a name can be anything: " +
+          "type status in the console to see everyone's. This game cannot keep its own ban list, so the node keeps it and gives it back to the server at every start."));
+      }
+
+      // The ban list.
+      content.appendChild(el("h4", null, "Banned"));
+      const banned = view.banned || [];
+      if (!banned.length) content.appendChild(el("p", "muted small", "Nobody."));
+      else {
+        const list = el("div", "mod-list");
+        for (const b of banned) {
+          const row = el("div", "mod-row");
+          const who = el("span", "mod-name", b.target);
+          if (b.reason) who.appendChild(el("span", "muted small", " · " + b.reason));
+          row.appendChild(who);
+          const un = el("button", "btn btn-sm", "Unban");
+          un.type = "button";
+          un.onclick = () => act("unban", b.target, null);
+          row.appendChild(un);
+          list.appendChild(row);
+        }
+        content.appendChild(list);
+      }
+
+      // Operators, for a game that has them.
+      if (view.ops) {
+        content.appendChild(el("h4", null, "Operators"));
+        content.appendChild(el("p", "muted small", "Operators can run any command in game, including ban and stop."));
+        if (!view.ops.length) content.appendChild(el("p", "muted small", "None."));
+        else {
+          const list = el("div", "mod-list");
+          for (const o of view.ops) {
+            const row = el("div", "mod-row");
+            row.appendChild(el("span", "mod-name", o.target));
+            const de = el("button", "btn btn-sm", "Remove operator");
+            de.type = "button";
+            de.disabled = !running;
+            de.title = running ? "" : "The server has to be running.";
+            de.onclick = () => act("deop", o.target, null);
+            row.appendChild(de);
+            list.appendChild(row);
+          }
+          content.appendChild(list);
+        }
+      }
+    }
+    load();
+  });
+  const box = $("moderation-dialog");
+  if (box) box.querySelector(".modal").classList.add("modal-mid");
 }
 
 // ---------- invite links ----------

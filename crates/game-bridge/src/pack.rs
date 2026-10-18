@@ -175,6 +175,35 @@ pub struct GamePack {
     /// is the publisher's.
     #[serde(default)]
     pub art: Option<String>,
+    /// A licence the game's publisher requires a server's owner to accept,
+    /// such as Minecraft's EULA (`MINECRAFT.md` §8). A pack with one cannot be
+    /// created without a recorded acceptance, and the image starts the server
+    /// only with one. Nothing accepts on anybody's behalf.
+    #[serde(default)]
+    pub eula: Option<PackEula>,
+}
+
+/// A pack's `[eula]` block: what the licence is called and where to read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackEula {
+    pub name: String,
+    /// `https`, shown as a link for a person to open. Never fetched.
+    pub url: String,
+}
+
+impl PackEula {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() || self.name.len() > 120 || self.name.chars().any(char::is_control) {
+            return Err("the EULA's name must be one line of at most 120 characters".to_string());
+        }
+        let rest = self.url.strip_prefix("https://").ok_or("the EULA's url must be https://")?;
+        let ok = |c: char| c.is_ascii_alphanumeric() || "-._~/%:?=&#".contains(c);
+        if self.url.len() > 300 || rest.is_empty() || !rest.chars().all(ok) || rest.starts_with('/') {
+            return Err("the EULA's url must be a plain https address of at most 300 characters".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Whether `id` can name a file: ASCII letters, digits, `-`, `_` and `.`,
@@ -330,6 +359,7 @@ pub enum PackTransport {
 #[serde(rename_all = "lowercase")]
 pub enum PackQuery {
     A2s,
+    Minecraft,
 }
 
 /// The console a pack's game speaks, as it appears in a pack file.
@@ -338,6 +368,7 @@ pub enum PackQuery {
 pub enum PackConsole {
     Goldsrc,
     Source,
+    Minecraft,
 }
 
 /// Which bot implementation a pack's game has, as written in the pack.
@@ -370,6 +401,7 @@ impl From<PackConsole> for ConsoleProtocol {
         match c {
             PackConsole::Goldsrc => ConsoleProtocol::Goldsrc,
             PackConsole::Source => ConsoleProtocol::Source,
+            PackConsole::Minecraft => ConsoleProtocol::Minecraft,
         }
     }
 }
@@ -378,6 +410,7 @@ impl From<PackQuery> for QueryProtocol {
     fn from(q: PackQuery) -> Self {
         match q {
             PackQuery::A2s => QueryProtocol::A2s,
+            PackQuery::Minecraft => QueryProtocol::Minecraft,
         }
     }
 }
@@ -412,6 +445,7 @@ pub enum PackError {
     /// The pack's `[lan]` block is not usable.
     InvalidLan(String),
     InvalidArt(String),
+    InvalidEula(String),
     /// The pack's `id` could not safely name a file.
     InvalidId(String),
 }
@@ -431,6 +465,7 @@ impl core::fmt::Display for PackError {
             Self::InvalidLaunch(e) => write!(f, "pack describes an unusable launch: {e}"),
             Self::InvalidLan(e) => write!(f, "pack describes an unusable LAN: {e}"),
             Self::InvalidArt(e) => write!(f, "pack names unusable art: {e}"),
+            Self::InvalidEula(e) => write!(f, "pack names an unusable EULA: {e}"),
             Self::InvalidId(id) => write!(
                 f,
                 "pack id {id:?} must be letters, digits, '-', '_' or '.', and not start with '.'"
@@ -499,6 +534,7 @@ impl GamePack {
             lan: None,
             // Its Steam header, from `launch.steam_app_id`.
             art: None,
+            eula: None,
             notes: Some(
                 "GoldSrc. app_name is frozen by PLAN.md §5: deployed svencoop-prns \
                  v0.1.10 servers announce under it."
@@ -535,6 +571,9 @@ impl GamePack {
         }
         if let Some(art) = &pack.art {
             validate_art_url(art).map_err(PackError::InvalidArt)?;
+        }
+        if let Some(eula) = &pack.eula {
+            eula.validate().map_err(PackError::InvalidEula)?;
         }
         Ok(pack)
     }
