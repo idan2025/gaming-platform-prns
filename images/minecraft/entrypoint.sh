@@ -62,7 +62,8 @@ if [ "$(cat "$MARKER" 2>/dev/null || true)" != "$BUILD" ]; then
     echo "Preparing $BUILD in $SERVER"
     case "$TYPE" in
         vanilla|paper)
-            cp "$CONTENT/server.jar" ./server.jar
+            # Nothing to copy: the jar runs from the read-only copy, and
+            # unpacks its libraries into this directory on first start.
             ;;
         fabric)
             "$JAVA" -jar "$CONTENT/installer.jar" server \
@@ -132,7 +133,7 @@ echo "Starting $BUILD on Java $JAVA_MAJOR with ${MIN_MB}-${MAX_MB} MB, port $POR
 case "$TYPE" in
     vanilla|paper)
         # shellcheck disable=SC2086 # HEAP is two flags built from numbers above
-        exec "$JAVA" $HEAP -jar server.jar nogui
+        exec "$JAVA" $HEAP -jar "$CONTENT/server.jar" nogui
         ;;
     fabric)
         # shellcheck disable=SC2086

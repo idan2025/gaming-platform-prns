@@ -812,6 +812,8 @@ async fn create(
     // content. Caught by `a_hostile_instance_id_is_refused`.
     spec.validate()
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    // The pack's own demands, before a missing copy can start a download.
+    state.agent.check_spec(&spec).await.map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
 
     match state.agent.create(spec.clone()).await {
         Ok(status) => Ok((

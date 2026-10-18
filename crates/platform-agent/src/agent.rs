@@ -804,6 +804,17 @@ impl Agent {
         }
     }
 
+    /// What the pack demands of a spec (an accepted EULA, Java settings only
+    /// for Minecraft), asked before a create can turn into a download: a
+    /// refused spec must be refused, not answered with gigabytes.
+    pub async fn check_spec(&self, spec: &InstanceSpec) -> Result<()> {
+        let packs = self.packs.read().await;
+        match packs.get(&spec.game_id) {
+            Some(pack) => check_spec_against_pack(spec, pack),
+            None => Ok(()),
+        }
+    }
+
     /// Install a game's content if it is not already there.
     ///
     /// Deliberately **not** part of `create`. Fetching a game is gigabytes over
