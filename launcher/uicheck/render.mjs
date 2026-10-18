@@ -1983,6 +1983,104 @@ await run('a copy that cannot replace itself links to the download page', {
   w.close();
 }
 
+// Lanthorn Host's Minecraft form (MINECRAFT.md): nothing is created before the
+// owner ticks the EULA, a size the host refuses cannot be submitted, and what
+// is sent carries the build, the heap and the acceptance.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  let verdict = { level: 'ok', messages: [], total_mb: 32000, available_mb: 24000, reserve_mb: 3200, limit_mb: 5632, host_cpus: 8 };
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' },
+    '/capacity': { max_instances: 4, running: 0 },
+    '/instances': [],
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 },
+    '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 },
+    '/content': { copies: [], downloads: [] },
+    '/games': [{ id: 'minecraft-java', display_name: 'Minecraft: Java Edition', runnable: true, transport: 'tcp', default_port: 25565,
+      extra_ports: 0, console: true, minecraft: true, default_build: 'paper-26.3',
+      eula: { name: 'Minecraft End User License Agreement', url: 'https://aka.ms/MinecraftEULA' } }],
+    '/minecraft/versions': [{ build: 'paper-26.3', game_version: '26.3', loader: null, recommended: false },
+      { build: 'paper-1.21.11', game_version: '1.21.11', loader: null, recommended: false }],
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ path: route, body: opts.body ? JSON.parse(opts.body) : null });
+      const out = route === '/instances' ? { instance_id: 'x', state: 'running' } : {};
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' }, json: async () => out, text: async () => '{}' };
+    }
+    const body = route === '/resources/check' ? verdict : routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
+      headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__mod = onModeration;');
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  w.__start('minecraft-java');
+  await settle();
+  const d = w.document;
+  const create = d.getElementById('mc-create');
+  check('the Minecraft form opens instead of the plain one', !!create && !!d.getElementById('mc-version'));
+  check('it offers the versions the node lists', d.getElementById('mc-version').options.length === 2 && d.getElementById('mc-version').value === 'paper-26.3');
+  check('Create stays off until the EULA is ticked', create.disabled && /EULA/.test(create.title), create.title);
+  const eula = d.getElementById('mc-eula');
+  eula.checked = true;
+  eula.dispatchEvent(new w.Event('change'));
+  check('ticking the EULA turns Create on', !create.disabled, create.title);
+  check('the EULA links to the licence', d.querySelector('.eula a').href === 'https://aka.ms/MinecraftEULA');
+
+  verdict = { level: 'refuse', messages: ['Not enough free memory.'], total_mb: 8000, available_mb: 3000, reserve_mb: 1024, limit_mb: 7680, host_cpus: 4 };
+  [...d.querySelectorAll('.chip-btn')].find(b => b.textContent === 'Large').click();
+  await settle();
+  check('a size the host refuses cannot be submitted', create.disabled && d.querySelector('.verdict').classList.contains('bad'));
+  verdict = { level: 'ok', messages: [], total_mb: 32000, available_mb: 24000, reserve_mb: 3200, limit_mb: 5632, host_cpus: 8 };
+  [...d.querySelectorAll('.chip-btn')].find(b => b.textContent === 'Medium').click();
+  [...d.querySelectorAll('.chip-btn')].find(b => b.textContent === '50').click();
+  await settle();
+  d.getElementById('mc-name').value = 'Friday';
+  d.querySelector('.mc-form').dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  const sent = posts.find(p => p.path === '/instances');
+  check('the create carries the build, heap, slots and the acceptance',
+    sent && sent.body.content_version === 'paper-26.3' && sent.body.memory.max_mb === 4096 && sent.body.memory.min_mb === 2048
+      && sent.body.max_players === 50 && Number.isInteger(sent.body.eula_accepted_at) && sent.body.minecraft.online_mode === true,
+    JSON.stringify(sent && sent.body));
+  check('a daily backup is set by default', posts.some(p => p.path.endsWith('/backup-schedule') && p.body.schedule.every_hours === 24));
+
+  // Kick, ban and operators: online players get buttons, the ban list gets
+  // Unban, and a button sends exactly that action.
+  routes['/instances'] = [{ instance_id: 'mc1', game_id: 'minecraft-java', name: 'Friday', state: 'running', port: 27300, ports: [] }];
+  routes['/instances/mc1/moderation'] = {
+    actions: ['kick', 'ban', 'unban', 'op', 'deop'].map(a => ({ action: a, target: 'minecraft-name' })),
+    ban_list: 'game-file', banned: [{ target: 'Griefer', reason: 'broke spawn' }], ops: [{ target: 'Notch' }],
+  };
+  routes['/instances/mc1/players'] = [{ name: 'Alex', score: 0, connected_secs: 0 }];
+  await w.__nodePoll();
+  await settle();
+  w.__mod('mc1');
+  await settle();
+  const m = d.getElementById('moderation-dialog');
+  const rows = m ? [...m.querySelectorAll('.mod-row')].map(r => r.textContent) : [];
+  check('the dialog lists who is on, the banned and the operators',
+    rows.some(t => t.startsWith('Alex')) && rows.some(t => t.includes('Griefer')) && rows.some(t => t.startsWith('Notch')), JSON.stringify(rows));
+  posts.length = 0;
+  [...m.querySelectorAll('.mod-row')].find(r => r.textContent.startsWith('Alex')).querySelector('button').click();
+  await settle();
+  const kick = posts.find(p => p.path === '/instances/mc1/moderation');
+  check('a player\'s Kick button sends a kick for that name', kick && kick.body.action === 'kick' && kick.body.target === 'Alex', JSON.stringify(kick));
+  w.close();
+}
+
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
 
 if (failures.length) {
