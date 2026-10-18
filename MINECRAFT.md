@@ -296,3 +296,55 @@ Also not yet:
   interface on this host): Server List Ping through the link in 24 ms, a
   protocol ping/pong in 10 ms. A real Minecraft client join has not been
   done yet.
+
+## 16. Bedrock Edition (2026-10-18)
+
+The edition the Android and iOS app, consoles and Windows play.
+`packs/minecraft-bedrock.toml`, `images/minecraft-bedrock`. A different game
+on the wire from Java Edition; players of the two do not meet.
+
+What was found, and what it decided:
+
+- **Mojang's dedicated server for Linux publishes no digest.** The download
+  list (`net-secondary.web.minecraft-services.net/api/v1.0/download/links`)
+  gives only URLs. So the pack pins one with the ordinary `archive` driver:
+  the bytes minecraft.net served on 2026-10-18 (1.26.52.3, SHA-256
+  `f6348d84…71c6`), which matched the `Content-MD5` it sent. **A new Bedrock
+  release needs a new pack version**, because players' apps update
+  themselves and join only a server of the same version.
+- **minecraft.net holds a request with no User-Agent, or one carrying a URL,
+  until it times out.** The archive driver now sends a bare `Lanthorn/<version>`.
+- **The zip is extracted under the same rules as a tar**, and a file marked
+  executable stays so (only `0o755`, never setuid): the server is a program.
+- **NetherNet is the only transport this release's players connect with.**
+  With `transport=raknet` the server logs that players cannot connect. NetherNet
+  is an HTTP handshake on TCP `server-port`, then WebRTC over UDP on ports the
+  server names to the client. So the pack is TCP 19132 plus UDP channels 1
+  to 4 (19133 to 19136), and the image sets
+  `server-udp-ports=127.0.0.1:19133-19136:19133-19136`: the server tells
+  each client to send its UDP to its own loopback, on its game port plus 1 to
+  4, which is where a Lanthorn client bridge listens. The client's port must
+  stay 19132 for that to line up.
+- **The server ignores SIGTERM.** `docker stop` ended it with SIGKILL and an
+  unsaved world. The image owns the server's console through a pipe, copies
+  the container's stdin into it (where the node's lines arrive), and turns
+  TERM or INT into `stop`. Measured: "Quit correctly".
+- **Its server has no ban.** Kick, op and deop work by gamertag (quoted,
+  since a gamertag may hold spaces). The page says to use the allowlist.
+- **Backups** use `save hold`, then `save query` until "Data saved", then
+  `save resume`. The image links the server's own files in from the shared
+  copy, by absolute path; a backup leaves out any link restore would refuse
+  (absolute, or climbing out), and the image makes them again at start.
+- **No player count**: a NetherNet server answers no query a node can send,
+  so a Bedrock server is never treated as empty.
+
+Measured on this host: the build downloaded, matched its pin, started
+("Accepting clients on [::]:19132", "Signed in to signaling service"), its
+handshake port answered HTTP through the node's published port and through a
+Reticulum link, op reached it and ban was refused, a running backup held and
+resumed the world, and `docker stop` quit it cleanly.
+
+**Not yet measured: a player joining from the Minecraft app**, which is the
+NetherNet UDP path through Lanthorn, and whether one pinned port per player
+or several share one (four are open; if each player needs one, four can be
+connected at once).

@@ -2161,6 +2161,71 @@ await run('on Android a joined server can be left from the detail pane', {
   w.close();
 }
 
+// A Bedrock server (a pack with an [eula] and world settings, without the
+// Java form): the plain form asks for the EULA and sends the acceptance.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' }, '/capacity': { max_instances: 4, running: 0 }, '/instances': [],
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 }, '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 }, '/content': { copies: [], downloads: [] },
+    '/games': [{ id: 'minecraft-bedrock', display_name: 'Minecraft: Bedrock Edition', runnable: true, transport: 'tcp', default_port: 19132,
+      extra_ports: 4, console: true, minecraft: false, world_settings: true,
+      eula: { name: 'Minecraft End User License Agreement', url: 'https://aka.ms/MinecraftEULA' } }],
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v) };
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ path: route, body: opts.body ? JSON.parse(opts.body) : null });
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' }, json: async () => ({ instance_id: 'b', state: 'running' }), text: async () => '{}' };
+    }
+    const body = routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '', headers: { get: () => 'application/json' },
+      json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs + '\n;window.__start = openStartDialog;');
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  w.__start('minecraft-bedrock');
+  await settle();
+  const d = w.document;
+  const go = d.getElementById('sf-start');
+  check('a Bedrock server cannot be started before the EULA is ticked', go && go.disabled);
+  check('the plain form offers world settings for Bedrock', !!d.getElementById('sf-mode') && !d.getElementById('mc-version'));
+  d.getElementById('sf-eula').checked = true;
+  d.getElementById('sf-eula').dispatchEvent(new w.Event('change'));
+  d.getElementById('sf-name').value = 'Phones welcome';
+  d.getElementById('sf-mode').value = 'creative';
+  go.closest('form').dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  const sent = posts.find(p => p.path === '/instances');
+  check('the Bedrock create carries the acceptance and the settings',
+    sent && Number.isInteger(sent.body.eula_accepted_at) && sent.body.minecraft.gamemode === 'creative' && !sent.body.memory,
+    JSON.stringify(sent && sent.body));
+  w.close();
+}
+
+// On a phone a banner's text keeps the width and its buttons wrap below: in
+// one row, three buttons squeezed an update notice to one word per line. No
+// layout here, so this pins the rule (measured in headless Chrome at 412 px
+// when it was written: 70 px of text before, the full width after).
+{
+  const css = fs.readFileSync(new URL('../dist/style.css', import.meta.url), 'utf8');
+  check('phone banners wrap their buttons below the text',
+    /html\.phone \.room-banner, html\.phone \.notice \{ flex-wrap: wrap;/.test(css) && /html\.phone \.room-banner \.rb-text \{ flex: 1 1 calc\(100% - 34px\);/.test(css));
+  check('rows with text beside buttons wrap on a phone too',
+    /html\.phone \.item, html\.phone \.fav-off-row \{ flex-wrap: wrap;/.test(css));
+}
+
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
 
 if (failures.length) {

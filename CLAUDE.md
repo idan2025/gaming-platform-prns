@@ -510,6 +510,17 @@ break:
   the content path rules, no links, one world (or Paper's three folders), the
   old world backed up first (`world.rs`).
 
+**Bedrock Edition is a pack too** (2026-10-18, `MINECRAFT.md` §16). Rules:
+- **NetherNet only, and the UDP side names the client's loopback**
+  (`server-udp-ports=127.0.0.1:19133-19136:…`): TCP 19132 is the handshake,
+  UDP channels 1–4 the game. RakNet is refused by this release's players.
+- **The download is pinned in the pack** (`archive` driver; Mojang publishes
+  no digest). A new Bedrock release is a new pack version.
+- **The image owns the server's console** through a pipe and turns SIGTERM
+  into `stop`; the server ignores SIGTERM on its own.
+- **Backups leave out links restore would refuse** (`backups::append_tree`);
+  the Bedrock image links its files in by absolute path.
+
 **The server list is what is live, never history** (2026-10-10, the user's
 call). `list_servers` does not list remembered servers; a heard row drops off
 after `STALE_AFTER` (180 s) unless the query sets `max_age_secs`. Because a

@@ -1072,7 +1072,11 @@ async fn fetch(
     dest: &Path,
     progress: Option<&InstallProgress>,
 ) -> Result<u64, ProvisionError> {
+    // minecraft.net holds a request until it times out when it has no
+    // User-Agent, or one carrying a URL (measured 2026-10-18), so this is a
+    // bare product name.
     let client = reqwest::Client::builder()
+        .user_agent(concat!("Lanthorn/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| ProvisionError::Http { url: url.to_string(), detail: e.to_string() })?;
     let mut response = client
@@ -1141,6 +1145,11 @@ pub fn extract(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64,
     };
     let magic = &magic[..read];
 
+    // A zip (Minecraft: Bedrock Edition's server ships as one) is judged
+    // entry by entry under the same rules as a tar.
+    if magic.starts_with(b"PK\x03\x04") {
+        return extract_zip_stripped(archive, dest, strip_components);
+    }
     if magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         // lzma-rs has no streaming reader, so xz is decompressed to a file
         // beside the download rather than into memory: game content is
@@ -1172,6 +1181,10 @@ pub fn extract(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64,
 /// judged by [`safe_relative`], the same size ceiling, and no links at all — a
 /// zip that needs one is not a world or a backup.
 pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
+    extract_zip_stripped(archive, dest, 0)
+}
+
+fn extract_zip_stripped(archive: &Path, dest: &Path, strip_components: u8) -> Result<u64, ProvisionError> {
     let file = fs::File::open(archive)?;
     let mut zip = zip::ZipArchive::new(BufReader::new(file))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("not a zip: {e}")))?;
@@ -1185,6 +1198,7 @@ pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
         if entry.is_symlink() {
             return Err(ProvisionError::UnsafeEntry { entry: name, reason: "a link" });
         }
+        let Some(relative) = strip(&relative, strip_components) else { continue };
         let target = dest.join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&target)?;
@@ -1200,19 +1214,20 @@ pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
         let mut out = LimitedWriter::new(fs::File::create(&target)?, MAX_EXTRACTED_BYTES);
         io::copy(&mut entry, &mut out)?;
         out.inner.flush()?;
+        // A program in the zip stays runnable (the Bedrock server is one).
+        // Only the execute bits are carried over, never setuid or the like.
+        #[cfg(unix)]
+        if entry.unix_mode().is_some_and(|m| m & 0o111 != 0) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+        }
     }
     Ok(written)
 }
 
 /// A zip or a tar (plain, gzip or xz), told apart by its first bytes.
 pub fn extract_any(archive: &Path, dest: &Path) -> Result<u64, ProvisionError> {
-    let mut magic = [0u8; 4];
-    let n = read_up_to(&mut fs::File::open(archive)?, &mut magic)?;
-    if n == 4 && magic == *b"PK\x03\x04" {
-        extract_zip(archive, dest)
-    } else {
-        extract(archive, dest, 0)
-    }
+    extract(archive, dest, 0)
 }
 
 fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
@@ -1542,6 +1557,38 @@ Unloading Steam API...OK
         fs::create_dir_all(&dest).unwrap();
         extract(&archive, &dest, 1).unwrap();
         assert_eq!(fs::read(dest.join("svencoop/maps/one.bsp")).unwrap(), b"map");
+    }
+
+    #[test]
+    fn a_zip_extracts_under_the_same_rules_and_keeps_only_execute_bits() {
+        use std::io::Write as _;
+        let zip_of = |entries: &[(&str, &[u8], u32)]| {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut z = zip::ZipWriter::new(&mut buf);
+            for (name, body, mode) in entries {
+                z.start_file(*name, zip::write::SimpleFileOptions::default().unix_permissions(*mode)).unwrap();
+                z.write_all(body).unwrap();
+            }
+            z.finish().unwrap();
+            buf.into_inner()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let a = write(tmp.path(), "server.zip", &zip_of(&[("wrap/bedrock_server", b"elf", 0o4755), ("wrap/server.properties", b"x=1", 0o644)]));
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        extract(&a, &out, 1).unwrap();
+        assert_eq!(fs::read(out.join("server.properties")).unwrap(), b"x=1", "the wrapper was stripped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(out.join("bedrock_server")).unwrap().permissions().mode() & 0o7777, 0o755, "runnable, and never setuid");
+            assert_eq!(fs::metadata(out.join("server.properties")).unwrap().permissions().mode() & 0o111, 0);
+        }
+        let evil = write(tmp.path(), "evil.zip", &zip_of(&[("../escape", b"x", 0o644)]));
+        let out2 = tmp.path().join("out2");
+        fs::create_dir_all(&out2).unwrap();
+        assert!(matches!(extract(&evil, &out2, 0), Err(ProvisionError::UnsafeEntry { .. })));
+        assert!(!tmp.path().join("escape").exists());
     }
 
     #[test]

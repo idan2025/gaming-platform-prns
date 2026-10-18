@@ -435,6 +435,28 @@ What to know:
 - **Players connect with their own Minecraft launcher** to the address
   Lanthorn shows after Join.
 
+## Minecraft: Bedrock Edition
+
+For players on the Minecraft app (Android, iOS, consoles, Windows). Mojang's
+own server, Linux x86-64 only. The pack pins the download by its SHA-256.
+
+```
+docker build -t gpp/minecraft-bedrock:1 images/minecraft-bedrock
+```
+
+```toml
+[games.minecraft-bedrock]
+image = "gpp/minecraft-bedrock:1"
+content_root = "/game"
+content_version = "1.26.52.3"
+```
+
+Each server takes five ports from the range (TCP 19132 and UDP 19133 to
+19136 inside). Players join from Lanthorn and then, in the app, Servers → Add
+Server with the address Lanthorn shows, on port 19132. When Mojang releases a
+new version, the pack has to be updated before players with the new app can
+join. Its server has no ban: use the allowlist. See `MINECRAFT.md` §16.
+
 ## Server names
 
 A server's name reaches the game's own console at start, so a node refuses

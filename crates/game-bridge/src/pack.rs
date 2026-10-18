@@ -369,6 +369,7 @@ pub enum PackConsole {
     Goldsrc,
     Source,
     Minecraft,
+    Bedrock,
 }
 
 /// Which bot implementation a pack's game has, as written in the pack.
@@ -402,6 +403,7 @@ impl From<PackConsole> for ConsoleProtocol {
             PackConsole::Goldsrc => ConsoleProtocol::Goldsrc,
             PackConsole::Source => ConsoleProtocol::Source,
             PackConsole::Minecraft => ConsoleProtocol::Minecraft,
+            PackConsole::Bedrock => ConsoleProtocol::Bedrock,
         }
     }
 }

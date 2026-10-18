@@ -727,3 +727,13 @@ html.phone .build-version { display: none;}
 html.phone .toast { bottom: 76px;}
 html.phone .error { bottom: 84px;}
 html.phone .toast, html.phone .error { max-width: calc(100vw - 24px);}
+/* A banner's buttons go on their own row on a phone. Left in one row, three
+   buttons left the text a few characters wide, one word per line. */
+html.phone .room-banner, html.phone .notice { flex-wrap: wrap; margin: 10px 12px 0;}
+html.phone .room-banner .rb-text { flex: 1 1 calc(100% - 34px);}
+html.phone .notice > :first-child { flex: 1 1 100%;}
+html.phone .room-banner .btn, html.phone .notice .btn { flex: 1 1 auto;}
+/* The same rule for every row where text sits beside buttons: the text keeps
+   at least 12rem and the buttons wrap below, instead of the text shrinking. */
+html.phone .item, html.phone .fav-off-row { flex-wrap: wrap;}
+html.phone .item .item-main, html.phone .fav-off-name { flex: 1 1 12rem;}

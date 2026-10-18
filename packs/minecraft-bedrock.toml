@@ -1,0 +1,74 @@
+# Minecraft: Bedrock Edition (MINECRAFT.md §16): the edition phones (the
+# Android and iOS app), consoles and Windows play. A different game on the
+# wire from Java Edition: UDP, its own server, its own commands. Players of the
+# two editions do not meet.
+#
+# `app_name` is a wire contract. Freeze it now: every server announcing under
+# it becomes undiscoverable if it changes.
+
+schema_version = 1
+
+id = "minecraft-bedrock"
+display_name = "Minecraft: Bedrock Edition"
+app_name = "minecraft-bedrock"
+default_port = 19132
+# NetherNet, the only transport this release's players connect with: the
+# handshake is HTTP on TCP 19132, and the game is WebRTC over UDP on the
+# ports below. The image tells clients to send that UDP to their own loopback
+# on 19133 to 19136, which is where a Lanthorn client listens for channels 1
+# to 4. Keep the client's port at 19132 for that to line up.
+transport = "tcp"
+min_link_class = 1
+
+# The server reads commands on stdin. `bedrock` selects words this build
+# carries (crates/game-bridge/src/console.rs): say, kick, op, deop, and save
+# hold/query/resume around a backup. Its server has no ban.
+console = "bedrock"
+
+# The server's own directory: the world, settings, and the permission and
+# allow lists. The rest of the server is linked from the shared copy.
+writable_paths = ["server"]
+
+art = "https://upload.wikimedia.org/wikipedia/en/b/be/Minecraft_game_logo_2023.png"
+
+notes = "No player count: a NetherNet server answers no query a node can send, so a Bedrock server is never treated as empty. Join from the Minecraft app (Android, iOS, Windows, consoles): Servers, Add Server, the address Lanthorn shows. A new Bedrock release needs this pack updated, because players' apps update themselves and only join a server of the same version."
+
+# Mojang publishes no digest for this zip, so the pack pins one: the bytes
+# minecraft.net served on 2026-10-18, which matched the Content-MD5 it sent
+# with them. A new server release is a new pack version.
+[content]
+driver = "archive"
+url = "https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-1.26.52.3.zip"
+sha256 = "f6348d84fa714d04ca194f207e89453ca6bba0a1359396475271a52a150471c6"
+
+# Mojang requires every server's owner to accept this, and its privacy
+# policy, to run the dedicated server. A node never starts one without the
+# owner's recorded acceptance, and never accepts for them.
+[eula]
+name = "Minecraft End User License Agreement"
+url = "https://aka.ms/MinecraftEULA"
+
+[[extra_ports]]
+channel = 1
+name = "game-1"
+port = 19133
+transport = "udp"
+
+[[extra_ports]]
+channel = 2
+name = "game-2"
+port = 19134
+transport = "udp"
+
+[[extra_ports]]
+channel = 3
+name = "game-3"
+port = 19135
+transport = "udp"
+
+[[extra_ports]]
+channel = 4
+name = "game-4"
+port = 19136
+transport = "udp"
+

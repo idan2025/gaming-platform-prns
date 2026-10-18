@@ -1383,6 +1383,27 @@ function openStartDialog(gameId) {
     crashWrap.append(crash, el("span", null, "Start it again if it crashes"));
     form.append(crashWrap, el("p", "muted small",
       "Up to " + MAX_CRASH_RESTARTS + " times an hour. A Stop is never undone. Can be changed later from the server's menu."));
+    // Minecraft's world settings, for a game that takes them without the
+    // Java form (Bedrock Edition).
+    let world = null;
+    if (game.world_settings) {
+      const ws = el("details");
+      ws.appendChild(el("summary", "muted", "Game settings"));
+      const g = el("div", "advanced-wrap");
+      g.style.marginTop = "8px";
+      const mode = selectField(g, "sf-mode", "Game mode", [["survival", "Survival"], ["creative", "Creative"], ["adventure", "Adventure"]], "survival");
+      const diff = selectField(g, "sf-diff", "Difficulty", [["peaceful", "Peaceful"], ["easy", "Easy"], ["normal", "Normal"], ["hard", "Hard"]], "normal");
+      const wl = checkField(g, "sf-wl", "Only players on the allowlist can join", false);
+      const online = checkField(g, "sf-online", "Check accounts with Xbox Live (online mode)", true);
+      const seed = field(g, "sf-seed", "Seed (optional)", { type: "text", placeholder: "random", maxLength: 32 });
+      ws.appendChild(g);
+      form.appendChild(ws);
+      world = () => {
+        const out = { gamemode: mode.value, difficulty: diff.value, pvp: true, whitelist: wl.checked, online_mode: online.checked };
+        if (seed.value.trim()) out.seed = seed.value.trim();
+        return out;
+      };
+    }
     const adv = el("details");
     adv.appendChild(el("summary", "muted", "Advanced"));
     const advWrap = el("div", "advanced-wrap");
@@ -1392,6 +1413,21 @@ function openStartDialog(gameId) {
     adv.appendChild(advWrap);
     form.appendChild(adv);
 
+    // A game whose publisher requires its EULA: the owner ticks it here, and
+    // nothing is created before.
+    let eulaBox = null;
+    if (game.eula) {
+      const wrap = el("label", "check eula");
+      eulaBox = el("input");
+      eulaBox.type = "checkbox";
+      eulaBox.id = "sf-eula";
+      const text = el("span");
+      const a = el("a", null, game.eula.name);
+      a.href = game.eula.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      text.append("I accept the ", a, ". The game's publisher requires it of every server's owner.");
+      wrap.append(eulaBox, text);
+      form.appendChild(wrap);
+    }
     const actions = el("div", "form-actions");
     actions.style.marginTop = "8px";
     const cancel = el("button", "btn", "Cancel");
@@ -1399,13 +1435,21 @@ function openStartDialog(gameId) {
     cancel.onclick = close;
     const go = el("button", "btn btn-primary", "Start server");
     go.type = "submit";
+    go.id = "sf-start";
     actions.append(cancel, go);
     form.appendChild(actions);
+    if (eulaBox) {
+      const sync = () => { go.disabled = !eulaBox.checked; go.title = eulaBox.checked ? "" : "Accept the EULA first."; };
+      eulaBox.addEventListener("change", sync);
+      sync();
+    }
     form.addEventListener("submit", (e) => {
       e.preventDefault();
+      if (go.disabled) return;
       onStartSubmit(gameId, {
         name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value,
         bots: bots ? bots.value : "", fixedPort: port.value, restartOnCrash: crash.checked,
+        eula: !!(eulaBox && eulaBox.checked), world: world ? world() : null,
       }, go, close);
     });
     body.appendChild(form);
@@ -1463,6 +1507,11 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
     extra_ports: {}, map: map === "" ? null : map, bots, owner: null,
     restart_on_crash: !!f.restartOnCrash,
   };
+  if (f.eula) body.eula_accepted_at = Math.floor(Date.now() / 1000);
+  if (f.world) {
+    if (f.world.seed && !/^[A-Za-z0-9-]{1,32}$/.test(f.world.seed)) { showError("A seed may only hold letters, digits and '-', up to 32."); return; }
+    body.minecraft = f.world;
+  }
   submitBtn.disabled = true;
   submitBtn.textContent = "Starting…";
   try {
@@ -1977,6 +2026,7 @@ async function onUploadWorld(instanceId) {
 
 const TARGET_HINT = {
   "minecraft-name": "Minecraft name",
+  "gamertag": "Gamertag",
   "player-name": "Name in game",
   "steam-id": "Steam ID, like STEAM_0:1:12345",
 };
@@ -2027,7 +2077,9 @@ async function onModeration(instanceId) {
       // Who is on now, with a button per action that takes their name.
       content.appendChild(el("h4", null, "Online now"));
       if (!running) content.appendChild(el("p", "muted small", "The server is stopped. Bans still change and reach it when it starts."));
-      else if (!players || !players.length) content.appendChild(el("p", "muted small", players ? "Nobody is on." : "This game does not say who is on."));
+      else if (!players || !players.length) content.appendChild(el("p", "muted small", players
+        ? "Nobody is listed. Some games, Bedrock among them, say how many are on but not who: type a name below."
+        : "This game does not say who is on."));
       else {
         const list = el("div", "mod-list");
         for (const p of players) {
@@ -2070,32 +2122,38 @@ async function onModeration(instanceId) {
       go.onclick = () => { if (target.value.trim()) act(action.value, target.value.trim(), reason.value.trim()); };
       form.append(action, target, reason, go);
       content.appendChild(form);
+      if (view.ban_list === "none") {
+        content.appendChild(el("p", "muted small", "This game's server has no ban. To keep someone out, turn on the allowlist " +
+          "in the server's settings and list only the players you want."));
+      }
       if (view.ban_list === "node-record") {
         content.appendChild(el("p", "muted small", "A kick takes the name shown in game. A ban takes the player's Steam ID, because a name can be anything: " +
           "type status in the console to see everyone's. This game cannot keep its own ban list, so the node keeps it and gives it back to the server at every start."));
       }
 
-      // The ban list.
-      content.appendChild(el("h4", null, "Banned"));
-      const banned = view.banned || [];
-      if (!banned.length) content.appendChild(el("p", "muted small", "Nobody."));
-      else {
-        const list = el("div", "mod-list");
-        for (const b of banned) {
-          const row = el("div", "mod-row");
-          const who = el("span", "mod-name", b.target);
-          if (b.reason) who.appendChild(el("span", "muted small", " · " + b.reason));
-          row.appendChild(who);
-          const un = el("button", "btn btn-sm", "Unban");
-          un.type = "button";
-          un.onclick = () => act("unban", b.target, null);
-          row.appendChild(un);
-          list.appendChild(row);
+      // The ban list, for a game that has one.
+      if (view.ban_list !== "none") {
+        content.appendChild(el("h4", null, "Banned"));
+        const banned = view.banned || [];
+        if (!banned.length) content.appendChild(el("p", "muted small", "Nobody."));
+        else {
+          const list = el("div", "mod-list");
+          for (const b of banned) {
+            const row = el("div", "mod-row");
+            const who = el("span", "mod-name", b.target);
+            if (b.reason) who.appendChild(el("span", "muted small", " · " + b.reason));
+            row.appendChild(who);
+            const un = el("button", "btn btn-sm", "Unban");
+            un.type = "button";
+            un.onclick = () => act("unban", b.target, null);
+            row.appendChild(un);
+            list.appendChild(row);
+          }
+          content.appendChild(list);
         }
-        content.appendChild(list);
       }
 
-      // Operators, for a game that has them.
+      // Operators, for a game that lists them.
       if (view.ops) {
         content.appendChild(el("h4", null, "Operators"));
         content.appendChild(el("p", "muted small", "Operators can run any command in game, including ban and stop."));

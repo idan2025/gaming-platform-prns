@@ -1424,6 +1424,7 @@ impl Agent {
         let server_dir = dir.join("writable").join("server");
         let (banned, ops) = match console.ban_list() {
             BanList::NodeRecord => (crate::bans::read(&dir)?, None),
+            BanList::None => (Vec::new(), None),
             BanList::GameFile => (
                 crate::bans::read_minecraft_list(&server_dir.join("banned-players.json"))?,
                 Some(crate::bans::read_minecraft_list(&server_dir.join("ops.json"))?),
@@ -2169,7 +2170,7 @@ impl Agent {
             InstanceState::Running => self.console_of(instance_id).await.ok().map(|(_, p)| p),
             _ => None,
         };
-        if let Some(console) = console.filter(|p| !p.before_backup().is_empty()) {
+        if let Some(console) = console.filter(|p| p.backup_ready().is_some()) {
             self.hold_world(instance_id, console).await;
         }
         let name = crate::backups::new_name(&dir, now_unix());
@@ -2191,7 +2192,8 @@ impl Agent {
     /// up anyway: a copy taken mid-save is still better than none, and the
     /// log says it happened.
     async fn hold_world(&self, instance_id: &str, console: ConsoleProtocol) {
-        let saved = |log: &str| log.matches("Saved the game").count();
+        let Some((poll, marker)) = console.backup_ready() else { return };
+        let saved = |log: &str| log.matches(marker).count();
         let before = self.logs(instance_id, 200).await.map(|l| saved(&l)).unwrap_or(0);
         for line in console.before_backup() {
             if let Err(e) = self.docker.send_console_line(instance_id, line).await {
@@ -2202,6 +2204,12 @@ impl Agent {
         let deadline = Instant::now() + WORLD_SAVE_WAIT;
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            // Bedrock prepares in the background and says it is ready only
+            // when asked.
+            if let Some(line) = poll {
+                let _ = self.docker.send_console_line(instance_id, line).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             if self.logs(instance_id, 200).await.map(|l| saved(&l)).unwrap_or(0) > before {
                 return;
             }
@@ -3577,11 +3585,14 @@ pub fn check_spec_against_pack(spec: &InstanceSpec, pack: &GamePack) -> Result<(
         }
     }
     let minecraft = matches!(pack.content, PackContent::Minecraft {});
-    if !minecraft && (o.memory.is_some() || o.minecraft.is_some() || o.content_version.is_some()) {
-        return Err(anyhow!(
-            "{} does not take a Java memory size, Minecraft settings or a picked version",
-            pack.display_name
-        ));
+    if !minecraft && (o.memory.is_some() || o.content_version.is_some()) {
+        return Err(anyhow!("{} does not take a Java memory size or a picked version", pack.display_name));
+    }
+    // World settings (game mode, difficulty, allowlist) belong to either
+    // Minecraft, Java or Bedrock.
+    let world = matches!(pack.console, Some(game_bridge::pack::PackConsole::Minecraft | game_bridge::pack::PackConsole::Bedrock));
+    if !world && o.minecraft.is_some() {
+        return Err(anyhow!("{} does not take Minecraft settings", pack.display_name));
     }
     if let (true, Some(v)) = (minecraft, &o.content_version) {
         game_bridge::minecraft::MinecraftBuild::parse(v).map_err(|e| anyhow!("{e}"))?;
@@ -3665,6 +3676,17 @@ url = "https://aka.ms/MinecraftEULA"
             ..Default::default()
         };
         assert!(check_spec_against_pack(&spec(bad), &pack).is_err());
+
+        let bedrock = GamePack::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/minecraft-bedrock.toml")).unwrap();
+        let mut b = spec(InstanceOptions {
+            eula_accepted_at: Some(1),
+            minecraft: Some(crate::instance::MinecraftSettings::default()),
+            ..Default::default()
+        });
+        b.game_id = "minecraft-bedrock".into();
+        assert!(check_spec_against_pack(&b, &bedrock).is_ok(), "Bedrock takes world settings");
+        b.options.memory = Some(MemorySpec { min_mb: 1024, max_mb: 2048 });
+        assert!(check_spec_against_pack(&b, &bedrock).is_err(), "and no Java heap");
 
         let sven = GamePack::sven_coop();
         let heap = InstanceOptions { memory: Some(MemorySpec { min_mb: 1024, max_mb: 2048 }), ..Default::default() };
