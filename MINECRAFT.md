@@ -7,8 +7,9 @@ themselves, and limits that keep one server from taking the host down. Also
 kick, ban, the ban list and operators, which most of it applies to every game
 with a console, not only Minecraft.
 
-This is the plan before code. Where it states a fact about an upstream API, it
-was read live on 2026-10-18 and the endpoint is named.
+This was the plan before code, kept up to date as it was built (2026-10-18,
+branch `feat/minecraft`). Where it states a fact about an upstream API, it was
+read live on 2026-10-18 and the endpoint is named. §15 is what was measured.
 
 ## 0. What already exists and is reused
 
@@ -210,13 +211,18 @@ as the owner set it.
 
 ## 11. The image
 
-`images/minecraft`: Debian slim with Eclipse Temurin JREs 8, 17, 21 and 25,
-chosen by the build's Java major. The entrypoint:
+`images/minecraft`: Debian slim with Eclipse Temurin JREs 17, 21 and 25,
+chosen by the build's Java major. **No release older than 1.18.1 is hosted**:
+1.7 to 1.18.0 ship a Log4j that runs lookups in chat (Log4Shell), so any
+player could make the server run code; Mojang fixed it in 1.18.1, and older
+versions need per-range logging configs this build does not carry
+(`game_bridge::minecraft::OLDEST_RELEASE`). The entrypoint:
 
 1. refuses without `GPP_EULA_ACCEPTED_AT`;
-2. on first start, or when the build changed, prepares the server directory
-   from the read-only copy: copies the jar (vanilla, Paper), or runs the
-   installer (`--installServer` for Forge, `server` for Fabric) into it;
+2. on first start, or when the build changed, prepares the server directory:
+   nothing for vanilla and Paper, whose jar runs from the read-only copy and
+   unpacks its libraries into the server's directory; the installer
+   (`--installServer` for Forge, `server` for Fabric) for the loaders;
 3. writes the managed `server.properties` keys;
 4. `exec`s Java with `-Xms`/`-Xmx` from the spec and `nogui`, so `docker stop`
    reaches the JVM, which saves the world.
@@ -260,4 +266,33 @@ Each step is one commit with its tests.
 ## 14. Not in v1
 
 Mods and plugins. Bedrock (UDP 19132). Modpacks. Velocity or BungeeCord
-proxies. RCON. A version change on an existing world.
+proxies. RCON. A version change on an existing world. Releases before 1.18.1.
+
+Also not yet:
+
+- **An index cannot deploy a Minecraft server.** Its `DeployRequest` carries
+  no EULA acceptance or options, so the node refuses it, which is the safe
+  failure. Hosted deploys need the request to carry them.
+- **A backup holds regenerable files** (libraries, Paper's cache, about
+  200 MB). Leaving them out would need restore to rebuild them, which Forge's
+  installed libraries cannot do by themselves.
+- **Two different builds asked for at once** share the game's one download
+  slot; the second create answers "downloading" and the page creates it once
+  the first finishes, then asks again.
+
+## 15. Measured (2026-10-18, this repository's host)
+
+- Paper 26.3 (Java 25), vanilla 1.21.11 (Java 21), Fabric 26.3 with loader
+  0.19.5 (Java 25), and Forge 26.2 / 65.1.0 (Java 25) each downloaded,
+  matched their publisher's digest, started, and answered Server List Ping
+  through the node's published port.
+- `op` and `ban` reached Paper's console and its own `ops.json` and
+  `banned-players.json`, which the node read back.
+- A backup of the running Paper server sent `save-off` and `save-all flush`,
+  waited for "Saved the game", copied 217 MB, and sent `save-on`.
+- A world uploaded as a zip in a wrapping folder replaced the world; the old
+  one became a backup first; the server started on the imported world.
+- Paper over a Reticulum link (`game-bridge server` and `client` over a TCP
+  interface on this host): Server List Ping through the link in 24 ms, a
+  protocol ping/pong in 10 ms. A real Minecraft client join has not been
+  done yet.
