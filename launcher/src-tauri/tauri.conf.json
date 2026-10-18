@@ -49,6 +49,9 @@
     "resources": {
       "../../packs/*.toml": "packs/"
     },
+    "android": {
+      "versionCode": 2045002
+    },
     "shortDescription": "Decentralized game-server browser over Reticulum",
     "longDescription": "Find and join game servers over a Reticulum mesh with no account, no port forwarding, no central service and no internet required. The launcher browses announces directly; an index, if one exists at all, is only a cache.",
     "icon": [

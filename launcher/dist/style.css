@@ -660,3 +660,68 @@ body.bigscreen .sidebar-foot { display: none; }
 /* ---------- hosting from the launcher (PLAN.md §13.3 step 2) ---------- */
 .host-srv-form { grid-template-columns: 1.4fr 1.6fr 0.7fr 0.9fr auto; }
 @media (max-width: 900px) { .host-srv-form { grid-template-columns: 1fr 1fr; } }
+
+/* ---------- phone (Android) ----------
+   The same page, laid out for a phone: the sidebar becomes a bottom tab bar,
+   the toolbar wraps, a server is two lines instead of seven columns, and the
+   detail pane is a full screen sheet. Nothing here changes what a control does.
+   Every rule is scoped to `html.phone`, a class only the Android build sets
+   (app.js), so nothing here can reach the desktop layout. Last in the file so
+   it wins over the desktop rules above, including `.has-detail`, which sets
+   its own columns. */
+html.phone, html.phone body { -webkit-tap-highlight-color: transparent;}
+html.phone body { font-size: 14px;}
+html.phone .shell { flex-direction: column; height: 100vh; height: 100dvh;}
+html.phone .workspace { order: 1; flex: 1; min-height: 0;}
+html.phone .sidebar {
+    order: 2; width: 100%; flex: none; flex-direction: row;
+    padding: 0 4px; border-right: 0; border-top: 1px solid var(--line);}
+html.phone .sidebar .brand, html.phone .sidebar-foot { display: none;}
+html.phone .nav { flex-direction: row; width: 100%; gap: 0;}
+html.phone .nav-item {
+    flex: 1; min-width: 0; flex-direction: column; justify-content: center; gap: 3px;
+    height: 56px; padding: 0 2px; font-size: 10.5px; position: relative;}
+html.phone .nav-item svg { width: 22px; height: 22px;}
+html.phone .nav-item span:first-of-type { flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+html.phone .nav-count { display: none;}
+html.phone .nav-dot { position: absolute; top: 8px; right: calc(50% - 18px);}
+html.phone #nav-rooms { display: none !important;}
+html.phone .toolbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 8px;}
+html.phone .search { width: 100%; max-width: none; flex: 1 1 100%;}
+html.phone .search input, html.phone .select-wrap select, html.phone select.select { height: 44px; font-size: 15px;}
+html.phone .select-wrap { flex: 1 1 0; min-width: 0;}
+html.phone .select-wrap select { width: 100%; max-width: none;}
+html.phone .toolbar-spacer { display: none;}
+html.phone .tool { height: 44px; min-width: 44px; padding: 0 12px; justify-content: center;}
+html.phone #invite-btn span, html.phone #announce-btn span { display: none;}
+html.phone .split { margin-left: auto;}
+html.phone .popover, html.phone .popover-right, html.phone .popover.menu-pop {
+    position: fixed; left: 12px; right: 12px; top: auto; bottom: 72px;
+    min-width: 0; max-width: none; z-index: 60;}
+html.phone .invite-form { width: auto;}
+html.phone .menu-item { min-height: 44px;}
+html.phone .page { padding: 16px 16px 32px; max-width: none;}
+html.phone .btn { min-height: 44px;}
+html.phone .fav-off-row .btn { min-height: 36px;}
+html.phone .inline-form { flex-wrap: wrap;}
+html.phone .host-srv-form { grid-template-columns: 1fr;}
+html.phone .list-head, html.phone .row, html.phone .has-detail .list-head, html.phone .has-detail .row { grid-template-columns: 62px minmax(0, 1fr) 64px; column-gap: 10px; padding: 0 6px;}
+html.phone .list-head { height: 30px;}
+html.phone .col-game, html.phone .col-map, html.phone .col-hops, html.phone .col-seen { display: none !important;}
+html.phone .row { --row-h: 64px; margin: 0 4px;}
+html.phone .art-thumb { width: 62px; height: 40px;}
+html.phone .row .col-name .v { font-size: 14.5px;}
+html.phone .detail {
+    position: fixed; inset: 0; z-index: 40; width: auto; border-left: 0;
+    padding-bottom: env(safe-area-inset-bottom);}
+html.phone .detail-hero { height: 150px;}
+html.phone .detail-close { width: 40px; height: 40px;}
+html.phone .detail-actions { padding: 6px 14px 12px;}
+html.phone .detail-actions .btn-join, html.phone .detail-actions .btn-play { height: 48px; font-size: 15px;}
+html.phone .detail-body { padding: 4px 14px 24px;}
+html.phone .server-chat-dock { max-height: 55%;}
+html.phone .statusbar { padding: 0 12px; height: 24px;}
+html.phone .build-version { display: none;}
+html.phone .toast { bottom: 76px;}
+html.phone .error { bottom: 84px;}
+html.phone .toast, html.phone .error { max-width: calc(100vw - 24px);}

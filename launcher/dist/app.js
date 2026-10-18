@@ -249,6 +249,13 @@ function toast(msg) {
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => box.classList.add('hidden'), 5000);
 }
+// A phone runs the same page. What changes is the layout (style.css reads the
+// `phone` class and the screen width) and a few things a phone cannot do: it
+// starts no game itself, so a join ends with an address to copy instead of a
+// Play button.
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+if (IS_ANDROID) document.documentElement.classList.add('phone');
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -865,6 +872,9 @@ function openDetail(hash, fallback) {
     joined: hash === state.joinedHash,
     joinMsg: null,
   };
+  // On a phone the detail is a full screen sheet, and Back should close it
+  // rather than leave the app.
+  if (IS_ANDROID) { try { history.pushState({ detail: true }, ''); } catch (_) { /* no history */ } }
   renderList();
   // A room answers no detail probe — it has no such endpoint — so asking
   // would only ever render "No direct response" under a room that is fine.
@@ -894,6 +904,7 @@ function openDetail(hash, fallback) {
 }
 
 function closeDetail() {
+  if (IS_ANDROID && history.state && history.state.detail) { try { history.back(); } catch (_) { /* no history */ } }
   state.detail = null;
   $('detail').hidden = true;
   $('view-servers').classList.remove('has-detail');
@@ -1154,7 +1165,12 @@ function renderJoinActions(foot, d, gameId) {
   // only for a game whose pack can start it. When the game cannot be found on
   // this machine it becomes "Locate game": the launcher never guesses an
   // executable.
-  if (d.joined && d.canLaunch) {
+  if (d.joined && IS_ANDROID && d.listenAddr) {
+    const copy = el('button', 'btn btn-play', 'Copy address');
+    copy.type = 'button';
+    copy.onclick = () => copyText(d.listenAddr);
+    foot.appendChild(copy);
+  } else if (d.joined && d.canLaunch) {
     if (d.launchReady) {
       const play = el('button', 'btn btn-play', d.playing ? 'Starting…' : 'Play');
       play.id = 'detail-play';
@@ -1458,7 +1474,9 @@ async function joinServer() {
       renderList();
       return;
     }
-    if (d.canLaunch && d.launchReady) {
+    if (IS_ANDROID) {
+      d.joinMsg = 'Connected. In your game, connect to ' + res.listen_addr + '. Keep Lanthorn open in the background while you play.';
+    } else if (d.canLaunch && d.launchReady) {
       d.joinMsg = 'Connected. Press Play to start the game (listening on ' + res.listen_addr + ').';
     } else if (d.canLaunch) {
       d.joinMsg = 'Connected on ' + res.listen_addr + '. Locate your game once to enable Play, or point your game at that address.';
@@ -1796,6 +1814,8 @@ let pressTarget = null;
 document.addEventListener('pointerdown', e => { pressTarget = e.target; }, true);
 document.addEventListener('pointerup', () => { pressTarget = null; }, true);
 document.addEventListener('pointercancel', () => { pressTarget = null; }, true);
+// Android's Back button walks history; the detail sheet pushed one entry.
+window.addEventListener('popstate', () => { if (IS_ANDROID && state.detail) closeDetail(); });
 function pressedInside(host) { return !!(host && pressTarget && host.contains(pressTarget)); }
 
 async function pollStatus() {

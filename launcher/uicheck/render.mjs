@@ -1983,6 +1983,25 @@ await run('a copy that cannot replace itself links to the download page', {
   w.close();
 }
 
+// A phone starts no game itself: a join ends with the address to point the game
+// at and a button to copy it, never Play, even for a pack that can launch.
+await run('on Android a join ends with an address to copy, never Play', {
+  status: running,
+  rows: () => [row()],
+  join: { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: true, can_launch: true, launch_ready: true },
+  beforeApp: win => Object.defineProperty(win.navigator, 'userAgent', { value: 'Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36', configurable: true }),
+}, async (win, doc) => {
+  check('the page knows it is on a phone', doc.documentElement.classList.contains('phone'));
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  doc.querySelector('#detail-join').click();
+  await settle();
+  const detail = doc.querySelector('#detail');
+  check('the message says where to point the game', /connect to 127\.0\.0\.1:27015/.test(detail.textContent), detail.textContent.slice(-200));
+  check('there is no Play button', !doc.querySelector('#detail-play') && !detail.querySelector('.btn-locate'));
+  check('there is a Copy address button', [...detail.querySelectorAll('button')].some(b => b.textContent === 'Copy address'));
+});
+
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
 
 if (failures.length) {
