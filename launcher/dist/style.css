@@ -686,6 +686,7 @@ html.phone .nav-item span:first-of-type { flex: none; max-width: 100%; overflow:
 html.phone .nav-count { display: none;}
 html.phone .nav-dot { position: absolute; top: 8px; right: calc(50% - 18px);}
 html.phone #nav-rooms { display: none !important;}
+html.phone #nav-games { display: none !important;}
 html.phone .toolbar { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 8px;}
 html.phone .search { width: 100%; max-width: none; flex: 1 1 100%;}
 html.phone .search input, html.phone .select-wrap select, html.phone select.select { height: 44px; font-size: 15px;}
@@ -699,6 +700,7 @@ html.phone .popover, html.phone .popover-right, html.phone .popover.menu-pop {
     position: fixed; left: 12px; right: 12px; top: auto; bottom: 72px;
     min-width: 0; max-width: none; z-index: 60;}
 html.phone .invite-form { width: auto;}
+html.phone #ctx-menu:has(.invite-form) { left: 12px !important; right: 12px; top: 12px !important;}
 html.phone .menu-item { min-height: 44px;}
 html.phone .page { padding: 16px 16px 32px; max-width: none;}
 html.phone .btn { min-height: 44px;}

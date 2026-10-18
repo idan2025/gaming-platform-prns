@@ -34,6 +34,9 @@ struct AppState {
     /// The update the last check found, kept for `install_update`.
     #[cfg(desktop)]
     update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// The APK the last Android check found, for `open_release_page`.
+    #[cfg(target_os = "android")]
+    android_apk: std::sync::Mutex<Option<String>>,
     /// Whether the tray icon came up. Without one (a Linux desktop with no
     /// tray, say) closing the window quits as it always did: a hidden window
     /// with no icon to bring it back would be a launcher nobody can reach.
@@ -207,7 +210,9 @@ async fn check_update(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<UpdateView, String> {
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
+    return check_update_android(app, state).await;
+    #[cfg(all(mobile, not(target_os = "android")))]
     {
         let _ = (app, state);
         return Err("this build updates from the release page".into());
@@ -215,6 +220,34 @@ async fn check_update(
     #[cfg(desktop)]
     check_update_desktop(app, state).await
 }
+
+/// The Android build's check (`launcher_core::update::android`): the newest
+/// Android release with a higher `versionCode` than this APK's. It is never
+/// installed from here; the page offers its APK to download and open.
+#[cfg(target_os = "android")]
+async fn check_update_android(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<UpdateView, String> {
+    use launcher_core::update::{android, InstallMode};
+    let code: u32 = env!("LANTHORN_ANDROID_VERSION_CODE").parse().map_err(|_| "no versionCode in this build")?;
+    let current = format!("{} (build {})", app.package_info().version, code % 1000);
+    let auto = state.launcher.auto_check_updates().await;
+    let found = android::check(code).await.map_err(|e| format!("could not check for updates: {e}"))?;
+    let mut view = UpdateView::none(&current, InstallMode::LinkOnly, auto);
+    view.page = ANDROID_RELEASES_PAGE.to_string();
+    if let Some(release) = &found {
+        view.available = Some(release.label());
+        view.notes = release.notes.clone();
+    }
+    *state.android_apk.lock().unwrap() = found.map(|r| r.apk_url);
+    Ok(view)
+}
+
+/// Every release, because the Android builds are prereleases and
+/// `/releases/latest` never shows one.
+#[cfg(target_os = "android")]
+const ANDROID_RELEASES_PAGE: &str = "https://github.com/idan2025/gaming-platform-prns/releases";
 
 #[cfg(desktop)]
 async fn check_update_desktop(
@@ -422,9 +455,28 @@ fn invite_link(
 #[tauri::command]
 fn open_release_page(app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(launcher_core::update::RELEASES_PAGE, None::<&str>)
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "android")]
+    let url = ANDROID_RELEASES_PAGE;
+    #[cfg(not(target_os = "android"))]
+    let url = launcher_core::update::RELEASES_PAGE;
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+/// Android: open the APK the last check found, which the browser downloads
+/// and the system installs over this one only if the same key signed it. It
+/// was checked to be one of this repository's downloads
+/// (`update::android::DOWNLOAD_PREFIX`); without one, the release page.
+#[tauri::command]
+fn open_update_download(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        let found = app.state::<AppState>().android_apk.lock().unwrap().clone();
+        let url = found.unwrap_or_else(|| ANDROID_RELEASES_PAGE.to_string());
+        return app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    open_release_page(app)
 }
 
 /// An invite link reached this launcher — at start, from a second launch, or
@@ -817,6 +869,7 @@ async fn unblock_room_programs(state: tauri::State<'_, AppState>) -> Result<Room
     state.launcher.unblock_room_programs().await.map_err(fmt_err)
 }
 
+#[cfg(not(target_os = "android"))]
 fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     // Beside the executable first: that is the portable layout, and on Linux
     // `resource_dir` never points there outside a cargo `target/` — it resolves
@@ -837,7 +890,30 @@ fn pack_dir(app: &tauri::AppHandle) -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs"))
 }
 
-#[tauri::mobile_entry_point]
+#[cfg(target_os = "android")]
+mod bundled {
+    include!(concat!(env!("OUT_DIR"), "/bundled_packs.rs"));
+}
+
+/// Where an Android launcher keeps its packs and its settings: the app's own
+/// folder, the only place it may write. There is no `$HOME` to derive one
+/// from (writing under `/` is what failed with "Permission denied"), and the
+/// shipped packs are APK assets no file call can read, so they are written
+/// out from the binary on every start, replacing the last start's copy.
+/// Packs from a repository live beside the settings file, as on desktop.
+#[cfg(target_os = "android")]
+fn android_dirs(app: &tauri::AppHandle) -> Result<(PathBuf, Option<PathBuf>), Box<dyn std::error::Error>> {
+    let root = app.path().app_data_dir()?;
+    let packs = root.join("bundled-packs");
+    let _ = std::fs::remove_dir_all(&packs);
+    std::fs::create_dir_all(&packs)?;
+    for (name, bytes) in bundled::BUNDLED_PACKS {
+        std::fs::write(packs.join(name), bytes)?;
+    }
+    Ok((packs, Some(root.join("gaming-platform-prns").join("launcher.json"))))
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Portable mode (`launcher-core/src/portable.rs`): every per-user
     // directory is pointed inside the portable folder *before* anything else
@@ -876,8 +952,11 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            let packs = pack_dir(app.handle());
-            let launcher = Launcher::from_pack_dir(&packs).with_portable(portable.is_some());
+            #[cfg(not(target_os = "android"))]
+            let (packs, settings) = (pack_dir(app.handle()), launcher_core::settings::default_settings_path());
+            #[cfg(target_os = "android")]
+            let (packs, settings) = android_dirs(app.handle())?;
+            let launcher = Launcher::from_pack_dir_at(&packs, settings).with_portable(portable.is_some());
             tracing::info!(
                 packs = %packs.display(),
                 games = launcher.list_games().len(),
@@ -889,6 +968,8 @@ pub fn run() {
                 pending_invite: std::sync::Mutex::new(None),
                 #[cfg(desktop)]
                 update: tokio::sync::Mutex::new(None),
+                #[cfg(target_os = "android")]
+                android_apk: std::sync::Mutex::new(None),
                 tray: std::sync::atomic::AtomicBool::new(false),
                 told_tray: std::sync::atomic::AtomicBool::new(false),
             });
@@ -1013,6 +1094,7 @@ pub fn run() {
             parse_invite,
             invite_link,
             open_release_page,
+            open_update_download,
             indexes,
             add_index,
             remove_index,

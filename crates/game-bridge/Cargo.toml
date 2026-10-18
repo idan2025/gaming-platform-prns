@@ -32,6 +32,11 @@ getrandom = "0.2"
 # subscriber — a launcher that links this crate owns that decision.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Android has no system root store reqwest can reach without the JVM, so an
+# Android build carries Mozilla's roots instead (`repo::http_client`).
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1"
+
 # The Mode 3 adapter (`src/lan_adapter.rs`) is TUN ioctls, Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

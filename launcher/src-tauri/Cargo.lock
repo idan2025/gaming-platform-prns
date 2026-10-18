@@ -1603,6 +1603,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "webpki-root-certs",
  "windows-sys 0.61.2",
 ]
 

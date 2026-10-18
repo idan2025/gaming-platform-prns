@@ -175,6 +175,7 @@ function makeInvoke(scenario) {
         return scenario.update ?? { current: '1.0.0', available: null, notes: null, install: 'in-place', page: 'x', auto_check: true };
       case 'install_update':
       case 'open_release_page':
+      case 'open_update_download':
         return null;
       case 'trace_path':
         return { destination_hash: args.destinationHash, found: true, hops: 2, millis: 140, error: null };
@@ -2000,6 +2001,46 @@ await run('on Android a join ends with an address to copy, never Play', {
   check('the message says where to point the game', /connect to 127\.0\.0\.1:27015/.test(detail.textContent), detail.textContent.slice(-200));
   check('there is no Play button', !doc.querySelector('#detail-play') && !detail.querySelector('.btn-locate'));
   check('there is a Copy address button', [...detail.querySelectorAll('button')].some(b => b.textContent === 'Copy address'));
+});
+
+const ANDROID_UA = win => Object.defineProperty(win.navigator, 'userAgent', { value: 'Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36', configurable: true });
+
+await run('on Android the invite field survives the keyboard, and Games and LAN rooms are not pages', {
+  status: running,
+  rows: () => [row()],
+  beforeApp: ANDROID_UA,
+}, async (win, doc) => {
+  doc.querySelector('#invite-btn').click();
+  await settle();
+  const input = doc.querySelector('#invite-input');
+  check('the invite field is focused', doc.activeElement === input);
+  // The keyboard coming up resizes the window and scrolls the field into view.
+  win.dispatchEvent(new win.Event('resize'));
+  doc.dispatchEvent(new win.Event('scroll'));
+  check('the invite field is still open after the keyboard', !doc.querySelector('#ctx-menu').hidden && doc.querySelector('#invite-input'));
+  doc.querySelector('#nav-games').click();
+  await settle();
+  check('the Games page never opens on a phone', doc.querySelector('#view-games').hidden && !doc.querySelector('#view-servers').hidden);
+});
+
+await run('on Android an update is a download, never an install', {
+  status: running,
+  rows: () => [],
+  autoUpdate: true,
+  update: { current: '0.2.45 (build 3)', available: '0.2.46 (build 1)', notes: 'notes', install: 'link-only', page: 'x', auto_check: true },
+  beforeApp: ANDROID_UA,
+}, async (win, doc) => {
+  doc.querySelector('#nav-settings').click();
+  await settle();
+  doc.querySelector('#update-check').click();
+  await settle();
+  const go = doc.querySelector('#update-install');
+  const before = calls.length;
+  check('the button says Download', go && go.textContent === 'Download', go && go.textContent);
+  go.click();
+  await settle();
+  check('it opens the download, not the installer', calls.slice(before).includes('open_update_download') && !calls.slice(before).includes('install_update'));
+  check('there is no big screen switch on a phone', !doc.querySelector('#bigscreen-on'));
 });
 
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);

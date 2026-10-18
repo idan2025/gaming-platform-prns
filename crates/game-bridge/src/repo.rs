@@ -191,6 +191,25 @@ pub fn signature_due(expires_at: Option<u64>, now: std::time::SystemTime) -> boo
 /// How long one fetch may take.
 pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The one HTTP client builder, for this crate and the launcher.
+///
+/// On Android reqwest's platform verifier needs the JVM handed to it before
+/// its first use, and without that every https fetch fails. An Android build
+/// checks certificates against Mozilla's roots (`webpki-root-certs`) instead.
+pub fn http_client(timeout: std::time::Duration) -> anyhow::Result<reqwest::Client> {
+    // The shell's updater also uses rustls with ring; whichever installs the
+    // provider first wins, and the other's attempt is a harmless error.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let builder = reqwest::Client::builder().timeout(timeout);
+    #[cfg(target_os = "android")]
+    let builder = builder.tls_certs_only(
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|der| reqwest::Certificate::from_der(der).ok()),
+    );
+    Ok(builder.build()?)
+}
+
 /// Largest signature file read.
 pub const MAX_SIG_BYTES: usize = 16 * 1024;
 
@@ -218,10 +237,7 @@ pub async fn fetch_optional(url: &str, max: usize) -> anyhow::Result<Option<Vec<
             tokio::fs::read(&path).await.with_context(|| format!("reading {}", path.display()))?,
         ));
     }
-    // The shell's updater also uses rustls with ring; whichever installs the
-    // provider first wins, and the other's attempt is a harmless error.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
+    let client = http_client(FETCH_TIMEOUT)?;
     let mut response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);

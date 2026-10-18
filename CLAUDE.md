@@ -458,6 +458,28 @@ quietly break:
   outside its folder. Single-instance is what hands a clicked link to the
   running launcher instead of starting a second mesh node.
 
+**The launcher builds for Android** (2026-10-18, branch `feat/android-preview`,
+prereleases tagged `android-preview-*`, never `v*`). A phone joins servers and
+shows the address to point a game at; it hosts nothing, opens no LAN room and
+starts no game. Rules a later change could quietly break:
+- **The desktop layout never changes for the phone.** Every phone rule in
+  `style.css` sits under `html.phone`, which only `IS_ANDROID` sets, and every
+  behaviour change in `app.js` is gated on it.
+- **An Android app has no `$HOME` and its resources are APK assets.** The
+  shell passes a settings path inside the app's own folder
+  (`Launcher::from_pack_dir_at`) and writes the shipped packs, compiled in by
+  `build.rs`, out to it at start. Deriving either the desktop way failed with
+  "Permission denied".
+- **HTTPS on Android checks against Mozilla's roots**
+  (`game_bridge::repo::http_client`): reqwest's platform verifier needs the
+  JVM handed to it first, and without that every fetch fails.
+- **The Android update check reads asset names**: an APK must be published
+  as `lanthorn-<version>-android-arm64-<versionCode>.apk` on an `android-*`
+  tag, or no installed phone sees it (`update::android`). The versionCode in
+  `tauri.conf.json` is the one source; `build.rs` reads it. The page only
+  opens the APK; Android installs it only over a copy signed by the same key
+  (`~/.config/lanthorn-android/`, not in the repo).
+
 **The server list is what is live, never history** (2026-10-10, the user's
 call). `list_servers` does not list remembered servers; a heard row drops off
 after `STALE_AFTER` (180 s) unless the query sets `max_age_secs`. Because a

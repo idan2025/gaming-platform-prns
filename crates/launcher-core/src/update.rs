@@ -98,6 +98,102 @@ impl UpdateView {
     }
 }
 
+/// The Android build's updates (`android` below). The Tauri updater has no
+/// Android side, and an app cannot replace its own APK: the system's package
+/// installer does that, and refuses an APK signed by any other key than the one
+/// installed. So the check finds the newest Android release, and the player
+/// downloads its APK and opens it.
+pub mod android {
+    use serde::Deserialize;
+
+    /// Every release, prereleases included: the Android builds are prereleases.
+    pub const RELEASES_API: &str = "https://api.github.com/repos/idan2025/gaming-platform-prns/releases?per_page=30";
+    /// The only place an APK is downloaded from.
+    pub const DOWNLOAD_PREFIX: &str = "https://github.com/idan2025/gaming-platform-prns/releases/download/";
+    const TAG_PREFIX: &str = "android-";
+
+    /// An Android build on the release page.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Release {
+        /// The launcher version, as in the asset name.
+        pub version: String,
+        /// The Android `versionCode`, which is what decides "newer".
+        pub code: u32,
+        pub apk_url: String,
+        pub notes: Option<String>,
+    }
+
+    impl Release {
+        /// What the UI shows as the version: the build number tells two
+        /// Android builds of one launcher version apart.
+        pub fn label(&self) -> String {
+            format!("{} (build {})", self.version, self.code % 1000)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct ApiRelease {
+        tag_name: String,
+        #[serde(default)]
+        draft: bool,
+        body: Option<String>,
+        #[serde(default)]
+        assets: Vec<ApiAsset>,
+    }
+
+    #[derive(Deserialize)]
+    struct ApiAsset {
+        name: String,
+        browser_download_url: String,
+    }
+
+    /// `lanthorn-<version>-android-arm64-<versionCode>.apk`, or `None` for any
+    /// other name (older Android releases did not carry the code).
+    fn parse_asset_name(name: &str) -> Option<(String, u32)> {
+        let rest = name.strip_prefix("lanthorn-")?.strip_suffix(".apk")?;
+        let (version, code) = rest.split_once("-android-arm64-")?;
+        let valid = !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+        valid.then_some(())?;
+        Some((version.to_string(), code.parse().ok()?))
+    }
+
+    /// The newest Android release in a GitHub releases listing that is newer
+    /// than `current_code`. An APK linked from anywhere but this repository's
+    /// own downloads is ignored.
+    pub fn newest(listing: &str, current_code: u32) -> anyhow::Result<Option<Release>> {
+        let releases: Vec<ApiRelease> = serde_json::from_str(listing)?;
+        let mut best: Option<Release> = None;
+        for r in releases.into_iter().filter(|r| !r.draft && r.tag_name.starts_with(TAG_PREFIX)) {
+            for a in &r.assets {
+                let Some((version, code)) = parse_asset_name(&a.name) else { continue };
+                if !a.browser_download_url.starts_with(DOWNLOAD_PREFIX) || code <= current_code {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|b| code > b.code) {
+                    best = Some(Release { version, code, apk_url: a.browser_download_url.clone(), notes: r.body.clone() });
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Ask GitHub for the newest Android release newer than `current_code`.
+    pub async fn check(current_code: u32) -> anyhow::Result<Option<Release>> {
+        let client = game_bridge::repo::http_client(game_bridge::repo::FETCH_TIMEOUT)?;
+        let response = client
+            .get(RELEASES_API)
+            // GitHub's API refuses a request without one.
+            .header("User-Agent", concat!("Lanthorn/", env!("CARGO_PKG_VERSION")))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("the release page answered {}", response.status());
+        }
+        newest(&response.text().await?, current_code)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +220,46 @@ mod tests {
     fn installed_windows_and_macos_update_in_place() {
         assert_eq!(install_mode(facts(false, "windows", false)), InstallMode::InPlace);
         assert_eq!(install_mode(facts(false, "macos", false)), InstallMode::InPlace);
+    }
+
+    fn listing(assets: &[(&str, &str, &str)]) -> String {
+        let releases: Vec<_> = assets
+            .iter()
+            .map(|(tag, name, url)| {
+                serde_json::json!({ "tag_name": tag, "draft": false, "body": "notes",
+                    "assets": [{ "name": name, "browser_download_url": url }] })
+            })
+            .collect();
+        serde_json::to_string(&releases).unwrap()
+    }
+
+    const DL: &str = "https://github.com/idan2025/gaming-platform-prns/releases/download/";
+
+    #[test]
+    fn the_newest_android_build_is_picked_by_its_version_code() {
+        let a = format!("{DL}android-preview-0.2.45-3/lanthorn-0.2.45-android-arm64-2045003.apk");
+        let b = format!("{DL}android-preview-0.2.46-1/lanthorn-0.2.46-android-arm64-2046001.apk");
+        let list = listing(&[
+            ("android-preview-0.2.45-3", "lanthorn-0.2.45-android-arm64-2045003.apk", &a),
+            ("android-preview-0.2.46-1", "lanthorn-0.2.46-android-arm64-2046001.apk", &b),
+            // A desktop release and an old Android asset without a code.
+            ("v0.2.47", "lanthorn-0.2.47-android-arm64-2047001.apk", &b),
+            ("android-preview-0.2.45-2", "lanthorn-0.2.45-android-arm64-2.apk", &a),
+        ]);
+        let r = android::newest(&list, 2045003).unwrap().unwrap();
+        assert_eq!((r.version.as_str(), r.code, r.apk_url.as_str()), ("0.2.46", 2046001, b.as_str()));
+        assert_eq!(r.label(), "0.2.46 (build 1)");
+        assert_eq!(android::newest(&list, 2046001).unwrap(), None, "nothing newer");
+    }
+
+    #[test]
+    fn an_apk_from_anywhere_but_this_repositorys_downloads_is_ignored() {
+        let list = listing(&[(
+            "android-preview-9.9.9-1",
+            "lanthorn-9.9.9-android-arm64-9009001.apk",
+            "https://example.com/releases/download/lanthorn.apk",
+        )]);
+        assert_eq!(android::newest(&list, 1).unwrap(), None);
     }
 
     #[test]
