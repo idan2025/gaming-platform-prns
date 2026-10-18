@@ -1175,6 +1175,13 @@ function renderJoinActions(foot, d, gameId) {
     copy.type = 'button';
     copy.onclick = () => copyText(d.listenAddr);
     foot.appendChild(copy);
+    // A phone has no tray and no other way out of a join: this is the only
+    // place to end it, and it ends the background service with it.
+    const leave = el('button', 'btn btn-danger', 'Leave server');
+    leave.id = 'detail-leave';
+    leave.type = 'button';
+    leave.onclick = leaveServer;
+    foot.appendChild(leave);
   } else if (d.joined && d.canLaunch) {
     if (d.launchReady) {
       const play = el('button', 'btn btn-play', d.playing ? 'Starting…' : 'Play');
@@ -1424,6 +1431,28 @@ function primaryAction(hash) {
   } else {
     joinServer();
   }
+}
+
+// Ends the join the detail pane shows (`Launcher::leave`): the local listener
+// closes and, once nothing is joined, the Android background service stops.
+async function leaveServer() {
+  try {
+    await invoke('leave');
+    hideError();
+  } catch (err) {
+    showError('Could not leave the server: ' + errText(err));
+  }
+  state.joinedHash = null;
+  const d = state.detail;
+  if (d) {
+    d.joined = false;
+    d.joining = false;
+    d.listenAddr = null;
+    d.joinErr = false;
+    d.joinMsg = 'Left the server. Join again whenever you like.';
+  }
+  renderList();
+  if (state.detail) renderDetail();
 }
 
 async function joinServer() {

@@ -2043,6 +2043,26 @@ await run('on Android an update is a download, never an install', {
   check('there is no big screen switch on a phone', !doc.querySelector('#bigscreen-on'));
 });
 
+await run('on Android a joined server can be left from the detail pane', {
+  status: running,
+  rows: () => [row()],
+  join: { listen_addr: '127.0.0.1:27015', game_id: 'sven-coop', reachable: true, can_launch: true, launch_ready: true },
+  beforeApp: ANDROID_UA,
+}, async (win, doc) => {
+  doc.querySelector('#list .row').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await settle();
+  doc.querySelector('#detail-join').click();
+  await settle();
+  const leave = doc.querySelector('#detail-leave');
+  check('a Leave server button is there while joined', !!leave);
+  const before = calls.length;
+  leave && leave.click();
+  await settle();
+  check('leaving calls the core', calls.slice(before).includes('leave'));
+  check('the detail says it left', /Left the server/.test(doc.querySelector('#detail').textContent));
+  check('the Leave button is gone', !doc.querySelector('#detail-leave'));
+});
+
 for (const e of consoleErrors) failures.push(`uncaught: ${e}`);
 
 if (failures.length) {
