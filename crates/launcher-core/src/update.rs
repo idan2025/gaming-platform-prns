@@ -112,6 +112,35 @@ pub mod android {
     pub const DOWNLOAD_PREFIX: &str = "https://github.com/idan2025/gaming-platform-prns/releases/download/";
     const TAG_PREFIX: &str = "android-";
 
+    /// Where an update is downloaded, under the app's cache folder. The
+    /// FileProvider serves that folder (`res/xml/file_paths.xml`).
+    pub const CACHE_SUBDIR: &str = "updates";
+    /// The verified APK, and the file it is written to while it downloads.
+    pub const APK_FILE: &str = "lanthorn-update.apk";
+    pub const PART_FILE: &str = "lanthorn-update.apk.part";
+
+    /// Remove what an update left in the app's cache folder: the downloaded
+    /// APK and any half-downloaded one. Run at start. Either the update was
+    /// installed and this is the new build, or the player never installed it;
+    /// the file is not needed in either case, and 36 MB is not worth keeping.
+    /// Returns the bytes freed. A missing folder is nothing to do, and a file
+    /// that cannot be removed is left for next time, never an error at start.
+    pub fn clean_cache(cache_dir: &std::path::Path) -> u64 {
+        let dir = cache_dir.join(CACHE_SUBDIR);
+        let freed = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let _ = std::fs::remove_dir_all(&dir);
+        freed
+    }
+
     /// An Android build on the release page.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Release {
@@ -326,6 +355,23 @@ mod tests {
         let list = listing(&[("android-preview-0.2.46-1", "lanthorn-0.2.46-android-arm64-2046001.apk", b)]);
         assert_eq!(android::newest(&list, 1, false).unwrap(), None);
         assert!(android::newest(&list, 1, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn what_an_update_left_in_the_cache_is_removed_and_nothing_else() {
+        let cache = tempfile::tempdir().unwrap();
+        let updates = cache.path().join(android::CACHE_SUBDIR);
+        std::fs::create_dir_all(&updates).unwrap();
+        std::fs::write(updates.join(android::APK_FILE), vec![0u8; 1000]).unwrap();
+        std::fs::write(updates.join(android::PART_FILE), vec![0u8; 234]).unwrap();
+        // Something else in the cache is not the updater's to delete.
+        std::fs::write(cache.path().join("other.bin"), b"keep").unwrap();
+
+        assert_eq!(android::clean_cache(cache.path()), 1234);
+        assert!(!updates.exists(), "the updates folder is gone");
+        assert!(cache.path().join("other.bin").exists(), "an unrelated cache file stays");
+        // Nothing left to clean is nothing, not an error.
+        assert_eq!(android::clean_cache(cache.path()), 0);
     }
 
     #[test]
