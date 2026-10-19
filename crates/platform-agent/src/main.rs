@@ -149,6 +149,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // A game that answers no network query but says its player count on its
+    // console (Bedrock): read it and give it to the mesh announce.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                agent.feed_mesh_counts().await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+    }
+
     // Daily restart windows (`schedule.rs`): only servers the operator gave one.
     {
         let agent = agent.clone();

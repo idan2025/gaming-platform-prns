@@ -780,6 +780,28 @@ impl BridgeSession {
                         }
                     }
                 });
+            } else if let Some(feed) = args.live_feed.clone() {
+                // No query to ask, but the host process knows the count (a
+                // node reads Bedrock's off its console). Read it the way a
+                // query's answer is read; a feed that is empty stores nothing,
+                // so the last number keeps its age instead of looking fresh.
+                let feed_state = state.clone();
+                let _feed_task = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(LIVE_STATS_INTERVAL);
+                    loop {
+                        ticker.tick().await;
+                        let fed = feed.lock().ok().and_then(|f| *f);
+                        if let Some((players, max_players)) = fed {
+                            feed_state.store_live(LiveStats {
+                                players,
+                                max_players,
+                                map: String::new(),
+                                player_names: Vec::new(),
+                                read_at: Instant::now(),
+                            });
+                        }
+                    }
+                });
             }
 
             // Announcer.

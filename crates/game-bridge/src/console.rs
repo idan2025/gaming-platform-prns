@@ -127,6 +127,30 @@ impl ConsoleProtocol {
             Self::Goldsrc | Self::Source | Self::Minecraft | Self::Bedrock => format!("say {message}"),
         })
     }
+
+    /// The console line that makes the server print how many players are on
+    /// it, for a game whose status cannot be asked over the network. Bedrock
+    /// answers no status query (NetherNet), so its count comes from here;
+    /// the answer is a log line, read by [`parse_player_count`].
+    pub fn player_count_line(&self) -> Option<&'static str> {
+        match self {
+            Self::Bedrock => Some("list"),
+            Self::Goldsrc | Self::Source | Self::Minecraft => None,
+        }
+    }
+}
+
+/// `(online, max)` from a server log line that answers a player-count line,
+/// such as Bedrock's `There are 1/10 players online:`. Any other line is
+/// `None`, never a guess.
+pub fn parse_player_count(log_line: &str) -> Option<(u32, u32)> {
+    let rest = log_line.split("There are ").nth(1)?;
+    let (online, rest) = rest.split_once('/')?;
+    let (max, rest) = rest.split_once(' ')?;
+    if !rest.starts_with("players online") {
+        return None;
+    }
+    Some((online.parse().ok()?, max.parse().ok()?))
 }
 
 /// Most bots a caller may ask for. A GoldSrc server holds 32 slots including
@@ -623,6 +647,21 @@ mod tests {
         assert_eq!(mc.ban_list(), BanList::GameFile);
         assert!(!mc.has_maps() && mc.change_map("world").is_err());
         assert_eq!(mc.before_backup(), ["save-off", "save-all flush"]);
+    }
+
+    #[test]
+    fn bedrock_counts_players_from_its_log_and_other_lines_are_not_a_count() {
+        assert_eq!(ConsoleProtocol::Bedrock.player_count_line(), Some("list"));
+        assert_eq!(ConsoleProtocol::Minecraft.player_count_line(), None);
+        assert_eq!(
+            parse_player_count("[2026-10-19 16:36:51:201 INFO] There are 1/10 players online:"),
+            Some((1, 10))
+        );
+        assert_eq!(parse_player_count("[INFO] There are 0/10 players online:"), Some((0, 10)));
+        // A line that merely mentions a count is not an answer to `list`.
+        assert_eq!(parse_player_count("There are 3 bots online"), None);
+        assert_eq!(parse_player_count("There are x/10 players online:"), None);
+        assert_eq!(parse_player_count("Player connected: idan2025"), None);
     }
 
     #[test]

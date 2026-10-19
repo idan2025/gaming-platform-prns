@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::content::PackContent;
-use game_bridge::console::{BotProtocol, ConsoleProtocol};
+use game_bridge::console::{parse_player_count, BotProtocol, ConsoleProtocol};
 use game_bridge::GamePack;
 use tokio::sync::{Mutex, RwLock};
 
@@ -93,6 +93,13 @@ fn human_bytes(n: u64) -> String {
 
 /// How long a backup waits for a running world to finish saving.
 const WORLD_SAVE_WAIT: Duration = Duration::from_secs(30);
+/// A console-read `(online, max)` and when it was read.
+type CountedAt = (Instant, (u32, u32));
+/// How long a console's answer to a player-count line is waited for.
+const COUNT_WAIT: Duration = Duration::from_secs(3);
+/// How long a console-counted number is kept. The page polls every few seconds;
+/// without this every poll would type a command into the server.
+const COUNT_TTL: Duration = Duration::from_secs(5);
 
 pub(crate) fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -130,6 +137,9 @@ pub struct Agent {
     mesh: Arc<crate::mesh::MeshBridges>,
     /// Restart-on-crash bookkeeping (`check_crashes`).
     crashes: Mutex<CrashWatch>,
+    /// The last player count a server's console answered, per instance, and
+    /// when it was asked (`console_count`).
+    console_counts: Mutex<HashMap<String, CountedAt>>,
     /// Sizes of installed copies, keyed by directory and its modification
     /// time. A copy is never changed in place (`content.rs`), so a walk of a
     /// 20 GB tree is done once, not on every poll of the page.
@@ -537,6 +547,7 @@ impl Agent {
             specs: Mutex::new(BTreeMap::new()),
             mesh,
             crashes: Mutex::new(CrashWatch::default()),
+            console_counts: Mutex::new(HashMap::new()),
             content_sizes: std::sync::Mutex::new(HashMap::new()),
             active: crate::active::ActiveVersions::load(&config_data_root),
             updates: crate::updates::UpdateChecks::load(&config_data_root),
@@ -650,15 +661,9 @@ impl Agent {
                 continue;
             };
             let identity = crate::mesh::identity_path(&self.config.data_root, &instance.instance_id);
-            let max_players = self
-                .specs
-                .lock()
-                .await
-                .get(&instance.instance_id)
-                .map(|s| s.max_players)
-                // The spec is this run's memory and a restart has none, so fall
-                // back to the pack's own idea rather than refusing to restore.
-                .unwrap_or(16);
+            // The spec is this run's memory and a restart has none, so the
+            // container's own record stands in for it.
+            let max_players = self.max_players_of(&instance.instance_id).await;
             // Only a seed for the first announce; the bridge's A2S poller
             // replaces it with the map the game is really on. A restarted agent
             // has no spec and so seeds nothing, which is correct — it should
@@ -1710,13 +1715,7 @@ impl Agent {
         let Some(pack) = packs.get(&instance.game_id) else { return Ok(()) };
         let profile = pack.to_profile().map_err(|e| anyhow!("{e}"))?;
         let Some(addr) = self.game_address(instance_id).await else { return Ok(()) };
-        let max_players = self
-            .specs
-            .lock()
-            .await
-            .get(instance_id)
-            .map(|s| s.max_players)
-            .unwrap_or(16);
+        let max_players = self.max_players_of(instance_id).await;
         let seed_map = self.specs.lock().await.get(instance_id).and_then(|s| s.map.clone());
         let identity = crate::mesh::identity_path(&self.config.data_root, instance_id);
         if let Err(e) = self
@@ -1913,7 +1912,7 @@ impl Agent {
         for (instance, s) in instances.iter_mut().zip(stats) {
             instance.players_now = s.as_ref().map(|(p, _, _)| *p);
             instance.max_players_now = s.as_ref().map(|(_, m, _)| *m);
-            instance.map_now = s.map(|(_, _, m)| m);
+            instance.map_now = s.map(|(_, _, m)| m).filter(|m| !m.is_empty());
         }
         let mut crashes = self.crashes.lock().await;
         for instance in instances.iter_mut() {
@@ -1971,9 +1970,79 @@ impl Agent {
     /// the game is a container this agent started, not a stranger on the
     /// network.
     async fn live_stats(&self, instance: &InstanceStatus) -> Option<(u32, u32, String)> {
-        self.ask_game(instance)
-            .await
-            .map(|s| (u32::from(s.info.players), u32::from(s.info.max_players), s.info.map))
+        if let Some(s) = self.ask_game(instance).await {
+            return Some((u32::from(s.info.players), u32::from(s.info.max_players), s.info.map));
+        }
+        // A game that cannot be asked over the network may still say its count
+        // on its console (Bedrock). Its map is not something it says, so empty.
+        self.console_count(instance).await.map(|(p, m)| (p, m, String::new()))
+    }
+
+    /// How many players an instance was created for: this run's spec, else the
+    /// container's own record (`GPP_MAX_PLAYERS`), which survives an agent
+    /// restart. 16 only for a container that carries neither.
+    async fn max_players_of(&self, instance_id: &str) -> u8 {
+        if let Some(s) = self.specs.lock().await.get(instance_id) {
+            return s.max_players;
+        }
+        self.docker.spec_of(instance_id).await.map(|s| s.max_players).unwrap_or(16)
+    }
+
+    /// Hand each running server's console-read player count to its mesh
+    /// bridge, so the announce a browser lists carries it. Only for games
+    /// whose console can be asked (`player_count_line`); a count that cannot
+    /// be read now is fed as unknown, never as zero.
+    pub async fn feed_mesh_counts(&self) {
+        let Ok(instances) = self.list().await else { return };
+        for instance in instances.iter().filter(|i| i.state == InstanceState::Running) {
+            let asks = self
+                .packs
+                .read()
+                .await
+                .get(&instance.game_id)
+                .and_then(|p| p.console)
+                .is_some_and(|c| ConsoleProtocol::from(c).player_count_line().is_some());
+            if !asks {
+                continue;
+            }
+            let count = self.console_count(instance).await;
+            let fed = count.map(|(p, m)| (p.min(255) as u8, m.min(255) as u8));
+            self.mesh.feed_count(&instance.instance_id, fed).await;
+        }
+    }
+
+    /// The player count a server prints on its console, when its pack has a
+    /// console that can be asked. Asked at most once per `COUNT_TTL`; a
+    /// server that does not answer in `COUNT_WAIT` is `None`, never zero.
+    async fn console_count(&self, instance: &InstanceStatus) -> Option<(u32, u32)> {
+        if instance.state != InstanceState::Running {
+            return None;
+        }
+        let console: ConsoleProtocol = self.packs.read().await.get(&instance.game_id).and_then(|p| p.console)?.into();
+        let line = console.player_count_line()?;
+        if let Some((at, count)) = self.console_counts.lock().await.get(&instance.instance_id) {
+            if at.elapsed() < COUNT_TTL {
+                return Some(*count);
+            }
+        }
+        let id = instance.instance_id.as_str();
+        // Count the answers already in the log, so only one written after
+        // this line can be the reply.
+        let answers = |log: &str| log.lines().filter_map(parse_player_count).collect::<Vec<_>>();
+        let before = self.logs(id, 200).await.map(|l| answers(&l).len()).unwrap_or(0);
+        self.docker.send_console_line(id, line).await.ok()?;
+        let deadline = Instant::now() + COUNT_WAIT;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let Ok(log) = self.logs(id, 200).await else { continue };
+            let found = answers(&log);
+            if found.len() > before {
+                let count = *found.last()?;
+                self.console_counts.lock().await.insert(instance.instance_id.clone(), (Instant::now(), count));
+                return Some(count);
+            }
+        }
+        None
     }
 
     /// One query to a running instance's game (A2S or Server List Ping), when
