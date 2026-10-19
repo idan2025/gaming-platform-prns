@@ -737,3 +737,29 @@ html.phone .room-banner .btn, html.phone .notice .btn { flex: 1 1 auto;}
    at least 12rem and the buttons wrap below, instead of the text shrinking. */
 html.phone .item, html.phone .fav-off-row { flex-wrap: wrap;}
 html.phone .item .item-main, html.phone .fav-off-name { flex: 1 1 12rem;}
+
+/* Android update download (app.js installAndroidUpdate). Phone only: the
+   banner it sits in is the phone's, and the desktop never shows it. */
+html.phone .update-progress {
+  height: 6px;
+  margin: 8px 0 4px;
+  border-radius: 3px;
+  background: var(--line-strong);
+  overflow: hidden;
+}
+html.phone .update-progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.2s linear;
+}
+html.phone .update-progress.indeterminate .update-progress-bar {
+  width: 30%;
+  animation: update-slide 1.2s ease-in-out infinite alternate;
+}
+@keyframes update-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(330%); }
+}
+

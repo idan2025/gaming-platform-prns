@@ -98,6 +98,11 @@ pub struct LauncherSettings {
     /// file written before it existed — means the check is on.
     #[serde(default)]
     pub update_check_off: bool,
+    /// The player turned off previews in the Android update check. Stored as
+    /// "off" so a settings file from before it means previews are offered, the
+    /// same as before there were official Android releases to choose from.
+    #[serde(default)]
+    pub android_previews_off: bool,
     /// Servers and rooms the player starred, as hex destination hashes.
     ///
     /// The one exception to "the list is what is live": a favorite that is

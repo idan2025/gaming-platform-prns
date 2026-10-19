@@ -34,9 +34,12 @@ struct AppState {
     /// The update the last check found, kept for `install_update`.
     #[cfg(desktop)]
     update: tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>,
-    /// The APK the last Android check found, for `open_release_page`.
+    /// The APK the last Android check found, kept for `download_update`.
     #[cfg(target_os = "android")]
-    android_apk: std::sync::Mutex<Option<String>>,
+    android_update: std::sync::Mutex<Option<launcher_core::update::android::Release>>,
+    /// Where `download_update` put the verified APK, for `install_update_android`.
+    #[cfg(target_os = "android")]
+    android_apk_path: std::sync::Mutex<Option<PathBuf>>,
     /// Whether the tray icon came up. Without one (a Linux desktop with no
     /// tray, say) closing the window quits as it always did: a hidden window
     /// with no icon to bring it back would be a launcher nobody can reach.
@@ -233,14 +236,18 @@ async fn check_update_android(
     let code: u32 = env!("LANTHORN_ANDROID_VERSION_CODE").parse().map_err(|_| "no versionCode in this build")?;
     let current = format!("{} (build {})", app.package_info().version, code % 1000);
     let auto = state.launcher.auto_check_updates().await;
-    let found = android::check(code).await.map_err(|e| format!("could not check for updates: {e}"))?;
+    let previews = state.launcher.android_previews_on().await;
+    let found = android::check(code, previews).await.map_err(|e| format!("could not check for updates: {e}"))?;
     let mut view = UpdateView::none(&current, InstallMode::LinkOnly, auto);
     view.page = ANDROID_RELEASES_PAGE.to_string();
     if let Some(release) = &found {
         view.available = Some(release.label());
         view.notes = release.notes.clone();
     }
-    *state.android_apk.lock().unwrap() = found.map(|r| r.apk_url);
+    *state.android_update.lock().unwrap() = found;
+    // A new check may find a different build; the APK kept for install is
+    // only the one that was downloaded for the build now offered.
+    *state.android_apk_path.lock().unwrap() = None;
     Ok(view)
 }
 
@@ -462,21 +469,170 @@ fn open_release_page(app: tauri::AppHandle) -> Result<(), String> {
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
-/// Android: open the APK the last check found, which the browser downloads
-/// and the system installs over this one only if the same key signed it. It
-/// was checked to be one of this repository's downloads
-/// (`update::android::DOWNLOAD_PREFIX`); without one, the release page.
+/// Android: download the APK the last check found into the app's cache, with
+/// progress sent to the page as `update-progress` events. The file is held to
+/// the SHA-256 GitHub reported for it and to its size, and only then kept under
+/// its final name; a mismatch is deleted and nothing is installed. The
+/// download is from `update::android::DOWNLOAD_PREFIX` only, checked when the
+/// release was picked.
 #[tauri::command]
-fn open_update_download(app: tauri::AppHandle) -> Result<(), String> {
+async fn download_update(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        use tauri_plugin_opener::OpenerExt;
-        let found = app.state::<AppState>().android_apk.lock().unwrap().clone();
-        let url = found.unwrap_or_else(|| ANDROID_RELEASES_PAGE.to_string());
-        return app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string());
+        use std::io::Write;
+        use tauri::Emitter;
+        let release = state
+            .android_update
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("no update is known; check for updates first")?;
+        let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("updates");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+        let part = dir.join("lanthorn-update.apk.part");
+        let apk = dir.join("lanthorn-update.apk");
+        let _ = std::fs::remove_file(&part);
+
+        let client = game_bridge::repo::http_client(std::time::Duration::from_secs(900)).map_err(|e| e.to_string())?;
+        let mut response = client
+            .get(&release.apk_url)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the download: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("the download answered {}", response.status()));
+        }
+        let total = if release.size > 0 { Some(release.size) } else { None };
+        let mut file = std::fs::File::create(&part).map_err(|e| format!("could not write {}: {e}", part.display()))?;
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        let mut received: u64 = 0;
+        let mut last_sent = std::time::Instant::now();
+        let _ = app.emit("update-progress", serde_json::json!({ "received": 0, "total": total }));
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(format!("the download stopped: {e}"));
+                }
+            };
+            sha2::Digest::update(&mut hasher, &chunk);
+            file.write_all(&chunk).map_err(|e| format!("could not write the download: {e}"))?;
+            received += chunk.len() as u64;
+            if last_sent.elapsed() >= std::time::Duration::from_millis(200) {
+                last_sent = std::time::Instant::now();
+                let _ = app.emit("update-progress", serde_json::json!({ "received": received, "total": total }));
+            }
+        }
+        file.sync_all().map_err(|e| format!("could not finish the download: {e}"))?;
+        drop(file);
+        let _ = app.emit("update-progress", serde_json::json!({ "received": received, "total": total }));
+
+        let digest = sha2::Digest::finalize(hasher);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let size_ok = release.size == 0 || received == release.size;
+        let digest_ok = release.sha256.as_deref().is_none_or(|expected| expected == hex);
+        if !size_ok || !digest_ok {
+            let _ = std::fs::remove_file(&part);
+            return Err(
+                "the download does not match the checksum GitHub published for it; nothing was installed".into(),
+            );
+        }
+        std::fs::rename(&part, &apk).map_err(|e| format!("could not keep the download: {e}"))?;
+        *state.android_apk_path.lock().unwrap() = Some(apk);
+        return Ok(());
     }
     #[cfg(not(target_os = "android"))]
-    open_release_page(app)
+    {
+        let _ = (app, state);
+        Err("this build updates from the release page".into())
+    }
+}
+
+/// Android: hand the downloaded APK to the system installer, which asks the
+/// player to confirm and refuses it unless the same key signed it.
+#[tauri::command]
+fn install_update_android(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let path = state
+            .android_apk_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("the update is not downloaded yet")?;
+        return install_apk(&path);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = state;
+        Err("this build updates from the release page".into())
+    }
+}
+
+/// Start the system package installer on `path` through the app's FileProvider.
+/// The provider's authority is `${applicationId}.fileprovider` (AndroidManifest.xml),
+/// and it serves the cache folder (`res/xml/file_paths.xml`).
+#[cfg(target_os = "android")]
+fn install_apk(path: &std::path::Path) -> Result<(), String> {
+    use jni::objects::JObject;
+    // The window library set both up before any command runs.
+    let ctx = ndk_context::android_context();
+    // SAFETY: the VM and the activity are the ones the Android runtime gave the
+    // window library. The activity is a reference the runtime owns, so it is
+    // never released here.
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let activity = std::mem::ManuallyDrop::new(unsafe { JObject::from_raw(ctx.context().cast()) });
+    start_installer(&mut env, &activity, path).map_err(|e| {
+        let _ = env.exception_clear();
+        format!("could not open the installer: {e}")
+    })
+}
+
+#[cfg(target_os = "android")]
+fn start_installer(
+    env: &mut jni::JNIEnv,
+    activity: &jni::objects::JObject,
+    path: &std::path::Path,
+) -> jni::errors::Result<()> {
+    use jni::objects::{JObject, JValue};
+    let authority = env.new_string("org.idan2025.gamingplatformprns.launcher.fileprovider")?;
+    let name = env.new_string(path.to_string_lossy().as_ref())?;
+    let file = env.new_object("java/io/File", "(Ljava/lang/String;)V", &[JValue::Object(&name)])?;
+    let uri = env
+        .call_static_method(
+            "androidx/core/content/FileProvider",
+            "getUriForFile",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
+            &[JValue::Object(activity), JValue::Object(&authority), JValue::Object(&file)],
+        )?
+        .l()?;
+    let action = env.new_string("android.intent.action.VIEW")?;
+    let intent: JObject = env.new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])?;
+    let mime = env.new_string("application/vnd.android.package-archive")?;
+    env.call_method(
+        &intent,
+        "setDataAndType",
+        "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
+        &[JValue::Object(&uri), JValue::Object(&mime)],
+    )?;
+    // FLAG_GRANT_READ_URI_PERMISSION: the installer reads the file through the provider.
+    env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(0x0000_0001)])?;
+    env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
+    Ok(())
+}
+
+/// Whether an Android launcher offers prerelease builds (`update::android`).
+#[tauri::command]
+async fn android_previews(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.launcher.android_previews_on().await)
+}
+
+#[tauri::command]
+async fn set_android_previews(state: tauri::State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.launcher.set_android_previews_on(on).await.map_err(|e| e.to_string())
 }
 
 /// An invite link reached this launcher — at start, from a second launch, or
@@ -969,7 +1125,9 @@ pub fn run() {
                 #[cfg(desktop)]
                 update: tokio::sync::Mutex::new(None),
                 #[cfg(target_os = "android")]
-                android_apk: std::sync::Mutex::new(None),
+                android_update: std::sync::Mutex::new(None),
+                #[cfg(target_os = "android")]
+                android_apk_path: std::sync::Mutex::new(None),
                 tray: std::sync::atomic::AtomicBool::new(false),
                 told_tray: std::sync::atomic::AtomicBool::new(false),
             });
@@ -1094,7 +1252,10 @@ pub fn run() {
             parse_invite,
             invite_link,
             open_release_page,
-            open_update_download,
+            download_update,
+            install_update_android,
+            android_previews,
+            set_android_previews,
             indexes,
             add_index,
             remove_index,

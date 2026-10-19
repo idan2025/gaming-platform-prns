@@ -175,7 +175,12 @@ function makeInvoke(scenario) {
         return scenario.update ?? { current: '1.0.0', available: null, notes: null, install: 'in-place', page: 'x', auto_check: true };
       case 'install_update':
       case 'open_release_page':
-      case 'open_update_download':
+      case 'download_update':
+      case 'install_update_android':
+        return null;
+      case 'android_previews':
+        return true;
+      case 'set_android_previews':
         return null;
       case 'trace_path':
         return { destination_hash: args.destinationHash, found: true, hops: 2, millis: 140, error: null };
@@ -2023,7 +2028,7 @@ await run('on Android the invite field survives the keyboard, and Games and LAN 
   check('the Games page never opens on a phone', doc.querySelector('#view-games').hidden && !doc.querySelector('#view-servers').hidden);
 });
 
-await run('on Android an update is a download, never an install', {
+await run('on Android an update is downloaded in the app and handed to the installer', {
   status: running,
   rows: () => [],
   autoUpdate: true,
@@ -2039,7 +2044,7 @@ await run('on Android an update is a download, never an install', {
   check('the button says Download', go && go.textContent === 'Download', go && go.textContent);
   go.click();
   await settle();
-  check('it opens the download, not the installer', calls.slice(before).includes('open_update_download') && !calls.slice(before).includes('install_update'));
+  check('it downloads in the app and then opens the installer', calls.slice(before).includes('download_update') && calls.slice(before).includes('install_update_android') && !calls.slice(before).includes('install_update'));
   check('there is no big screen switch on a phone', !doc.querySelector('#bigscreen-on'));
 });
 
