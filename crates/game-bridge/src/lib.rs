@@ -12,6 +12,7 @@
 
 pub mod a2s;
 pub mod announce;
+pub mod bedrock_ping;
 pub mod browse;
 pub mod config;
 pub mod console;
