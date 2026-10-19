@@ -178,6 +178,8 @@ function makeInvoke(scenario) {
       case 'download_update':
       case 'install_update_android':
         return null;
+      case 'exit_app':
+        return null;
       case 'android_previews':
         return true;
       case 'set_android_previews':
@@ -1900,6 +1902,10 @@ await run('a copy that cannot replace itself links to the download page', {
   check('it says Download', doc.querySelector('#update-now')?.textContent === 'Download');
   check('it opens the release page', calls.includes('open_release_page'));
   check('and never installs', calls.filter(c => c === 'install_update').length === before);
+  // The Exit button is the phone's: a desktop closes its window the usual way.
+  doc.querySelector('#nav-settings').click();
+  await settle();
+  check('Settings has no Exit button on desktop', !doc.querySelector('#exit-app'));
 });
 
 {
@@ -2044,6 +2050,12 @@ await run('on Android an update is downloaded in the app and handed to the insta
   check('the button says Download', go && go.textContent === 'Download', go && go.textContent);
   go.click();
   await settle();
+  const exitButton = doc.querySelector('#exit-app');
+  check('Settings has an Exit button on Android', !!exitButton);
+  const beforeExit = calls.length;
+  exitButton.click();
+  await settle();
+  check('Exit asks the shell to close the app', calls.slice(beforeExit).includes('exit_app'));
   check('it downloads in the app and then opens the installer', calls.slice(before).includes('download_update') && calls.slice(before).includes('install_update_android') && !calls.slice(before).includes('install_update'));
   check('there is no big screen switch on a phone', !doc.querySelector('#bigscreen-on'));
 });

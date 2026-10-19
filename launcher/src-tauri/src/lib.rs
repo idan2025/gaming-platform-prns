@@ -624,6 +624,33 @@ fn start_installer(
     Ok(())
 }
 
+/// Close the app completely (the Exit button in Settings, Android). A joined
+/// server is left and the foreground service that keeps a session alive in the
+/// background is stopped; then the process ends. Closing the window alone
+/// leaves the process, and the mesh node in it, running.
+#[tauri::command]
+async fn exit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = state.launcher.leave().await;
+        let _ = tauri_plugin_keepalive::set(&app, false);
+        app.exit(0);
+        // `exit` ends the window; the process is ended too, after the answer
+        // below has had a moment to reach the page.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::process::exit(0);
+        });
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = state;
+        app.exit(0);
+        Ok(())
+    }
+}
+
 /// Whether an Android launcher offers prerelease builds (`update::android`).
 #[tauri::command]
 async fn android_previews(state: tauri::State<'_, AppState>) -> Result<bool, String> {
@@ -1254,6 +1281,7 @@ pub fn run() {
             open_release_page,
             download_update,
             install_update_android,
+            exit_app,
             android_previews,
             set_android_previews,
             indexes,

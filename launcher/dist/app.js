@@ -3825,6 +3825,26 @@ function renderSettings() {
   page.onclick = openReleasePage;
   about.appendChild(page);
   body.appendChild(about);
+  if (IS_ANDROID) {
+    // Closing the window leaves the process, and the mesh node in it, running
+    // in the background; this ends it.
+    const quit = el('div', 'card');
+    const qh = el('div', 'card-head');
+    qh.appendChild(el('h2', '', 'Exit'));
+    quit.appendChild(qh);
+    quit.appendChild(el('p', 'card-text', 'Close Lanthorn completely. A server you have joined is left, and '
+      + 'nothing keeps running in the background.'));
+    const exit = el('button', 'btn', 'Exit Lanthorn');
+    exit.type = 'button';
+    exit.id = 'exit-app';
+    exit.onclick = async () => {
+      exit.disabled = true;
+      try { await invoke('exit_app'); }
+      catch (err) { exit.disabled = false; showError('Could not exit: ' + errText(err)); }
+    };
+    quit.appendChild(exit);
+    body.appendChild(quit);
+  }
   if (keep) document.getElementById(keep)?.focus({ preventScroll: true });
 }
 
