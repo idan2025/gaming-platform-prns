@@ -854,6 +854,35 @@ impl DockerRuntime {
         Ok(output)
     }
 
+    /// The log a managed container wrote from `since` (Unix seconds) on. Read
+    /// by time rather than by line count: a busy server's answer can scroll
+    /// out of a fixed tail, which would look like no answer at all.
+    pub async fn logs_since(&self, spec_id: &str, since: i64) -> Result<String> {
+        use futures_util::StreamExt;
+        let name = format!("{}{}", crate::config::CONTAINER_PREFIX, spec_id);
+        self.assert_managed(&name).await?;
+        let mut logs = self.docker.logs(
+            &name,
+            Some(LogsOptions::<String> {
+                stdout: true,
+                stderr: true,
+                since,
+                tail: "all".to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut output = String::new();
+        while let Some(next) = logs.next().await {
+            match next.with_context(|| format!("reading the log of {name}"))? {
+                LogOutput::StdOut { message } | LogOutput::StdErr { message } | LogOutput::Console { message } => {
+                    output.push_str(&String::from_utf8_lossy(&message));
+                }
+                LogOutput::StdIn { .. } => {}
+            }
+        }
+        Ok(output)
+    }
+
     /// One reading of a managed container's resource counters.
     ///
     /// Takes the container id from `list_managed`, so it only ever reads a

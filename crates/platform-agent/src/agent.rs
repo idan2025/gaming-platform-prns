@@ -2026,18 +2026,16 @@ impl Agent {
             }
         }
         let id = instance.instance_id.as_str();
-        // Count the answers already in the log, so only one written after
-        // this line can be the reply.
-        let answers = |log: &str| log.lines().filter_map(parse_player_count).collect::<Vec<_>>();
-        let before = self.logs(id, 200).await.map(|l| answers(&l).len()).unwrap_or(0);
+        // Only what is written after the line goes out can be its answer. The
+        // log is read by time, not by a line count: a busy server's older
+        // answers scroll out of a fixed tail, and that looked like silence.
+        let since = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         self.docker.send_console_line(id, line).await.ok()?;
         let deadline = Instant::now() + COUNT_WAIT;
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let Ok(log) = self.logs(id, 200).await else { continue };
-            let found = answers(&log);
-            if found.len() > before {
-                let count = *found.last()?;
+            let Ok(log) = self.docker.logs_since(id, since).await else { continue };
+            if let Some(count) = log.lines().filter_map(parse_player_count).next_back() {
                 self.console_counts.lock().await.insert(instance.instance_id.clone(), (Instant::now(), count));
                 return Some(count);
             }
