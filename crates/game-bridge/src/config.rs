@@ -14,6 +14,10 @@ use std::path::PathBuf;
 
 use crate::profile::GameProfile;
 
+/// `(players, max players)` a host process writes for the bridge to announce
+/// (`ServerArgs::live_feed`).
+pub type LiveFeed = std::sync::Arc<std::sync::Mutex<Option<(u8, u8)>>>;
+
 /// Server role: announce a destination, bridge accepted links to a local game
 /// server's port.
 #[derive(Debug, Clone)]
@@ -79,6 +83,13 @@ pub struct ServerArgs {
     /// announce. Can be turned on and off while running
     /// (`BridgeSession::set_chat`).
     pub chat: bool,
+    /// Live numbers fed in by the process hosting this bridge, for a game
+    /// that answers no network query (Bedrock). The bridge reads it like it
+    /// reads a query's answer, so the announce and the detail probe carry it.
+    /// `None` inside is "not known now", never zero. Never serialized: it is a
+    /// handle to this process's own memory.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub live_feed: Option<LiveFeed>,
 }
 
 impl ServerArgs {
@@ -107,6 +118,7 @@ impl ServerArgs {
             identify_timeout_secs: 10,
             relay_transit: true,
             chat: false,
+            live_feed: None,
         }
     }
 }

@@ -163,6 +163,8 @@ pub struct MeshStatus {
 struct Bridge {
     session: BridgeSession,
     status: MeshStatus,
+    /// What the node writes for the announce when the game answers no query.
+    feed: game_bridge::config::LiveFeed,
 }
 
 /// An interface every game bridge on this node attaches, added at runtime.
@@ -656,6 +658,8 @@ impl MeshBridges {
         // strangers, and someone must moderate). The choice is a file in the
         // instance folder, so it outlives a restart.
         args.chat = identity_path.parent().is_some_and(chat_on);
+        let feed: game_bridge::config::LiveFeed = Default::default();
+        args.live_feed = Some(feed.clone());
 
         let session = BridgeSession::start_server(args)
             .await
@@ -688,8 +692,19 @@ not announced: {e}"
             game_port = game.port,
             "announcing this server on the mesh"
         );
-        bridges.insert(instance_id.to_string(), Bridge { session, status: status.clone() });
+        bridges.insert(instance_id.to_string(), Bridge { session, status: status.clone(), feed });
         Ok(Some(status))
+    }
+
+    /// Write the player count the node read off a game's console, for the
+    /// announce. `None` says it could not be read now. Silent for an instance
+    /// with no bridge.
+    pub async fn feed_count(&self, instance_id: &str, count: Option<(u8, u8)>) {
+        if let Some(bridge) = self.bridges.lock().await.get(instance_id) {
+            if let Ok(mut slot) = bridge.feed.lock() {
+                *slot = count;
+            }
+        }
     }
 
     /// Take an instance off the mesh. Silent when it was never on it.
