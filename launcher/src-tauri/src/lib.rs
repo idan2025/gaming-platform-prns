@@ -487,10 +487,14 @@ async fn download_update(app: tauri::AppHandle, state: tauri::State<'_, AppState
             .unwrap()
             .clone()
             .ok_or("no update is known; check for updates first")?;
-        let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("updates");
+        let dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join(launcher_core::update::android::CACHE_SUBDIR);
         std::fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
-        let part = dir.join("lanthorn-update.apk.part");
-        let apk = dir.join("lanthorn-update.apk");
+        let part = dir.join(launcher_core::update::android::PART_FILE);
+        let apk = dir.join(launcher_core::update::android::APK_FILE);
         let _ = std::fs::remove_file(&part);
 
         let client = game_bridge::repo::http_client(std::time::Duration::from_secs(900)).map_err(|e| e.to_string())?;
@@ -622,6 +626,33 @@ fn start_installer(
     env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(0x0000_0001)])?;
     env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
     Ok(())
+}
+
+/// Close the app completely (the Exit button in Settings, Android). A joined
+/// server is left and the foreground service that keeps a session alive in the
+/// background is stopped; then the process ends. Closing the window alone
+/// leaves the process, and the mesh node in it, running.
+#[tauri::command]
+async fn exit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = state.launcher.leave().await;
+        let _ = tauri_plugin_keepalive::set(&app, false);
+        app.exit(0);
+        // `exit` ends the window; the process is ended too, after the answer
+        // below has had a moment to reach the page.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::process::exit(0);
+        });
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = state;
+        app.exit(0);
+        Ok(())
+    }
 }
 
 /// Whether an Android launcher offers prerelease builds (`update::android`).
@@ -1112,6 +1143,15 @@ pub fn run() {
             let (packs, settings) = (pack_dir(app.handle()), launcher_core::settings::default_settings_path());
             #[cfg(target_os = "android")]
             let (packs, settings) = android_dirs(app.handle())?;
+            // An update's file is not needed once the build it was for is the
+            // one running, or once the player passed on it.
+            #[cfg(target_os = "android")]
+            if let Ok(cache) = app.path().app_cache_dir() {
+                let freed = launcher_core::update::android::clean_cache(&cache);
+                if freed > 0 {
+                    tracing::info!(bytes = freed, "removed a downloaded update");
+                }
+            }
             let launcher = Launcher::from_pack_dir_at(&packs, settings).with_portable(portable.is_some());
             tracing::info!(
                 packs = %packs.display(),
@@ -1254,6 +1294,7 @@ pub fn run() {
             open_release_page,
             download_update,
             install_update_android,
+            exit_app,
             android_previews,
             set_android_previews,
             indexes,
