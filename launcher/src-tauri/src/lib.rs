@@ -589,10 +589,28 @@ fn install_apk(path: &std::path::Path) -> Result<(), String> {
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let activity = std::mem::ManuallyDrop::new(unsafe { JObject::from_raw(ctx.context().cast()) });
-    start_installer(&mut env, &activity, path).map_err(|e| {
-        let _ = env.exception_clear();
-        format!("could not open the installer: {e}")
-    })
+    start_installer(&mut env, &activity, path).map_err(|e| format!("could not open the installer: {}", java_error(&mut env, e)))
+}
+
+/// What Java said when a call failed, not just that it did: the exception's
+/// own text (`java.lang.IllegalArgumentException: Failed to find configured
+/// root…`). The pending exception is cleared so the thread can be used again.
+#[cfg(target_os = "android")]
+fn java_error(env: &mut jni::JNIEnv, e: jni::errors::Error) -> String {
+    use jni::objects::JString;
+    if let Ok(exception) = env.exception_occurred() {
+        if !exception.as_raw().is_null() {
+            let _ = env.exception_clear();
+            let text = env
+                .call_method(&exception, "toString", "()Ljava/lang/String;", &[])
+                .and_then(|v| v.l())
+                .and_then(|s| env.get_string(&JString::from(s)).map(String::from));
+            if let Ok(text) = text {
+                return text;
+            }
+        }
+    }
+    e.to_string()
 }
 
 #[cfg(target_os = "android")]
@@ -601,13 +619,23 @@ fn start_installer(
     activity: &jni::objects::JObject,
     path: &std::path::Path,
 ) -> jni::errors::Result<()> {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::{JClass, JObject, JValue};
+    // This thread was made by the Rust runtime, not by Java, so a plain class
+    // lookup goes through the system loader, which knows Android's own classes
+    // but not this app's: the FileProvider is in the app. The activity's loader
+    // knows both.
+    let loader = env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+    let provider_name = env.new_string("androidx.core.content.FileProvider")?;
+    let provider = env
+        .call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&provider_name)])?
+        .l()?;
+    let provider = JClass::from(provider);
     let authority = env.new_string("org.idan2025.gamingplatformprns.launcher.fileprovider")?;
     let name = env.new_string(path.to_string_lossy().as_ref())?;
     let file = env.new_object("java/io/File", "(Ljava/lang/String;)V", &[JValue::Object(&name)])?;
     let uri = env
         .call_static_method(
-            "androidx/core/content/FileProvider",
+            &provider,
             "getUriForFile",
             "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
             &[JValue::Object(activity), JValue::Object(&authority), JValue::Object(&file)],
