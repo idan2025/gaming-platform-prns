@@ -100,6 +100,8 @@ const state = {
   updateError: null,
   updateDismissed: null,
   autoUpdate: true,
+  androidPreviews: true,
+  updateProgress: null,
 };
 
 // The headless render check shortens it before this script loads.
@@ -3513,6 +3515,7 @@ function wireInvites() {
   // A clicked link while the launcher runs (the shell emits it).
   const ev = window.__TAURI__ && window.__TAURI__.event;
   if (ev && ev.listen) ev.listen('invite', e => { invoke('take_invite').catch(() => {}); showInvite(e.payload); });
+  if (ev && ev.listen) ev.listen('update-progress', e => showUpdateProgress(e.payload));
   // Pasting a link anywhere that is not a text field opens it.
   document.addEventListener('paste', e => {
     if (e.target.closest && e.target.closest('input, textarea')) return;
@@ -3533,6 +3536,9 @@ function wireInvites() {
 
 async function startupUpdateCheck() {
   try { state.notifications = await invoke('notifications_on'); } catch (_) { /* an older shell */ }
+  if (IS_ANDROID) {
+    try { state.androidPreviews = await invoke('android_previews'); } catch (_) { /* an older shell */ }
+  }
   try {
     state.autoUpdate = await invoke('auto_update');
   } catch (_) { return; } // an older shell
@@ -3562,11 +3568,7 @@ async function checkUpdate(quiet) {
 async function installUpdate() {
   const u = state.update;
   if (!u || !u.available || state.updateBusy) return;
-  if (IS_ANDROID) {
-    try { await invoke('open_update_download'); }
-    catch (err) { showError('Could not open the browser: ' + errText(err)); }
-    return;
-  }
+  if (IS_ANDROID) { await installAndroidUpdate(); return; }
   if (u.install !== 'in-place') { openReleasePage(); return; }
   state.updateBusy = 'installing';
   renderUpdateBanner();
@@ -3580,6 +3582,42 @@ async function installUpdate() {
     renderUpdateBanner();
     renderSettings();
   }
+}
+
+// Android: the launcher downloads the APK itself (progress shown), checks it,
+// and hands it to the system installer, which asks the player to confirm.
+async function installAndroidUpdate() {
+  state.updateBusy = 'downloading';
+  state.updateError = null;
+  state.updateProgress = { received: 0, total: 0 };
+  renderUpdateBanner();
+  renderSettings();
+  try {
+    await invoke('download_update');
+    state.updateBusy = 'installing';
+    renderUpdateBanner();
+    await invoke('install_update_android');
+  } catch (err) {
+    state.updateError = errText(err);
+    showError(state.updateError);
+  }
+  state.updateBusy = null;
+  state.updateProgress = null;
+  renderUpdateBanner();
+  renderSettings();
+}
+
+// Moves the bar in place: a progress event is not a reason to rebuild the banner.
+function showUpdateProgress(p) {
+  state.updateProgress = p;
+  const track = $('update-progress');
+  const bar = $('update-progress-bar');
+  const text = $('update-progress-text');
+  if (!track || !bar || !text) return;
+  const mb = n => (n / 1048576).toFixed(1);
+  track.classList.toggle('indeterminate', !p.total);
+  bar.style.width = p.total ? Math.min(100, Math.round((p.received / p.total) * 100)) + '%' : '';
+  text.textContent = p.total ? mb(p.received) + ' of ' + mb(p.total) + ' MB' : mb(p.received) + ' MB';
 }
 
 async function openReleasePage() {
@@ -3602,17 +3640,30 @@ function renderUpdateBanner() {
   text.appendChild(el('div', 'rb-title', 'Lanthorn ' + u.available + ' is available'));
   text.appendChild(el('div', 'rb-sub', u.install === 'in-place'
     ? 'You have ' + u.current + '. Updating restarts Lanthorn and leaves any room you are in.'
-    : IS_ANDROID ? 'You have ' + u.current + '. Download it and open the file to install it over this one.'
+    : IS_ANDROID ? 'You have ' + u.current + '. Lanthorn downloads it here; Android then asks you to install it over this one.'
     : 'You have ' + u.current + '. This copy updates from the download page.'));
+  if (IS_ANDROID && state.updateBusy === 'downloading') {
+    const track = el('div', 'update-progress');
+    track.id = 'update-progress';
+    const bar = el('div', 'update-progress-bar');
+    bar.id = 'update-progress-bar';
+    const label = el('div', 'rb-sub');
+    label.id = 'update-progress-text';
+    track.appendChild(bar);
+    text.append(track, label);
+    const p = state.updateProgress;
+    if (p) showUpdateProgress(p);
+  }
   b.appendChild(text);
   const notes = el('button', 'btn', 'What\u2019s new');
   notes.type = 'button';
   notes.onclick = () => setView('settings');
-  const go = el('button', 'btn btn-primary', state.updateBusy === 'installing' ? 'Updating…'
-    : (u.install === 'in-place' ? 'Update now' : 'Download'));
+  const go = el('button', 'btn btn-primary', state.updateBusy === 'downloading' ? 'Downloading…'
+    : state.updateBusy === 'installing' ? (IS_ANDROID ? 'Opening installer…' : 'Updating…')
+    : (u.install === 'in-place' ? 'Update now' : IS_ANDROID ? 'Download and install' : 'Download'));
   go.type = 'button';
   go.id = 'update-now';
-  go.disabled = state.updateBusy === 'installing';
+  go.disabled = !!state.updateBusy;
   go.onclick = installUpdate;
   const later = el('button', 'btn', 'Later');
   later.type = 'button';
@@ -3717,6 +3768,22 @@ function renderSettings() {
   };
   auto.append(box, el('span', '', 'Look for updates when Lanthorn starts'));
   card.appendChild(auto);
+  if (IS_ANDROID) {
+    const pv = el('label', 'toggle-row');
+    const pbox = el('input');
+    pbox.type = 'checkbox';
+    pbox.id = 'android-previews';
+    pbox.checked = state.androidPreviews;
+    pbox.onchange = async () => {
+      state.androidPreviews = pbox.checked;
+      try { await invoke('set_android_previews', { on: pbox.checked }); }
+      catch (err) { showError('Could not save that: ' + errText(err)); return; }
+      // Look again now, so the banner matches the choice.
+      checkUpdate(true);
+    };
+    pv.append(pbox, el('span', '', 'Include preview builds'));
+    card.appendChild(pv);
+  }
   const notes = el('label', 'toggle-row');
   const nbox = el('input');
   nbox.type = 'checkbox';

@@ -4,6 +4,9 @@
     <!-- Reticulum's LAN interface finds peers by multicast, which Android
          drops on Wi-Fi unless the app holds a multicast lock (MainActivity). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Lets the launcher open the downloaded update in the system installer.
+         Android still asks the player to allow it, once, for this app. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />

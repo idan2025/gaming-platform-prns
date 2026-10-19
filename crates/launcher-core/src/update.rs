@@ -120,6 +120,15 @@ pub mod android {
         /// The Android `versionCode`, which is what decides "newer".
         pub code: u32,
         pub apk_url: String,
+        /// GitHub's own mark on the release. Previews and official builds are
+        /// told apart by this flag, never by the tag's name.
+        pub prerelease: bool,
+        /// The APK's SHA-256 as GitHub reports it, lowercase hex. `None` when
+        /// GitHub reports no digest; the install then rests on Android's own
+        /// check that the file is signed by the installed key.
+        pub sha256: Option<String>,
+        /// The APK's size in bytes, as GitHub reports it (0 when unknown).
+        pub size: u64,
         pub notes: Option<String>,
     }
 
@@ -136,6 +145,8 @@ pub mod android {
         tag_name: String,
         #[serde(default)]
         draft: bool,
+        #[serde(default)]
+        prerelease: bool,
         body: Option<String>,
         #[serde(default)]
         assets: Vec<ApiAsset>,
@@ -145,6 +156,10 @@ pub mod android {
     struct ApiAsset {
         name: String,
         browser_download_url: String,
+        #[serde(default)]
+        size: u64,
+        /// `sha256:<hex>` on GitHub's own listing; absent on older releases.
+        digest: Option<String>,
     }
 
     /// `lanthorn-<version>-android-arm64-<versionCode>.apk`, or `None` for any
@@ -157,20 +172,40 @@ pub mod android {
         Some((version.to_string(), code.parse().ok()?))
     }
 
+    /// The SHA-256 of a `sha256:<hex>` digest, or `None` for any other form.
+    fn parse_digest(digest: Option<&str>) -> Option<String> {
+        let hex = digest?.strip_prefix("sha256:")?;
+        let valid = hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit());
+        valid.then(|| hex.to_ascii_lowercase())
+    }
+
     /// The newest Android release in a GitHub releases listing that is newer
-    /// than `current_code`. An APK linked from anywhere but this repository's
-    /// own downloads is ignored.
-    pub fn newest(listing: &str, current_code: u32) -> anyhow::Result<Option<Release>> {
+    /// than `current_code`. A prerelease is offered only when `include_previews`
+    /// is set. An APK linked from anywhere but this repository's own downloads
+    /// is ignored.
+    pub fn newest(listing: &str, current_code: u32, include_previews: bool) -> anyhow::Result<Option<Release>> {
         let releases: Vec<ApiRelease> = serde_json::from_str(listing)?;
         let mut best: Option<Release> = None;
-        for r in releases.into_iter().filter(|r| !r.draft && r.tag_name.starts_with(TAG_PREFIX)) {
+        let candidates = releases
+            .into_iter()
+            .filter(|r| !r.draft && r.tag_name.starts_with(TAG_PREFIX))
+            .filter(|r| include_previews || !r.prerelease);
+        for r in candidates {
             for a in &r.assets {
                 let Some((version, code)) = parse_asset_name(&a.name) else { continue };
                 if !a.browser_download_url.starts_with(DOWNLOAD_PREFIX) || code <= current_code {
                     continue;
                 }
                 if best.as_ref().is_none_or(|b| code > b.code) {
-                    best = Some(Release { version, code, apk_url: a.browser_download_url.clone(), notes: r.body.clone() });
+                    best = Some(Release {
+                        version,
+                        code,
+                        apk_url: a.browser_download_url.clone(),
+                        prerelease: r.prerelease,
+                        sha256: parse_digest(a.digest.as_deref()),
+                        size: a.size,
+                        notes: r.body.clone(),
+                    });
                 }
             }
         }
@@ -178,7 +213,7 @@ pub mod android {
     }
 
     /// Ask GitHub for the newest Android release newer than `current_code`.
-    pub async fn check(current_code: u32) -> anyhow::Result<Option<Release>> {
+    pub async fn check(current_code: u32, include_previews: bool) -> anyhow::Result<Option<Release>> {
         let client = game_bridge::repo::http_client(game_bridge::repo::FETCH_TIMEOUT)?;
         let response = client
             .get(RELEASES_API)
@@ -190,7 +225,7 @@ pub mod android {
         if !response.status().is_success() {
             anyhow::bail!("the release page answered {}", response.status());
         }
-        newest(&response.text().await?, current_code)
+        newest(&response.text().await?, current_code, include_previews)
     }
 }
 
@@ -226,8 +261,9 @@ mod tests {
         let releases: Vec<_> = assets
             .iter()
             .map(|(tag, name, url)| {
-                serde_json::json!({ "tag_name": tag, "draft": false, "body": "notes",
-                    "assets": [{ "name": name, "browser_download_url": url }] })
+                serde_json::json!({ "tag_name": tag, "draft": false, "prerelease": true, "body": "notes",
+                    "assets": [{ "name": name, "browser_download_url": url, "size": 36_000_000,
+                        "digest": "sha256:AB".to_string() + &"cd".repeat(31) }] })
             })
             .collect();
         serde_json::to_string(&releases).unwrap()
@@ -246,10 +282,50 @@ mod tests {
             ("v0.2.47", "lanthorn-0.2.47-android-arm64-2047001.apk", &b),
             ("android-preview-0.2.45-2", "lanthorn-0.2.45-android-arm64-2.apk", &a),
         ]);
-        let r = android::newest(&list, 2045003).unwrap().unwrap();
+        let r = android::newest(&list, 2045003, true).unwrap().unwrap();
         assert_eq!((r.version.as_str(), r.code, r.apk_url.as_str()), ("0.2.46", 2046001, b.as_str()));
         assert_eq!(r.label(), "0.2.46 (build 1)");
-        assert_eq!(android::newest(&list, 2046001).unwrap(), None, "nothing newer");
+        assert_eq!(android::newest(&list, 2046001, true).unwrap(), None, "nothing newer");
+    }
+
+    #[test]
+    fn a_release_carries_its_digest_size_and_channel() {
+        let b = format!("{DL}android-preview-0.2.46-1/lanthorn-0.2.46-android-arm64-2046001.apk");
+        let list = listing(&[("android-preview-0.2.46-1", "lanthorn-0.2.46-android-arm64-2046001.apk", &b)]);
+        let r = android::newest(&list, 1, true).unwrap().unwrap();
+        assert_eq!(r.sha256.as_deref(), Some(("ab".to_string() + &"cd".repeat(31)).as_str()));
+        assert_eq!((r.size, r.prerelease), (36_000_000, true));
+        // A digest that is not a sha256 of the right length is no digest at all.
+        let bad = serde_json::json!([{ "tag_name": "android-preview-0.2.46-1", "prerelease": true,
+            "assets": [{ "name": "lanthorn-0.2.46-android-arm64-2046001.apk",
+                "browser_download_url": b, "digest": "md5:abc" }] }]);
+        assert_eq!(android::newest(&bad.to_string(), 1, true).unwrap().unwrap().sha256, None);
+    }
+
+    #[test]
+    fn previews_are_offered_only_when_the_player_asks_for_them() {
+        let b = format!("{DL}android-preview-0.2.46-1/lanthorn-0.2.46-android-arm64-2046001.apk");
+        let c = format!("{DL}android-0.2.46-2/lanthorn-0.2.46-android-arm64-2046002.apk");
+        let mut list: serde_json::Value = serde_json::from_str(&listing(&[
+            ("android-preview-0.2.46-1", "lanthorn-0.2.46-android-arm64-2046001.apk", &b),
+            ("android-0.2.46-2", "lanthorn-0.2.46-android-arm64-2046002.apk", &c),
+        ]))
+        .unwrap();
+        // The second release is the official one: not a prerelease.
+        list[1]["prerelease"] = serde_json::json!(false);
+        let list = list.to_string();
+        // Official only: the preview is newer by code but not offered.
+        assert_eq!(android::newest(&list, 1, false).unwrap().unwrap().code, 2046002);
+        // With previews, the newer code wins, preview or not.
+        assert_eq!(android::newest(&list, 1, true).unwrap().unwrap().code, 2046002);
+        // Only a preview exists: official-only finds nothing.
+        list_only_preview(&b);
+    }
+
+    fn list_only_preview(b: &str) {
+        let list = listing(&[("android-preview-0.2.46-1", "lanthorn-0.2.46-android-arm64-2046001.apk", b)]);
+        assert_eq!(android::newest(&list, 1, false).unwrap(), None);
+        assert!(android::newest(&list, 1, true).unwrap().is_some());
     }
 
     #[test]
@@ -259,7 +335,7 @@ mod tests {
             "lanthorn-9.9.9-android-arm64-9009001.apk",
             "https://example.com/releases/download/lanthorn.apk",
         )]);
-        assert_eq!(android::newest(&list, 1).unwrap(), None);
+        assert_eq!(android::newest(&list, 1, true).unwrap(), None);
     }
 
     #[test]

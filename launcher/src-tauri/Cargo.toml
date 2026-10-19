@@ -28,6 +28,14 @@ tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
 
+# The phone downloads its own update and hands it to the system installer. The
+# JVM is reached through the context the window library already sets up.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+game-bridge = { path = "../../crates/game-bridge" }
+ndk-context = "0.1"
+sha2 = "0.10"
+
 # Updating and a second launch are desktop ideas: an app store owns the first on
 # a phone, and the OS owns the second.
 [target.'cfg(not(target_os = "android"))'.dependencies]

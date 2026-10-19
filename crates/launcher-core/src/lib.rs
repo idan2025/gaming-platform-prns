@@ -1830,6 +1830,18 @@ impl Launcher {
         self.persist(&settings)
     }
 
+    /// Whether the Android update check offers prerelease builds as well as
+    /// official ones (`update::android`).
+    pub async fn android_previews_on(&self) -> bool {
+        !self.settings.lock().await.android_previews_off
+    }
+
+    pub async fn set_android_previews_on(&self, on: bool) -> Result<()> {
+        let mut settings = self.settings.lock().await;
+        settings.android_previews_off = !on;
+        self.persist(&settings)
+    }
+
     /// Whether to show the first-run screen (`PLAN.md` §13.3 step 4): never
     /// once it was finished or skipped, and never on a launcher that already
     /// has a way onto the mesh saved, which is every launcher from before it.

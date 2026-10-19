@@ -2557,9 +2557,13 @@ dependencies = [
 name = "launcher"
 version = "0.2.45"
 dependencies = [
+ "game-bridge",
+ "jni 0.21.1",
  "launcher-core",
+ "ndk-context",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-deep-link",
