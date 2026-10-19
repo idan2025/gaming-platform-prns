@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use game_bridge::announce::AnnounceInfo;
+use game_bridge::bedrock_ping;
 use game_bridge::browse::{BrowseFilter, SortBy};
 use game_bridge::config::{BrowserArgs, ClientArgs};
 use game_bridge::details::StatsSource;
@@ -525,6 +526,63 @@ struct Inner {
     keepalive: Option<tokio::task::JoinHandle<()>>,
     /// The chat of the server joined, if it has one (`server_chat.rs`).
     joined_chat: Option<server_chat::JoinedChat>,
+    /// The phone's answer to the Minecraft app's server-list ping for the
+    /// joined Bedrock server (`bedrock_ping.rs`). Replaced on each join,
+    /// stopped on leave.
+    ping: Option<PingAnswer>,
+}
+
+/// Whether this build answers the Minecraft app's ping. Only the phone: a
+/// desktop may run a Bedrock server of its own on UDP 19132, and a launcher must
+/// never take that port from it.
+const ANSWERS_PINGS: bool = cfg!(target_os = "android");
+
+/// The UDP responder for one join, and the name and count it answers with.
+/// `motd` is `None` while the joined server's row is not live, and then nothing
+/// is answered.
+struct PingAnswer {
+    motd: Arc<std::sync::Mutex<Option<bedrock_ping::Motd>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PingAnswer {
+    fn start(port: u16) -> Self {
+        let motd = Arc::new(std::sync::Mutex::new(None));
+        let task = tokio::spawn(answer_pings(port, motd.clone()));
+        Self { motd, task }
+    }
+}
+
+/// Answer each unconnected ping that reaches the joined server's loopback
+/// port, from what `motd` holds. Bind failure is logged and the join goes on
+/// without an answer: the game itself does not use UDP on this port.
+async fn answer_pings(port: u16, motd: Arc<std::sync::Mutex<Option<bedrock_ping::Motd>>>) {
+    let socket = match tokio::net::UdpSocket::bind(("127.0.0.1", port)).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            tracing::warn!(port, error = %e, "could not answer the Minecraft server list ping");
+            return;
+        }
+    };
+    // Any id will do: it names the server to the app, nothing more.
+    let server_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let mut buf = [0u8; 256];
+    loop {
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(current) = motd.lock().ok().and_then(|m| m.clone()) else { continue };
+        if let Some(pong) = bedrock_ping::pong_for(&buf[..n], server_id, &current) {
+            let _ = socket.send_to(&pong, from).await;
+        }
+    }
 }
 
 /// The address a live join is pointed at, kept so Play can start a game against
@@ -657,6 +715,7 @@ impl Launcher {
                 hidden: Default::default(),
                 keepalive: None,
                 joined_chat: None,
+                ping: None,
             })),
             packs: Arc::new(std::sync::RwLock::new(packs)),
             settings: Arc::new(Mutex::new(settings)),
@@ -908,6 +967,23 @@ impl Launcher {
                 if in_use.contains(&row.destination_hash) {
                     out.push(row_view(&row));
                 }
+            }
+        }
+        // The app's ping is answered from the joined server's live row, so the
+        // count it sees is the one this list shows. A row that is not live has
+        // no count to give, and then nothing is answered.
+        if let (Some(answer), Some(join)) = (inner.ping.as_ref(), inner.last_join.as_ref()) {
+            let hash = hex::encode(join.destination.as_bytes());
+            let motd = out.iter().find(|r| r.destination_hash == hash).and_then(|r| {
+                Some(bedrock_ping::Motd {
+                    name: r.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "Lanthorn server".to_string()),
+                    online: r.players,
+                    max: r.max_players?,
+                    port: join.port,
+                })
+            });
+            if let Ok(mut slot) = answer.motd.lock() {
+                *slot = motd;
             }
         }
         drop(inner);
@@ -1461,6 +1537,7 @@ impl Launcher {
         // Whether Play can run for this game is settled before the session lock
         // is taken, so the two locks are never held at once.
         let can_launch = self.launch_profile(&game_id).is_some();
+        let answers_pings = ANSWERS_PINGS && self.is_bedrock(&game_id);
         let launch_ready = self.game_location(&game_id).await.launch_ready;
         let listen_addr = format!("127.0.0.1:{listen_port}");
         let chat_name = server_chat::chat_name(self.player_name().await);
@@ -1510,12 +1587,27 @@ impl Launcher {
             port: listen_port,
             game_id: game_id.clone(),
         });
+        if let Some(old) = inner.ping.take() {
+            old.task.abort();
+        }
+        if answers_pings {
+            inner.ping = Some(PingAnswer::start(listen_port));
+        }
         drop(inner);
         // Ask whether anyone can actually route to this server, using the probe
         // the detail pane already uses. One Link, on a join the player asked
         // for — not the per-row traffic `PLAN.md` §3.4 rules out.
         let reachable = self.probe_reachable(destination_hash).await;
         Ok(JoinResult { listen_addr, can_launch, launch_ready, reachable, game_id: Some(game_id) })
+    }
+
+    /// Whether a game's pack declares the Bedrock console, the one whose server
+    /// answers no status query.
+    fn is_bedrock(&self, game_id: &str) -> bool {
+        self.packs()
+            .iter()
+            .find(|p| p.pack.id == game_id)
+            .is_some_and(|p| matches!(p.pack.console, Some(game_bridge::pack::PackConsole::Bedrock)))
     }
 
     fn launch_profile(&self, game_id: &str) -> Option<LaunchProfile> {
@@ -1852,6 +1944,9 @@ impl Launcher {
     pub async fn leave(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         inner.joined_chat = None;
+        if let Some(answer) = inner.ping.take() {
+            answer.task.abort();
+        }
         if let Some(mut session) = inner.client.take() {
             session.stop().await;
         }
@@ -2082,6 +2177,43 @@ fn plan_launch(
 
 #[cfg(test)]
 mod tests {
+    /// A real UDP ping to the responder gets the joined row's name and count
+    /// back, and a ping with no live row gets nothing.
+    #[tokio::test]
+    async fn a_bedrock_ping_is_answered_from_the_live_row_and_not_without_one() {
+        use game_bridge::bedrock_ping::{pong_for, Motd, MAGIC};
+        let port = {
+            let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let answer = super::PingAnswer::start(port);
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut ping = vec![0x01];
+        ping.extend_from_slice(&5i64.to_be_bytes());
+        ping.extend_from_slice(&MAGIC);
+        ping.extend_from_slice(&9u64.to_be_bytes());
+
+        // No live row yet: silence, not a zero the app would show.
+        client.send_to(&ping, ("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 512];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), client.recv_from(&mut buf)).await.is_err(),
+            "a ping with no live count must not be answered"
+        );
+
+        *answer.motd.lock().unwrap() = Some(Motd { name: "Bedrock test".into(), online: Some(1), max: 10, port });
+        client.send_to(&ping, ("127.0.0.1", port)).await.unwrap();
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("answered")
+            .unwrap();
+        assert_eq!(buf[0], 0x1c, "an unconnected pong");
+        let text = &buf[35..n];
+        assert!(std::str::from_utf8(text).unwrap().starts_with("MCPE;Bedrock test;2193;1.26.52.3;1;10;"));
+        assert!(pong_for(&ping, 0, &Motd { name: "x".into(), online: None, max: 1, port }).is_none());
+        answer.task.abort();
+    }
+
     use super::*;
 
     /// The frontend reads these keys by name. A rename here is a silent break
