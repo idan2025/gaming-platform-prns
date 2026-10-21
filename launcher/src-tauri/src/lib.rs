@@ -457,6 +457,12 @@ fn invite_link(
     launcher_core::invite::web_link(&destination_hash, game_id.as_deref(), name.as_deref(), room)
 }
 
+/// An invite as a QR code (SVG). Only an invite `invite::parse` accepts.
+#[tauri::command]
+fn invite_qr(invite: String) -> Result<String, String> {
+    launcher_core::invite::qr_svg(&invite)
+}
+
 /// Open the release page in the player's browser. The one URL this opens:
 /// the page never hands the shell a URL to visit.
 #[tauri::command]
@@ -1319,6 +1325,7 @@ pub fn run() {
             take_invite,
             parse_invite,
             invite_link,
+            invite_qr,
             open_release_page,
             download_update,
             install_update_android,
