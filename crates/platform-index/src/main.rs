@@ -33,12 +33,16 @@ const HOSTING_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs
 const USAGE: &str = "\
 platform-index — an optional announce indexer and HTTP front door
 
-usage: platform-index [--bind ADDR] [--tcp HOST:PORT] [--auto] [--hosting FILE]
+usage: platform-index [--bind ADDR] [--tcp HOST:PORT] [--auto] [--hosting FILE] [--identity FILE]
        platform-index --help | --version
 
   --bind ADDR       where the HTTP API listens (default: 127.0.0.1:4760)
   --tcp HOST:PORT   dial a Reticulum TCP peer, or 0.0.0.0:PORT to bind one
   --auto            attach auto-discovered local interfaces
+  --identity FILE   keep the index's identity in this file (made on first run,
+                    readable by its owner only). Without it the identity is new
+                    at every start, so the address players add and the entry in
+                    a node's trusted_indexes both stop working after a restart.
   --hosting FILE    enable hosted deploy from this config. Off without it, and
                     off with it unless the file lists games and a node.
 
@@ -56,12 +60,14 @@ async fn main() -> Result<()> {
     let mut tcp = None;
     let mut auto = false;
     let mut hosting_path: Option<String> = None;
+    let mut identity_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => bind = args.next().context("--bind needs an address")?,
             "--tcp" => tcp = Some(args.next().context("--tcp needs host:port")?),
             "--auto" => auto = true,
+            "--identity" => identity_path = Some(args.next().context("--identity needs a path")?),
             "--hosting" => hosting_path = Some(args.next().context("--hosting needs a path")?),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -100,7 +106,13 @@ async fn main() -> Result<()> {
     // signatures to. Ephemeral for now: a restart invalidates outstanding
     // sessions, which is correct for something that holds no durable state.
     let mut secret = [0u8; 64];
-    getrandom_bytes(&mut secret)?;
+    match &identity_path {
+        Some(path) => load_or_make_identity(std::path::Path::new(path), &mut secret)?,
+        None => {
+            tracing::warn!("no --identity file; this index's address changes at every start");
+            getrandom_bytes(&mut secret)?;
+        }
+    }
     let identity = prns_core::identity::PrivateIdentityMaterial::from_slice(&secret)
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     tracing::info!(
@@ -227,6 +239,77 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The identity kept in `path` as 128 hex characters, or a new one written
+/// there, owner-only. A file that exists and is not an identity is an error and
+/// is never overwritten: replacing it would silently change the address every
+/// player and every node trusts.
+fn load_or_make_identity(path: &std::path::Path, secret: &mut [u8; 64]) -> Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let bytes = hex::decode(text.trim()).with_context(|| format!("{} is not a hex identity", path.display()))?;
+            anyhow::ensure!(bytes.len() == 64, "{} holds {} bytes, an identity is 64", path.display(), bytes.len());
+            secret.copy_from_slice(&bytes);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            getrandom_bytes(secret)?;
+            write_private(path, hex::encode(secret.as_slice()).as_bytes())
+                .with_context(|| format!("writing a new identity to {}", path.display()))?;
+            tracing::info!(path = %path.display(), "made a new index identity");
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
 fn getrandom_bytes(buf: &mut [u8]) -> Result<()> {
     getrandom::getrandom(buf).map_err(|e| anyhow::anyhow!("no entropy: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("index-identity-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn an_identity_is_made_once_and_read_back_the_same() {
+        let path = temp("once");
+        let _ = std::fs::remove_file(&path);
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        load_or_make_identity(&path, &mut a).unwrap();
+        load_or_make_identity(&path, &mut b).unwrap();
+        assert_eq!(a, b, "the second start has the first start's identity");
+        assert_ne!(a, [0u8; 64]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_identity_is_refused_and_left_alone() {
+        let path = temp("junk");
+        std::fs::write(&path, "not an identity").unwrap();
+        let mut s = [0u8; 64];
+        assert!(load_or_make_identity(&path, &mut s).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not an identity");
+        let _ = std::fs::remove_file(&path);
+    }
 }
