@@ -22,6 +22,8 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation, Linux gamepads read by the launcher itself |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
+| 13 | Cluster: one controller, many worker nodes | operators with more than one machine | L | **planned** (§13) |
+| 14 | QR codes on invite links | players, phones | S | **planned** (§14) |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 ## Not working — check needed
@@ -759,6 +761,78 @@ in-game warning; the reserve defaults to the larger of 10% of the disk and
   copy is not swept meanwhile.
 
 ---
+
+## 13. Cluster: one controller, many worker nodes
+
+**Status (2026-10-21): planned.** About 70% exists underneath; this item is
+the rest. Nothing here is money, tiers or billing, and none of it may become a
+dependency: a single node with no index must keep working exactly as today.
+
+**What.** An operator runs one **controller** (an index, `platform-index`) and
+any number of **workers** (ordinary agents). Someone starts a server in the
+web UI and never learns which machine runs it: the controller places it on the
+worker with the most room, then drives it from then on. Players find it on the
+mesh the same way, because each server announces itself from whichever worker
+holds it.
+
+**Already built** (do not rebuild): placement by the operator's `priority`,
+then free memory, then free slots, with a silent node ranked last
+(`hosting::rank_node`, `Agent::capacity`); the agent's control surface over
+Reticulum (`uplink.rs`) so a worker needs no inbound port; the index's
+`agent_client.rs`; `trusted_indexes` re-checked on every op; create, stop,
+start, remove and list over the uplink; the hosting file re-read every 10 s;
+the owner stamped from the user's identity.
+
+**To build, public repo** (each is a general feature for any operator):
+1. **Setup guide** in `HOSTING.md`: run an index beside a node, add a second
+   machine as a worker, test placement. No code.
+2. **Disk in placement.** Free disk joins the capacity report and the ranking,
+   under the same disk reserve a node already keeps. A node under its reserve
+   is full.
+3. **Node classes.** A worker carries an operator-chosen label in the hosting
+   file (`class = "…"`), and a create may require one. The index only matches
+   the label; **what a class is for is the operator's business**, and the
+   public code assigns it no meaning.
+4. **One-command worker setup:** installs the agent, creates its identity,
+   trusts the index, and prints the hosting-file line.
+5. **The node's own web UI creates through a configured controller**, so the
+   page an operator knows places servers across workers. The server list shows
+   every worker's servers; stop, start, logs and backups go to the node that
+   holds the server.
+6. **The missing uplink operations** for item 5: logs, backups, map change.
+7. **Moving a server between workers**, reusing the backup and world import
+   that exist.
+
+**A decision, not a default.** The uplink must never gain a console route
+(`CLAUDE.md`: an index must not type at a node's servers). Moderation and the
+console on a worker, driven from a controller the same operator owns, is a
+different trust case; widening the rule is the project owner's call and gets
+its own entry here before any code.
+
+**Not here, on purpose.** Starting new machines when every worker is full
+(auto-scaling) needs a provider's API and is optional; it is not part of the
+public roadmap. Payment, quotas by plan and which class a customer gets are
+private (the private repo `idan2025/lanthorn-hosted`).
+
+**Rules this has to respect.** Decentralized by default: no index, no
+controller, no account must always still work. Game traffic never transits the
+controller. A worker is trusted per request, never per session. A pack still
+cannot name what runs.
+
+### Build order
+
+2 and 3 first (small, testable with the existing two-node round-trip test),
+then 4, 5 and 6 together, then 7. Item 1 is written alongside the first
+real second machine.
+
+## 14. QR codes on invite links
+
+**Status (2026-10-21): planned.** Copy invite already produces the web form
+link (`invite::WEB_PAGE`, `site/join/`, the invite in the fragment). Show it as
+a QR code in the launcher, desktop and Android, so a phone joins by scanning.
+The code is drawn locally and sent nowhere. The page the code opens applies
+the same validation as `invite::parse`: a scan selects a server and never joins
+one.
 
 ## Rebrand
 
