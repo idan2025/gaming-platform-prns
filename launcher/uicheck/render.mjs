@@ -167,6 +167,9 @@ function makeInvoke(scenario) {
         return { destination_hash: args.text.slice(16, 48), game_id: null, name: null, room: false };
       case 'invite_link':
         return `lanthorn://join/${args.destinationHash}${args.room ? '?room=1' : ''}`;
+      case 'invite_qr':
+        if (!/^lanthorn:\/\/join\//.test(args.invite)) throw new Error('not an invite');
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>';
       case 'auto_update':
         return scenario.autoUpdate ?? false;
       case 'set_auto_update':
@@ -1872,6 +1875,24 @@ await run('a room row copies a room invite', {
   doc.querySelector('#ctx-invite').click();
   await settle();
   check('invite_link is asked for a room link', lastArgs.get('invite_link')?.room === true && lastArgs.get('invite_link')?.destinationHash === roomRow.destination_hash);
+});
+
+await run('an invite can be shown as a QR code for a phone to scan', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  rows: () => [roomRow],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').click();
+  await settle();
+  const btn = doc.querySelector('#detail-invite-qr');
+  check('the detail pane has a QR code button', !!btn);
+  btn.click();
+  await settle();
+  const asked = lastArgs.get('invite_qr');
+  check('the core is asked for the same room link', !!asked && asked.invite === `lanthorn://join/${roomRow.destination_hash}?room=1`);
+  const img = doc.querySelector('#invite-qr img');
+  check('the code is shown as an image', !!img && img.src.startsWith('data:image/svg+xml'));
 });
 
 await run('an update that installs itself is offered once found', {
