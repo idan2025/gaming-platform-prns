@@ -31,7 +31,7 @@ use tracing::{debug, info};
 
 use crate::http::IndexState;
 use crate::wire::{
-    encode_result, IndexQuery, INDEX_APP_NAME, INDEX_ASPECT, QUERY_ENDPOINT_ID,
+    encode_result, IndexQuery, INDEX_ANNOUNCE, INDEX_APP_NAME, INDEX_ASPECT, QUERY_ENDPOINT_ID,
 };
 
 /// How often the index re-announces itself.
@@ -123,7 +123,7 @@ pub async fn start(
         app_name: INDEX_APP_NAME,
         aspects: &[INDEX_ASPECT],
         identity: identity.clone(),
-        announce_app_data: b"",
+        announce_app_data: INDEX_ANNOUNCE,
         proof: ProofStrategy::ProveAll,
         link_requests: LinkRequestPolicy::AcceptAll,
         ratchet: RatchetPolicy::NoRatchets,
@@ -156,7 +156,7 @@ pub async fn start(
                     app_name: INDEX_APP_NAME,
                     aspects: &[INDEX_ASPECT],
                     identity: identity.clone(),
-                    announce_app_data: b"",
+                    announce_app_data: INDEX_ANNOUNCE,
                     proof: ProofStrategy::ProveAll,
                     link_requests: LinkRequestPolicy::AcceptAll,
                     ratchet: RatchetPolicy::NoRatchets,
