@@ -19,3 +19,10 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+# The installer is opened by name over JNI (`start_installer` calls
+# `getUriForFile` by its name). R8 renamed that method in the release build,
+# so the call failed with "no such method" on every phone. Keep the class's
+# public API as the library ships it.
+-keep class androidx.core.content.FileProvider {
+  public *;
+}
