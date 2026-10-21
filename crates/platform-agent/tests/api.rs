@@ -508,7 +508,7 @@ async fn starting_a_server_with_no_content_begins_the_download() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["installing"], "sven-coop");
     // The sentence is for a person to read, so it has to say what happens next.
-    assert!(body["message"].as_str().unwrap().contains("start once it finishes"));
+    assert!(body["message"].as_str().unwrap().contains("same request again"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

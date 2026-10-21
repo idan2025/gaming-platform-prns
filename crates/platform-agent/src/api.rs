@@ -850,7 +850,8 @@ async fn create(
                     "started": started,
                     "status": state.installs.state(&spec.game_id).await,
                     "message": "This game's files are not on this node yet, so the download \
-                                started. Your server will start once it finishes.",
+                                started. Send the same request again when it finishes; the server \
+                                is not created for you.",
                 })),
             ))
         }
