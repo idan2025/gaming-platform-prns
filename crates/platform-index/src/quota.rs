@@ -22,6 +22,7 @@
 //! know how old this is" is **brand new** — never "infinitely idle", which would
 //! reap a running server because someone's clock drifted.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,31 @@ pub struct QuotaPolicy {
     pub min_lifetime: Duration,
     /// Refuse a new instance from an account that created one within this long.
     pub create_cooldown: Option<Duration>,
+    /// Accounts that differ from the rules above. Anyone not listed gets the
+    /// rules as written.
+    #[serde(default)]
+    pub overrides: BTreeMap<AccountId, AccountLimits>,
+}
+
+/// What one account is allowed beyond (or below) the shared rules. Every field
+/// left out means "as everyone else".
+///
+/// Nothing here can lift the node-wide cap: `max_total_instances` is checked
+/// for every account, so an override can reserve room for one account but never
+/// make a full node take another server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountLimits {
+    /// Instances this account may hold, in place of `max_instances_per_account`.
+    #[serde(default)]
+    pub max_instances: Option<u32>,
+    /// The outer `Some` is "this account has its own rule"; the inner `None` is
+    /// "no cooldown at all".
+    #[serde(default)]
+    pub create_cooldown: Option<Option<Duration>>,
+    /// Never stop this account's servers for being idle.
+    #[serde(default)]
+    pub never_reap: bool,
 }
 
 impl Default for QuotaPolicy {
@@ -54,6 +80,7 @@ impl Default for QuotaPolicy {
             idle_timeout: Some(Duration::from_secs(30 * 60)),
             min_lifetime: Duration::from_secs(5 * 60),
             create_cooldown: Some(Duration::from_secs(30)),
+            overrides: BTreeMap::new(),
         }
     }
 }
@@ -140,6 +167,22 @@ impl Quotas {
         &self.policy
     }
 
+    /// The limit that applies to `account`: its override if it has one.
+    pub fn max_instances_for(&self, account: &AccountId) -> u32 {
+        self.policy
+            .overrides
+            .get(account)
+            .and_then(|o| o.max_instances)
+            .unwrap_or(self.policy.max_instances_per_account)
+    }
+
+    fn cooldown_for(&self, account: &AccountId) -> Option<Duration> {
+        match self.policy.overrides.get(account).and_then(|o| o.create_cooldown) {
+            Some(own) => own,
+            None => self.policy.create_cooldown,
+        }
+    }
+
     pub fn held_by(&self, account: &AccountId, existing: &[InstanceRecord]) -> u32 {
         existing.iter().filter(|i| &i.account == account).count() as u32
     }
@@ -159,11 +202,9 @@ impl Quotas {
         // where "the node is full" reads as somebody else's problem even when
         // the caller is the one filling it.
         let held = self.held_by(account, existing);
-        if held >= self.policy.max_instances_per_account {
-            return Err(DenyReason::AccountInstanceLimit {
-                limit: self.policy.max_instances_per_account,
-                held,
-            });
+        let limit = self.max_instances_for(account);
+        if held >= limit {
+            return Err(DenyReason::AccountInstanceLimit { limit, held });
         }
 
         let total = existing.len() as u32;
@@ -174,7 +215,7 @@ impl Quotas {
             });
         }
 
-        if let Some(cooldown) = self.policy.create_cooldown {
+        if let Some(cooldown) = self.cooldown_for(account) {
             let newest = existing
                 .iter()
                 .filter(|i| &i.account == account)
@@ -207,6 +248,10 @@ impl Quotas {
             .filter_map(|i| {
                 // An operator pinned it.
                 if i.exempt_from_reaping {
+                    return None;
+                }
+                // The account's own rule: its servers are kept.
+                if self.policy.overrides.get(&i.account).is_some_and(|o| o.never_reap) {
                     return None;
                 }
                 // Someone is playing. This ends the question even if
@@ -252,7 +297,14 @@ mod tests {
             idle_timeout: Some(Duration::from_secs(600)),
             min_lifetime: Duration::from_secs(300),
             create_cooldown: Some(Duration::from_secs(30)),
+            overrides: BTreeMap::new(),
         }
+    }
+
+    fn with_override(limits: AccountLimits, who: u8) -> Quotas {
+        let mut p = policy();
+        p.overrides.insert(account(who), limits);
+        Quotas::new(p)
     }
 
     fn account(n: u8) -> AccountId {
@@ -427,5 +479,70 @@ mod tests {
         assert!(d.max_total_instances > 0);
         assert!(d.idle_timeout.is_some(), "reaping off by default is free compute");
         assert!(d.min_lifetime > Duration::ZERO);
+    }
+
+    #[test]
+    fn an_account_with_its_own_limit_gets_it_and_others_keep_the_shared_one() {
+        let q = with_override(AccountLimits { max_instances: Some(3), ..Default::default() }, 1);
+        let mine = vec![rec("a", 1, 1000), rec("b", 1, 1000)];
+        assert_eq!(q.admit(&account(1), &mine, t0()), Ok(()), "two of its three");
+        let theirs = vec![rec("a", 2, 1000), rec("b", 2, 1000)];
+        assert_eq!(
+            q.admit(&account(2), &theirs, t0()),
+            Err(DenyReason::AccountInstanceLimit { limit: 2, held: 2 }),
+            "another account is not widened"
+        );
+    }
+
+    #[test]
+    fn an_override_can_lower_a_limit_too() {
+        let q = with_override(AccountLimits { max_instances: Some(1), ..Default::default() }, 1);
+        assert_eq!(
+            q.admit(&account(1), &[rec("a", 1, 1000)], t0()),
+            Err(DenyReason::AccountInstanceLimit { limit: 1, held: 1 })
+        );
+    }
+
+    /// An override reserves room for one account; it never makes a full node
+    /// take another server.
+    #[test]
+    fn an_override_cannot_lift_the_node_wide_cap() {
+        let q = with_override(AccountLimits { max_instances: Some(50), ..Default::default() }, 1);
+        let others = vec![rec("a", 2, 1000), rec("b", 3, 1000), rec("c", 4, 1000)];
+        assert_eq!(
+            q.admit(&account(1), &others, t0()),
+            Err(DenyReason::NodeInstanceLimit { limit: 3, held: 3 })
+        );
+    }
+
+    #[test]
+    fn an_account_can_have_its_own_cooldown_or_none() {
+        let just_made = vec![rec("a", 1, 10)];
+        let none = with_override(AccountLimits { create_cooldown: Some(None), ..Default::default() }, 1);
+        assert_eq!(none.admit(&account(1), &just_made, t0()), Ok(()));
+        let long = with_override(
+            AccountLimits { create_cooldown: Some(Some(Duration::from_secs(100))), ..Default::default() },
+            1,
+        );
+        assert_eq!(
+            long.admit(&account(1), &just_made, t0()),
+            Err(DenyReason::Cooldown { retry_after: Duration::from_secs(90) })
+        );
+        // Someone else still has the shared 30 s.
+        let theirs = vec![rec("a", 2, 10)];
+        assert_eq!(
+            none.admit(&account(2), &theirs, t0()),
+            Err(DenyReason::Cooldown { retry_after: Duration::from_secs(20) })
+        );
+    }
+
+    #[test]
+    fn a_never_reap_account_is_kept_and_its_neighbour_is_not() {
+        let q = with_override(AccountLimits { never_reap: true, ..Default::default() }, 1);
+        let kept = rec("kept", 1, 100_000);
+        let gone = rec("gone", 2, 100_000);
+        let reaped = q.to_reap(&[kept, gone], t0());
+        let ids: Vec<&str> = reaped.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["gone"]);
     }
 }

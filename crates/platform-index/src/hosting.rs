@@ -48,7 +48,7 @@ use tokio::sync::Mutex;
 use platform_agent::uplink_wire::CapacityResp;
 
 use crate::agent_client::AgentClient;
-use crate::quota::{AccountId, InstanceRecord, QuotaPolicy, Quotas, ReapReason};
+use crate::quota::{AccountId, AccountLimits, InstanceRecord, QuotaPolicy, Quotas, ReapReason};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,15 +88,54 @@ pub struct NodeConfig {
     pub priority: i32,
 }
 
-/// The quota knobs, as an operator writes them.
+/// The quota knobs, as an operator writes them. Any left out take the
+/// default, so a file may carry only `[quota.accounts.<hash>]` sections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct QuotaSettings {
     pub max_instances_per_account: u32,
     pub max_total_instances: u32,
     pub idle_timeout_secs: Option<u64>,
     pub min_lifetime_secs: u64,
     pub create_cooldown_secs: Option<u64>,
+    /// Accounts with rules of their own, keyed by identity hash in hex
+    /// (`[quota.accounts.<hash>]`). Anyone not listed gets the rules above.
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, AccountSettings>,
+}
+
+/// One account's rules, as an operator writes them. A field left out means
+/// "as everyone else".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountSettings {
+    pub max_instances: Option<u32>,
+    /// Seconds between creates for this account; 0 means no cooldown at all.
+    pub create_cooldown_secs: Option<u64>,
+    /// Never stop this account's servers for being idle.
+    #[serde(default)]
+    pub never_reap: bool,
+}
+
+impl QuotaSettings {
+    /// An account key is an identity hash, and a key that is not one can
+    /// never match anybody. That is refused, not kept: a typo'd key would
+    /// otherwise leave the account on the shared rules without a word.
+    pub fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for key in self.accounts.keys() {
+            let ok = key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit());
+            if !ok {
+                return Err(anyhow!(
+                    "[quota.accounts.{key}] is not an identity hash (32 hex characters)"
+                ));
+            }
+            if !seen.insert(key.to_ascii_lowercase()) {
+                return Err(anyhow!("[quota.accounts.{key}] is listed twice"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for QuotaSettings {
@@ -108,6 +147,7 @@ impl Default for QuotaSettings {
             idle_timeout_secs: d.idle_timeout.map(|t| t.as_secs()),
             min_lifetime_secs: d.min_lifetime.as_secs(),
             create_cooldown_secs: d.create_cooldown.map(|t| t.as_secs()),
+            accounts: Default::default(),
         }
     }
 }
@@ -121,6 +161,20 @@ impl From<&QuotaSettings> for QuotaPolicy {
             idle_timeout: s.idle_timeout_secs.map(Duration::from_secs),
             min_lifetime: Duration::from_secs(s.min_lifetime_secs),
             create_cooldown: s.create_cooldown_secs.map(Duration::from_secs),
+            overrides: s
+                .accounts
+                .iter()
+                .map(|(key, a)| {
+                    let limits = AccountLimits {
+                        max_instances: a.max_instances,
+                        create_cooldown: a
+                            .create_cooldown_secs
+                            .map(|n| (n > 0).then(|| Duration::from_secs(n))),
+                        never_reap: a.never_reap,
+                    };
+                    (AccountId(key.to_ascii_lowercase()), limits)
+                })
+                .collect(),
         }
     }
 }
@@ -251,7 +305,10 @@ impl Hosting {
     /// hosting off.
     pub fn load(path: &std::path::Path) -> Result<HostingConfig> {
         let src = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
+        let config: HostingConfig =
+            toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
+        config.quota.validate().with_context(|| format!("in {}", path.display()))?;
+        Ok(config)
     }
 
     /// Re-read `path` and put it in force if it parses. On an error the
@@ -1154,10 +1211,62 @@ mod tests {
             idle_timeout_secs: Some(60),
             min_lifetime_secs: 30,
             create_cooldown_secs: None,
+            accounts: Default::default(),
         };
         let p = QuotaPolicy::from(&s);
         assert_eq!(p.max_instances_per_account, 2);
         assert_eq!(p.idle_timeout, Some(std::time::Duration::from_secs(60)));
         assert_eq!(p.create_cooldown, None);
+    }
+
+    fn hosting_file(dir: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosting.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_account_section_in_the_file_becomes_an_override_for_that_identity() {
+        let hash = "B7F20B85976CA7B7B6C56A883992FB9A".to_ascii_lowercase();
+        let path = hosting_file(
+            "gpp-index-quota-accounts-ok",
+            &format!(
+                "games = [\"x\"]\n[quota.accounts.{hash}]\nmax_instances = 9\ncreate_cooldown_secs = 0\nnever_reap = true\n"
+            ),
+        );
+        let config = Hosting::load(&path).unwrap();
+        let q = Quotas::new(QuotaPolicy::from(&config.quota));
+        let who = AccountId(hash);
+        assert_eq!(q.max_instances_for(&who), 9);
+        assert_eq!(q.max_instances_for(&AccountId("0".repeat(32))), 3, "others keep the shared limit");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_account_key_that_is_not_an_identity_hash_is_refused_not_ignored() {
+        let path = hosting_file(
+            "gpp-index-quota-accounts-bad",
+            "games = [\"x\"]\n[quota.accounts.not-a-hash]\nmax_instances = 9\n",
+        );
+        let err = Hosting::load(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("not an identity hash"), "{err:#}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_same_identity_in_two_cases_is_refused() {
+        let lower = "b7f20b85976ca7b7b6c56a883992fb9a";
+        let path = hosting_file(
+            "gpp-index-quota-accounts-twice",
+            &format!(
+                "[quota.accounts.{lower}]\nmax_instances = 1\n[quota.accounts.{}]\nmax_instances = 2\n",
+                lower.to_ascii_uppercase()
+            ),
+        );
+        let err = Hosting::load(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("listed twice"), "{err:#}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
