@@ -803,8 +803,12 @@ the owner stamped from the user's identity.
    whether or not the class exists. Without that, naming a class would be
    self-service. Caught by `a_classed_node_takes_only_creates_naming_its_class`
    and `an_account_that_was_not_given_a_class_cannot_ask_for_it`.
-4. **One-command worker setup:** installs the agent, creates its identity,
-   trusts the index, and prints the hosting-file line.
+4. **One-command worker setup** (built, `scripts/setup-worker.sh`, `HOSTING.md`
+   "Adding a worker"). Writes the worker's config trusting the index, makes its
+   identity, points it at a hub, and prints the hosting-file block. The block's
+   `agent` hash comes from `platform-agent --control-address`, which derives the
+   same destination `uplink::start` serves
+   (`tests/control_address.rs`). Does not install Docker or the agent binary.
 5. **The node's own web UI creates through a configured controller**, so the
    page an operator knows places servers across workers. The server list shows
    every worker's servers; stop, start, logs and backups go to the node that
