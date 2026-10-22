@@ -102,6 +102,9 @@ pub struct QuotaSettings {
     /// (`[quota.accounts.<hash>]`). Anyone not listed gets the rules above.
     #[serde(default)]
     pub accounts: std::collections::BTreeMap<String, AccountSettings>,
+    /// Remove a server stopped for this many days. Absent keeps stopped servers
+    /// for ever. Removing takes the container, never the server's files.
+    pub stopped_delete_after_days: Option<u64>,
 }
 
 /// One account's rules, as an operator writes them. A field left out means
@@ -122,6 +125,11 @@ impl QuotaSettings {
     /// never match anybody. That is refused, not kept: a typo'd key would
     /// otherwise leave the account on the shared rules without a word.
     pub fn validate(&self) -> Result<()> {
+        // Zero would remove every server the moment it stopped: a stop would
+        // be a delete, and nothing an operator wrote asks for that.
+        if self.stopped_delete_after_days == Some(0) {
+            return Err(anyhow!("stopped_delete_after_days must be at least 1"));
+        }
         let mut seen = std::collections::BTreeSet::new();
         for key in self.accounts.keys() {
             let ok = key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit());
@@ -148,6 +156,7 @@ impl Default for QuotaSettings {
             min_lifetime_secs: d.min_lifetime.as_secs(),
             create_cooldown_secs: d.create_cooldown.map(|t| t.as_secs()),
             accounts: Default::default(),
+            stopped_delete_after_days: None,
         }
     }
 }
@@ -161,6 +170,9 @@ impl From<&QuotaSettings> for QuotaPolicy {
             idle_timeout: s.idle_timeout_secs.map(Duration::from_secs),
             min_lifetime: Duration::from_secs(s.min_lifetime_secs),
             create_cooldown: s.create_cooldown_secs.map(Duration::from_secs),
+            stopped_expiry: s
+                .stopped_delete_after_days
+                .map(|days| Duration::from_secs(days.saturating_mul(86_400))),
             overrides: s
                 .accounts
                 .iter()
@@ -221,6 +233,15 @@ pub struct HostedInstance {
     /// is a cache of what the node says.
     #[serde(default)]
     pub ports: Vec<InstancePort>,
+    /// Seconds since a stopped server last ended, as the node reports it.
+    /// `None` while it runs, or when the node did not say.
+    #[serde(default)]
+    pub stopped_secs: Option<u64>,
+    /// For a stopped server on an index with a removal rule: seconds until the
+    /// index removes it. Set by the index, never by a node. Absent means it
+    /// will not be removed.
+    #[serde(default)]
+    pub delete_in_secs: Option<u64>,
     pub owner: Option<String>,
     /// Seconds this instance has existed, as the node reports it. `None` means
     /// the node did not say — which is "age unknown", never "brand new".
@@ -368,6 +389,12 @@ impl Hosting {
                 Err(e) => tracing::warn!(node = %node.name, error = %e, "node did not answer"),
             }
         }
+        // A stopped server shows how long it has left, so its owner can see it
+        // before it goes. Only this index knows its rule, so only it can say.
+        let quotas = Self::quotas(&config);
+        for instance in out.iter_mut() {
+            instance.delete_in_secs = delete_in_secs(&quotas, instance);
+        }
         out.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
         Ok(out)
     }
@@ -397,6 +424,8 @@ impl Hosting {
                     ports: r.ports,
                     owner: r.owner,
                     uptime_secs: r.uptime_secs,
+                    stopped_secs: r.stopped_secs,
+                    delete_in_secs: None,
                     players_now: r.players_now,
                 })
                 .collect());
@@ -424,6 +453,8 @@ impl Hosting {
                 ports: ports_from_json(&r["ports"]),
                 owner: r["owner"].as_str().map(str::to_string),
                 uptime_secs: r["uptime_secs"].as_u64(),
+                stopped_secs: r["stopped_secs"].as_u64(),
+                delete_in_secs: None,
                 players_now: r["players_now"].as_u64().map(|p| p as u32),
             })
             .collect())
@@ -522,6 +553,8 @@ impl Hosting {
                 owner: Some(account.0.clone()),
                 // Just created, and nobody has had time to join.
                 uptime_secs: Some(0),
+                stopped_secs: None,
+                delete_in_secs: None,
                 players_now: Some(0),
             });
         }
@@ -561,6 +594,8 @@ impl Hosting {
             ports: ports_from_json(&created["ports"]),
             owner: Some(account.0.clone()),
             uptime_secs: Some(0),
+            stopped_secs: None,
+            delete_in_secs: None,
             players_now: Some(0),
         })
     }
@@ -615,11 +650,16 @@ impl Hosting {
     /// Stop and remove one of the caller's own instances.
     pub async fn destroy(&self, account: &AccountId, instance_id: &str) -> Result<()> {
         let (_, node) = self.owned(account, instance_id).await?;
+        self.remove_on(&node, instance_id).await
+    }
 
+    /// Remove one instance from the node that holds it, on whichever transport
+    /// that node uses. The caller has already checked whose it is.
+    async fn remove_on(&self, node: &NodeConfig, instance_id: &str) -> Result<()> {
         // Remote agent over Reticulum: ask it to remove the instance. Ownership
         // was just checked against the label the agent itself reported, so a
         // restarted index still enforces it correctly on either path.
-        if let Some(dest) = Self::agent_dest(&node) {
+        if let Some(dest) = Self::agent_dest(node) {
             let dest = dest?;
             let client = self
                 .agent_client()
@@ -752,6 +792,41 @@ impl Hosting {
         Ok(reaped)
     }
 
+    /// Remove stopped servers past the operator's expiry. A node that refuses
+    /// is logged and skipped, as in `reap_idle`.
+    ///
+    /// Only the container goes: the node keeps the server's files, so a removal
+    /// the operator did not mean is recoverable by hand.
+    pub async fn expire_stopped(&self) -> Result<Vec<String>> {
+        let config = self.config();
+        let quotas = Self::quotas(&config);
+        if quotas.policy().stopped_expiry.is_none() {
+            return Ok(Vec::new());
+        }
+        let existing = self.all_instances().await?;
+        let mut removed = Vec::new();
+        for instance in existing.iter().filter(|i| i.state == "stopped") {
+            let Some(stopped_for) = instance.stopped_secs else { continue };
+            let account = AccountId(instance.owner.clone().unwrap_or_default());
+            if !quotas.stopped_expired(&account, Duration::from_secs(stopped_for)) {
+                continue;
+            }
+            let Some(node) = config.nodes.iter().find(|n| n.name == instance.node) else {
+                continue;
+            };
+            match self.remove_on(node, &instance.instance_id).await {
+                Ok(()) => {
+                    tracing::info!(instance = %instance.instance_id, node = %node.name, stopped_for, "removed a server stopped too long");
+                    removed.push(instance.instance_id.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(instance = %instance.instance_id, node = %node.name, error = %e, "could not remove a stopped server")
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// Most free room wins, asking each node what it actually has.
     ///
     /// The index's own instance count is not the node's capacity. A node has a
@@ -831,6 +906,18 @@ fn record_for(instance: &HostedInstance, now: SystemTime) -> InstanceRecord {
         players_now: instance.players_now.unwrap_or(0),
         exempt_from_reaping: instance.players_now.is_none(),
     }
+}
+
+/// Seconds until the index removes a stopped server, or `None` when it will
+/// not: it is running, the node did not say how long it has been stopped, or
+/// no removal rule applies to its owner.
+fn delete_in_secs(quotas: &Quotas, instance: &HostedInstance) -> Option<u64> {
+    if instance.state != "stopped" {
+        return None;
+    }
+    let stopped = instance.stopped_secs?;
+    let after = quotas.stopped_expiry_for(&AccountId(instance.owner.clone().unwrap_or_default()))?;
+    Some(after.as_secs().saturating_sub(stopped))
 }
 
 /// A node reporting less free memory than this is full, whatever its slot
@@ -1037,6 +1124,8 @@ mod tests {
             state: "running".into(),
             port: None,
             ports: Vec::new(),
+            stopped_secs: None,
+            delete_in_secs: None,
             owner: None,
             uptime_secs: None,
             players_now: None,
@@ -1055,6 +1144,8 @@ mod tests {
             state: "running".into(),
             port: None,
             ports: Vec::new(),
+            stopped_secs: None,
+            delete_in_secs: None,
             owner: Some("acct".into()),
             uptime_secs: uptime,
             players_now: players,
@@ -1212,6 +1303,7 @@ mod tests {
             min_lifetime_secs: 30,
             create_cooldown_secs: None,
             accounts: Default::default(),
+            stopped_delete_after_days: None,
         };
         let p = QuotaPolicy::from(&s);
         assert_eq!(p.max_instances_per_account, 2);
@@ -1268,5 +1360,137 @@ mod tests {
         let err = Hosting::load(&path).unwrap_err();
         assert!(format!("{err:#}").contains("listed twice"), "{err:#}");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn stopped_on_index(owner: &str, stopped_secs: Option<u64>) -> HostedInstance {
+        HostedInstance {
+            instance_id: "x".into(),
+            node: "n".into(),
+            game_id: "g".into(),
+            name: "x".into(),
+            state: "stopped".into(),
+            port: None,
+            ports: Vec::new(),
+            stopped_secs,
+            delete_in_secs: None,
+            owner: Some(owner.into()),
+            uptime_secs: None,
+            players_now: None,
+        }
+    }
+
+    #[test]
+    fn a_stopped_server_shows_how_long_until_it_is_removed() {
+        let settings = QuotaSettings { stopped_delete_after_days: Some(30), ..Default::default() };
+        let q = Quotas::new(QuotaPolicy::from(&settings));
+        let day = 86_400;
+        assert_eq!(delete_in_secs(&q, &stopped_on_index("aa", Some(10 * day))), Some(20 * day));
+        assert_eq!(delete_in_secs(&q, &stopped_on_index("aa", Some(40 * day))), Some(0));
+        // A node that did not say how long is never counted down from zero.
+        assert_eq!(delete_in_secs(&q, &stopped_on_index("aa", None)), None);
+    }
+
+    #[test]
+    fn nothing_shows_a_countdown_when_no_rule_or_not_stopped() {
+        let q = Quotas::new(QuotaPolicy::from(&QuotaSettings::default()));
+        assert_eq!(delete_in_secs(&q, &stopped_on_index("aa", Some(5))), None, "no rule set");
+        let settings = QuotaSettings { stopped_delete_after_days: Some(30), ..Default::default() };
+        let q = Quotas::new(QuotaPolicy::from(&settings));
+        let mut running = stopped_on_index("aa", Some(5));
+        running.state = "running".into();
+        assert_eq!(delete_in_secs(&q, &running), None);
+    }
+
+    #[test]
+    fn a_zero_day_expiry_is_refused_so_a_stop_is_never_a_delete() {
+        let s = QuotaSettings { stopped_delete_after_days: Some(0), ..Default::default() };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn a_stopped_expiry_in_the_file_becomes_the_policy() {
+        let path = hosting_file(
+            "gpp-index-stopped-expiry",
+            "games = [\"x\"]\n[quota]\nstopped_delete_after_days = 14\n",
+        );
+        let config = Hosting::load(&path).unwrap();
+        let p = QuotaPolicy::from(&config.quota);
+        assert_eq!(p.stopped_expiry, Some(std::time::Duration::from_secs(14 * 86_400)));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A loopback node that lists four servers and records every removal.
+    async fn fake_node() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::{delete, get};
+        use axum::{Json, Router};
+
+        async fn list() -> Json<serde_json::Value> {
+            let row = |id: &str, state: &str, stopped: Option<u64>, owner: &str| {
+                serde_json::json!({
+                    "instance_id": id, "game_id": "sven-coop", "name": id, "state": state,
+                    "port": null, "ports": [], "owner": owner, "uptime_secs": 100,
+                    "players_now": 0, "stopped_secs": stopped,
+                })
+            };
+            let day = 86_400;
+            Json(serde_json::json!([
+                row("old", "stopped", Some(40 * day), &"aa".repeat(16)),
+                row("fresh", "stopped", Some(day), &"aa".repeat(16)),
+                row("kept", "stopped", Some(40 * day), &"bb".repeat(16)),
+                row("up", "running", None, &"aa".repeat(16)),
+            ]))
+        }
+        async fn remove(State(removed): State<Arc<std::sync::Mutex<Vec<String>>>>, Path(id): Path<String>) -> StatusCode {
+            removed.lock().unwrap().push(id);
+            StatusCode::NO_CONTENT
+        }
+
+        let removed: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let app = Router::new()
+            .route("/instances", get(list))
+            .route("/instances/:id", delete(remove))
+            .with_state(removed.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, removed)
+    }
+
+    #[tokio::test]
+    async fn an_expired_stopped_server_is_removed_and_nothing_else_is() {
+        let (addr, removed) = fake_node().await;
+        let mut c = config();
+        c.nodes[0].api = format!("http://{addr}");
+        c.quota.stopped_delete_after_days = Some(30);
+        c.quota.accounts.insert(
+            "bb".repeat(16),
+            AccountSettings { never_reap: true, ..Default::default() },
+        );
+        let h = Hosting::new(c);
+
+        // `old` is past 30 days, `fresh` is not, `kept` belongs to an account
+        // that asked to keep its servers, and `up` is running.
+        assert_eq!(h.expire_stopped().await.unwrap(), vec!["old".to_string()]);
+        assert_eq!(*removed.lock().unwrap(), vec!["old".to_string()]);
+
+        let listed = h.all_instances().await.unwrap();
+        let fresh = listed.iter().find(|i| i.instance_id == "fresh").unwrap();
+        assert_eq!(fresh.delete_in_secs, Some(29 * 86_400), "a countdown is shown to the owner");
+        let kept = listed.iter().find(|i| i.instance_id == "kept").unwrap();
+        assert_eq!(kept.delete_in_secs, None, "never_reap shows no countdown either");
+    }
+
+    #[tokio::test]
+    async fn with_no_expiry_set_the_sweep_removes_nothing_and_asks_nothing() {
+        let (addr, removed) = fake_node().await;
+        let mut c = config();
+        c.nodes[0].api = format!("http://{addr}");
+        let h = Hosting::new(c);
+        assert!(h.expire_stopped().await.unwrap().is_empty());
+        assert!(removed.lock().unwrap().is_empty());
     }
 }

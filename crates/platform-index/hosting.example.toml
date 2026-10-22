@@ -42,6 +42,9 @@ max_total_instances = 20
 idle_timeout_secs = 1800
 min_lifetime_secs = 300
 create_cooldown_secs = 30
+# Remove a stopped server after this many days. Absent keeps it for ever.
+# Removes the container only; the server's files stay on the node.
+# stopped_delete_after_days = 30
 
 # An account with rules of its own, keyed by its identity hash (32 hex
 # characters). Anyone not listed gets the rules above. Every field is optional.

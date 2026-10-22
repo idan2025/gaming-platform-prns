@@ -47,6 +47,13 @@ pub struct QuotaPolicy {
     /// rules as written.
     #[serde(default)]
     pub overrides: BTreeMap<AccountId, AccountLimits>,
+    /// Remove a server that has been stopped for this long. `None` keeps
+    /// stopped servers for ever, which is the default.
+    ///
+    /// Removing takes the container only. The server's files stay on the node
+    /// until the operator removes them, the same as any server removed by hand.
+    #[serde(default)]
+    pub stopped_expiry: Option<Duration>,
 }
 
 /// What one account is allowed beyond (or below) the shared rules. Every field
@@ -65,7 +72,8 @@ pub struct AccountLimits {
     /// "no cooldown at all".
     #[serde(default)]
     pub create_cooldown: Option<Option<Duration>>,
-    /// Never stop this account's servers for being idle.
+    /// Never stop this account's servers for being idle, and never remove them
+    /// for having been stopped too long.
     #[serde(default)]
     pub never_reap: bool,
 }
@@ -81,6 +89,7 @@ impl Default for QuotaPolicy {
             min_lifetime: Duration::from_secs(5 * 60),
             create_cooldown: Some(Duration::from_secs(30)),
             overrides: BTreeMap::new(),
+            stopped_expiry: None,
         }
     }
 }
@@ -174,6 +183,20 @@ impl Quotas {
             .get(account)
             .and_then(|o| o.max_instances)
             .unwrap_or(self.policy.max_instances_per_account)
+    }
+
+    /// How long a stopped server of `account` is kept before it is removed, or
+    /// `None` when it is kept for ever.
+    pub fn stopped_expiry_for(&self, account: &AccountId) -> Option<Duration> {
+        if self.policy.overrides.get(account).is_some_and(|o| o.never_reap) {
+            return None;
+        }
+        self.policy.stopped_expiry
+    }
+
+    /// Whether a server of `account` stopped for `stopped_for` is due removal.
+    pub fn stopped_expired(&self, account: &AccountId, stopped_for: Duration) -> bool {
+        self.stopped_expiry_for(account).is_some_and(|after| stopped_for >= after)
     }
 
     fn cooldown_for(&self, account: &AccountId) -> Option<Duration> {
@@ -298,7 +321,33 @@ mod tests {
             min_lifetime: Duration::from_secs(300),
             create_cooldown: Some(Duration::from_secs(30)),
             overrides: BTreeMap::new(),
+            stopped_expiry: None,
         }
+    }
+
+    #[test]
+    fn a_stopped_server_is_removed_only_after_the_expiry() {
+        let mut p = policy();
+        p.stopped_expiry = Some(Duration::from_secs(86_400));
+        let q = Quotas::new(p);
+        assert!(!q.stopped_expired(&account(1), Duration::from_secs(86_399)));
+        assert!(q.stopped_expired(&account(1), Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn with_no_expiry_set_a_stopped_server_is_kept_for_ever() {
+        let q = Quotas::new(policy());
+        assert!(!q.stopped_expired(&account(1), Duration::from_secs(10 * 365 * 86_400)));
+    }
+
+    #[test]
+    fn a_never_reap_account_keeps_its_stopped_servers_too() {
+        let mut p = policy();
+        p.stopped_expiry = Some(Duration::from_secs(60));
+        p.overrides.insert(account(1), AccountLimits { never_reap: true, ..Default::default() });
+        let q = Quotas::new(p);
+        assert!(!q.stopped_expired(&account(1), Duration::from_secs(1_000_000)));
+        assert!(q.stopped_expired(&account(2), Duration::from_secs(1_000_000)));
     }
 
     fn with_override(limits: AccountLimits, who: u8) -> Quotas {
