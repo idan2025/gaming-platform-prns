@@ -334,12 +334,43 @@ fn parse_identity_hash(hex_str: &str) -> Result<IdentityHash> {
 /// `identity_secret_path` is loaded (or created on first run, like the bridge)
 /// from `UplinkConfig`. The same key is the announce identity, the auth
 /// audience, and the transport identity — one key, consistent.
+/// The addresses an agent with this identity secret is reached at: its
+/// identity hash, and the control destination an index names in its hosting
+/// file. Derived from the secret alone, so `platform-agent --control-address`
+/// prints exactly what `start` will serve, without starting anything.
+pub fn addresses_of(secret: &[u8; 64]) -> Result<(IdentityHash, DestinationHash)> {
+    let identity = PrivateIdentityMaterial::from_slice(&secret[..])
+        .map_err(|e| anyhow!("agent identity key: {e:?}"))?;
+    let destination = PreConfiguredDestination::Single {
+        app_name: AGENT_APP_NAME,
+        aspects: &[AGENT_ASPECT],
+        identity: Zeroizing::new(*secret),
+        announce_app_data: b"",
+        proof: ProofStrategy::ProveAll,
+        link_requests: LinkRequestPolicy::AcceptAll,
+        ratchet: RatchetPolicy::NoRatchets,
+        resource_strategy: ResourceStrategy::AcceptNone,
+        maximum_request_bytes: Default::default(),
+        request_endpoints: ServeMyRequestEndpoints::Yes,
+    }
+    .destination_hash()
+    .map_err(|e| anyhow!("invalid agent destination: {e:?}"))?;
+    Ok((identity.identity_hash(), destination))
+}
+
+/// The addresses of the agent whose identity lives at `config`'s path, creating
+/// the identity on first use exactly as `start` does. Reads nothing else, so it
+/// needs no Docker and no network.
+pub fn control_address_of(config: &UplinkConfig) -> Result<(IdentityHash, DestinationHash)> {
+    let secret = load_or_create_identity_secret(&config.identity_secret_path)
+        .map_err(|e| anyhow!("loading agent identity: {e}"))?;
+    addresses_of(&secret)
+}
+
 pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplinkNode> {
     let secret = load_or_create_identity_secret(&config.identity_secret_path)
         .map_err(|e| anyhow!("loading agent identity: {e}"))?;
-    let identity = PrivateIdentityMaterial::from_slice(&secret[..])
-        .map_err(|e| anyhow!("agent identity key: {e:?}"))?;
-    let identity_hash = identity.identity_hash();
+    let (identity_hash, destination_hash) = addresses_of(&secret)?;
 
     let trusted: Vec<IdentityHash> = config
         .trusted_indexes
@@ -352,21 +383,6 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
         auth: Mutex::new(Authenticator::new(identity_hash)),
         trusted,
     });
-
-    let destination_hash = PreConfiguredDestination::Single {
-        app_name: AGENT_APP_NAME,
-        aspects: &[AGENT_ASPECT],
-        identity: secret.clone(),
-        announce_app_data: b"",
-        proof: ProofStrategy::ProveAll,
-        link_requests: LinkRequestPolicy::AcceptAll,
-        ratchet: RatchetPolicy::NoRatchets,
-        resource_strategy: ResourceStrategy::AcceptNone,
-        maximum_request_bytes: Default::default(),
-        request_endpoints: ServeMyRequestEndpoints::Yes,
-    }
-    .destination_hash()
-    .map_err(|e| anyhow!("invalid agent destination: {e:?}"))?;
 
     // The init handshake carries the node handle out of the dedicated uplink
     // thread as well as the stop channel, so the local API can drive interfaces
