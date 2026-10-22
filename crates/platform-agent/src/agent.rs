@@ -1811,6 +1811,7 @@ impl Agent {
             })
             .unwrap_or(0);
         let memory = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| parse_meminfo(&m));
+        let disk = self.reserve();
         CapacityResp {
             max_instances: self.config.max_instances,
             running,
@@ -1819,6 +1820,8 @@ impl Agent {
             memory_total_bytes: memory.map(|(total, _)| total),
             memory_available_bytes: memory.map(|(_, available)| available),
             cpus: std::thread::available_parallelism().ok().and_then(|n| u32::try_from(n.get()).ok()),
+            disk_free_bytes: disk.as_ref().map(|(storage, _)| storage.free_bytes),
+            disk_reserve_bytes: disk.map(|(_, reserve)| reserve),
         }
     }
 
