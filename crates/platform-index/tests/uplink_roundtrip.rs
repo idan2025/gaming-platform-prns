@@ -196,6 +196,10 @@ async fn two_nodes(trusted: impl FnOnce(&str) -> Vec<String>) -> Option<TwoNodes
 /// The link needs the interface to come up and a path to resolve, so the first
 /// attempt can lose a race that has nothing to do with the agent. Same shape as
 /// `reticulum_query.rs`'s `with_retries`.
+/// The two tests that create servers on the one Docker host take turns. Run
+/// together they fight over the same game ports and fail for no real reason.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn with_retries<F, Fut, T>(mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -217,6 +221,7 @@ where
 /// `spec.owner` to `OWNER_LABEL`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let Some(mut tn) = two_nodes(|idx| vec![idx.to_string()]).await else {
         eprintln!("skipping: no Docker daemon");
         return;
@@ -342,6 +347,95 @@ async fn an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent() {
     tn.agent_node.stop().await;
     tn.index.stop().await;
     outcome.expect("the uplink round-trip should complete");
+}
+
+/// Logs and backups over the uplink, against a real remote agent: the newest
+/// lines come back, a backup is made and listed, a restore is refused while the
+/// server runs, and a restore and a delete work once it is stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_servers_logs_and_backups_work_over_the_uplink() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let Some(mut tn) = two_nodes(|idx| vec![idx.to_string()]).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let id = format!("uplbk{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+
+    let outcome: Result<()> = async {
+        let spec = platform_agent::instance::InstanceSpec {
+            instance_id: id.clone(),
+            game_id: "sven-coop".to_string(),
+            name: "Remote backups".to_string(),
+            max_players: 8,
+            port: None,
+            extra_ports: Default::default(),
+            map: None,
+            bots: None,
+            restart_on_crash: false,
+            owner: None,
+            options: Default::default(),
+        };
+        // A create whose reply was lost is retried, and the retry finds the
+        // instance the first attempt made. That is the same server, so read it back.
+        let created: InstanceStatus = match with_retries(|| {
+            let spec = spec.clone();
+            let client = tn.client.clone();
+            let dest = tn.agent_dest;
+            async move { client.create(dest, spec, Some(USER_IDENTITY_HEX.to_string())).await }
+        })
+        .await
+        {
+            Ok(c) => c,
+            Err(e) if format!("{e:#}").contains("already exists") => tn
+                .client
+                .list(tn.agent_dest)
+                .await?
+                .into_iter()
+                .find(|r| r.instance_id == id)
+                .ok_or_else(|| anyhow!("the create said it exists, and the node does not list it"))?,
+            Err(e) => return Err(e),
+        };
+        assert_eq!(created.instance_id, id);
+
+        // Logs: the reply is well formed; the server may have written nothing yet.
+        let logs = tn.client.logs(tn.agent_dest, &id, 50).await?;
+        assert!(!logs.truncated, "a short log is not flagged as cut: {logs:?}");
+
+        // Back up the running server; the backup is listed under the name made.
+        let made = tn.client.backup_create(tn.agent_dest, &id).await?;
+        let listed = tn.client.backups(tn.agent_dest, &id).await?;
+        assert!(
+            listed.backups.iter().any(|b| b.name == made.name),
+            "the backup just made is not listed: {listed:?}"
+        );
+
+        // A restore while the server runs is refused, never done under its players.
+        let while_running = tn.client.backup_restore(tn.agent_dest, &id, &made.name).await;
+        assert!(while_running.is_err(), "a restore while running must be refused");
+
+        // Stop, then restore works.
+        tn.client.stop(tn.agent_dest, &id).await?;
+        tn.client.backup_restore(tn.agent_dest, &id, &made.name).await?;
+
+        // Delete removes the backup and only that one.
+        tn.client.backup_delete(tn.agent_dest, &id, &made.name).await?;
+        let after = tn.client.backups(tn.agent_dest, &id).await?;
+        assert!(
+            !after.backups.iter().any(|b| b.name == made.name),
+            "the deleted backup is still listed"
+        );
+
+        tn.client.remove(tn.agent_dest, &id).await?;
+        Ok(())
+    }
+    .await;
+
+    docker_rm(&name);
+    tn.agent_node.stop().await;
+    tn.index.stop().await;
+    outcome.expect("logs and backups should work over the uplink");
 }
 
 /// An index the operator did not list is refused on its very first request — it

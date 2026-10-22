@@ -10,6 +10,7 @@ pub mod backups;
 pub mod bans;
 pub mod api;
 pub mod config;
+pub mod controller;
 pub mod content;
 pub mod docker;
 pub mod install;

@@ -106,6 +106,8 @@ pub fn router_full(
     Router::new()
         .route("/health", get(health))
         .route("/capacity", get(capacity))
+        .route("/controller/status", get(controller_status))
+        .route("/controller/*rest", axum::routing::any(controller_proxy))
         .route("/instances", get(list).post(create))
         .route("/usage", get(usage))
         .route("/storage", get(storage))
@@ -739,6 +741,55 @@ async fn logs(
         .logs(&id, q.lines.unwrap_or(200))
         .await
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+/// Whether this page places servers through a controller, and where. The
+/// address is not a secret; the login is, and it is never sent to the page.
+async fn controller_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(match state.agent.controller() {
+        Some(c) => json!({ "enabled": true, "url": c.address() }),
+        None => json!({ "enabled": false }),
+    })
+}
+
+/// Pass one request through to the controller, if its path is on the allowlist
+/// (`controller::allowed_path`). Anything else is refused here, before a login
+/// is attempted, so a request the list does not name never reaches the index.
+async fn controller_proxy(
+    State(state): State<ApiState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(controller) = state.agent.controller() else {
+        return fail(StatusCode::NOT_FOUND, "this node has no controller").into_response();
+    };
+    let rest = uri.path().strip_prefix("/controller/").unwrap_or_default();
+    let rest = match uri.query() {
+        Some(q) => format!("{rest}?{q}"),
+        None => rest.to_string(),
+    };
+    let Some(path) = crate::controller::allowed_path(&method, &rest) else {
+        return fail(
+            StatusCode::NOT_FOUND,
+            "the controller does not carry that yet; this server's own page keeps it",
+        )
+        .into_response();
+    };
+    let body = (!body.is_empty()).then_some(&body[..]);
+    match controller.forward(&method, &path, body).await {
+        Ok(reply) => {
+            let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = Response::builder().status(status);
+            if let Some(ct) = reply.content_type {
+                response = response.header(header::CONTENT_TYPE, ct);
+            }
+            response
+                .body(axum::body::Body::from(reply.body))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        Err(e) => fail(StatusCode::BAD_GATEWAY, e).into_response(),
+    }
 }
 
 /// Who is on a server, from the game. 404 for an unknown instance; `null` for

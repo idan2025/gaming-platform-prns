@@ -48,6 +48,8 @@ use tokio::sync::Mutex;
 use platform_agent::uplink_wire::CapacityResp;
 
 use crate::agent_client::AgentClient;
+use platform_agent::backups::Backup;
+use platform_agent::uplink_wire::{BackupsResp, LogsResp};
 use crate::quota::{AccountId, AccountLimits, InstanceRecord, QuotaPolicy, Quotas, ReapReason};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -749,6 +751,115 @@ impl Hosting {
         Ok(())
     }
 
+    /// The newest lines one of the caller's own servers wrote. A node whose agent
+    /// predates the op says so, rather than "unknown op".
+    pub async fn logs(&self, account: &AccountId, instance_id: &str, lines: u32) -> Result<LogsResp> {
+        let (_, node) = self.owned(account, instance_id).await?;
+        let too_old = || anyhow!("node {} runs an agent too old to show logs; update it", node.name);
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client = self.agent_client().await.ok_or_else(|| {
+                anyhow!("node {} is remote but this index has no uplink", node.name)
+            })?;
+            return match client.logs(dest, instance_id, lines).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => Err(too_old()),
+                other => other.with_context(|| format!("asking agent {} for its logs", node.name)),
+            };
+        }
+        let url = format!("{}/instances/{}/logs?lines={}", node.api.trim_end_matches('/'), instance_id, lines);
+        let response = self.http.get(&url).send().await.context("asking the node")?;
+        if !response.status().is_success() {
+            return Err(anyhow!("the node refused to show its logs"));
+        }
+        let text = response.text().await.context("reading the node's logs")?;
+        Ok(LogsResp { text, truncated: false })
+    }
+
+    /// The caller's own server's backups, and the calls that make, restore and
+    /// remove one. Restore and remove take a name the agent made; a name that is
+    /// not one of its shapes is refused here before it reaches a URL or a node.
+    pub async fn backups(&self, account: &AccountId, instance_id: &str) -> Result<BackupsResp> {
+        let (_, node) = self.owned(account, instance_id).await?;
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client = self.agent_client().await.ok_or_else(|| {
+                anyhow!("node {} is remote but this index has no uplink", node.name)
+            })?;
+            return client
+                .backups(dest, instance_id)
+                .await
+                .with_context(|| format!("asking agent {} for its backups", node.name));
+        }
+        let url = format!("{}/instances/{}/backups", node.api.trim_end_matches('/'), instance_id);
+        let backups: Vec<Backup> = self.node_json(self.http.get(&url), &node).await?;
+        Ok(BackupsResp { backups, truncated: false })
+    }
+
+    pub async fn backup_create(&self, account: &AccountId, instance_id: &str) -> Result<Backup> {
+        let (_, node) = self.owned(account, instance_id).await?;
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client = self.agent_client().await.ok_or_else(|| {
+                anyhow!("node {} is remote but this index has no uplink", node.name)
+            })?;
+            return client
+                .backup_create(dest, instance_id)
+                .await
+                .with_context(|| format!("asking agent {} to back up", node.name));
+        }
+        let url = format!("{}/instances/{}/backups", node.api.trim_end_matches('/'), instance_id);
+        self.node_json(self.http.post(&url), &node).await
+    }
+
+    pub async fn backup_restore(&self, account: &AccountId, instance_id: &str, name: &str) -> Result<()> {
+        self.backup_named(account, instance_id, name, Restore::Restore).await
+    }
+
+    pub async fn backup_delete(&self, account: &AccountId, instance_id: &str, name: &str) -> Result<()> {
+        self.backup_named(account, instance_id, name, Restore::Delete).await
+    }
+
+    async fn backup_named(&self, account: &AccountId, instance_id: &str, name: &str, what: Restore) -> Result<()> {
+        if !platform_agent::backups::valid_name(name) {
+            return Err(anyhow!("that is not a backup name the platform made"));
+        }
+        let (_, node) = self.owned(account, instance_id).await?;
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client = self.agent_client().await.ok_or_else(|| {
+                anyhow!("node {} is remote but this index has no uplink", node.name)
+            })?;
+            return match what {
+                Restore::Restore => client.backup_restore(dest, instance_id, name).await,
+                Restore::Delete => client.backup_delete(dest, instance_id, name).await,
+            }
+            .with_context(|| format!("asking agent {} about that backup", node.name));
+        }
+        let base = format!("{}/instances/{}/backups/{}", node.api.trim_end_matches('/'), instance_id, name);
+        let request = match what {
+            Restore::Restore => self.http.post(format!("{base}/restore")),
+            Restore::Delete => self.http.delete(&base),
+        };
+        let response = request.send().await.context("asking the node")?;
+        if !response.status().is_success() {
+            return Err(anyhow!("the node refused that backup action"));
+        }
+        Ok(())
+    }
+
+    /// Send one loopback request to a node and read its JSON reply.
+    async fn node_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        node: &NodeConfig,
+    ) -> Result<T> {
+        let response = request.send().await.with_context(|| format!("asking node {}", node.name))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("node {} refused the request", node.name));
+        }
+        response.json().await.with_context(|| format!("reading node {}'s reply", node.name))
+    }
+
     /// Ask one node to start one stopped instance, on whichever transport it
     /// uses. A node whose agent predates the op says so in words an operator
     /// can act on, rather than "unknown op".
@@ -961,6 +1072,13 @@ fn delete_in_secs(quotas: &Quotas, instance: &HostedInstance) -> Option<u64> {
     let stopped = instance.stopped_secs?;
     let after = quotas.stopped_expiry_for(&AccountId(instance.owner.clone().unwrap_or_default()))?;
     Some(after.as_secs().saturating_sub(stopped))
+}
+
+/// Which backup call a named request makes. Two calls, one check on the name.
+#[derive(Clone, Copy)]
+enum Restore {
+    Restore,
+    Delete,
 }
 
 /// A node reporting less free memory than this is full, whatever its slot
@@ -1669,5 +1787,108 @@ mod tests {
         );
         assert!(format!("{:#}", Hosting::load(&bad_account).unwrap_err()).contains("not a valid label"));
         let _ = std::fs::remove_dir_all(bad_account.parent().unwrap());
+    }
+
+    /// A loopback node with one server, owned by `aa`, that records each request
+    /// it is asked for. Enough to see whether a call reached the node at all.
+    async fn recording_node() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::extract::{Path, Query, State};
+        use axum::routing::{delete, get, post};
+        use axum::{Json, Router};
+
+        type Hits = Arc<std::sync::Mutex<Vec<String>>>;
+        async fn list() -> Json<serde_json::Value> {
+            Json(serde_json::json!([{
+                "instance_id": "srv", "game_id": "sven-coop", "name": "srv", "state": "running",
+                "port": null, "ports": [], "owner": "aa".repeat(16), "uptime_secs": 5,
+                "players_now": 0, "stopped_secs": null,
+            }]))
+        }
+        async fn logs(State(h): State<Hits>, Path(id): Path<String>, Query(_q): Query<serde_json::Value>) -> String {
+            h.lock().unwrap().push(format!("logs {id}"));
+            "a line\n".to_string()
+        }
+        async fn backups_list(State(h): State<Hits>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("list {id}"));
+            Json(serde_json::json!([]))
+        }
+        async fn backups_make(State(h): State<Hits>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("make {id}"));
+            Json(serde_json::json!({"name": "20261022-000000.tar.gz", "bytes": 1, "created_unix": 0}))
+        }
+        async fn restore(State(h): State<Hits>, Path((id, name)): Path<(String, String)>) -> &'static str {
+            h.lock().unwrap().push(format!("restore {id} {name}"));
+            "ok"
+        }
+        async fn remove(State(h): State<Hits>, Path((id, name)): Path<(String, String)>) -> &'static str {
+            h.lock().unwrap().push(format!("delete {id} {name}"));
+            "ok"
+        }
+
+        let hits: Hits = Default::default();
+        let app = Router::new()
+            .route("/instances", get(list))
+            .route("/instances/:id/logs", get(logs))
+            .route("/instances/:id/backups", get(backups_list).post(backups_make))
+            .route("/instances/:id/backups/:name/restore", post(restore))
+            .route("/instances/:id/backups/:name", delete(remove))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, hits)
+    }
+
+    fn one_node_at(addr: std::net::SocketAddr) -> HostingConfig {
+        let mut c = config();
+        c.nodes[0].api = format!("http://{addr}");
+        c
+    }
+
+    /// Someone else's server is "no such instance" for logs and backups too, and
+    /// the node is never asked. Otherwise the answer would tell them it exists.
+    #[tokio::test]
+    async fn another_accounts_server_logs_and_backups_are_not_found_and_never_asked_for() {
+        let (addr, hits) = recording_node().await;
+        let h = Hosting::new(one_node_at(addr));
+        let stranger = AccountId("bb".repeat(16));
+        assert_eq!(h.logs(&stranger, "srv", 10).await.unwrap_err().to_string(), "no such instance");
+        assert_eq!(h.backups(&stranger, "srv").await.unwrap_err().to_string(), "no such instance");
+        assert_eq!(h.backup_create(&stranger, "srv").await.unwrap_err().to_string(), "no such instance");
+        assert_eq!(
+            h.backup_delete(&stranger, "srv", "20261022-000000.tar.gz").await.unwrap_err().to_string(),
+            "no such instance"
+        );
+        assert!(hits.lock().unwrap().is_empty(), "the node was asked: {:?}", hits.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_owner_reaches_their_server_on_the_node_that_holds_it() {
+        let (addr, hits) = recording_node().await;
+        let h = Hosting::new(one_node_at(addr));
+        let owner = AccountId("aa".repeat(16));
+        assert_eq!(h.logs(&owner, "srv", 10).await.unwrap().text, "a line\n");
+        h.backup_create(&owner, "srv").await.unwrap();
+        h.backup_restore(&owner, "srv", "20261022-000000.tar.gz").await.unwrap();
+        assert_eq!(
+            *hits.lock().unwrap(),
+            vec!["logs srv", "make srv", "restore srv 20261022-000000.tar.gz"]
+        );
+    }
+
+    /// A backup name becomes part of a node URL on the loopback path, so it is
+    /// refused before any request, the same as a name the node would refuse.
+    #[tokio::test]
+    async fn a_backup_name_the_platform_did_not_make_never_reaches_a_node() {
+        let (addr, hits) = recording_node().await;
+        let h = Hosting::new(one_node_at(addr));
+        let owner = AccountId("aa".repeat(16));
+        for name in ["../../instances", "20261022-000000.tar.gz/../x", "x.tar.gz", ""] {
+            let err = h.backup_delete(&owner, "srv", name).await.unwrap_err().to_string();
+            assert!(err.contains("not a backup name"), "{name}: {err}");
+        }
+        assert!(hits.lock().unwrap().is_empty());
     }
 }

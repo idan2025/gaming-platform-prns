@@ -60,6 +60,10 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/instances/:id", axum::routing::delete(destroy))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/start", post(start))
+        .route("/instances/:id/logs", get(logs))
+        .route("/instances/:id/backups", get(backups).post(backup_create))
+        .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
+        .route("/instances/:id/backups/:name/restore", post(backup_restore))
         .with_state(state)
 }
 
@@ -310,6 +314,77 @@ async fn stop(
         .stop(&account, &id)
         .await
         .map(|()| Json(json!({ "stopped": id })))
+        .map_err(owner_op_failure)
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    lines: Option<u32>,
+}
+
+/// The last lines one of the caller's own servers wrote. Read-only: it types
+/// nothing at the server.
+async fn logs(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> ApiResult<platform_agent::uplink_wire::LogsResp> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .logs(&account, &id, q.lines.unwrap_or(200).clamp(1, 2000))
+        .await
+        .map(Json)
+        .map_err(owner_op_failure)
+}
+
+async fn backups(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<platform_agent::uplink_wire::BackupsResp> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.backups(&account, &id).await.map(Json).map_err(owner_op_failure)
+}
+
+/// Back up one of the caller's own servers now.
+async fn backup_create(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<platform_agent::backups::Backup> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.backup_create(&account, &id).await.map(Json).map_err(owner_op_failure)
+}
+
+async fn backup_restore(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, name)): axum::extract::Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .backup_restore(&account, &id, &name)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "restored": name })))
+        .map_err(owner_op_failure)
+}
+
+async fn backup_delete(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, name)): axum::extract::Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .backup_delete(&account, &id, &name)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "deleted": name })))
         .map_err(owner_op_failure)
 }
 
