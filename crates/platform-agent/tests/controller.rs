@@ -1,0 +1,173 @@
+//! The node's controller client, against an index that does the real login.
+//!
+//! The fake index runs `platform_auth::Authenticator` exactly as the index's
+//! HTTP front door does, so the signature, the pinned audience and the session
+//! are the real ones. Only the routes behind the login are faked. Needs no
+//! Docker.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use platform_agent::config::ControllerConfig;
+use platform_agent::controller::{allowed_path, Controller};
+use platform_auth::{Authenticator, ChallengeResponse};
+use prns_core::identity::PrivateIdentityMaterial;
+
+struct FakeIndex {
+    auth: Mutex<Authenticator>,
+    /// Tokens this index issued and has not revoked.
+    live: Mutex<HashSet<String>>,
+    /// Every request path that got past the login, so a test can see what the
+    /// node actually asked for.
+    seen: Mutex<Vec<String>>,
+}
+
+async fn challenge(State(s): State<Arc<FakeIndex>>) -> Json<platform_auth::Challenge> {
+    Json(s.auth.lock().unwrap().issue_challenge(std::time::SystemTime::now()).unwrap())
+}
+
+async fn verify(
+    State(s): State<Arc<FakeIndex>>,
+    Json(response): Json<ChallengeResponse>,
+) -> Result<Json<platform_auth::Session>, StatusCode> {
+    let session = s
+        .auth
+        .lock()
+        .unwrap()
+        .verify(&response, std::time::SystemTime::now())
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    s.live.lock().unwrap().insert(session.token.clone());
+    Ok(Json(session))
+}
+
+fn authorised(s: &FakeIndex, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if s.live.lock().unwrap().contains(token) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn instances(State(s): State<Arc<FakeIndex>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+    authorised(&s, &headers)?;
+    s.seen.lock().unwrap().push("/instances".into());
+    Ok(Json(serde_json::json!([{"instance_id": "sven-coop-1"}])))
+}
+
+async fn logs(
+    State(s): State<Arc<FakeIndex>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<String, StatusCode> {
+    authorised(&s, &headers)?;
+    s.seen.lock().unwrap().push(format!("/instances/{id}/logs"));
+    Ok("a line\n".into())
+}
+
+/// Start an index with its own identity. Returns its address and identity hash.
+async fn serve_index(dir: &std::path::Path) -> (String, String, Arc<FakeIndex>) {
+    let secret = personal_rns::load_or_create_identity_secret(&dir.join("index.identity")).unwrap();
+    let identity = PrivateIdentityMaterial::from_slice(&secret[..]).unwrap();
+    let hash = identity.identity_hash();
+    let index_hash = hex::encode(hash.as_bytes());
+    let state = Arc::new(FakeIndex {
+        auth: Mutex::new(Authenticator::new(hash)),
+        live: Mutex::new(HashSet::new()),
+        seen: Mutex::new(Vec::new()),
+    });
+    let app = Router::new()
+        .route("/auth/challenge", post(challenge))
+        .route("/auth/verify", post(verify))
+        .route("/instances", get(instances))
+        .route("/instances/:id/logs", get(logs))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), index_hash, state)
+}
+
+fn node_identity(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("node.identity")
+}
+
+#[tokio::test]
+async fn the_node_logs_in_with_its_own_identity_and_forwards_what_the_allowlist_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, index_hash, index) = serve_index(dir.path()).await;
+    let controller = Controller::new(
+        &ControllerConfig { url: url.clone(), identity: index_hash.clone() },
+        &node_identity(dir.path()),
+    )
+    .unwrap();
+
+    // First request logs in, then lists.
+    let reply = controller.forward(&Method::GET, "/instances", None).await.unwrap();
+    assert_eq!(reply.status, 200);
+    let list: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(list[0]["instance_id"], "sven-coop-1");
+
+    // The next one reuses the session: no second login is needed to read logs.
+    let path = allowed_path(&Method::GET, "instances/sven-coop-1/logs?lines=20").unwrap();
+    let reply = controller.forward(&Method::GET, &path, None).await.unwrap();
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, b"a line\n");
+
+    assert_eq!(*index.seen.lock().unwrap(), vec!["/instances", "/instances/sven-coop-1/logs"]);
+}
+
+/// The session is dropped on the index's side (a restart, an expiry). The node
+/// notices the refusal, logs in again and tries once more.
+#[tokio::test]
+async fn a_revoked_session_is_renewed_once_and_the_request_goes_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, index_hash, index) = serve_index(dir.path()).await;
+    let controller = Controller::new(
+        &ControllerConfig { url, identity: index_hash },
+        &node_identity(dir.path()),
+    )
+    .unwrap();
+    assert_eq!(controller.forward(&Method::GET, "/instances", None).await.unwrap().status, 200);
+
+    index.live.lock().unwrap().clear();
+    let reply = controller.forward(&Method::GET, "/instances", None).await.unwrap();
+    assert_eq!(reply.status, 200, "the request must succeed after a fresh login");
+}
+
+/// The login is bound to the index it was made for. Pinned to a different index,
+/// the node's signature is refused, so the login cannot be used there.
+#[tokio::test]
+async fn a_login_is_refused_by_an_index_the_node_is_not_pinned_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _real, _index) = serve_index(dir.path()).await;
+    let other_dir = tempfile::tempdir().unwrap();
+    let (_other_url, other_hash, _other) = serve_index(other_dir.path()).await;
+    let controller = Controller::new(
+        &ControllerConfig { url, identity: other_hash },
+        &node_identity(dir.path()),
+    )
+    .unwrap();
+    assert!(controller.forward(&Method::GET, "/instances", None).await.is_err());
+}
+
+#[tokio::test]
+async fn a_plain_http_address_off_this_machine_is_refused_before_any_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".to_string();
+    let err = Controller::new(
+        &ControllerConfig { url: "http://192.168.1.5:4760".into(), identity: hash },
+        &node_identity(dir.path()),
+    );
+    assert!(err.is_err());
+}

@@ -28,6 +28,7 @@ const MAP_NAME_RE = /^[A-Za-z0-9_.\/-]+$/;
 
 const state = {
   token: null,
+  controllerOn: false,   // this page places servers through a controller (controller.rs)
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
@@ -176,7 +177,47 @@ function setToken(t) {
 
 // ---------- api ----------
 
+// With a controller, the server actions the controller carries go through it,
+// and the list shows every worker's servers. This mirrors controller::allowed_path
+// on the node, so a request the node would refuse is refused here first, with
+// the same words, and nothing is sent. Anything else on a server stays local.
+const CONTROLLER_ROUTES = [
+  [/^\/instances$/, ["GET", "POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}$/, ["GET", "DELETE"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(stop|start)$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/logs(\?lines=\d{1,4})?$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/backups$/, ["GET", "POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+$/, ["DELETE"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+\/restore$/, ["POST"]],
+];
+
+// The URL a request really goes to: through the controller when this page has
+// one and the controller carries the request; the node's own path otherwise.
+function routeFor(method, path) {
+  if (!state.controllerOn || !path.startsWith("/instances")) return path;
+  const allowed = CONTROLLER_ROUTES.some(([re, methods]) => re.test(path) && methods.includes(method));
+  if (!allowed) {
+    throw { error: "Not available through the controller yet. This server's own page keeps it.", status: 404 };
+  }
+  return "/controller" + path;
+}
+
+async function loadControllerStatus() {
+  try {
+    const s = await api("GET", "/controller/status");
+    state.controllerOn = !!(s && s.enabled);
+    const note = $("controller-note");
+    if (note) {
+      note.hidden = !state.controllerOn;
+      note.textContent = state.controllerOn ? "Servers are placed through the controller at " + s.url + ", across every worker it drives." : "";
+    }
+  } catch (_) {
+    state.controllerOn = false;
+  }
+}
+
 async function api(method, path, body) {
+  const url = routeFor(method, path);
   const opts = { method, headers: { "Authorization": "Bearer " + (state.token || "") } };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
@@ -184,7 +225,7 @@ async function api(method, path, body) {
   }
   let resp;
   try {
-    resp = await fetch(path, opts);
+    resp = await fetch(url, opts);
   } catch (e) {
     throw { __network: true, error: "Could not reach the node. " + (e && e.message ? e.message : "") };
   }
@@ -208,9 +249,10 @@ async function api(method, path, body) {
 
 // The same as api(), for an endpoint that answers plain text (a server log).
 async function apiText(path) {
+  const url = routeFor("GET", path);
   let resp;
   try {
-    resp = await fetch(path, { headers: { "Authorization": "Bearer " + (state.token || "") } });
+    resp = await fetch(url, { headers: { "Authorization": "Bearer " + (state.token || "") } });
   } catch (e) {
     throw { __network: true, error: "Could not reach the node. " + (e && e.message ? e.message : "") };
   }
@@ -587,6 +629,7 @@ async function tryConnect(token) {
     const games = await api("GET", "/games");
     state.games = Array.isArray(games) ? games : [];
     state.capacity = await api("GET", "/capacity");
+    await loadControllerStatus();
     const insts = await api("GET", "/instances");
     state.instances = Array.isArray(insts) ? insts : [];
     clearError();

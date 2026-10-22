@@ -809,11 +809,22 @@ the owner stamped from the user's identity.
    `agent` hash comes from `platform-agent --control-address`, which derives the
    same destination `uplink::start` serves
    (`tests/control_address.rs`). Does not install Docker or the agent binary.
-5. **The node's own web UI creates through a configured controller**, so the
-   page an operator knows places servers across workers. The server list shows
-   every worker's servers; stop, start, logs and backups go to the node that
-   holds the server.
-6. **The missing uplink operations** for item 5: logs, backups, map change.
+5. **The node's own web UI creates through a configured controller** (built,
+   `controller.rs`, `HOSTING.md` "Placing servers through a controller"). With
+   a `[controller]` section the page lists every worker's servers, creates
+   through the index, and sends stop, start, remove, logs and backups to the
+   node that holds the server. The node logs in with its uplink identity,
+   pinned to the index's identity, and forwards only what
+   `controller::allowed_path` names. Not carried yet: console, map change,
+   bots, chat, players, restart, world upload and backup download, which stay
+   on the node's own page. Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
+   and `a_login_is_refused_by_an_index_the_node_is_not_pinned_to`.
+6. **The missing uplink operations** (built: logs, backups list, create,
+   restore and delete, `OP_LOGS` to `OP_BACKUP_DELETE`). Replies are capped to
+   one packet: logs keep their newest text, and backup lists keep the newest
+   backups; both say when they were cut. **Map change is not built**: it types
+   a line at the console, which the uplink never gains (`CLAUDE.md`), and
+   ROADMAP §13's console decision is still the owner's to make.
 7. **Moving a server between workers**, reusing the backup and world import
    that exist.
 

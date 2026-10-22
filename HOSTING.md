@@ -575,6 +575,38 @@ The index's identity hash is in its log at start (`index identity ... identity=`
 Nothing the script prints is secret: the two hashes are public, and the identity
 file never leaves the worker.
 
+## Placing servers through a controller
+
+A worker's page shows one machine. Add a `[controller]` section and the same
+page places servers through an index instead, across every worker it drives:
+
+```toml
+[uplink]
+identity_secret_path = "/var/lib/gaming-platform-prns/agent.identity"
+trusted_indexes = ["<index identity hash>"]
+
+[controller]
+url = "https://index.example.org"        # or http://127.0.0.1:4760 on this machine
+identity = "<index identity hash>"       # the same hash, pinned
+```
+
+The node logs in to the index with its uplink identity, so **the servers the
+page places belong to this node's identity**, and the quotas that index keeps
+apply to it. The login's signature is bound to the pinned identity: an index
+the node is not pinned to cannot use it. A plain `http://` address off this
+machine is refused at start, because it would send the session in the clear.
+
+The page lists every server on every worker the index drives. Create, stop,
+start, remove, logs and backups go through the index, which sends each to the
+node that holds the server. **What the controller does not carry**, and what
+stays on the node's own page: console, map change, bots, chat, players,
+restart, world upload and backup download. The node refuses those on this
+route, so nothing that types at a server or moves its files is reachable from
+the controller.
+
+Each action on the controller list is one request to the index, and the page
+polls. Keep that in mind when several people leave a page open on a big index.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an

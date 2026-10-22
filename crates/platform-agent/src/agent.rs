@@ -118,6 +118,9 @@ pub struct Storage {
 
 pub struct Agent {
     config: AgentConfig,
+    /// This node's page places servers through this index, when configured
+    /// (`controller.rs`). `None` keeps the page on this node alone.
+    controller: Option<Arc<crate::controller::Controller>>,
     layout: StoreLayout,
     content: Provisioner,
     docker: DockerRuntime,
@@ -537,8 +540,16 @@ impl Agent {
             config.data_root.join("mesh-interfaces.json"),
         );
         let config_data_root = config.data_root.clone();
+        let controller = match (&config.controller, &config.uplink) {
+            (Some(c), Some(u)) => Some(Arc::new(
+                crate::controller::Controller::new(c, &u.identity_secret_path)
+                    .context("starting the controller client")?,
+            )),
+            _ => None,
+        };
         Ok(Self {
             config,
+            controller,
             layout,
             content,
             docker,
@@ -711,6 +722,11 @@ impl Agent {
 
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// The controller this page places servers through, when one is configured.
+    pub fn controller(&self) -> Option<&Arc<crate::controller::Controller>> {
+        self.controller.as_ref()
     }
 
     /// Plan an instance's layout and refuse early if the shared content copy
