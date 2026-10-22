@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::AgentConfig;
 use crate::content::{ProvisionError, Provisioned, Provisioner};
 use crate::docker::{DockerRuntime, PublishedPort};
-use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus};
+use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus, LastExit};
 use crate::ports::PortAllocator;
 use crate::store::{ContentRef, InstancePlan, StoreLayout};
 use crate::uplink_wire::CapacityResp;
@@ -1192,6 +1192,7 @@ impl Agent {
             players_now: None,
             max_players_now: None,
             last_exit: None,
+            stopped_secs: None,
             restart_on_crash: None,
             crash_restarts: None,
             map_now: None,
@@ -1862,6 +1863,7 @@ impl Agent {
                     players_now: None,
                     max_players_now: None,
                     last_exit: None,
+                    stopped_secs: None,
                     restart_on_crash: None,
                     crash_restarts: None,
                     map_now: None,
@@ -1921,10 +1923,15 @@ impl Agent {
         }
         drop(crashes);
         // Only a stopped server has an ending worth showing, and there are few.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
         for instance in instances.iter_mut().filter(|i| i.state == InstanceState::Stopped) {
             if let Some(cid) = instance.container_id.as_deref() {
                 instance.last_exit = self.docker.last_exit(cid).await.ok().flatten();
             }
+            instance.stopped_secs = match (instance.last_exit.as_ref().and_then(LastExit::ended_unix), now) {
+                (Some(ended), Some(now)) => Some(now.saturating_sub(ended)),
+                _ => None,
+            };
         }
         Ok(instances)
     }

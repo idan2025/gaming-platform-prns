@@ -320,6 +320,11 @@ pub struct InstanceStatus {
     /// for a container Docker would not describe.
     #[serde(default)]
     pub last_exit: Option<LastExit>,
+    /// Seconds since a stopped container last ended, as Docker recorded it.
+    /// `None` while it runs, and when the node could not read the time: an
+    /// unknown end is never treated as an old one.
+    #[serde(default)]
+    pub stopped_secs: Option<u64>,
     /// Whether this node starts the server again when it crashes.
     #[serde(default)]
     pub restart_on_crash: Option<bool>,
@@ -352,6 +357,12 @@ pub struct LastExit {
 }
 
 impl LastExit {
+    /// When this ending happened, in seconds since the Unix epoch. `None` when
+    /// Docker's text is not the RFC 3339 form it always writes.
+    pub fn ended_unix(&self) -> Option<u64> {
+        parse_utc_rfc3339(self.finished_at.as_deref()?)
+    }
+
     /// Whether this ending was a crash rather than a stop.
     ///
     /// A stop ends in 0, or in the signal a stop sends: SIGTERM (143), SIGINT
@@ -364,6 +375,34 @@ impl LastExit {
             || self.error.as_deref().is_some_and(|e| !e.is_empty())
             || !matches!(self.code, 0 | 130 | 137 | 143)
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z` in seconds since the epoch. Docker writes
+/// nothing else for a container's times, and a zone offset is refused rather
+/// than guessed at.
+fn parse_utc_rfc3339(text: &str) -> Option<u64> {
+    let text = text.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let time = time.split('.').next()?;
+    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
+    let (hh, mm, ss) = (t.next()??, t.next()??, t.next()??);
+    if t.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's civil-calendar algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3_600 + mm * 60 + ss).ok()
 }
 
 /// What one running server is using, as Docker's own counters say.
@@ -695,6 +734,7 @@ mod tests {
             players_now: Some(14),
             max_players_now: Some(16),
             last_exit: None,
+            stopped_secs: None,
             restart_on_crash: None,
             crash_restarts: None,
             map_now: Some("cs_italy_cz".into()),
@@ -726,5 +766,31 @@ mod tests {
         }
         assert!(LastExit { oom_killed: true, ..exit(137) }.is_crash(), "out of memory reads as 137 too");
         assert!(LastExit { error: Some("no such file".into()), ..exit(0) }.is_crash());
+    }
+
+    #[test]
+    fn docker_end_times_read_as_unix_seconds() {
+        // 2000-03-01 is 951_868_800: 2000 is a leap year, so March 1 follows a day 29.
+        assert_eq!(parse_utc_rfc3339("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(parse_utc_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        // Docker's nanoseconds are read and dropped, not rounded into the second.
+        assert_eq!(parse_utc_rfc3339("1970-01-01T00:00:01.999999999Z"), Some(1));
+        assert_eq!(parse_utc_rfc3339("2026-10-22T10:11:12.123456789Z"), parse_utc_rfc3339("2026-10-22T10:11:12Z"));
+    }
+
+    #[test]
+    fn a_time_it_cannot_read_is_unknown_not_old() {
+        for bad in [
+            "",
+            "2026-10-22T10:11:12",
+            "2026-10-22T10:11:12+02:00",
+            "2026-10-22 10:11:12Z",
+            "2026-13-01T00:00:00Z",
+            "2026-10-22T25:00:00Z",
+            // Before the epoch: Docker's "never finished" zero time lands here.
+            "0001-01-01T00:00:00Z",
+        ] {
+            assert_eq!(parse_utc_rfc3339(bad), None, "{bad}");
+        }
     }
 }
