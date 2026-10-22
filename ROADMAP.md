@@ -786,13 +786,23 @@ the owner stamped from the user's identity.
 **To build, public repo** (each is a general feature for any operator):
 1. **Setup guide** in `HOSTING.md`: run an index beside a node, add a second
    machine as a worker, test placement. No code.
-2. **Disk in placement.** Free disk joins the capacity report and the ranking,
-   under the same disk reserve a node already keeps. A node under its reserve
-   is full.
-3. **Node classes.** A worker carries an operator-chosen label in the hosting
-   file (`class = "…"`), and a create may require one. The index only matches
-   the label; **what a class is for is the operator's business**, and the
-   public code assigns it no meaning.
+2. **Disk in placement** (built). Free disk joins the capacity report
+   (`disk_free_bytes`, `disk_reserve_bytes`) and the ranking, under the same
+   disk reserve a node already keeps. A node under its reserve is full; among
+   equals, more room above the reserve wins, after priority and memory. An
+   older agent reports none, and counts as none, like memory
+   (`a_node_under_its_disk_reserve_is_full_and_one_that_did_not_say_is_not`).
+3. **Node classes** (built). A worker carries an operator-chosen label in the
+   hosting file (`class = "…"`), and a create may require one. The index only
+   matches the label; **what a class is for is the operator's business**, and
+   the public code assigns it no meaning. Two rules fall out of "matches":
+   a classed node takes only creates naming its class, and a create naming
+   none takes only unclassed nodes. And an account may ask for a class only if
+   its hosting-file entry lists it (`[quota.accounts.<hash>] classes`); an
+   account listing none may ask for none, and a refusal says the same words
+   whether or not the class exists. Without that, naming a class would be
+   self-service. Caught by `a_classed_node_takes_only_creates_naming_its_class`
+   and `an_account_that_was_not_given_a_class_cannot_ask_for_it`.
 4. **One-command worker setup:** installs the agent, creates its identity,
    trusts the index, and prints the hosting-file line.
 5. **The node's own web UI creates through a configured controller**, so the

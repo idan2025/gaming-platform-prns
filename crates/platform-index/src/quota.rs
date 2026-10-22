@@ -76,6 +76,10 @@ pub struct AccountLimits {
     /// for having been stopped too long.
     #[serde(default)]
     pub never_reap: bool,
+    /// The node classes this account may ask for. An account that lists none
+    /// may ask for none, so naming a class is never self-service.
+    #[serde(default)]
+    pub classes: Vec<String>,
 }
 
 impl Default for QuotaPolicy {
@@ -192,6 +196,11 @@ impl Quotas {
             return None;
         }
         self.policy.stopped_expiry
+    }
+
+    /// May `account` ask for servers on nodes of `class`?
+    pub fn may_use_class(&self, account: &AccountId, class: &str) -> bool {
+        self.policy.overrides.get(account).is_some_and(|o| o.classes.iter().any(|c| c == class))
     }
 
     /// Whether a server of `account` stopped for `stopped_for` is due removal.
@@ -323,6 +332,17 @@ mod tests {
             overrides: BTreeMap::new(),
             stopped_expiry: None,
         }
+    }
+
+    #[test]
+    fn an_account_may_ask_only_for_the_classes_it_was_given() {
+        let q = with_override(
+            AccountLimits { classes: vec!["gold".into()], ..Default::default() },
+            1,
+        );
+        assert!(q.may_use_class(&account(1), "gold"));
+        assert!(!q.may_use_class(&account(1), "silver"), "a class it was not given");
+        assert!(!q.may_use_class(&account(2), "gold"), "an account with no entry has none");
     }
 
     #[test]
