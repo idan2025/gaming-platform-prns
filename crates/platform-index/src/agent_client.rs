@@ -37,10 +37,12 @@ use tracing::debug;
 
 use platform_agent::instance::{InstanceSpec, InstanceStatus};
 use platform_agent::uplink::CONTROL_ENDPOINT_ID;
+use platform_agent::backups::Backup;
 use platform_agent::uplink_wire::{
-    decode_response, encode_request, parse_payload, payload_bytes, CapacityResp, CreateReq,
-    InstanceReq, ListResp, TokenReq, OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_LIST, OP_REMOVE,
-    OP_START, OP_STOP, OP_VERIFY,
+    decode_response, encode_request, parse_payload, payload_bytes, BackupReq, BackupsResp,
+    CapacityResp, CreateReq, InstanceReq, ListResp, LogsReq, LogsResp, TokenReq, OP_BACKUPS,
+    OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_RESTORE, OP_CAPACITY, OP_CHALLENGE, OP_CREATE,
+    OP_LIST, OP_LOGS, OP_REMOVE, OP_START, OP_STOP, OP_VERIFY,
 };
 use platform_auth::{answer_challenge, Challenge, ChallengeResponse, Session};
 
@@ -115,6 +117,37 @@ impl AgentClient {
         let body = self.signed_op(agent, OP_LIST, &payload_bytes(&req)?).await?;
         let resp: ListResp = parse_ok(&body, OP_LIST)?;
         Ok(resp.instances)
+    }
+
+    /// The newest lines a server wrote, as the node could fit in one reply.
+    pub async fn logs(&self, agent: DestinationHash, instance_id: &str, lines: u32) -> Result<LogsResp> {
+        let req = LogsReq { token: String::new(), instance_id: instance_id.to_string(), lines };
+        let body = self.signed_op(agent, OP_LOGS, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_LOGS)
+    }
+
+    pub async fn backups(&self, agent: DestinationHash, instance_id: &str) -> Result<BackupsResp> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_BACKUPS, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_BACKUPS)
+    }
+
+    pub async fn backup_create(&self, agent: DestinationHash, instance_id: &str) -> Result<Backup> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_BACKUP_CREATE, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_BACKUP_CREATE)
+    }
+
+    pub async fn backup_restore(&self, agent: DestinationHash, instance_id: &str, name: &str) -> Result<()> {
+        let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
+        let body = self.signed_op(agent, OP_BACKUP_RESTORE, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_BACKUP_RESTORE)
+    }
+
+    pub async fn backup_delete(&self, agent: DestinationHash, instance_id: &str, name: &str) -> Result<()> {
+        let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
+        let body = self.signed_op(agent, OP_BACKUP_DELETE, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_BACKUP_DELETE)
     }
 
     pub async fn capacity(&self, agent: DestinationHash) -> Result<CapacityResp> {
@@ -275,6 +308,21 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
         }
         OP_LIST | OP_CAPACITY => {
             let mut r: TokenReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_LOGS => {
+            let mut r: LogsReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_BACKUPS | OP_BACKUP_CREATE => {
+            let mut r: InstanceReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_BACKUP_RESTORE | OP_BACKUP_DELETE => {
+            let mut r: BackupReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }

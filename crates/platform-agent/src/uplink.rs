@@ -265,6 +265,80 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_LOGS => {
+            let req: LogsReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_LOGS, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_LOGS, &msg);
+            }
+            match state.agent.logs(&req.instance_id, req.lines as usize).await {
+                Ok(text) => encode_logs_resp(&text),
+                Err(e) => encode_err(OP_LOGS, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUPS => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUPS, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUPS, &msg);
+            }
+            match state.agent.backups(&req.instance_id).await {
+                Ok(list) => encode_backups_resp(&list),
+                Err(e) => encode_err(OP_BACKUPS, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_CREATE => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_CREATE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_CREATE, &msg);
+            }
+            match state.agent.create_backup(&req.instance_id).await {
+                Ok(made) => match payload_bytes(&made) {
+                    Ok(bytes) if fits(bytes.len()).is_ok() => encode_ok(OP_BACKUP_CREATE, &bytes),
+                    Ok(bytes) => encode_err(OP_BACKUP_CREATE, &WireError::TooLarge(bytes.len()).to_string()),
+                    Err(e) => encode_err(OP_BACKUP_CREATE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_BACKUP_CREATE, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_RESTORE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_RESTORE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_RESTORE, &msg);
+            }
+            match state.agent.restore_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_BACKUP_RESTORE, &[]),
+                Err(e) => encode_err(OP_BACKUP_RESTORE, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_DELETE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_DELETE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_DELETE, &msg);
+            }
+            match state.agent.delete_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_BACKUP_DELETE, &[]),
+                Err(e) => encode_err(OP_BACKUP_DELETE, &format!("{e:#}")),
+            }
+        }
+
         OP_REMOVE => {
             let req: InstanceReq = match parse_payload(body) {
                 Ok(r) => r,
