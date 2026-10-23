@@ -116,6 +116,23 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   An agent too old for `OP_START` is named as such. Pinned by
   `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
 
+**A server moves between workers through the index** (2026-10-23,
+`Hosting::relocate`, ROADMAP §13 item 7). Rules a later change could quietly
+break:
+- **The old server is removed last.** Every step before it is undone on
+  failure (the new copy removed, the old one started again if it ran), so a
+  move that fails never loses a server. Caught by
+  `a_move_that_fails_on_the_new_node_leaves_the_old_server_running`.
+- **The uplink reads a request whole before it knows who sent it**, so the
+  control destination caps requests at one file piece
+  (`uplink::MAX_REQUEST_BYTES`). Leaving it `Unlimited` lets anyone who can
+  reach the destination make a node hold any size.
+- **An upload piece must start where the file ends**, and the first is held
+  to `backups::MAX_IMPORT_BYTES` and the disk reserve by its declared total;
+  the finished file goes through `import_backup`'s check like any upload.
+- **The server's identity does not travel.** It gets a new id and address;
+  carrying `mesh.identity` would put its secret through the index.
+
 **`StreamRelay` is built** (2026-08-31, `crates/game-bridge/src/stream.rs`): a
 pack declaring `transport = "tcp"` runs. It rides the link's **channel**, not
 `SendToLink` — a link data packet is acked individually and carries no sequence

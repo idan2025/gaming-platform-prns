@@ -764,8 +764,8 @@ in-game warning; the reserve defaults to the larger of 10% of the disk and
 
 ## 13. Cluster: one controller, many worker nodes
 
-**Status (2026-10-21): planned.** About 70% exists underneath; this item is
-the rest. Nothing here is money, tiers or billing, and none of it may become a
+**Status (2026-10-23): items 1–7 built.** Map change and the console stay
+unbuilt on purpose (below). Nothing here is money, tiers or billing, and none of it may become a
 dependency: a single node with no index must keep working exactly as today.
 
 **What.** An operator runs one **controller** (an index, `platform-index`) and
@@ -825,8 +825,16 @@ the owner stamped from the user's identity.
    backups; both say when they were cut. **Map change is not built**: it types
    a line at the console, which the uplink never gains (`CLAUDE.md`), and
    ROADMAP §13's console decision is still the owner's to make.
-7. **Moving a server between workers**, reusing the backup and world import
-   that exist.
+7. **Moving a server between workers** (built, `Hosting::relocate`,
+   `POST /instances/:id/relocate`, `HOSTING.md` "Moving a server to another
+   worker"). Stop, back up, carry the backup across in `TRANSFER_CHUNK` pieces
+   (`OP_SPEC`, `OP_BACKUP_READ`, `OP_BACKUP_WRITE`, riding Reticulum resources),
+   create the same server on the new worker, restore, start, and remove the old
+   one last; a failure before that removes what was made and starts the old one
+   again. The server gets a new id and a new mesh address. Caught by
+   `a_server_moves_with_its_files_and_the_old_one_goes_last`,
+   `a_move_that_fails_on_the_new_node_leaves_the_old_server_running` and, live,
+   `a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplink`.
 
 **A decision, not a default.** The uplink must never gain a console route
 (`CLAUDE.md`: an index must not type at a node's servers). Moderation and the

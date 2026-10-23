@@ -184,7 +184,7 @@ function setToken(t) {
 const CONTROLLER_ROUTES = [
   [/^\/instances$/, ["GET", "POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}$/, ["GET", "DELETE"]],
-  [/^\/instances\/[a-z0-9-]{1,64}\/(stop|start)$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(stop|start|relocate)$/, ["POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/logs(\?lines=\d{1,4})?$/, ["GET"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups$/, ["GET", "POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+$/, ["DELETE"]],
@@ -962,6 +962,11 @@ function openInstanceMenu(id, x, y) {
     title: inst.mesh_destination ? "Talk with the players who joined through Lanthorn, and turn this server's chat on or off."
       : "Only a server on the mesh has chat.",
     action: () => onChat(id) });
+  if (state.controllerOn) {
+    items.push({ label: "Move to another worker…", icon: "restart",
+      title: "Stop it, carry its files to the worker with the most room, and start it there. It gets a new mesh address.",
+      action: () => onRelocate(id, inst.name) });
+  }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
   showMenu(x, y, items);
@@ -2956,6 +2961,19 @@ async function onRemove(id, name) {
   return rowAction(id, null, null,
     () => api("DELETE", "/instances/" + encodeURIComponent(id)),
     "The server was not removed.", "Removed.");
+}
+
+// Through the controller only: it picks the worker, carries the files and
+// removes the old server once the new one stands.
+async function onRelocate(id, name) {
+  const confirmed = confirm(
+    'Move "' + (name || id) + '" to another worker?\n\n' +
+    "It is stopped, its files are copied to the worker with the most room, and it is started there. " +
+    "Players on it are dropped, and it gets a new mesh address, so old invite links stop working.");
+  if (!confirmed) return;
+  return rowAction(id, null, null,
+    () => api("POST", "/instances/" + encodeURIComponent(id) + "/relocate"),
+    "The server was not moved.", "Moved.");
 }
 
 // Announce now, rather than at each announcer's next tick. Each announcer keeps

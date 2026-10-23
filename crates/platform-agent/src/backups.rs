@@ -299,6 +299,61 @@ pub fn path_of(dir: &Path, name: &str) -> Option<PathBuf> {
     valid_name(name).then(|| dir.join(name))
 }
 
+/// The largest backup the node takes in, by upload or over the uplink. A
+/// server's own files (saves, settings, logs) are megabytes; this is a bound
+/// on a mistake, not a quota.
+pub const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Where an upload arriving piece by piece stands: its id, the bytes the node
+/// holds, and the backup it became once the last piece arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadProgress {
+    pub upload: String,
+    pub received: u64,
+    pub backup: Option<Backup>,
+}
+
+/// An upload still arriving is `.upload-<16 hex>.partial`: hidden, and never
+/// named like a backup, so `list` never shows it.
+const UPLOAD_PREFIX: &str = ".upload-";
+const UPLOAD_SUFFIX: &str = ".partial";
+
+/// Whether `id` is one an upload in progress could be called: the agent made
+/// it from 8 random bytes, and nothing else ever names a file.
+pub fn valid_upload_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The file an upload with `id` is written to in `dir`, or `None` for an id
+/// the agent would not have made.
+pub fn upload_path(dir: &Path, id: &str) -> Option<PathBuf> {
+    valid_upload_id(id).then(|| dir.join(format!("{UPLOAD_PREFIX}{id}{UPLOAD_SUFFIX}")))
+}
+
+/// Delete uploads in `dir` that have not grown for `older_than`: a sender
+/// that stopped halfway never comes back for them, and they hold disk.
+pub fn sweep_stale_uploads(dir: &Path, older_than: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix(UPLOAD_PREFIX).and_then(|n| n.strip_suffix(UPLOAD_SUFFIX)) else {
+            continue;
+        };
+        if !valid_upload_id(id) {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > older_than);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -423,5 +478,35 @@ mod tests {
         assert_eq!(std::fs::read(writable.join("save/slot1.sav")).unwrap(), b"level 3");
         assert!(writable.join("added-later").is_dir(), "a mount source is never left missing");
         assert!(!root.path().join("staging").exists(), "nothing left in staging");
+    }
+
+    /// An upload id names a file, so only the agent's own shape is one; and a
+    /// sweep takes only abandoned uploads, never a backup or a fresh upload.
+    #[test]
+    fn only_an_agent_made_upload_id_names_a_file_and_a_sweep_takes_only_stale_uploads() {
+        for bad in ["../../etc/passwd", "0123456789ABCDEF", "0123456789abcde", "0123456789abcdefa", ""] {
+            assert!(upload_path(Path::new("/b"), bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(
+            upload_path(Path::new("/b"), "0123456789abcdef").unwrap(),
+            Path::new("/b/.upload-0123456789abcdef.partial")
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(".upload-0123456789abcdef.partial"), b"half").unwrap();
+        std::fs::write(dir.join("20261023-000000.tar.gz"), b"kept").unwrap();
+        sweep_stale_uploads(dir, std::time::Duration::from_secs(3600));
+        assert!(dir.join(".upload-0123456789abcdef.partial").exists(), "a fresh upload is kept");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(".upload-0123456789abcdef.partial"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        sweep_stale_uploads(dir, std::time::Duration::from_secs(3600));
+        assert!(!dir.join(".upload-0123456789abcdef.partial").exists(), "a stale upload is swept");
+        assert!(dir.join("20261023-000000.tar.gz").exists(), "a backup is never swept");
     }
 }

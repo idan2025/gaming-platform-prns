@@ -319,6 +319,9 @@ pub struct Hosting {
     /// (and reported as such) and loopback-HTTP nodes keep working. Set after
     /// construction once `node.rs` has produced a handle (`set_agent_client`).
     agent_client: Mutex<Option<Arc<AgentClient>>>,
+    /// Servers being moved right now (`relocate`), so a second move of the
+    /// same one is refused rather than run beside the first.
+    moving: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Hosting {
@@ -332,6 +335,7 @@ impl Hosting {
                 .build()
                 .unwrap_or_default(),
             agent_client: Mutex::new(None),
+            moving: Default::default(),
         }
     }
 
@@ -847,6 +851,280 @@ impl Hosting {
         Ok(())
     }
 
+    /// Move one of the caller's own servers to another node (ROADMAP §13 item
+    /// 7), with its files, and remove it from the first only once it stands on
+    /// the second.
+    ///
+    /// The steps are the ones an operator would take by hand, each through an
+    /// op that already exists: stop it, back it up, carry the backup across,
+    /// create the same server on the new node, put the backup back there, start
+    /// it if it was running, then remove the old one. **Until that last step
+    /// the old server is untouched but for the stop**, so any failure removes
+    /// what was made on the new node and starts the old one again if it was
+    /// running. The backup stays on the old node either way, like every backup
+    /// of a removed server.
+    ///
+    /// The new node is picked by the same placement as a create, among the
+    /// nodes of the old node's class, never the old node itself. No quota is
+    /// taken: the account holds one server before and after.
+    ///
+    /// The server gets a new id and a new mesh address: its address is its
+    /// identity, and carrying that key through the index would put a server's
+    /// secret in a place that does not need it.
+    pub async fn relocate(&self, account: &AccountId, instance_id: &str) -> Result<HostedInstance> {
+        let config = self.config();
+        let (found, from) = self.owned(account, instance_id).await?;
+        let _held = MoveGuard::take(&self.moving, instance_id)
+            .ok_or_else(|| anyhow!("this server is already being moved"))?;
+        let existing = self.all_instances().await?;
+        let to = self
+            .pick_node_except(&config, &existing, from.class.as_deref(), &from.name)
+            .await
+            .ok_or_else(|| anyhow!("no other node has room for it"))?
+            .clone();
+        let too_old = |node: &NodeConfig| anyhow!("node {} runs an agent too old to move servers; update it", node.name);
+        let old_agent = |e: anyhow::Error, node: &NodeConfig| {
+            if format!("{e:#}").contains("unknown op") { too_old(node) } else { e }
+        };
+
+        let mut spec = self.spec_on(&from, instance_id).await.map_err(|e| old_agent(e, &from))?;
+        let was_running = found.state == "running";
+        if was_running {
+            self.stop_on(&from, instance_id).await?;
+        }
+        let old_node = &from;
+        let restart_old = |e: anyhow::Error| async move {
+            if was_running {
+                if let Err(again) = self.start_on(old_node, instance_id).await {
+                    tracing::warn!(instance = %instance_id, error = %again, "could not start a server again after its move failed");
+                    return e.context(format!("and it could not be started again on {}", old_node.name));
+                }
+            }
+            e
+        };
+
+        let carried = match self.carry_backup(&from, &to, instance_id).await {
+            Ok(file) => file,
+            Err(e) => return Err(restart_old(old_agent(e, &from)).await),
+        };
+
+        spec.instance_id = new_instance_id(&spec.game_id)?;
+        // The new node picks every port, as on a create.
+        spec.port = None;
+        spec.extra_ports = Default::default();
+        let new_id = spec.instance_id.clone();
+        if let Err(e) = self.create_on(&to, spec.clone(), &account.0).await {
+            return Err(restart_old(e.context(format!("creating it on {}", to.name))).await);
+        }
+        let landed = async {
+            // A create starts the server; its files are swapped only while it
+            // is stopped.
+            self.stop_on(&to, &new_id).await?;
+            let backup = self.push_backup(&to, &new_id, carried.path()).await.map_err(|e| old_agent(e, &to))?;
+            self.restore_on(&to, &new_id, &backup.name).await?;
+            if was_running {
+                self.start_on(&to, &new_id).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(e) = landed {
+            if let Err(undo) = self.remove_on(&to, &new_id).await {
+                tracing::warn!(instance = %new_id, node = %to.name, error = %undo, "a half-moved server was left on the new node");
+            }
+            return Err(restart_old(e.context(format!("moving it onto {}", to.name))).await);
+        }
+
+        // It stands on the new node. A failure to remove the old one leaves two
+        // copies, which is said rather than undone: the new one is the move.
+        if let Err(e) = self.remove_on(&from, instance_id).await {
+            tracing::warn!(instance = %instance_id, node = %from.name, error = %e, "moved, but the old server was not removed");
+        }
+        tracing::info!(from = %instance_id, to = %new_id, from_node = %from.name, to_node = %to.name, "moved a server");
+        Ok(HostedInstance {
+            instance_id: new_id,
+            node: to.name.clone(),
+            game_id: spec.game_id,
+            name: spec.name,
+            state: if was_running { "running" } else { "stopped" }.to_string(),
+            port: None,
+            ports: Vec::new(),
+            owner: Some(account.0.clone()),
+            uptime_secs: Some(0),
+            stopped_secs: None,
+            delete_in_secs: None,
+            players_now: None,
+        })
+    }
+
+    /// The Reticulum client and destination for a node driven over its uplink,
+    /// or `None` for a loopback-HTTP node.
+    async fn uplink_of(&self, node: &NodeConfig) -> Result<Option<(Arc<AgentClient>, DestinationHash)>> {
+        let Some(dest) = Self::agent_dest(node) else { return Ok(None) };
+        let dest = dest?;
+        let client = self
+            .agent_client()
+            .await
+            .ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+        Ok(Some((client, dest)))
+    }
+
+    async fn spec_on(&self, node: &NodeConfig, instance_id: &str) -> Result<platform_agent::instance::InstanceSpec> {
+        if let Some((client, dest)) = self.uplink_of(node).await? {
+            return client.spec(dest, instance_id).await.with_context(|| format!("asking agent {} for the server's settings", node.name));
+        }
+        let url = format!("{}/instances/{}/spec", node.api.trim_end_matches('/'), instance_id);
+        let response = self.http.get(&url).send().await.with_context(|| format!("asking node {}", node.name))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // An agent without the route says 404 too; either way the move
+            // cannot read what to make.
+            return Err(anyhow!("unknown op: node {} could not say how the server was made", node.name));
+        }
+        if !response.status().is_success() {
+            return Err(anyhow!("node {} refused the request", node.name));
+        }
+        response.json().await.with_context(|| format!("reading node {}'s reply", node.name))
+    }
+
+    async fn create_on(&self, node: &NodeConfig, spec: platform_agent::instance::InstanceSpec, owner: &str) -> Result<()> {
+        if let Some((client, dest)) = self.uplink_of(node).await? {
+            return client.create(dest, spec, Some(owner.to_string())).await.map(|_| ());
+        }
+        let mut spec = spec;
+        spec.owner = Some(owner.to_string());
+        let url = format!("{}/instances", node.api.trim_end_matches('/'));
+        let response = self.http.post(&url).json(&spec).send().await.with_context(|| format!("asking node {}", node.name))?;
+        if !response.status().is_success() {
+            let detail: serde_json::Value = response.json().await.unwrap_or_default();
+            return Err(anyhow!("{}", detail["error"].as_str().unwrap_or("the node refused")));
+        }
+        Ok(())
+    }
+
+    async fn restore_on(&self, node: &NodeConfig, instance_id: &str, name: &str) -> Result<()> {
+        if let Some((client, dest)) = self.uplink_of(node).await? {
+            return client.backup_restore(dest, instance_id, name).await;
+        }
+        let url = format!("{}/instances/{}/backups/{}/restore", node.api.trim_end_matches('/'), instance_id, name);
+        let response = self.http.post(&url).send().await.context("asking the node")?;
+        if !response.status().is_success() {
+            let detail: serde_json::Value = response.json().await.unwrap_or_default();
+            return Err(anyhow!("{}", detail["error"].as_str().unwrap_or("the node refused to restore it")));
+        }
+        Ok(())
+    }
+
+    /// Back a stopped server up on `from` and bring the file here, into a
+    /// temporary file that is deleted when the move is done with it. The
+    /// file passes through the index because two nodes have no way to reach
+    /// each other but through it; it never holds more than one piece in memory.
+    async fn carry_backup(&self, from: &NodeConfig, to: &NodeConfig, instance_id: &str) -> Result<TempFile> {
+        use tokio::io::AsyncWriteExt;
+        let file = TempFile::new()?;
+        let mut out = tokio::fs::File::create(file.path()).await?;
+        if let Some((client, dest)) = self.uplink_of(from).await? {
+            let backup = client.backup_create(dest, instance_id).await.context("backing it up")?;
+            // Refused before a byte moves if the new node could never take it.
+            if backup.bytes > platform_agent::backups::MAX_IMPORT_BYTES {
+                return Err(anyhow!("its files are over 4 GB, more than {} takes in", to.name));
+            }
+            let mut offset = 0;
+            loop {
+                let (total, data) = client.backup_read(dest, instance_id, &backup.name, offset).await?;
+                if data.is_empty() && offset < total {
+                    return Err(anyhow!("node {} sent an empty piece of the backup", from.name));
+                }
+                out.write_all(&data).await?;
+                offset += data.len() as u64;
+                if offset >= total {
+                    break;
+                }
+            }
+        } else {
+            let base = format!("{}/instances/{}/backups", from.api.trim_end_matches('/'), instance_id);
+            let backup: Backup = self.node_json(self.http.post(&base), from).await.context("backing it up")?;
+            let mut response = self
+                .http
+                .get(format!("{base}/{}/file", backup.name))
+                .timeout(TRANSFER_HTTP_TIMEOUT)
+                .send()
+                .await
+                .context("asking the node for the backup")?;
+            if !response.status().is_success() {
+                return Err(anyhow!("node {} refused to hand over the backup", from.name));
+            }
+            while let Some(piece) = response.chunk().await.context("reading the backup")? {
+                out.write_all(&piece).await?;
+            }
+        }
+        out.flush().await?;
+        Ok(file)
+    }
+
+    /// Send a backup file to a node as an import for `instance_id`; the node
+    /// checks it like any uploaded backup and names it.
+    async fn push_backup(&self, node: &NodeConfig, instance_id: &str, file: &std::path::Path) -> Result<Backup> {
+        use tokio::io::AsyncReadExt;
+        let total = tokio::fs::metadata(file).await?.len();
+        if let Some((client, dest)) = self.uplink_of(node).await? {
+            let mut input = tokio::fs::File::open(file).await?;
+            let mut upload: Option<String> = None;
+            let mut offset = 0u64;
+            let mut buf = vec![0u8; platform_agent::uplink_wire::TRANSFER_CHUNK];
+            loop {
+                let mut filled = 0;
+                while filled < buf.len() {
+                    let n = input.read(&mut buf[filled..]).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                let progress = client
+                    .backup_write(dest, instance_id, upload.as_deref(), offset, total, &buf[..filled])
+                    .await
+                    .context("sending the backup")?;
+                offset = progress.received;
+                if let Some(backup) = progress.backup {
+                    return Ok(backup);
+                }
+                if filled == 0 {
+                    return Err(anyhow!("node {} did not take the whole backup", node.name));
+                }
+                upload = Some(progress.upload);
+            }
+        }
+        // Streamed, as the uplink path is in pieces: a backup can be gigabytes.
+        let input = tokio::fs::File::open(file).await?;
+        let stream = futures_util::stream::unfold(input, |mut input| async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            match input.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(buf), input))
+                }
+                Err(e) => Some((Err(e), input)),
+            }
+        });
+        let body = reqwest::Body::wrap_stream(stream);
+        let url = format!("{}/instances/{}/backups/import", node.api.trim_end_matches('/'), instance_id);
+        let response = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_LENGTH, total)
+            .body(body)
+            .timeout(TRANSFER_HTTP_TIMEOUT)
+            .send()
+            .await
+            .context("sending the backup")?;
+        if !response.status().is_success() {
+            let detail: serde_json::Value = response.json().await.unwrap_or_default();
+            return Err(anyhow!("{}", detail["error"].as_str().unwrap_or("the node refused the backup")));
+        }
+        response.json().await.context("reading the node's reply")
+    }
+
     /// Send one loopback request to a node and read its JSON reply.
     async fn node_json<T: serde::de::DeserializeOwned>(
         &self,
@@ -993,10 +1271,22 @@ impl Hosting {
         existing: &[HostedInstance],
         class: Option<&str>,
     ) -> Option<&'c NodeConfig> {
+        self.pick_node_except(config, existing, class, "").await
+    }
+
+    /// [`pick_node`](Self::pick_node) leaving out the node named `except`, the
+    /// one a move is leaving.
+    async fn pick_node_except<'c>(
+        &self,
+        config: &'c HostingConfig,
+        existing: &[HostedInstance],
+        class: Option<&str>,
+        except: &str,
+    ) -> Option<&'c NodeConfig> {
         let mut best: Option<(&NodeConfig, Rank)> = None;
         // A classed node takes only creates that name its class, and a create
         // that names none takes only the nodes that have none.
-        for node in config.nodes.iter().filter(|n| n.class.as_deref() == class) {
+        for node in config.nodes.iter().filter(|n| n.class.as_deref() == class && n.name != except) {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let Some(ranked) = rank_node(self.node_capacity(node).await, here, node.priority) else {
                 continue;
@@ -1122,6 +1412,50 @@ fn rank_node(capacity: Option<CapacityResp>, own_count: usize, priority: i32) ->
             cap.max_instances - cap.running,
         )),
         None => Some((0, priority, 0, 0, usize::MAX - own_count)),
+    }
+}
+
+/// How long a loopback node may take to hand over or take in a whole backup.
+/// The client's usual 20 s is for one small reply.
+const TRANSFER_HTTP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// A server id held by a move in progress, given back when the move ends
+/// however it ends.
+struct MoveGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    id: String,
+}
+
+impl<'a> MoveGuard<'a> {
+    fn take(set: &'a std::sync::Mutex<std::collections::HashSet<String>>, id: &str) -> Option<Self> {
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string()).then(|| Self { set, id: id.to_string() })
+    }
+}
+
+impl Drop for MoveGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
+/// A file in the system's temporary directory, deleted on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new() -> Result<Self> {
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no entropy: {e}"))?;
+        Ok(Self(std::env::temp_dir().join(format!("lanthorn-move-{}.tar.gz", hex::encode(seed)))))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -1890,5 +2224,196 @@ mod tests {
             assert!(err.contains("not a backup name"), "{name}: {err}");
         }
         assert!(hits.lock().unwrap().is_empty());
+    }
+
+    /// A loopback node that keeps its servers in memory and records what it was
+    /// asked, in order, for the move tests. `holds_srv` starts it with one
+    /// running server, `srv`, owned by `aa`; `fail_restore` makes every restore
+    /// fail, as a node refusing a backup would.
+    async fn moving_node(holds_srv: bool, fail_restore: bool) -> (std::net::SocketAddr, Arc<std::sync::Mutex<FakeNode>>) {
+        use axum::body::Bytes;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        type Node = Arc<std::sync::Mutex<FakeNode>>;
+        fn row(id: &str, state: &str, owner: &str) -> serde_json::Value {
+            serde_json::json!({
+                "instance_id": id, "game_id": "sven-coop", "name": "Moving", "state": state,
+                "port": null, "ports": [], "owner": owner, "uptime_secs": 5, "players_now": 0,
+            })
+        }
+        async fn list(State(n): State<Node>) -> Json<serde_json::Value> {
+            Json(serde_json::Value::Array(n.lock().unwrap().servers.clone()))
+        }
+        async fn capacity() -> Json<serde_json::Value> {
+            Json(serde_json::json!({"max_instances": 10, "running": 0, "port_range_start": 1, "port_range_end": 2}))
+        }
+        async fn create(State(n): State<Node>, Json(spec): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let mut n = n.lock().unwrap();
+            let id = spec["instance_id"].as_str().unwrap().to_string();
+            n.hits.push(format!("create {} port={} owner={}", spec["name"].as_str().unwrap(), spec["port"], spec["owner"].as_str().unwrap()));
+            n.servers.push(row(&id, "running", spec["owner"].as_str().unwrap()));
+            Json(serde_json::json!({"state": "running", "port": 27015}))
+        }
+        fn set_state(n: &Node, id: &str, state: &str) {
+            let mut n = n.lock().unwrap();
+            n.hits.push(format!("{state} {id}"));
+            for r in n.servers.iter_mut().filter(|r| r["instance_id"] == id) {
+                r["state"] = state.into();
+            }
+        }
+        async fn stop(State(n): State<Node>, Path(id): Path<String>) -> &'static str {
+            set_state(&n, &id, "stopped");
+            "ok"
+        }
+        async fn start(State(n): State<Node>, Path(id): Path<String>) -> &'static str {
+            set_state(&n, &id, "running");
+            "ok"
+        }
+        async fn remove(State(n): State<Node>, Path(id): Path<String>) -> &'static str {
+            let mut n = n.lock().unwrap();
+            n.hits.push(format!("remove {id}"));
+            n.servers.retain(|r| r["instance_id"] != id.as_str());
+            "ok"
+        }
+        async fn spec(State(n): State<Node>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            n.lock().unwrap().hits.push(format!("spec {id}"));
+            Json(serde_json::json!({
+                "instance_id": id, "game_id": "sven-coop", "name": "Moving", "max_players": 12,
+                "port": 27015, "extra_ports": {"1": 27016}, "map": "svencoop1",
+                "restart_on_crash": true, "owner": "aa".repeat(16),
+            }))
+        }
+        async fn make(State(n): State<Node>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            n.lock().unwrap().hits.push(format!("backup {id}"));
+            Json(serde_json::json!({"name": "20261022-000000.tar.gz", "bytes": 18, "created_unix": 0}))
+        }
+        async fn file(State(n): State<Node>, Path((id, _name)): Path<(String, String)>) -> &'static [u8] {
+            n.lock().unwrap().hits.push(format!("file {id}"));
+            b"the server's files"
+        }
+        async fn import(State(n): State<Node>, Path(id): Path<String>, body: Bytes) -> Json<serde_json::Value> {
+            let mut n = n.lock().unwrap();
+            n.hits.push(format!("import {id}"));
+            n.imported = body.to_vec();
+            Json(serde_json::json!({"name": "20261023-000000.tar.gz", "bytes": body.len(), "created_unix": 0}))
+        }
+        async fn restore(State(n): State<Node>, Path((id, name)): Path<(String, String)>) -> (StatusCode, Json<serde_json::Value>) {
+            let mut n = n.lock().unwrap();
+            n.hits.push(format!("restore {id} {name}"));
+            if n.fail_restore {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "that backup does not restore here"})));
+            }
+            (StatusCode::OK, Json(serde_json::json!({})))
+        }
+
+        let node: Node = Arc::new(std::sync::Mutex::new(FakeNode {
+            servers: if holds_srv { vec![row("srv", "running", &"aa".repeat(16))] } else { Vec::new() },
+            fail_restore,
+            ..Default::default()
+        }));
+        let app = Router::new()
+            .route("/instances", get(list).post(create))
+            .route("/capacity", get(capacity))
+            .route("/instances/:id", axum::routing::delete(remove))
+            .route("/instances/:id/stop", post(stop))
+            .route("/instances/:id/start", post(start))
+            .route("/instances/:id/spec", get(spec))
+            .route("/instances/:id/backups", post(make))
+            .route("/instances/:id/backups/import", post(import))
+            .route("/instances/:id/backups/:name/file", get(file))
+            .route("/instances/:id/backups/:name/restore", post(restore))
+            .with_state(node.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, node)
+    }
+
+    #[derive(Default)]
+    struct FakeNode {
+        servers: Vec<serde_json::Value>,
+        hits: Vec<String>,
+        imported: Vec<u8>,
+        fail_restore: bool,
+    }
+
+    fn two_nodes_at(a: std::net::SocketAddr, b: std::net::SocketAddr) -> HostingConfig {
+        let mut c = config();
+        c.nodes[0].name = "a".into();
+        c.nodes[0].api = format!("http://{a}");
+        let mut second = c.nodes[0].clone();
+        second.name = "b".into();
+        second.api = format!("http://{b}");
+        c.nodes.push(second);
+        c
+    }
+
+    /// A move makes the same server on the other node with the old one's files,
+    /// starts it because the old one was running, and only then removes the
+    /// old one. The new node picks the ports; the rest of the spec travels.
+    #[tokio::test]
+    async fn a_server_moves_with_its_files_and_the_old_one_goes_last() {
+        let (a, from) = moving_node(true, false).await;
+        let (b, to) = moving_node(false, false).await;
+        let h = Hosting::new(two_nodes_at(a, b));
+        let owner = AccountId("aa".repeat(16));
+
+        let stranger = AccountId("bb".repeat(16));
+        assert_eq!(h.relocate(&stranger, "srv").await.unwrap_err().to_string(), "no such instance");
+        assert!(from.lock().unwrap().hits.is_empty(), "a stranger's move reached the node");
+
+        let moved = h.relocate(&owner, "srv").await.unwrap();
+        assert_eq!(moved.node, "b");
+        assert_ne!(moved.instance_id, "srv");
+        assert_eq!(moved.state, "running");
+        let new = &moved.instance_id;
+        assert_eq!(
+            from.lock().unwrap().hits,
+            vec!["spec srv", "stopped srv", "backup srv", "file srv", "remove srv"],
+        );
+        assert_eq!(
+            to.lock().unwrap().hits,
+            vec![
+                format!("create Moving port=null owner={}", "aa".repeat(16)),
+                format!("stopped {new}"),
+                format!("import {new}"),
+                format!("restore {new} 20261023-000000.tar.gz"),
+                format!("running {new}"),
+            ],
+        );
+        assert_eq!(to.lock().unwrap().imported, b"the server's files");
+        assert!(from.lock().unwrap().servers.is_empty());
+    }
+
+    /// A move that fails on the new node removes what it made there and starts
+    /// the old server again, which was never removed.
+    #[tokio::test]
+    async fn a_move_that_fails_on_the_new_node_leaves_the_old_server_running() {
+        let (a, from) = moving_node(true, false).await;
+        let (b, to) = moving_node(false, true).await;
+        let h = Hosting::new(two_nodes_at(a, b));
+        let err = h.relocate(&AccountId("aa".repeat(16)), "srv").await.unwrap_err();
+        assert!(format!("{err:#}").contains("does not restore here"), "{err:#}");
+        let from = from.lock().unwrap();
+        assert_eq!(from.hits.last().map(String::as_str), Some("running srv"), "{:?}", from.hits);
+        assert!(!from.hits.iter().any(|h| h.starts_with("remove")), "the old server was removed: {:?}", from.hits);
+        let to = to.lock().unwrap();
+        assert!(to.hits.last().is_some_and(|h| h.starts_with("remove ")), "{:?}", to.hits);
+        assert!(to.servers.is_empty());
+    }
+
+    /// With nowhere to go, nothing is touched: the server is not even stopped.
+    #[tokio::test]
+    async fn a_move_with_no_other_node_touches_nothing() {
+        let (a, from) = moving_node(true, false).await;
+        let h = Hosting::new(one_node_at(a));
+        let err = h.relocate(&AccountId("aa".repeat(16)), "srv").await.unwrap_err();
+        assert_eq!(err.to_string(), "no other node has room for it");
+        assert!(from.lock().unwrap().hits.is_empty(), "{:?}", from.lock().unwrap().hits);
     }
 }

@@ -607,6 +607,30 @@ the controller.
 Each action on the controller list is one request to the index, and the page
 polls. Keep that in mind when several people leave a page open on a big index.
 
+## Moving a server to another worker
+
+"Move to another worker…" in a server's menu (on a page with a controller), or
+`POST /instances/<id>/relocate` on the index, moves one of your servers to the
+worker with the most room among the workers of the same class. The index:
+
+1. reads how the server was made, and stops it if it runs;
+2. backs it up and carries the backup across, in 256 KiB pieces over the
+   uplink, through a temporary file on the index's machine;
+3. creates the same server on the new worker (the new worker picks the ports),
+   puts the backup back there, and starts it if the old one was running;
+4. removes the old server, last.
+
+If any step before the last fails, what was made on the new worker is removed
+and the old server is started again. The backup stays on the old worker, as
+every removed server's backups do. The server gets **a new id and a new mesh
+address**: old invite links and favorites point at the old one. Players on it
+are dropped. A worker whose agent predates moves is named as too old.
+
+The index reads and writes backup files on its workers to do this, which it
+could not before. A backup holds a server's own files (saves, settings, logs),
+not the game; a worker that trusts an index already lets it create, restore and
+remove servers there.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an

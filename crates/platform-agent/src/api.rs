@@ -133,6 +133,7 @@ pub fn router_full(
         .route("/instances/:id/backups/:name/restore", post(restore_backup))
         .route("/instances/:id/backup-schedule", get(backup_schedule).put(set_backup_schedule))
         .route("/instances/:id/backups/:name/file", get(download_backup))
+        .route("/instances/:id/spec", get(instance_spec))
         .route(
             "/instances/:id/backups/import",
             post(import_backup).layer(axum::extract::DefaultBodyLimit::disable()),
@@ -1038,9 +1039,15 @@ async fn delete_backup(
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
 }
 
-/// The largest backup the node takes in. A server's own files (saves,
-/// settings, logs) are megabytes; this is a bound on a mistake, not a quota.
-const MAX_BACKUP_UPLOAD: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest backup the node takes in, the same bound the uplink holds an
+/// upload to.
+const MAX_BACKUP_UPLOAD: u64 = crate::backups::MAX_IMPORT_BYTES;
+
+/// What a server would be created from again on another node
+/// (`Agent::spec`): an index moving it reads this first.
+async fn instance_spec(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<crate::instance::InstanceSpec> {
+    state.agent.spec(&id).await.map(Json).map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
 
 /// A backup's file, for the operator to keep elsewhere. Streamed, never read
 /// whole into memory.

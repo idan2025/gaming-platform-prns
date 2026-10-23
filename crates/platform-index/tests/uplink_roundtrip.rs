@@ -438,6 +438,111 @@ async fn a_remote_servers_logs_and_backups_work_over_the_uplink() {
     outcome.expect("logs and backups should work over the uplink");
 }
 
+/// What a move carries, live over the uplink: a server's spec, and its backup
+/// read out of one server in pieces and written into another, bigger than one
+/// piece so both directions ride several Reticulum resources. The file comes
+/// back byte for byte after a restore, and a piece that does not follow on
+/// from the last is refused rather than written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplink() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let Some(mut tn) = two_nodes(|idx| vec![idx.to_string()]).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let from = format!("uplmvf{}", std::process::id());
+    let to = format!("uplmvt{}", std::process::id());
+    docker_rm(&format!("gpp-{from}"));
+    docker_rm(&format!("gpp-{to}"));
+    let root = tn._dir.path().to_path_buf();
+
+    let outcome: Result<()> = async {
+        let spec = |id: &str| platform_agent::instance::InstanceSpec {
+            instance_id: id.to_string(),
+            game_id: "sven-coop".to_string(),
+            name: "Remote move".to_string(),
+            max_players: 8,
+            port: None,
+            extra_ports: Default::default(),
+            map: None,
+            bots: None,
+            restart_on_crash: false,
+            owner: None,
+            options: Default::default(),
+        };
+        for id in [&from, &to] {
+            let made = with_retries(|| {
+                let spec = spec(id);
+                let client = tn.client.clone();
+                let dest = tn.agent_dest;
+                async move { client.create(dest, spec, Some(USER_IDENTITY_HEX.to_string())).await }
+            })
+            .await;
+            match made {
+                Ok(_) => {}
+                Err(e) if format!("{e:#}").contains("already exists") => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // The spec comes back as the server was made, owner included.
+        let read = tn.client.spec(tn.agent_dest, &from).await?;
+        assert_eq!((read.game_id.as_str(), read.name.as_str()), ("sven-coop", "Remote move"));
+        assert_eq!(read.owner.as_deref(), Some(USER_IDENTITY_HEX));
+
+        // Incompressible, and bigger than two pieces.
+        let mut original = vec![0u8; platform_agent::uplink_wire::TRANSFER_CHUNK * 2 + 12_345];
+        getrandom::getrandom(&mut original).map_err(|e| anyhow!("{e}"))?;
+        std::fs::write(root.join("instances").join(&from).join("writable/big.bin"), &original)?;
+        let made = tn.client.backup_create(tn.agent_dest, &from).await?;
+
+        let mut file = Vec::new();
+        let mut pieces = 0;
+        loop {
+            let (total, data) = tn.client.backup_read(tn.agent_dest, &from, &made.name, file.len() as u64).await?;
+            assert_eq!(total, made.bytes, "every piece states the whole file's length");
+            file.extend_from_slice(&data);
+            pieces += 1;
+            if file.len() as u64 >= total {
+                break;
+            }
+        }
+        assert!(pieces > 2, "the backup should have needed several pieces, took {pieces}");
+
+        tn.client.stop(tn.agent_dest, &to).await?;
+        let total = file.len() as u64;
+        let first = tn.client.backup_write(tn.agent_dest, &to, None, 0, total, &file[..1000]).await?;
+        assert_eq!((first.received, first.backup.is_none()), (1000, true));
+        let skipped = tn.client.backup_write(tn.agent_dest, &to, Some(&first.upload), 5000, total, &file[5000..6000]).await;
+        assert!(
+            skipped.as_ref().is_err_and(|e| format!("{e:#}").contains("does not follow on")),
+            "a piece that skips ahead must be refused: {skipped:?}"
+        );
+        let mut progress = first;
+        for piece in file[1000..].chunks(platform_agent::uplink_wire::TRANSFER_CHUNK) {
+            progress = tn
+                .client
+                .backup_write(tn.agent_dest, &to, Some(&progress.upload), progress.received, total, piece)
+                .await?;
+        }
+        let landed = progress.backup.ok_or_else(|| anyhow!("the last piece did not make a backup"))?;
+        tn.client.backup_restore(tn.agent_dest, &to, &landed.name).await?;
+        let back = std::fs::read(root.join("instances").join(&to).join("writable/big.bin"))?;
+        assert!(back == original, "the file did not come back byte for byte");
+
+        tn.client.remove(tn.agent_dest, &from).await?;
+        tn.client.remove(tn.agent_dest, &to).await?;
+        Ok(())
+    }
+    .await;
+
+    docker_rm(&format!("gpp-{from}"));
+    docker_rm(&format!("gpp-{to}"));
+    tn.agent_node.stop().await;
+    tn.index.stop().await;
+    outcome.expect("a backup should be carried in pieces over the uplink");
+}
+
 /// An index the operator did not list is refused on its very first request — it
 /// cannot even list. This is the allowlist gate, live over the wire: a stranger
 /// with a valid keypair and no path to the allowlist gets nothing.
