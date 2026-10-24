@@ -599,10 +599,12 @@ machine is refused at start, because it would send the session in the clear.
 The page lists every server on every worker the index drives. Create, stop,
 start, remove, logs and backups go through the index, which sends each to the
 node that holds the server. **What the controller does not carry**, and what
-stays on the node's own page: console, map change, bots, chat, players,
-restart, world upload and backup download. The node refuses those on this
-route, so nothing that types at a server or moves its files is reachable from
-the controller.
+stays on the node's own page: console, map change, changing bots on a running
+server, chat, players, restart, world upload and backup download. The node
+refuses those on this route, so nothing that types at a server or moves its
+files is reachable from the controller. What the create form asks for travels
+with the create: bots to start with, restart on crash, and a game's own
+choices (a Minecraft build, its heap, the EULA, world settings).
 
 Each action on the controller list is one request to the index, and the page
 polls. Keep that in mind when several people leave a page open on a big index.
