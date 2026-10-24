@@ -939,9 +939,10 @@ impl Hosting {
 
         // Made and held stopped: a create starts the server, and its files are
         // swapped only while it is stopped.
-        if let Err(e) = self.create_on(&to, spec.clone(), &account.0).await {
-            return Err(e.context(format!("creating it on {}", to.name)));
-        }
+        let (port, ports) = match self.create_on(&to, spec.clone(), &account.0).await {
+            Ok(picked) => picked,
+            Err(e) => return Err(e.context(format!("creating it on {}", to.name))),
+        };
         let remove_new = |e: anyhow::Error| async {
             if let Err(undo) = self.remove_on(&to, &new_id).await {
                 tracing::warn!(instance = %new_id, node = %to.name, error = %undo, "a half-moved server was left on the new node");
@@ -1021,8 +1022,10 @@ impl Hosting {
             game_id: spec.game_id,
             name: spec.name,
             state: if was_running { "running" } else { "stopped" }.to_string(),
-            port: None,
-            ports: Vec::new(),
+            // What the new node picked: a caller pointing a game at the
+            // server needs the port, not just the address.
+            port,
+            ports,
             owner: Some(account.0.clone()),
             uptime_secs: Some(0),
             stopped_secs: None,
@@ -1094,9 +1097,16 @@ impl Hosting {
         response.json().await.with_context(|| format!("reading node {}'s reply", node.name))
     }
 
-    async fn create_on(&self, node: &NodeConfig, spec: platform_agent::instance::InstanceSpec, owner: &str) -> Result<()> {
+    /// Create on one node and return the ports it picked.
+    async fn create_on(
+        &self,
+        node: &NodeConfig,
+        spec: platform_agent::instance::InstanceSpec,
+        owner: &str,
+    ) -> Result<(Option<u16>, Vec<InstancePort>)> {
         if let Some((client, dest)) = self.uplink_of(node).await? {
-            return client.create(dest, spec, Some(owner.to_string())).await.map(|_| ());
+            let created = client.create(dest, spec, Some(owner.to_string())).await?;
+            return Ok((created.port, created.ports));
         }
         let mut spec = spec;
         spec.owner = Some(owner.to_string());
@@ -1106,7 +1116,8 @@ impl Hosting {
             let detail: serde_json::Value = response.json().await.unwrap_or_default();
             return Err(anyhow!("{}", detail["error"].as_str().unwrap_or("the node refused")));
         }
-        Ok(())
+        let created: serde_json::Value = response.json().await.unwrap_or_default();
+        Ok((created["port"].as_u64().map(|p| p as u16), ports_from_json(&created["ports"])))
     }
 
     async fn restore_on(&self, node: &NodeConfig, instance_id: &str, name: &str) -> Result<()> {
@@ -2697,6 +2708,7 @@ mod tests {
         assert_eq!(moved.node, "b");
         assert_ne!(moved.instance_id, "srv");
         assert_eq!(moved.state, "running");
+        assert_eq!(moved.port, Some(27015), "the reply should name the port the new node picked");
         let new = &moved.instance_id;
         // The old server is stopped only after a full copy and a small live
         // delta, then one last delta; its identity is read after that.
