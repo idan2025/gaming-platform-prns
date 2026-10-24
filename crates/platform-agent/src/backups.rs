@@ -35,7 +35,7 @@ pub const BACKUPS_DIR: &str = "backups";
 const SUFFIX: &str = ".tar.gz";
 
 /// One backup of one server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Backup {
     pub name: String,
     pub bytes: u64,

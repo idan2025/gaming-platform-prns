@@ -47,6 +47,20 @@ pub const OP_CAPACITY: u8 = 7;
 /// Start a stopped instance. An agent older than this op answers "unknown
 /// op", which the index turns into "update that node".
 pub const OP_START: u8 = 8;
+/// The last lines a server wrote (`Agent::logs`). Read-only. The reply is the
+/// newest text that fits one packet, flagged when older lines were left out.
+pub const OP_LOGS: u8 = 9;
+/// A server's backups: list, make, restore and delete (`Agent::backups`,
+/// `create_backup`, `restore_backup`, `delete_backup`). Restore and delete name
+/// one backup by the agent's own name for it.
+pub const OP_BACKUPS: u8 = 10;
+pub const OP_BACKUP_CREATE: u8 = 11;
+pub const OP_BACKUP_RESTORE: u8 = 12;
+pub const OP_BACKUP_DELETE: u8 = 13;
+
+// Deliberately absent: a map change. It types a line at the server's console,
+// and the uplink never gains a console route (CLAUDE.md). Decided by the owner
+// before any code, per ROADMAP §13.
 
 // Status byte in a response.
 const STATUS_OK: u8 = 0;
@@ -110,6 +124,23 @@ pub struct InstanceReq {
     pub instance_id: String,
 }
 
+/// `OP_LOGS`: how many lines to ask for. The node caps it, and the reply is
+/// capped by what fits one packet regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsReq {
+    pub token: String,
+    pub instance_id: String,
+    pub lines: u32,
+}
+
+/// `OP_BACKUP_RESTORE` / `OP_BACKUP_DELETE`: one backup of one server, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupReq {
+    pub token: String,
+    pub instance_id: String,
+    pub name: String,
+}
+
 /// `OP_LIST` / `OP_CAPACITY`: read the node, with a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenReq {
@@ -117,6 +148,60 @@ pub struct TokenReq {
 }
 
 // ---- Response payloads ------------------------------------------------------
+
+/// `OP_LOGS`: the newest text that fit, and whether older lines were left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResp {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// `OP_BACKUPS`: the newest backups that fit, and whether older ones were left
+/// out. Backups are named by time, so newest is the end of the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupsResp {
+    pub backups: Vec<crate::backups::Backup>,
+    pub truncated: bool,
+}
+
+/// The newest log text that fits one reply, cut from the front on a character
+/// boundary: the end of a log is what someone asking for it needs.
+pub fn encode_logs_resp(text: &str) -> Vec<u8> {
+    let mut start = 0;
+    loop {
+        let kept = &text[start..];
+        let body = payload_bytes(&LogsResp { text: kept.to_string(), truncated: start > 0 })
+            .unwrap_or_default();
+        if body.len() <= MAX_BODY_LEN || kept.is_empty() {
+            return encode_ok(OP_LOGS, &body);
+        }
+        // Eighths keep this quick on a long log; the last few lines are found
+        // by the loop's final steps.
+        start += (kept.len() / 8).max(1);
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        if start >= text.len() {
+            start = text.len();
+        }
+    }
+}
+
+/// The newest backups that fit one reply. Names are the agent's own timestamps,
+/// so ascending by name is oldest first, and the oldest are the ones dropped.
+pub fn encode_backups_resp(backups: &[crate::backups::Backup]) -> Vec<u8> {
+    let mut sorted = backups.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut start = 0;
+    loop {
+        let kept = sorted[start..].to_vec();
+        let body = payload_bytes(&BackupsResp { backups: kept, truncated: start > 0 }).unwrap_or_default();
+        if body.len() <= MAX_BODY_LEN || start + 1 >= sorted.len() {
+            return encode_ok(OP_BACKUPS, &body);
+        }
+        start += 1;
+    }
+}
 
 /// `OP_LIST` result. Truncation is on the wire for the same reason as
 /// `wire.rs::QueryResult`: a caller that cannot tell "this is the whole node"
@@ -429,5 +514,50 @@ mod tests {
     fn fits_rejects_an_oversized_body() {
         assert!(fits(MAX_BODY_LEN).is_ok());
         assert_eq!(fits(MAX_BODY_LEN + 1), Err(WireError::TooLarge(MAX_BODY_LEN + 1)));
+    }
+
+    fn body_of(reply: &[u8]) -> Vec<u8> {
+        let (_, ok, body) = decode_response(reply).unwrap();
+        assert!(ok, "a reply that should be ok was an error");
+        body.to_vec()
+    }
+
+    /// A long log comes back as its newest lines that fit one packet, flagged,
+    /// and never with a character cut in half.
+    #[test]
+    fn a_long_log_keeps_its_newest_text_and_says_it_was_cut() {
+        let text: String = (0..4000).map(|i| format!("line {i} é\n")).collect();
+        let reply = encode_logs_resp(&text);
+        let resp: LogsResp = serde_json::from_slice(&body_of(&reply)).unwrap();
+        assert!(resp.truncated, "older lines were left out, and the reply must say so");
+        assert!(text.ends_with(&resp.text), "what is kept is the end of the log");
+        assert!(resp.text.contains("line 3999"), "the newest line is kept");
+        assert!(fits(body_of(&reply).len()).is_ok(), "the reply fits one packet");
+    }
+
+    #[test]
+    fn a_short_log_comes_back_whole_and_unflagged() {
+        let reply = encode_logs_resp("one\ntwo\n");
+        let resp: LogsResp = serde_json::from_slice(&body_of(&reply)).unwrap();
+        assert_eq!(resp, LogsResp { text: "one\ntwo\n".into(), truncated: false });
+    }
+
+    /// Backups are named by time, so the oldest are the ones left out, and the
+    /// reply says so rather than looking like the whole set.
+    #[test]
+    fn many_backups_keep_the_newest_and_say_so() {
+        let made: Vec<crate::backups::Backup> = (0..200)
+            .map(|i| crate::backups::Backup {
+                name: format!("20261022-{:06}.tar.gz", i),
+                bytes: 1024,
+                created_unix: Some(i),
+            })
+            .collect();
+        let reply = encode_backups_resp(&made);
+        let resp: BackupsResp = serde_json::from_slice(&body_of(&reply)).unwrap();
+        assert!(resp.truncated);
+        assert_eq!(resp.backups.last().unwrap().name, "20261022-000199.tar.gz", "newest kept");
+        assert!(resp.backups.len() < made.len());
+        assert!(fits(body_of(&reply).len()).is_ok());
     }
 }
