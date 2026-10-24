@@ -74,6 +74,61 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.46
+
+### Minecraft servers, and kick and ban for every game
+
+- A node can host **Minecraft: Java Edition** (vanilla, Paper, Fabric or
+  Forge, a version per server, 1.18.1 and newer) and **Bedrock Edition**.
+  Each Java build comes from its publisher's own site and is checked against
+  the publisher's digest; the owner accepts the EULA before a server is
+  made; memory and CPU are checked against the machine first, and each
+  server gets a hard memory cap. A world can be imported, and the old one is
+  backed up first. Bedrock servers report their player count.
+- Every game with a console has **kick and ban** on its node page.
+
+### Invites as a QR code
+
+- Next to Invite, the launcher shows the invite as a QR code, drawn on your
+  own computer, so a phone joins by scanning it.
+
+### Many machines, one place to start servers
+
+For people running servers on more than one machine (`HOSTING.md`):
+
+- **Workers.** `scripts/setup-worker.sh` turns a machine into a worker for an
+  index in one command. The index places each new server on the worker with
+  the most room, counting memory, disk and the operator's priority; a worker
+  that does not answer is never treated as empty.
+- **Your node's page can place servers across every worker**, through a
+  `[controller]` section: create, stop, start, remove, logs and backups, with
+  the create form's choices (bots, crash restart, a Minecraft build and its
+  settings) carried along. Several open pages share one list from the index.
+- **Moving a server to another worker** keeps it running while its files are
+  copied, then switches over and keeps its address, so invite links keep
+  working. A real Sven Co-op server with 300 MiB of files moved between two
+  machines in 22 seconds, and players lost it for 1.4 seconds. A move that
+  fails never loses the server.
+- **Regions and classes.** A worker can carry a region (`eu`), and a create
+  can ask for one; a worker can carry a class that only some creates use.
+- **More than one hub.** An index and a worker can each reach the mesh through
+  several hubs and keep working while any one is up.
+- **Quotas per account**, and stopped servers removed after a number of days,
+  with a countdown shown, if the operator turns it on.
+- **The index keeps its address** across restarts (`--identity FILE`), no
+  longer shows up as a server in the list, and its web address now shows a
+  page saying what it is and what it hosts.
+
+### Servers stop at once
+
+- A game server now stops in a quarter of a second instead of ten. Sven
+  Co-op and other servers that ignore the stop signal were killed after a
+  ten-second wait on every stop, restart and move; they now run under a small
+  init that passes the signal on. Sven Co-op also runs without Valve's
+  restart wrapper, which hid crashes from the node.
+- A removed server's address key is deleted with it (its files stay until you
+  delete them).
+
 ## v0.2.45
 
 ### A Linux-hosted LAN race no longer ends as it starts
