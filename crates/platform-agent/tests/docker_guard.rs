@@ -302,6 +302,43 @@ async fn an_instance_can_be_created_started_stopped_and_removed() {
     outcome.expect("the instance lifecycle should complete");
 }
 
+/// A stop reaches a game that installs no SIGTERM handler. The test image's
+/// `sleep` is such a process, as Sven Co-op's DS is: as PID 1 it ignored the
+/// signal, so every stop waited out the timeout and ended in SIGKILL (137),
+/// and that wait was a server move's whole downtime. Under Docker's init it
+/// ends on the signal itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_game_without_a_signal_handler_stops_on_the_signal_not_the_timeout() {
+    let Some(rt) = runtime_or_skip().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    if !ensure_test_image() {
+        eprintln!("skipping: could not build the test image");
+        return;
+    }
+    let id = format!("sigterm{}", std::process::id());
+    let name = format!("gpp-{id}");
+    docker_rm(&name);
+
+    let outcome = async {
+        rt.create_and_start(&spec(&id), &test_runtime(), &[], &one_port(27208)).await?;
+        let started = std::time::Instant::now();
+        rt.stop(&id).await?;
+        Ok::<_, anyhow::Error>(started.elapsed())
+    }
+    .await;
+    let exit = std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.ExitCode}} {{.HostConfig.Init}}", &name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    docker_rm(&name);
+
+    let took = outcome.expect("create and stop");
+    assert_eq!(exit.unwrap(), "143 true", "the stop should end in SIGTERM under init");
+    assert!(took < std::time::Duration::from_secs(5), "the stop waited out the timeout: {took:?}");
+}
+
 /// Usage is read off a live container, and only one this agent made: the
 /// counters a person watches are Docker's, so the test asks the daemon.
 #[tokio::test(flavor = "multi_thread")]
