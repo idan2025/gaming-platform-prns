@@ -562,6 +562,15 @@ scripts/setup-worker.sh --index <index identity hash> --hub <hub host:port> \
     --name <node name> [--class <label>] [--region <label>] [--priority <n>] [--service]
 ```
 
+**More than one hub.** Give `--hub` more than once and the worker dials each;
+give the index `--tcp` more than once and it does the same. Reticulum carries
+the traffic through whichever hub is up, so one hub going down does not take
+the cluster with it. Measured on two LXC workers with one hub on the index's
+machine and one on a worker: with the first hub stopped, logs, stop, start and
+a new create all went through the second without one failed request, and
+every client was back on the first hub within 4 s of it returning. A worker's
+hubs live in `data/agent-interfaces.json`, the same file its page edits.
+
 It writes `~/lanthorn-worker/agent.toml` that trusts the index, makes the
 worker's identity (`agent.identity`, owner-only), points the worker at the hub,
 and prints a `[[nodes]]` block. Paste that block into the index's hosting file;

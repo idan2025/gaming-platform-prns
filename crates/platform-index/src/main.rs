@@ -1,6 +1,6 @@
 //! `platform-index` — an optional announce indexer.
 //!
-//! Usage: `platform-index [--bind ADDR] [--tcp HOST:PORT] [--auto]`
+//! Usage: `platform-index [--bind ADDR] [--tcp HOST:PORT]... [--auto]`
 //!
 //! It hears servers the same way a launcher does, remembers them a little
 //! longer, and offers an HTTP front door. Anyone can run one; nothing depends on
@@ -33,11 +33,13 @@ const HOSTING_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs
 const USAGE: &str = "\
 platform-index — an optional announce indexer and HTTP front door
 
-usage: platform-index [--bind ADDR] [--tcp HOST:PORT] [--auto] [--hosting FILE] [--identity FILE]
+usage: platform-index [--bind ADDR] [--tcp HOST:PORT]... [--auto] [--hosting FILE] [--identity FILE]
        platform-index --help | --version
 
   --bind ADDR       where the HTTP API listens (default: 127.0.0.1:4760)
-  --tcp HOST:PORT   dial a Reticulum TCP peer, or 0.0.0.0:PORT to bind one
+  --tcp HOST:PORT   dial a Reticulum TCP peer, or 0.0.0.0:PORT to bind one.
+                    Give it more than once to reach the mesh through several
+                    hubs: workers stay reachable while any one of them is up.
   --auto            attach auto-discovered local interfaces
   --identity FILE   keep the index's identity in this file (made on first run,
                     readable by its owner only). Without it the identity is new
@@ -57,7 +59,7 @@ async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let mut bind = "127.0.0.1:4760".to_string();
-    let mut tcp = None;
+    let mut tcp: Vec<String> = Vec::new();
     let mut auto = false;
     let mut hosting_path: Option<String> = None;
     let mut identity_path: Option<String> = None;
@@ -65,7 +67,7 @@ async fn main() -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => bind = args.next().context("--bind needs an address")?,
-            "--tcp" => tcp = Some(args.next().context("--tcp needs host:port")?),
+            "--tcp" => tcp.push(args.next().context("--tcp needs host:port")?),
             "--auto" => auto = true,
             "--identity" => identity_path = Some(args.next().context("--identity needs a path")?),
             "--hosting" => hosting_path = Some(args.next().context("--hosting needs a path")?),
@@ -125,10 +127,15 @@ async fn main() -> Result<()> {
     let agent_client_secret = personal_rns::prelude::Zeroizing::new(secret);
 
     let browser = BridgeSession::start_browser(BrowserArgs {
-        tcp: tcp.clone(),
+        tcp: tcp.first().cloned(),
         auto,
     })
     .await?;
+    // The rest of the hubs, on the same browse node: a server is heard
+    // through whichever of them is up.
+    for hub in tcp.iter().skip(1) {
+        game_bridge::relay::attach_interfaces(browser.handle(), Some(hub), false);
+    }
     let state = Arc::new(IndexState {
         registry: Mutex::new(Registry::new()),
         auth: Mutex::new(Authenticator::new(identity.identity_hash())),
