@@ -351,3 +351,36 @@ async fn stopping_or_starting_someone_elses_instance_is_indistinguishable_from_a
         assert_eq!(unauthenticated.status(), 401, "{op} without a session");
     }
 }
+
+/// Someone opening the index's address in a browser gets a page saying what it
+/// is and the identity a worker or a node pins. It names no worker, and
+/// operator text on it is text, never markup.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_front_page_says_what_this_index_is_and_names_no_worker() {
+    let (addr, index_key) = serve().await;
+    let page = reqwest::get(format!("http://{addr}/")).await.unwrap();
+    assert!(page.status().is_success());
+    assert!(page.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    let page = page.text().await.unwrap();
+    assert!(page.contains(&hex::encode(index_key.identity_hash().as_bytes())), "the identity is missing");
+    assert!(page.contains("a directory only"), "an index without hosting should say so");
+
+    use platform_index::hosting::{Hosting, HostingConfig, NodeConfig};
+    let hosting = Hosting::new(HostingConfig {
+        games: vec!["sven-coop".into(), "<script>alert(1)</script>".into()],
+        nodes: vec![NodeConfig {
+            name: "worker-in-the-basement".into(),
+            api: "http://127.0.0.1:4750".into(),
+            agent: Some("3ba38d2b008cd1d999f7a47ce8f8d3e6".into()),
+            priority: 0,
+            class: None,
+        }],
+        quota: Default::default(),
+    });
+    let (addr, _) = serve_with(Some(hosting)).await;
+    let page = reqwest::get(format!("http://{addr}/")).await.unwrap().text().await.unwrap();
+    assert!(page.contains("sven-coop") && page.contains("<td>1</td>"), "{page}");
+    assert!(!page.contains("<script>"), "operator text reached the page as markup");
+    assert!(page.contains("&lt;script&gt;"));
+    assert!(!page.contains("worker-in-the-basement") && !page.contains("3ba38d2b"), "a worker was named");
+}

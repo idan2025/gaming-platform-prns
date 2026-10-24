@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
+use axum::response::Html;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -49,6 +50,7 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 pub fn router(state: Arc<IndexState>) -> Router {
     Router::new()
+        .route("/", get(status_page))
         .route("/health", get(health))
         .route("/servers", get(servers))
         .route("/auth/challenge", post(challenge))
@@ -79,6 +81,81 @@ async fn health(State(state): State<Arc<IndexState>>) -> Json<serde_json::Value>
         "servers_known": registry.len(),
         "retention_secs": registry.retention().as_secs(),
     }))
+}
+
+/// A page for a person who opens the index's address in a browser: what this
+/// index is, its identity (what a worker's `--index` and a node's
+/// `[controller]` name), and what `/health` and `/hosting` already say. No
+/// worker's name or address, and nothing that asks a worker, so opening it
+/// costs the index nothing and tells a stranger nothing new.
+async fn status_page(State(state): State<Arc<IndexState>>) -> Html<String> {
+    let identity = hex::encode(state.auth.lock().await.audience().as_bytes());
+    let (known, retention) = {
+        let registry = state.registry.lock().await;
+        (registry.len(), registry.retention().as_secs())
+    };
+    let hosting = match &state.hosting {
+        Some(h) if h.config().enabled() => {
+            let config = h.config();
+            let games = config.games.iter().map(|g| escape(g)).collect::<Vec<_>>().join(", ");
+            let quota = format!("up to {} per account", config.quota.max_instances_per_account);
+            format!(
+                "<tr><th>Hosting</th><td>on</td></tr><tr><th>Games</th><td>{games}</td></tr>\
+                 <tr><th>Workers</th><td>{}</td></tr><tr><th>Servers</th><td>{quota}</td></tr>",
+                config.nodes.len()
+            )
+        }
+        _ => "<tr><th>Hosting</th><td>off: this index is a directory only</td></tr>".to_string(),
+    };
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lanthorn index</title>
+<style>
+:root {{ color-scheme: light dark; --bg: #f7f7f5; --fg: #1d1d1b; --muted: #66665f; --line: #deded8; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg: #171716; --fg: #ecece8; --muted: #a3a39b; --line: #33332f; }} }}
+body {{ margin: 0; padding: 32px 16px; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }}
+main {{ max-width: 640px; margin: 0 auto; }}
+h1 {{ font-size: 1.4rem; margin: 0 0 4px; }}
+p {{ color: var(--muted); margin: 0 0 24px; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ text-align: left; padding: 10px 0; border-top: 1px solid var(--line); vertical-align: top; }}
+th {{ width: 34%; font-weight: 500; color: var(--muted); }}
+code {{ font: 0.95em ui-monospace, monospace; overflow-wrap: anywhere; }}
+a {{ color: inherit; }}
+</style></head>
+<body><main>
+<h1>Lanthorn index</h1>
+<p>A cache of the mesh, not an authority: a launcher can hear every server listed here by itself.</p>
+<table>
+<tr><th>Identity</th><td><code>{identity}</code></td></tr>
+<tr><th>Version</th><td>{version}</td></tr>
+<tr><th>Servers heard</th><td>{known}, each kept {retention_min} minutes after it was last heard</td></tr>
+{hosting}
+</table>
+<p style="margin-top:24px">Machine-readable: <a href="/health">/health</a>, <a href="/servers">/servers</a>, <a href="/hosting">/hosting</a>.</p>
+</main></body></html>
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+        retention_min = retention / 60,
+    ))
+}
+
+/// Text for an HTML page. Every value the status page shows goes through it,
+/// operator config included.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The listing query, as URL parameters.

@@ -571,7 +571,9 @@ which writes a systemd user unit and leaves enabling it to you.
 Add a `[games.<id>]` section to `agent.toml` for each game the worker runs. A
 game with no entry cannot be placed there.
 
-The index's identity hash is in its log at start (`index identity ... identity=`).
+The index's identity hash is in its log at start (`index identity ... identity=`),
+and on the page its HTTP address serves (`/`), which also says whether it hosts
+and which games, and names no worker.
 Nothing the script prints is secret: the two hashes are public, and the identity
 file never leaves the worker.
 
