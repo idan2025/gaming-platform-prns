@@ -838,9 +838,12 @@ the owner stamped from the user's identity.
    `a_move_that_fails_while_copying_never_stops_the_old_server`,
    `a_move_that_fails_after_the_stop_starts_the_old_server_again` and, live,
    `a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplink`
-   and `a_delta_and_an_identity_cross_the_uplink`. Downtime between two real
-   machines is still unmeasured: one Docker host cannot run both agents
-   without each seeing the other's servers.
+   and `a_delta_and_an_identity_cross_the_uplink`. Measured between two
+   LXC workers on a Proxmox host over the LAN, through a real index and hub
+   (300 MiB of server files and a log written to while it ran): the move took
+   18 s and the index logged `downtime_ms=478`. A game that ignores SIGTERM adds
+   Docker's 10 s stop timeout (`downtime_ms=10275` with a busybox `sleep` as PID 1),
+   so a game's image should handle it.
 
 **A decision, not a default.** The uplink must never gain a console route
 (`CLAUDE.md`: an index must not type at a node's servers). Moderation and the

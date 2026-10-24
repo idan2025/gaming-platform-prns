@@ -630,6 +630,13 @@ is the last small delta plus the boot (the index logs it as `downtime_ms`, which
 is the part it can see; the game's boot comes after). A server that is not
 running moves in one full copy.
 
+Measured between two LXC workers on one Proxmox host, over the LAN through a
+real index and hub, with 300 MiB of server files and a log being written to: the
+whole move took 18 s and `downtime_ms` was 478. A game that does not exit on
+SIGTERM adds Docker's 10 s stop timeout (10275 with a busybox `sleep` as PID 1),
+so a game's image should handle the signal. Two machines in different
+buildings will add each piece's round trip to the copy, not to the downtime.
+
 Until step 3 the old server is not touched. If any step before the last fails,
 what was made on the new worker is removed and the old server is started again
 if it had been stopped. A worker whose agent predates moves is named as too old.

@@ -148,8 +148,9 @@ address, 2026-10-24). Rules a later change could quietly break:
   address is the identity, so a move that keeps it must carry the 64 secret
   bytes, and two nodes reach each other only through the index. An index on a
   node's `trusted_indexes` can already create, stop and remove there; this
-  adds impersonating that one server, and the old node's copy goes with its
-  folder. It is read and set per request under the same allowlist check as
+  adds impersonating that one server, and the old node's copy goes when the old
+  server is removed (`Agent::remove` deletes `mesh.identity`; the folder stays).
+  Caught by `a_removed_servers_identity_goes_and_its_folder_stays`. It is read and set per request under the same allowlist check as
   every op, set only on a **stopped** server and only if exactly 64 bytes,
   written beside and renamed at mode 0600. Never log it or write it on the
   index. Caught by `a_delta_and_an_identity_cross_the_uplink`.
