@@ -106,6 +106,16 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   caller's identity. Pinned by
   `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
 
+- **A limit is checked against every worker, and silence is not zero**
+  (2026-10-24, `max_backups_per_account`, `[quota.accounts.<hash>] max_backups`,
+  `Hosting::backups_held`). The cap is off until written, 0 is refused at
+  load, and an account's own number replaces the shared one either way. The
+  count asks each worker itself and refuses when one cannot answer:
+  `all_instances` deliberately skips a silent worker so a listing survives an
+  outage, and counting through it would let a worker's outage lift the limit.
+  A backup a node's own schedule makes counts toward it but is not stopped by
+  it (the schedule has its own `keep`). Caught by
+  `a_backup_is_refused_at_the_accounts_cap_across_its_workers_and_never_counts_a_strangers`.
 - **The hosting file is re-read without a restart** (`Hosting::reload_from`,
   checked every 10 s by modification time). The config is swapped whole and
   each operation takes one snapshot, so a reload never changes the rules
