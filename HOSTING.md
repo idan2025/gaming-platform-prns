@@ -632,9 +632,10 @@ running moves in one full copy.
 
 Measured between two LXC workers on one Proxmox host, over the LAN through a
 real index and hub, with 300 MiB of server files and a log being written to: the
-whole move took 18 s and `downtime_ms` was 478. A game that does not exit on
-SIGTERM adds Docker's 10 s stop timeout (10275 with a busybox `sleep` as PID 1),
-so a game's image should handle the signal. Two machines in different
+whole move took 18 s and `downtime_ms` was 478. The first run logged 10275: the
+game was PID 1 and ignored SIGTERM, so Docker waited out its 10 s stop timeout.
+Every game container now runs under Docker's init, which hands the signal on,
+so a game with no handler of its own stops in a quarter of a second. Two machines in different
 buildings will add each piece's round trip to the copy, not to the downtime.
 
 Until step 3 the old server is not touched. If any step before the last fails,
