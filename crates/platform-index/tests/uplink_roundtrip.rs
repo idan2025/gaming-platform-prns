@@ -632,8 +632,11 @@ async fn a_delta_and_an_identity_cross_the_uplink() {
         assert!(short.is_err(), "ten bytes are not an identity");
         tn.client.identity_set(tn.agent_dest, &to, &key).await?;
         assert_eq!(std::fs::read(identity_file(&to))?, key);
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(identity_file(&to))?.permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(identity_file(&to))?.permissions().mode() & 0o777, 0o600);
+        }
 
         tn.client.remove(tn.agent_dest, &from).await?;
         tn.client.remove(tn.agent_dest, &to).await?;
