@@ -93,6 +93,12 @@ pub struct NodeConfig {
     /// word: what a class is for is the operator's business.
     #[serde(default)]
     pub class: Option<String>,
+    /// Where the node is, as the operator names it (`eu`, `il-north`). A
+    /// create may ask for a region; nodes in it are placed on first, and the
+    /// others still take the server when none there has room. Same shape as a
+    /// class.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// A class label is data that is matched and shown, never run: short, lower
@@ -216,6 +222,15 @@ impl From<&QuotaSettings> for QuotaPolicy {
 }
 
 impl HostingConfig {
+    /// The regions the nodes are in, sorted and once each: what a create form
+    /// may offer. Only the words, never which node is where.
+    pub fn regions(&self) -> Vec<String> {
+        let mut regions: Vec<String> = self.nodes.iter().filter_map(|n| n.region.clone()).collect();
+        regions.sort();
+        regions.dedup();
+        regions
+    }
+
     pub fn enabled(&self) -> bool {
         !self.games.is_empty() && !self.nodes.is_empty()
     }
@@ -302,6 +317,11 @@ pub struct DeployRequest {
     /// with no class. Only an account the operator allowed it to may ask.
     #[serde(default)]
     pub class: Option<String>,
+    /// Place it near here if a node in this region has room (`NodeConfig::region`).
+    /// A wish, not a rule: with no room there it goes wherever placement
+    /// would have put it.
+    #[serde(default)]
+    pub region: Option<String>,
     /// Bots to start with, when the caller asked for some. Passed through for
     /// the node to judge (only a game whose pack has bots takes them); the
     /// index never invents a number.
@@ -378,6 +398,9 @@ impl Hosting {
         config.quota.validate().with_context(|| format!("in {}", path.display()))?;
         if let Some(bad) = config.nodes.iter().filter_map(|n| n.class.as_deref()).find(|c| !valid_class(c)) {
             return Err(anyhow!("a node's class {bad:?} is not a valid label")).with_context(|| format!("in {}", path.display()));
+        }
+        if let Some(bad) = config.nodes.iter().filter_map(|n| n.region.as_deref()).find(|r| !valid_class(r)) {
+            return Err(anyhow!("a node's region {bad:?} is not a valid label")).with_context(|| format!("in {}", path.display()));
         }
         Ok(config)
     }
@@ -561,7 +584,12 @@ impl Hosting {
         let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
         quotas.admit(account, &records, now).map_err(|e| anyhow!("{e}"))?;
 
-        let node = self.pick_node(&config, &existing, request.class.as_deref()).await.ok_or_else(|| {
+        if let Some(region) = request.region.as_deref() {
+            if !valid_class(region) {
+                return Err(anyhow!("that is not a region name"));
+            }
+        }
+        let node = self.pick_node(&config, &existing, request.class.as_deref(), request.region.as_deref()).await.ok_or_else(|| {
             anyhow!("no node with room for another instance")
         })?;
 
@@ -920,7 +948,8 @@ impl Hosting {
             .ok_or_else(|| anyhow!("this server is already being moved"))?;
         let existing = self.all_instances().await?;
         let to = self
-            .pick_node_except(&config, &existing, from.class.as_deref(), &from.name)
+            // Near the players it already has: the region it is leaving first.
+            .pick_node_except(&config, &existing, from.class.as_deref(), from.region.as_deref(), &from.name)
             .await
             .ok_or_else(|| anyhow!("no other node has room for it"))?
             .clone();
@@ -1468,8 +1497,9 @@ impl Hosting {
         config: &'c HostingConfig,
         existing: &[HostedInstance],
         class: Option<&str>,
+        region: Option<&str>,
     ) -> Option<&'c NodeConfig> {
-        self.pick_node_except(config, existing, class, "").await
+        self.pick_node_except(config, existing, class, region, "").await
     }
 
     /// [`pick_node`](Self::pick_node) leaving out the node named `except`, the
@@ -1479,16 +1509,21 @@ impl Hosting {
         config: &'c HostingConfig,
         existing: &[HostedInstance],
         class: Option<&str>,
+        region: Option<&str>,
         except: &str,
     ) -> Option<&'c NodeConfig> {
-        let mut best: Option<(&NodeConfig, Rank)> = None;
+        // The asked-for region comes right after "answered": a node in it
+        // beats every other node that answered, and a silent node in it still
+        // loses to all of them, as silence always does.
+        let mut best: Option<(&NodeConfig, (u8, bool, Rank))> = None;
         // A classed node takes only creates that name its class, and a create
         // that names none takes only the nodes that have none.
         for node in config.nodes.iter().filter(|n| n.class.as_deref() == class && n.name != except) {
             let here = existing.iter().filter(|i| i.node == node.name).count();
-            let Some(ranked) = rank_node(self.node_capacity(node).await, here, node.priority) else {
+            let Some(rank) = rank_node(self.node_capacity(node).await, here, node.priority) else {
                 continue;
             };
+            let ranked = (rank.0, region.is_some() && node.region.as_deref() == region, rank);
             if best.is_none_or(|(_, current)| ranked > current) {
                 best = Some((node, ranked));
             }
@@ -1698,6 +1733,7 @@ mod tests {
                 agent: None,
                 priority: 0,
                 class: None,
+                region: None,
                 name: "local".to_string(),
                 api: "http://127.0.0.1:4750".to_string(),
             }],
@@ -1744,6 +1780,7 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    region: None,
                     bots: None,
                     restart_on_crash: false,
                     options: Default::default(),
@@ -1769,6 +1806,7 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    region: None,
                     bots: None,
                     restart_on_crash: false,
                     options: Default::default(),
@@ -1795,6 +1833,7 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    region: None,
                     bots: None,
                     restart_on_crash: false,
                     options: Default::default(),
@@ -1857,7 +1896,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_is_picked_by_load() {
         let mut c = config();
-        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0, class: None });
+        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0, class: None, region: None });
         let h = Hosting::new(c);
         let existing = vec![HostedInstance {
             instance_id: "a".into(),
@@ -1875,7 +1914,7 @@ mod tests {
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
-        assert_eq!(h.pick_node(&h.config(), &existing, None).await.unwrap().name, "second");
+        assert_eq!(h.pick_node(&h.config(), &existing, None, None).await.unwrap().name, "second");
     }
 
     fn hosted(id: &str, uptime: Option<u64>, players: Option<u32>) -> HostedInstance {
@@ -2274,6 +2313,7 @@ mod tests {
             agent: None,
             priority: 0,
             class: class.map(String::from),
+            region: None,
         }
     }
 
@@ -2288,11 +2328,67 @@ mod tests {
         let pick = |class: Option<&'static str>| {
             let h = &h;
             let config = &config;
-            async move { h.pick_node(config, &[], class).await.map(|n| n.name.clone()) }
+            async move { h.pick_node(config, &[], class, None).await.map(|n| n.name.clone()) }
         };
         assert_eq!(pick(None).await.as_deref(), Some("plain"), "a plain create stays off the classed node");
         assert_eq!(pick(Some("gold")).await.as_deref(), Some("big"));
         assert_eq!(pick(Some("silver")).await, None, "no node of that class");
+    }
+
+    /// A loopback node that answers capacity with room to spare.
+    async fn roomy_node() -> String {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/capacity",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "max_instances": 8, "running": 0, "port_range_start": 27100, "port_range_end": 27199,
+                    "memory_available_bytes": 8u64 << 30,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A region is a wish: a node there that answered wins, a node there that
+    /// did not answer still loses to every node that did (silence is never
+    /// room), and a region nobody has places as if none was asked.
+    #[tokio::test]
+    async fn a_create_lands_in_its_region_when_a_node_there_answered() {
+        let at = |name: &str, api: &str, region: &str| NodeConfig {
+            region: Some(region.into()),
+            api: api.into(),
+            ..classed(name, None)
+        };
+        let (far, near) = (roomy_node().await, roomy_node().await);
+        let mut c = config();
+        c.nodes = vec![at("far", &far, "us"), at("near", &near, "eu")];
+        // `far` first, so a tie (no region asked) goes to it.
+        let h = Hosting::new(c);
+        let config = h.config();
+        let pick = |region: Option<&'static str>| {
+            let (h, config) = (&h, &config);
+            async move { h.pick_node(config, &[], None, region).await.map(|n| n.name.clone()) }
+        };
+        assert_eq!(pick(Some("eu")).await.as_deref(), Some("near"));
+        assert_eq!(pick(Some("us")).await.as_deref(), Some("far"));
+        assert_eq!(pick(Some("mars")).await.as_deref(), Some("far"), "a region nobody has changes nothing");
+        assert_eq!(pick(None).await.as_deref(), Some("far"));
+
+        let mut c = config.as_ref().clone();
+        c.nodes[1].api = "http://127.0.0.1:1".into();
+        let h = Hosting::new(c);
+        let config = h.config();
+        assert_eq!(
+            h.pick_node(&config, &[], None, Some("eu")).await.map(|n| n.name.clone()).as_deref(),
+            Some("far"),
+            "a silent node in the region beat one that answered"
+        );
     }
 
     #[tokio::test]
@@ -2306,6 +2402,7 @@ mod tests {
             max_players: 8,
             map: None,
             class: Some(class.into()),
+            region: None,
             bots: None,
             restart_on_crash: false,
             options: Default::default(),
@@ -2663,8 +2760,16 @@ mod tests {
         let plain: DeployRequest =
             serde_json::from_value(serde_json::json!({ "game_id": "sven-coop", "name": "plain" })).unwrap();
         h.deploy(&AccountId("aa".repeat(16)), &plain, now).await.unwrap();
+        let bad: DeployRequest =
+            serde_json::from_value(serde_json::json!({ "game_id": "sven-coop", "name": "x", "region": "Mars Base" })).unwrap();
+        let err = h.deploy(&AccountId("aa".repeat(16)), &bad, now).await.unwrap_err().to_string();
+        assert_eq!(err, "that is not a region name");
+        let nowhere: DeployRequest =
+            serde_json::from_value(serde_json::json!({ "game_id": "sven-coop", "name": "y", "region": "mars" })).unwrap();
+        h.deploy(&AccountId("aa".repeat(16)), &nowhere, now).await.expect("a region nobody has still places");
+
         let seen = seen.lock().unwrap();
-        assert!(seen.len() == 2 && seen[1].get("eula_accepted_at").is_none());
+        assert!(seen.len() == 3 && seen[1].get("eula_accepted_at").is_none());
         assert!(seen[1]["bots"].is_null() && seen[1]["restart_on_crash"] == false, "nothing invented");
     }
 

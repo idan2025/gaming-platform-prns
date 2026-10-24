@@ -99,9 +99,16 @@ async fn status_page(State(state): State<Arc<IndexState>>) -> Html<String> {
             let config = h.config();
             let games = config.games.iter().map(|g| escape(g)).collect::<Vec<_>>().join(", ");
             let quota = format!("up to {} per account", config.quota.max_instances_per_account);
+            let regions = config.regions();
+            let regions = if regions.is_empty() {
+                String::new()
+            } else {
+                let list = regions.iter().map(|r| escape(r)).collect::<Vec<_>>().join(", ");
+                format!("<tr><th>Regions</th><td>{list}</td></tr>")
+            };
             format!(
                 "<tr><th>Hosting</th><td>on</td></tr><tr><th>Games</th><td>{games}</td></tr>\
-                 <tr><th>Workers</th><td>{}</td></tr><tr><th>Servers</th><td>{quota}</td></tr>",
+                 <tr><th>Workers</th><td>{}</td></tr>{regions}<tr><th>Servers</th><td>{quota}</td></tr>",
                 config.nodes.len()
             )
         }
@@ -310,6 +317,7 @@ async fn hosting_info(State(state): State<Arc<IndexState>>) -> Json<serde_json::
             "enabled": h.config().enabled(),
             "games": h.config().games,
             "nodes": h.config().nodes.len(),
+            "regions": h.config().regions(),
             "max_instances_per_account": h.config().quota.max_instances_per_account,
         })),
     }

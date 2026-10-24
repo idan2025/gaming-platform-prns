@@ -222,6 +222,7 @@ fn hosting_config() -> platform_index::hosting::HostingConfig {
             agent: None,
             priority: 0,
             class: None,
+            region: None,
         }],
         quota: Default::default(),
     }
@@ -374,6 +375,7 @@ async fn the_front_page_says_what_this_index_is_and_names_no_worker() {
             agent: Some("3ba38d2b008cd1d999f7a47ce8f8d3e6".into()),
             priority: 0,
             class: None,
+            region: None,
         }],
         quota: Default::default(),
     });

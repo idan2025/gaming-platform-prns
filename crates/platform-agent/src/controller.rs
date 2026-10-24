@@ -225,6 +225,9 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
     let segments: Vec<&str> = path.split('/').collect();
     let no_query = || query.is_none();
     match segments.as_slice() {
+        // What the index hosts and where (regions), read-only: the create form
+        // offers a region from it.
+        ["hosting"] if *method == Method::GET && no_query() => Some("/hosting".into()),
         ["instances"] => match *method {
             Method::GET | Method::POST if no_query() => Some("/instances".into()),
             _ => None,
@@ -304,6 +307,11 @@ mod tests {
         for (method, rest, want) in cases {
             assert_eq!(allowed_path(&method, &rest).as_deref(), Some(want), "{method} {rest}");
         }
+        // What the index hosts and in which regions, for the create form: a
+        // read and nothing else.
+        assert_eq!(allowed_path(&Method::GET, "hosting").as_deref(), Some("/hosting"));
+        assert_eq!(allowed_path(&Method::POST, "hosting"), None);
+        assert_eq!(allowed_path(&Method::GET, "hosting?x=1"), None);
     }
 
     /// The point of the list: nothing that types at a server, reads a player's
