@@ -627,6 +627,15 @@ under all of it). Rules a later change could quietly break:
   network and under host networking. Extra channels go through
   `ServerArgs::extra_game_ports`, since the node publishes them on its own
   numbers.
+- **Every game container runs under Docker's init** (`HostConfig.init`).
+  A dedicated server is PID 1 otherwise, gets no default action for a
+  SIGTERM it has no handler for, and Sven Co-op's DS has none: every stop
+  waited out the 10 s and ended in SIGKILL (137), and that wait was a server
+  move's whole downtime. Under init it ends on the signal (143, 0.25 s).
+  Sven's image also runs `svends_i686`, never the `svends_run` restart loop,
+  which ran the DS as its child even with `-norestart` and restarted crashes
+  behind the agent's crash watch. Caught by
+  `a_game_without_a_signal_handler_stops_on_the_signal_not_the_timeout`.
 - **A `gpp-games` network that lets containers talk is refused, never used**
   (`only_a_games_network_that_keeps_containers_apart_is_used`).
 - **A server's own files are held to `writable_limit_bytes`**
