@@ -45,6 +45,28 @@ stylistic, and both have tests against a real Docker daemon:
 The agent's Docker tests skip themselves where there is no daemon, and they
 build a tiny local image from busybox rather than pulling anything.
 
+**The node page signs in with accounts** (2026-10-24, `accounts.rs`, `/auth/*`
+in `api.rs`). The API token stays valid on every route and is what makes the
+first account (`/auth/setup`, refused once any account exists) and the way back
+in; accounts exist only where a token is configured. Rules a later change could
+quietly break:
+- **Passwords are Argon2id hashes; the file is owner-only and written beside
+  and renamed.** A file that does not parse turns accounts off, never into
+  "no accounts", which would let the next token holder make one.
+- **A wrong username and a wrong password read the same**, and a missing name
+  is still checked against a decoy hash, so neither the words nor the time say
+  which accounts exist (`the_page_signs_in_with_an_account_made_once_with_the_token`).
+- **Sign-in is throttled per name** (5 failures in 15 minutes lock it for 5),
+  whatever is sent; a wrong code counts, "code needed" does not.
+- **A code is good once**: the step of the last code accepted is kept and a
+  code for it or an older step is refused; codes are on only after one from the
+  new secret was typed back. HMAC-SHA1 and Base32 are written here and pinned
+  to RFC 6238, 2202 and 4648 vectors.
+- **Sessions are memory only** (12 h), end at sign-out, with a password change
+  (every other session of the account) and when an account is removed; the
+  last account cannot be removed. The token is no account: it changes no
+  password and turns on no codes (403).
+
 **The agent handles SIGTERM itself** (2026-09-23). As PID 1 in a container it
 gets no default action for a signal it has no handler for, so without one every
 `docker stop` sat out the 10 s timeout and ended in SIGKILL (exit 137). On a

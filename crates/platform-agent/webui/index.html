@@ -29,14 +29,36 @@
         <rect x="344" y="696" width="336" height="58" rx="20" fill="#e3eae7"/>
       </svg>
     <h1 id="token-heading">Lanthorn Host</h1>
-    <p class="help">This node is protected by a token. You will find it in the file named by
-      <code>api_token_file</code> in the agent's config.</p>
-    <form id="token-form" autocomplete="off">
+    <p id="login-help" class="help"></p>
+    <form id="login-form" hidden>
+      <label for="login-user">Username</label>
+      <input id="login-user" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="login-pass">Password</label>
+      <input id="login-pass" type="password" name="password" autocomplete="current-password" required>
+      <div id="login-code-wrap" hidden>
+        <label for="login-code">Code from your authenticator app</label>
+        <input id="login-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8">
+      </div>
+      <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+    </form>
+    <form id="setup-form" hidden>
+      <label for="setup-token">This node's API token</label>
+      <input id="setup-token" type="password" autocomplete="off" required>
+      <label for="setup-user">Username</label>
+      <input id="setup-user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="setup-pass">Password (at least 10 characters)</label>
+      <input id="setup-pass" type="password" autocomplete="new-password" required>
+      <label for="setup-pass2">The password again</label>
+      <input id="setup-pass2" type="password" autocomplete="new-password" required>
+      <button type="submit" class="btn btn-primary btn-block">Create the account</button>
+    </form>
+    <form id="token-form" autocomplete="off" hidden>
       <label for="token-input">Access token</label>
       <input id="token-input" type="password" name="token" required>
       <button type="submit" class="btn btn-primary btn-block">Sign in</button>
     </form>
     <p id="token-error" class="inline-error" aria-live="polite"></p>
+    <p class="help"><a href="#" id="login-switch"></a></p>
   </div>
 </section>
 
@@ -79,6 +101,10 @@
       <button id="tab-interfaces" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-interfaces">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
         <span>Mesh</span>
+      </button>
+      <button id="tab-account" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-account" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+        <span>Account</span>
       </button>
       <button id="tab-requests" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-requests" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 100 18 9 9 0 000-18z"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3z"/></svg>
@@ -277,6 +303,9 @@
         </div>
         <div id="requests-admin"></div>
         <div id="requests-mine"></div>
+      </section>
+      <section id="tab-panel-account" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-account">
+        <div id="account-body"></div>
       </section>
     </main>
   </div>

@@ -498,3 +498,11 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .chip.req-denied { background: var(--bad-soft); color: var(--bad); }
 .req-card .form-actions { margin-top: 8px; }
 #tab-panel-requests h3 { margin: 18px 0 8px; font-size: 14px; }
+
+/* Account tab (accounts.rs): the QR an authenticator app scans, on white so
+   every app reads it in either theme. */
+.totp-qr { display: block; width: 200px; height: 200px; background: #fff; padding: 8px; border-radius: 6px; margin: 8px 0; }
+#tab-panel-account .req-card label { display: block; margin-top: 8px; }
+#tab-panel-account .req-card input { width: 100%; max-width: 360px; }
+#login-code-wrap { margin-top: 4px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; overflow-wrap: anywhere; }

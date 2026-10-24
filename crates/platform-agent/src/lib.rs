@@ -4,6 +4,7 @@
 //! layout and its security boundary; `config` holds the split between what a
 //! game pack describes and what a node's operator decides.
 
+pub mod accounts;
 pub mod active;
 pub mod agent;
 pub mod backups;

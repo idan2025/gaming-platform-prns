@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -80,6 +80,9 @@ pub struct ApiState {
     /// answer "no uplink" rather than 404 — the difference between "this agent
     /// cannot do that" and "this agent has no mesh node to do it to".
     pub interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
+    /// Sign-in accounts for the page (`accounts.rs`). Only where a token is
+    /// configured: without one the API is loopback-only and unauthenticated.
+    pub accounts: Option<Arc<crate::accounts::Accounts>>,
 }
 
 pub fn router(agent: Arc<Agent>) -> Router {
@@ -96,12 +99,26 @@ pub fn router_full(
     pack_dir: Option<std::path::PathBuf>,
     interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
 ) -> Router {
+    // A file that cannot be read leaves accounts off rather than starting with
+    // none (which would let the next holder of the token make one). The token
+    // still works, so the operator is never locked out.
+    let accounts = token.as_ref().and_then(|_| {
+        let path = agent.config().data_root.join("web-accounts.json");
+        match crate::accounts::Accounts::load(&path) {
+            Ok(a) => Some(Arc::new(a)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "page accounts are off until this file is fixed; the API token still works");
+                None
+            }
+        }
+    });
     let state = ApiState {
         agent: agent.clone(),
         installs: agent.installs(),
         token: token.map(Arc::new),
         pack_dir: pack_dir.map(Arc::new),
         interfaces,
+        accounts,
     };
     Router::new()
         .route("/health", get(health))
@@ -186,7 +203,21 @@ pub fn router_full(
         .route("/interfaces", get(interfaces_status).post(interfaces_add))
         .route("/interfaces/:id", delete(interfaces_remove))
         .route("/interfaces/:id/rename", post(interfaces_rename))
+        .route("/auth/logout", post(auth_logout))
+        .route("/auth/me", get(auth_me))
+        .route("/auth/password", post(auth_password))
+        .route("/auth/totp/begin", post(auth_totp_begin))
+        .route("/auth/totp/enable", post(auth_totp_enable))
+        .route("/auth/totp/disable", post(auth_totp_disable))
+        .route("/auth/users", get(auth_users).post(auth_user_add))
+        .route("/auth/users/:name", delete(auth_user_remove))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        // Signing in happens before there is anything to present, so these
+        // sit outside the gate: what this node wants (`/auth/state`), a
+        // sign-in, and making the first account, which needs the API token.
+        .route("/auth/state", get(auth_state))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/setup", post(auth_setup))
         // The web UI is served **outside** the auth layer, deliberately. A
         // login page that needed the token to load could never be reached, and
         // these three files are the same for every install — they contain no
@@ -247,16 +278,212 @@ async fn require_token(
         // bind anywhere but loopback, so this is the local-only mode.
         return Ok(next.run(request).await);
     };
-    let presented = request
-        .headers()
+    let presented = presented_token(request.headers());
+    // The API token, or a live session from signing in with an account.
+    let by_token = constant_time_eq(presented.as_bytes(), expected.as_bytes());
+    let by_session = !by_token && state.accounts.as_ref().is_some_and(|a| a.session(presented).is_some());
+    if !by_token && !by_session {
+        return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
+    }
+    Ok(next.run(request).await)
+}
+
+fn presented_token(headers: &HeaderMap) -> &str {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        return Err(fail(StatusCode::UNAUTHORIZED, "a valid API token is required"));
+        .unwrap_or("")
+}
+
+// ---------- page accounts (accounts.rs) ----------
+
+const TOTP_ISSUER: &str = "Lanthorn Host";
+
+fn accounts_of(state: &ApiState) -> Result<&Arc<crate::accounts::Accounts>, (StatusCode, Json<ApiError>)> {
+    state
+        .accounts
+        .as_ref()
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "this node has no accounts: it needs an API token first"))
+}
+
+/// The account behind this request's session, for the routes that change an
+/// account. The API token is no account, so it cannot change a password.
+fn signed_in(state: &ApiState, headers: &HeaderMap) -> Result<String, (StatusCode, Json<ApiError>)> {
+    accounts_of(state)?
+        .session(presented_token(headers))
+        .ok_or_else(|| fail(StatusCode::FORBIDDEN, "sign in with an account to change it"))
+}
+
+/// What the page should offer: a sign-in, the first account, or nothing (no
+/// token, so loopback-only and open).
+async fn auth_state(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "token_required": state.token.is_some(),
+        "accounts": state.accounts.is_some(),
+        "has_accounts": state.accounts.as_ref().is_some_and(|a| a.any()),
+    }))
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    username: String,
+    password: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+async fn auth_login(
+    State(state): State<ApiState>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::accounts::LoginRefusal;
+    let refuse = |status: StatusCode, msg: String, needs_code: bool| {
+        (status, Json(serde_json::json!({ "error": msg, "needs_code": needs_code })))
+    };
+    let Some(accounts) = state.accounts.as_ref() else {
+        return Err(refuse(StatusCode::NOT_FOUND, "this node has no accounts".into(), false));
+    };
+    match accounts.login(&req.username, &req.password, req.code.as_deref(), std::time::SystemTime::now()) {
+        Ok(session) => {
+            tracing::info!(user = %req.username.to_ascii_lowercase(), "signed in to the page");
+            Ok(Json(serde_json::json!({
+                "session": session,
+                "username": req.username.to_ascii_lowercase(),
+                "expires_in_secs": crate::accounts::SESSION_LIFETIME.as_secs(),
+            })))
+        }
+        Err(r @ LoginRefusal::Throttled { .. }) => Err(refuse(StatusCode::TOO_MANY_REQUESTS, r.to_string(), false)),
+        Err(r @ (LoginRefusal::NeedsCode | LoginRefusal::WrongCode)) => {
+            Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), true))
+        }
+        Err(r @ LoginRefusal::Wrong) => Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), false)),
     }
-    Ok(next.run(request).await)
+}
+
+#[derive(Deserialize)]
+struct SetupReq {
+    token: String,
+    username: String,
+    password: String,
+}
+
+/// The first account, made with the API token: whoever can read that file owns
+/// this node. Refused once any account exists, so it is never a way in.
+async fn auth_setup(State(state): State<ApiState>, Json(req): Json<SetupReq>) -> ApiResult<crate::accounts::AccountView> {
+    let accounts = accounts_of(&state)?;
+    let Some(expected) = &state.token else {
+        return Err(fail(StatusCode::NOT_FOUND, "this node has no API token"));
+    };
+    if accounts.any() {
+        return Err(fail(StatusCode::CONFLICT, "an account already exists here; sign in with it"));
+    }
+    if !constant_time_eq(req.token.trim().as_bytes(), expected.as_bytes()) {
+        return Err(fail(StatusCode::UNAUTHORIZED, "that is not this node's API token"));
+    }
+    let made = accounts
+        .create(&req.username, &req.password, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %made.username, "the first page account was made");
+    Ok(Json(made))
+}
+
+async fn auth_logout(State(state): State<ApiState>, headers: HeaderMap) -> StatusCode {
+    if let Some(a) = state.accounts.as_ref() {
+        a.end_session(presented_token(&headers));
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn auth_me(State(state): State<ApiState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let user = state.accounts.as_ref().and_then(|a| a.session(presented_token(&headers)).and_then(|u| a.get(&u)));
+    Json(match user {
+        Some(u) => serde_json::json!({ "via": "account", "username": u.username, "totp_enabled": u.totp_enabled }),
+        None => serde_json::json!({ "via": "token" }),
+    })
+}
+
+#[derive(Deserialize)]
+struct PasswordReq {
+    current: String,
+    new: String,
+}
+
+async fn auth_password(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<PasswordReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let user = signed_in(&state, &headers)?;
+    accounts_of(&state)?
+        .change_password(&user, &req.current, &req.new, Some(presented_token(&headers)))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account changed its password");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_totp_begin(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<serde_json::Value> {
+    let user = signed_in(&state, &headers)?;
+    let (secret, uri, svg) = accounts_of(&state)?.begin_totp(&user, TOTP_ISSUER).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(serde_json::json!({ "secret": secret, "otpauth": uri, "qr_svg": svg })))
+}
+
+#[derive(Deserialize)]
+struct CodeReq {
+    code: String,
+}
+
+async fn auth_totp_enable(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CodeReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let user = signed_in(&state, &headers)?;
+    accounts_of(&state)?
+        .enable_totp(&user, &req.code, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account turned sign-in codes on");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_totp_disable(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CodeReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let user = signed_in(&state, &headers)?;
+    accounts_of(&state)?
+        .disable_totp(&user, &req.code, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account turned sign-in codes off");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_users(State(state): State<ApiState>) -> ApiResult<Vec<crate::accounts::AccountView>> {
+    Ok(Json(accounts_of(&state)?.list()))
+}
+
+#[derive(Deserialize)]
+struct UserReq {
+    username: String,
+    password: String,
+}
+
+async fn auth_user_add(State(state): State<ApiState>, Json(req): Json<UserReq>) -> ApiResult<crate::accounts::AccountView> {
+    let made = accounts_of(&state)?
+        .create(&req.username, &req.password, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %made.username, "a page account was added");
+    Ok(Json(made))
+}
+
+async fn auth_user_remove(
+    State(state): State<ApiState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    accounts_of(&state)?.remove(&name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %name, "a page account was removed");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Compare without leaking where the first difference is.
