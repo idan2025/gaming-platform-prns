@@ -60,6 +60,7 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/instances/:id", axum::routing::delete(destroy))
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/start", post(start))
+        .route("/instances/:id/relocate", post(relocate))
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
@@ -315,6 +316,19 @@ async fn stop(
         .await
         .map(|()| Json(json!({ "stopped": id })))
         .map_err(owner_op_failure)
+}
+
+/// Move one of the caller's own servers to another node, with its files
+/// (`Hosting::relocate`). The reply is the server as it now stands, under its
+/// new id.
+async fn relocate(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<crate::hosting::HostedInstance> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.relocate(&account, &id).await.map(Json).map_err(owner_op_failure)
 }
 
 #[derive(Deserialize)]

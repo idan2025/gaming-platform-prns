@@ -607,6 +607,50 @@ the controller.
 Each action on the controller list is one request to the index, and the page
 polls. Keep that in mind when several people leave a page open on a big index.
 
+## Moving a server to another worker
+
+"Move to another worker…" in a server's menu (on a page with a controller), or
+`POST /instances/<id>/relocate` on the index, moves one of your servers to the
+worker with the most room among the workers of the same class. **The server
+keeps running while its files are copied**, and comes up on the new worker at
+the **same mesh address**. The index:
+
+1. reads how the server was made and creates the same server on the new worker
+   (the new worker picks the ports), held stopped;
+2. while the old server still runs, copies all its files across (in 256 KiB
+   pieces over the uplink, through a temporary file on the index's machine),
+   then copies only what changed since, up to three times, until a copy is
+   under 1 MiB;
+3. stops the old server, copies the last changes, and gives the new server the
+   old one's identity;
+4. starts the new server, then removes the old one, last.
+
+Players are down from step 3 to the game's own boot, not for the copy: the time
+is the last small delta plus the boot (the index logs it as `downtime_ms`, which
+is the part it can see; the game's boot comes after). A server that is not
+running moves in one full copy.
+
+Until step 3 the old server is not touched. If any step before the last fails,
+what was made on the new worker is removed and the old server is started again
+if it had been stopped. A worker whose agent predates moves is named as too old.
+The server gets a new instance id, but players' invite links name its address,
+which does not change.
+
+The index reads and writes a server's files on its workers to do this, and
+**carries the server's identity**, the secret that is its address, in memory
+(never written on the index). A worker that trusts an index already lets it
+create, stop and remove servers there; this also lets it stand in for that one
+server's address. If the old worker cannot remove the old server after a
+successful move, it stays there stopped and is logged: start it and two servers
+would answer to one address.
+
+Carrying a copy over the uplink ran at about 47 MiB/s read and 108 MiB/s write
+on a local hub in a release build (`a_backup_carry_is_timed`, 32 MiB, Ryzen 9
+8945HS VM). A debug build ran the same code at 2.5 MiB/s: always time a release
+build. A real link adds its own round trip to each 256 KiB piece, and the
+pieces go one at a time, so a distant worker will be slower than the hub. The
+copy is time the server is up, not down.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an

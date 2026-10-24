@@ -93,6 +93,10 @@ fn human_bytes(n: u64) -> String {
 
 /// How long a backup waits for a running world to finish saving.
 const WORLD_SAVE_WAIT: Duration = Duration::from_secs(30);
+
+/// An upload over the uplink that has not grown for this long is abandoned,
+/// and deleted when the next one starts for the same server.
+const STALE_UPLOAD: Duration = Duration::from_secs(6 * 3600);
 /// A console-read `(online, max)` and when it was read.
 type CountedAt = (Instant, (u32, u32));
 /// How long a console's answer to a player-count line is waited for.
@@ -2249,6 +2253,17 @@ impl Agent {
     /// game may be writing a file at that moment, which the page says. Held
     /// to the disk reserve like a download, by the files' full size.
     pub async fn create_backup(&self, instance_id: &str) -> Result<crate::backups::Backup> {
+        self.make_backup(instance_id, None).await
+    }
+
+    /// What changed in a server's files since `since` (unix seconds on this
+    /// node's clock), as an archive for `merge_backup` (`backups::create_since`).
+    /// Made the same way as a backup, so a running world is held still too.
+    pub async fn create_delta(&self, instance_id: &str, since: i64) -> Result<crate::backups::Backup> {
+        self.make_backup(instance_id, Some(since)).await
+    }
+
+    async fn make_backup(&self, instance_id: &str, since: Option<i64>) -> Result<crate::backups::Backup> {
         let c = self.ensure_instance(instance_id).await?;
         let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
         let dir = self.backups_dir(instance_id)?;
@@ -2267,7 +2282,11 @@ impl Agent {
             self.hold_world(instance_id, console).await;
         }
         let name = crate::backups::new_name(&dir, now_unix());
-        let made = tokio::task::spawn_blocking(move || crate::backups::create(&writable, &dir, &name)).await;
+        let made = tokio::task::spawn_blocking(move || match since {
+            Some(since) => crate::backups::create_since(&writable, &dir, &name, since),
+            None => crate::backups::create(&writable, &dir, &name),
+        })
+        .await;
         if let Some(console) = console {
             for line in console.after_backup() {
                 if let Err(e) = self.docker.send_console_line(instance_id, line).await {
@@ -2333,6 +2352,75 @@ impl Agent {
         Ok(())
     }
 
+    /// Lay a delta (`create_delta`) over a stopped server's files, then delete
+    /// the delta: it is not a backup and restoring it later would drop files.
+    pub async fn merge_backup(&self, instance_id: &str, name: &str) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: its files cannot be changed while it runs"));
+        }
+        if self.is_moving(instance_id) {
+            return Err(anyhow!("this server is being moved to a new copy; try again when that is done"));
+        }
+        let archive = crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))?;
+        let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for a staging name: {e}"))?;
+        let staging = self.config.data_root.join("staging").join(format!("merge-{}", hex::encode(seed)));
+        let from = archive.clone();
+        tokio::task::spawn_blocking(move || crate::backups::merge(&from, &writable, &staging))
+            .await?
+            .map_err(|e| anyhow!("{e}"))?;
+        let _ = std::fs::remove_file(&archive);
+        tracing::info!(instance = %instance_id, backup = %name, "merged a delta into a server's files");
+        Ok(())
+    }
+
+    /// The server's mesh identity, which is its address. `None` for a node
+    /// with no mesh. Read only so a move can carry the address with the
+    /// files; it never leaves the node except to an index on `trusted_indexes`.
+    pub async fn identity(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
+        self.ensure_instance(instance_id).await?;
+        let path = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace a **stopped** server's mesh identity with `bytes`, so it
+    /// comes back at another server's address. Exactly the 64 bytes an
+    /// identity file holds, written beside and renamed, mode 0600.
+    pub async fn set_identity(&self, instance_id: &str, bytes: &[u8]) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: it announces under its identity while it runs"));
+        }
+        if bytes.len() != 64 {
+            return Err(anyhow!("that is not a mesh identity"));
+        }
+        let path = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        let partial = path.with_extension("identity.partial");
+        {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // Owner-only from the first byte. Windows has no mode bits; the
+            // file inherits the data directory's ACL there.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&partial)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&partial, &path)?;
+        tracing::info!(instance = %instance_id, "gave a server another mesh identity");
+        Ok(())
+    }
+
     /// Delete one backup. The server need not exist any more: a removed
     /// server's backups stay until deleted. The id is still checked as an
     /// instance id and the name against the agent's own shape.
@@ -2393,7 +2481,100 @@ impl Agent {
         }
         let bytes = std::fs::metadata(dir.join(&name))?.len();
         tracing::info!(instance = %instance_id, backup = %name, bytes, "imported a backup");
-        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()) })
+        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()), started_unix: None })
+    }
+
+    /// What this server would be created from again on another node: its
+    /// spec read back off the container (`DockerRuntime::spec_of`) with the
+    /// restart-on-crash choice kept beside it. Ports come back as this node
+    /// holds them; another node picks its own.
+    pub async fn spec(&self, instance_id: &str) -> Result<InstanceSpec> {
+        self.ensure_instance(instance_id).await?;
+        let mut spec = self.docker.spec_of(instance_id).await?;
+        spec.restart_on_crash = self.restart_on_crash(instance_id);
+        Ok(spec)
+    }
+
+    /// Up to `max` bytes of a named backup's file from `offset`, and the
+    /// file's whole length, so a caller can fetch it piece by piece over a
+    /// link that carries one bounded reply at a time. Like download, the
+    /// server need not exist any more.
+    pub async fn backup_chunk(&self, instance_id: &str, name: &str, offset: u64, max: usize) -> Result<(u64, Vec<u8>)> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let path = self.backup_file(instance_id, name).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        let total = file.metadata().await?.len();
+        if offset > total {
+            return Err(anyhow!("{name} is {total} bytes; there is nothing at {offset}"));
+        }
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut buf = Vec::with_capacity(max.min((total - offset) as usize));
+        file.take(max as u64).read_to_end(&mut buf).await?;
+        Ok((total, buf))
+    }
+
+    /// Add one piece to a backup arriving over the uplink. The first piece
+    /// (`upload` absent, `offset` 0) is held to `backups::MAX_IMPORT_BYTES` and
+    /// the disk reserve by the whole `total`, and gets an agent-made upload id;
+    /// every later piece must start exactly where the file ends, so a repeated
+    /// or skipped piece is refused rather than written twice or left as a
+    /// hole. The piece that completes it is checked and kept as a backup
+    /// (`import_backup`), exactly like an uploaded file.
+    pub async fn backup_upload_chunk(
+        &self,
+        instance_id: &str,
+        upload: Option<&str>,
+        offset: u64,
+        total: u64,
+        data: &[u8],
+    ) -> Result<crate::backups::UploadProgress> {
+        use tokio::io::AsyncWriteExt;
+        let (id, path) = match upload {
+            None => {
+                if offset != 0 {
+                    return Err(anyhow!("an upload starts at 0"));
+                }
+                if total > crate::backups::MAX_IMPORT_BYTES {
+                    return Err(anyhow!("a backup is at most 4 GB"));
+                }
+                // A sender that stopped halfway never comes back; its piece
+                // holds disk until here.
+                crate::backups::sweep_stale_uploads(&self.backups_dir(instance_id)?, STALE_UPLOAD);
+                let path = self.backup_upload_path(instance_id, Some(total)).await?;
+                let id = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix(".upload-"))
+                    .and_then(|n| n.strip_suffix(".partial"))
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("an upload path the agent cannot name"))?;
+                (id, path)
+            }
+            Some(id) => {
+                let path = crate::backups::upload_path(&self.backups_dir(instance_id)?, id)
+                    .filter(|p| p.is_file())
+                    .ok_or_else(|| anyhow!("no upload {id:?} is arriving for {instance_id}"))?;
+                (id.to_string(), path)
+            }
+        };
+        let have = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        if have != offset {
+            return Err(anyhow!("this upload has {have} bytes; a piece at {offset} does not follow on"));
+        }
+        let received = offset + data.len() as u64;
+        if received > total {
+            let _ = std::fs::remove_file(&path);
+            return Err(anyhow!("the upload is longer than it said"));
+        }
+        let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        drop(file);
+        if received < total {
+            return Ok(crate::backups::UploadProgress { upload: id, received, backup: None });
+        }
+        let backup = self.import_backup(instance_id, &path).await?;
+        Ok(crate::backups::UploadProgress { upload: id, received, backup: Some(backup) })
     }
 
     async fn server_exists(&self, instance_id: &str) -> Result<bool> {

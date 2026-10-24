@@ -32,6 +32,11 @@ use crate::config::{controller_url_is_acceptable, ControllerConfig};
 /// The most a reply from the controller may be before this node refuses it.
 const MAX_REPLY: usize = 4 * 1024 * 1024;
 
+/// How long a move through the controller may take (`POST
+/// /instances/:id/relocate`): the index's own loopback transfer allows 30
+/// minutes, and this waits on it.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(35 * 60);
+
 /// What the controller answered, for the node to pass on unchanged.
 pub struct Forwarded {
     pub status: u16,
@@ -107,6 +112,11 @@ impl Controller {
             .bearer_auth(token);
         if let Some(bytes) = body {
             request = request.header("Content-Type", "application/json").body(bytes.to_vec());
+        }
+        // A move carries a server's files between workers and takes as long
+        // as that takes; everything else is one quick reply.
+        if path.ends_with("/relocate") {
+            request = request.timeout(MOVE_TIMEOUT);
         }
         let response = request.send().await.context("asking the controller")?;
         let status = response.status().as_u16();
@@ -186,7 +196,7 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
             Method::GET | Method::DELETE if no_query() => Some(format!("/instances/{id}")),
             _ => None,
         },
-        ["instances", id, action @ ("stop" | "start")] if valid_id(id) && *method == Method::POST && no_query() => {
+        ["instances", id, action @ ("stop" | "start" | "relocate")] if valid_id(id) && *method == Method::POST && no_query() => {
             Some(format!("/instances/{id}/{action}"))
         }
         ["instances", id, "logs"] if valid_id(id) && *method == Method::GET => {
@@ -239,6 +249,7 @@ mod tests {
             (Method::DELETE, format!("instances/{id}"), "/instances/sven-coop-1a2b3c"),
             (Method::POST, format!("instances/{id}/stop"), "/instances/sven-coop-1a2b3c/stop"),
             (Method::POST, format!("instances/{id}/start"), "/instances/sven-coop-1a2b3c/start"),
+            (Method::POST, format!("instances/{id}/relocate"), "/instances/sven-coop-1a2b3c/relocate"),
             (Method::GET, format!("instances/{id}/logs?lines=50"), "/instances/sven-coop-1a2b3c/logs?lines=50"),
             (Method::GET, format!("instances/{id}/backups"), "/instances/sven-coop-1a2b3c/backups"),
             (Method::POST, format!("instances/{id}/backups"), "/instances/sven-coop-1a2b3c/backups"),
