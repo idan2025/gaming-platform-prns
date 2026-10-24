@@ -177,7 +177,7 @@ async fn two_nodes(trusted: impl FnOnce(&str) -> Vec<String>) -> Option<TwoNodes
     let index = platform_index::node::start(
         state,
         Zeroizing::new(idx_secret),
-        Some(format!("127.0.0.1:{port}")),
+        vec![format!("127.0.0.1:{port}")],
         false,
     )
     .await

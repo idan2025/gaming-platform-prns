@@ -116,7 +116,7 @@ impl IndexNode {
 pub async fn start(
     state: Arc<IndexState>,
     identity: Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>,
-    tcp: Option<String>,
+    tcp: Vec<String>,
     auto: bool,
 ) -> Result<IndexNode> {
     let destination_hash = PreConfiguredDestination::Single {
@@ -178,8 +178,15 @@ pub async fn start(
                     storage: GrowableHeap,
                     request_endpoints: request_endpoints![QueryEndpoint],
                     on_event: |_event, _state| {},
+                    // Every hub, so a remote agent stays reachable through
+                    // whichever is up; auto-discovery once.
                     interfaces: |node: &PrnsNodeHandle| {
-                        game_bridge::relay::attach_interfaces(node, tcp.as_deref(), auto);
+                        if tcp.is_empty() {
+                            game_bridge::relay::attach_interfaces(node, None, auto);
+                        }
+                        for (i, hub) in tcp.iter().enumerate() {
+                            game_bridge::relay::attach_interfaces(node, Some(hub), auto && i == 0);
+                        }
                     },
                     persistence: NoPersistence,
                 });

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up one worker: a platform-agent that an index can place servers on.
 #
-#   scripts/setup-worker.sh --index <32 hex> [--hub HOST:PORT] [--name NAME]
+#   scripts/setup-worker.sh --index <32 hex> [--hub HOST:PORT]... [--name NAME]
 #       [--class LABEL] [--region LABEL] [--priority N] [--dir DIR] [--agent PATH]
 #       [--packs DIR] [--service]
 #
@@ -9,7 +9,9 @@
 #   1. checks Docker answers and the agent binary runs,
 #   2. writes DIR/agent.toml trusting the index (an index's identity hash),
 #   3. makes the worker's identity (DIR/agent.identity, owner-only),
-#   4. with --hub, tells the worker to dial that hub over TCP,
+#   4. with --hub, tells the worker to dial that hub over TCP (give it more
+#      than once and the worker dials every one, staying reachable while any
+#      of them is up),
 #   5. prints the block to paste into the index's hosting file.
 #
 # It never prints a secret: the identity file stays where it is, and only the
@@ -22,13 +24,13 @@ set -euo pipefail
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "setup-worker: $*" >&2; exit 1; }
 
-INDEX=""; HUB=""; NAME=""; CLASS=""; REGION=""; PRIORITY="0"
+INDEX=""; HUBS=(); NAME=""; CLASS=""; REGION=""; PRIORITY="0"
 DIR="${HOME}/lanthorn-worker"; AGENT=""; PACKS=""; SERVICE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --index) INDEX="${2:-}"; shift 2 ;;
-    --hub) HUB="${2:-}"; shift 2 ;;
+    --hub) HUBS+=("${2:-}"); shift 2 ;;
     --name) NAME="${2:-}"; shift 2 ;;
     --class) CLASS="${2:-}"; shift 2 ;;
     --region) REGION="${2:-}"; shift 2 ;;
@@ -44,9 +46,9 @@ done
 
 # Inputs are checked as data before anything is written. Refused, never repaired.
 [[ "$INDEX" =~ ^[0-9a-f]{32}$ ]] || die "--index must be the index's identity hash: 32 lowercase hex characters"
-if [ -n "$HUB" ]; then
+for HUB in "${HUBS[@]}"; do
   [[ "$HUB" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || die "--hub must be host:port (IPv4 or a host name)"
-fi
+done
 if [ -n "$CLASS" ]; then
   [[ "$CLASS" =~ ^[a-z0-9_-]{1,32}$ ]] || die "--class must be 1-32 characters: lower case, digits, - and _"
 fi
@@ -102,8 +104,15 @@ chmod 600 "$CONFIG"
 
 # 4. The way out to the mesh: a TCP client to a hub, in the agent's own
 #    sidecar file (the same one the web UI writes).
-if [ -n "$HUB" ]; then
-  printf '{\n  "interfaces": [\n    {"kind": "tcp", "addr": "%s"}\n  ]\n}\n' "$HUB" > "$DIR/data/agent-interfaces.json"
+if [ "${#HUBS[@]}" -gt 0 ]; then
+  {
+    printf '{\n  "interfaces": [\n'
+    for i in "${!HUBS[@]}"; do
+      [ "$i" -eq 0 ] || printf ',\n'
+      printf '    {"kind": "tcp", "addr": "%s"}' "${HUBS[$i]}"
+    done
+    printf '\n  ]\n}\n'
+  } > "$DIR/data/agent-interfaces.json"
 fi
 
 # 3 and the addresses. The agent makes its identity on first use, exactly as it
@@ -145,7 +154,7 @@ echo "agent = \"$CONTROL\""
 echo "priority = $PRIORITY"
 [ -z "$CLASS" ] || echo "class = \"$CLASS\""
 [ -z "$REGION" ] || echo "region = \"$REGION\""
-if [ -z "$HUB" ]; then
+if [ "${#HUBS[@]}" -eq 0 ]; then
   echo
   echo "No --hub given: this worker reaches the mesh only on a LAN it can auto-discover."
 fi
