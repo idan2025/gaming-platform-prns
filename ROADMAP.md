@@ -844,7 +844,9 @@ the owner stamped from the user's identity.
    (300 MiB of server files and a log written to while it ran): the move took
    18 s and the index logged `downtime_ms=478`. The first run logged 10275: a game
    that is PID 1 ignores SIGTERM and Docker waited out 10 s. Game containers now
-   run under Docker's init, so the stop ends on the signal.
+   run under Docker's init, so the stop ends on the signal. With the real Sven
+   Co-op server the move took 22 s and players lost it for 1.4 s, measured by
+   A2S from the LAN (boot included).
 
 **A decision, not a default.** The uplink must never gain a console route
 (`CLAUDE.md`: an index must not type at a node's servers). Moderation and the
