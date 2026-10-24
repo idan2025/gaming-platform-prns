@@ -42,3 +42,13 @@ max_total_instances = 20
 idle_timeout_secs = 1800
 min_lifetime_secs = 300
 create_cooldown_secs = 30
+
+# An account with rules of its own, keyed by its identity hash (32 hex
+# characters). Anyone not listed gets the rules above. Every field is optional.
+# max_total_instances above still applies to everyone: this reserves room for
+# one account, it never makes a full node take another server.
+#
+# [quota.accounts.b7f20b85976ca7b7b6c56a883992fb9a]
+# max_instances = 10
+# create_cooldown_secs = 0   # 0 = no cooldown for this account
+# never_reap = true          # idle servers of this account are not stopped
