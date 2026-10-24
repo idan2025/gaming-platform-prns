@@ -439,7 +439,7 @@ async fn a_created_container_carries_the_managed_label() {
     let name = format!("gpp-{id}");
     docker_rm(&name);
 
-    let created = rt.create_and_start(&spec(&id), &test_runtime(), &[], &one_port(27198)).await;
+    let created = rt.create_and_start(&spec(&id), &test_runtime(), &[], &one_port(27195)).await;
     let labels = std::process::Command::new("docker")
         .args(["inspect", "-f", "{{json .Config.Labels}}", &name])
         .output();
