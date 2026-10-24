@@ -2406,8 +2406,13 @@ impl Agent {
         let partial = path.with_extension("identity.partial");
         {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&partial)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // Owner-only from the first byte. Windows has no mode bits; the
+            // file inherits the data directory's ACL there.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&partial)?;
             file.write_all(bytes)?;
             file.sync_all()?;
         }
