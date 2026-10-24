@@ -314,6 +314,7 @@ mod tests {
             players_now: None,
             max_players_now: None,
             last_exit: None,
+            stopped_secs: None,
             restart_on_crash: None,
             crash_restarts: None,
             map_now: None,

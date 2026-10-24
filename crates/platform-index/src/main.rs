@@ -216,6 +216,11 @@ async fn main() -> Result<()> {
                     // reason to stop sweeping: the next tick tries again.
                     Err(e) => tracing::warn!(error = %format!("{e:#}"), "idle sweep failed"),
                 }
+                match hosting.expire_stopped().await {
+                    Ok(gone) if !gone.is_empty() => tracing::info!(count = gone.len(), "removed stopped servers"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "stopped-server sweep failed"),
+                }
             }
         });
     }
