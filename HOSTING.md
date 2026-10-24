@@ -606,8 +606,10 @@ files is reachable from the controller. What the create form asks for travels
 with the create: bots to start with, restart on crash, and a game's own
 choices (a Minecraft build, its heap, the EULA, world settings).
 
-Each action on the controller list is one request to the index, and the page
-polls. Keep that in mind when several people leave a page open on a big index.
+Each action on the controller list is one request to the index. The page polls
+the list every 5 s; the node shares one list from the index among every page
+open on it for 4 s, and drops it whenever a change goes through, so several
+open pages cost the index what one does.
 
 ## Moving a server to another worker
 

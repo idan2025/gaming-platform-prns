@@ -16,7 +16,7 @@
 //! the controller never gains a console route (`CLAUDE.md`).
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use axum::http::Method;
@@ -37,7 +37,14 @@ const MAX_REPLY: usize = 4 * 1024 * 1024;
 /// minutes, and this waits on it.
 const MOVE_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 
+/// How long one server list from the controller answers every page open on
+/// this node. Under the page's own poll (5 s), so a page sees each change on
+/// its next poll; without it every open page cost the index one listing per
+/// poll, and a listing asks every worker.
+const LIST_FRESH: Duration = Duration::from_secs(4);
+
 /// What the controller answered, for the node to pass on unchanged.
+#[derive(Clone)]
 pub struct Forwarded {
     pub status: u16,
     pub content_type: Option<String>,
@@ -52,6 +59,10 @@ pub struct Controller {
     /// The session token, held in memory only. Dropped on a refusal, so the
     /// next request logs in again.
     token: Mutex<Option<String>>,
+    /// The last server list and when it came. Held while a list is fetched, so
+    /// pages that poll together wait for one request rather than send one
+    /// each; dropped by any change sent through the controller.
+    list: Mutex<Option<(Instant, Forwarded)>>,
 }
 
 impl Controller {
@@ -82,12 +93,38 @@ impl Controller {
             secret,
             http,
             token: Mutex::new(None),
+            list: Mutex::new(None),
         })
     }
 
-    /// Send one request to the controller, logging in first if needed. A refusal
-    /// that looks like an expired session is retried once after a fresh login.
+    /// Send one request to the controller, logging in first if needed. The
+    /// server list is shared by every page for [`LIST_FRESH`]; any other
+    /// request that is not a read drops it, before and after, so the list a
+    /// page sees next includes the change.
     pub async fn forward(&self, method: &Method, path: &str, body: Option<&[u8]>) -> Result<Forwarded> {
+        if *method == Method::GET && path == "/instances" {
+            let mut list = self.list.lock().await;
+            if let Some((at, reply)) = list.as_ref() {
+                if at.elapsed() < LIST_FRESH {
+                    return Ok(reply.clone());
+                }
+            }
+            let reply = self.forward_now(method, path, body).await?;
+            *list = (reply.status == 200).then(|| (Instant::now(), reply.clone()));
+            return Ok(reply);
+        }
+        if *method == Method::GET {
+            return self.forward_now(method, path, body).await;
+        }
+        *self.list.lock().await = None;
+        let reply = self.forward_now(method, path, body).await;
+        *self.list.lock().await = None;
+        reply
+    }
+
+    /// One request, no cache. A refusal that looks like an expired session is
+    /// retried once after a fresh login.
+    async fn forward_now(&self, method: &Method, path: &str, body: Option<&[u8]>) -> Result<Forwarded> {
         let token = self.token_or_login().await?;
         let first = self.send(method, path, body, &token).await?;
         if first.status != 401 {
