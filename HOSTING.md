@@ -644,9 +644,12 @@ server's address. If the old worker cannot remove the old server after a
 successful move, it stays there stopped and is logged: start it and two servers
 would answer to one address.
 
-Carrying a copy over the uplink ran at about 2.5 MiB/s each way on a local hub
-(`a_backup_carry_is_timed`; a real link will be slower), so a big world takes
-minutes to copy. That is time the server is up, not down.
+Carrying a copy over the uplink ran at about 47 MiB/s read and 108 MiB/s write
+on a local hub in a release build (`a_backup_carry_is_timed`, 32 MiB, Ryzen 9
+8945HS VM). A debug build ran the same code at 2.5 MiB/s: always time a release
+build. A real link adds its own round trip to each 256 KiB piece, and the
+pieces go one at a time, so a distant worker will be slower than the hub. The
+copy is time the server is up, not down.
 
 ## Reaching the mesh: how anyone finds your server
 
