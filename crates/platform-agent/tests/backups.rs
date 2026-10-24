@@ -200,6 +200,31 @@ async fn a_schedule_prunes_only_its_own_backups_and_a_removed_servers_stay() {
     assert!(agent.delete_removed_backups("../x").await.is_err());
 }
 
+/// A removed server's identity is its address, and nothing can use it again,
+/// so it goes with the server. The folder (its world, its backups) stays for
+/// the operator to delete. A move left the old worker holding the secret of a
+/// server that was live somewhere else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_servers_identity_goes_and_its_folder_stays() {
+    if !ensure_image() {
+        eprintln!("skipping: no Docker daemon, or no test image");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let Some(agent) = agent_in(dir.path(), 27246).await else { return };
+    let id = format!("bident{}", std::process::id());
+    let _cleanup = Container(id.clone());
+    agent.create(spec(&id)).await.expect("create");
+    agent.stop(&id).await.unwrap();
+    agent.set_identity(&id, &[7u8; 64]).await.expect("an identity to lose");
+    let identity = platform_agent::mesh::identity_path(dir.path(), &id);
+    assert!(identity.exists());
+
+    agent.remove(&id).await.unwrap();
+    assert!(!identity.exists(), "the removed server's address was left on disk");
+    assert!(identity.parent().unwrap().exists(), "the folder is the operator's to delete");
+}
+
 /// A backup leaves the node as a file and comes back in as one, over the
 /// HTTP API, and an upload that is not a backup is refused and leaves
 /// nothing behind.

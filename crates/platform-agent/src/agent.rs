@@ -1806,6 +1806,16 @@ impl Agent {
         self.docker.remove(instance_id).await?;
         self.ports.lock().await.release_all(&held);
         self.specs.lock().await.remove(instance_id);
+        // The folder stays (a world or a backup may be wanted; only the
+        // operator deletes it), but the identity is the server's address and
+        // nothing can use it once the server is gone. A move leaves it on the
+        // old worker otherwise, beside a copy that is now live elsewhere.
+        let identity = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        if let Err(e) = std::fs::remove_file(&identity) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(instance = instance_id, "could not delete a removed server's identity: {e}");
+            }
+        }
         // The server may have been the last one holding an old copy the
         // operator asked to remove after an update.
         self.sweep_old_copies().await;
