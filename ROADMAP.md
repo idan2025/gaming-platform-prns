@@ -820,6 +820,8 @@ the owner stamped from the user's identity.
    bots, chat, players, restart, world upload and backup download, which stay
    on the node's own page. Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
    and `a_login_is_refused_by_an_index_the_node_is_not_pinned_to`.
+   **Backup cap per account** (built 2026-10-24, `max_backups_per_account`):
+   counted across the account's workers when a backup is asked for.
 6. **The missing uplink operations** (built: logs, backups list, create,
    restore and delete, `OP_LOGS` to `OP_BACKUP_DELETE`). Replies are capped to
    one packet: logs keep their newest text, and backup lists keep the newest

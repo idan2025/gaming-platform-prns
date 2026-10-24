@@ -54,6 +54,12 @@ pub struct QuotaPolicy {
     /// until the operator removes them, the same as any server removed by hand.
     #[serde(default)]
     pub stopped_expiry: Option<Duration>,
+    /// Backups one account may hold across all its servers. `None` is no cap.
+    /// A server's backups sit on its node, so the index counts them when a
+    /// backup is asked for; a backup a node's own schedule makes counts too,
+    /// but is not stopped by this (the schedule has its own `keep`).
+    #[serde(default)]
+    pub max_backups_per_account: Option<u32>,
 }
 
 /// What one account is allowed beyond (or below) the shared rules. Every field
@@ -80,6 +86,10 @@ pub struct AccountLimits {
     /// may ask for none, so naming a class is never self-service.
     #[serde(default)]
     pub classes: Vec<String>,
+    /// Backups this account may hold, in place of `max_backups_per_account`.
+    /// Can be higher than the shared cap, and applies even where there is none.
+    #[serde(default)]
+    pub max_backups: Option<u32>,
 }
 
 impl Default for QuotaPolicy {
@@ -94,6 +104,7 @@ impl Default for QuotaPolicy {
             create_cooldown: Some(Duration::from_secs(30)),
             overrides: BTreeMap::new(),
             stopped_expiry: None,
+            max_backups_per_account: None,
         }
     }
 }
@@ -119,6 +130,7 @@ pub enum DenyReason {
     AccountInstanceLimit { limit: u32, held: u32 },
     NodeInstanceLimit { limit: u32, held: u32 },
     Cooldown { retry_after: Duration },
+    AccountBackupLimit { limit: u32, held: u32 },
 }
 
 impl core::fmt::Display for DenyReason {
@@ -136,6 +148,11 @@ impl core::fmt::Display for DenyReason {
                 f,
                 "too many servers started too quickly; try again in {} seconds",
                 retry_after.as_secs().max(1)
+            ),
+            Self::AccountBackupLimit { limit, held } => write!(
+                f,
+                "you already hold {held} of your {limit} backups; \
+                 delete one before making another"
             ),
         }
     }
@@ -187,6 +204,23 @@ impl Quotas {
             .get(account)
             .and_then(|o| o.max_instances)
             .unwrap_or(self.policy.max_instances_per_account)
+    }
+
+    /// The most backups `account` may hold, or `None` for no cap.
+    pub fn max_backups_for(&self, account: &AccountId) -> Option<u32> {
+        self.policy
+            .overrides
+            .get(account)
+            .and_then(|o| o.max_backups)
+            .or(self.policy.max_backups_per_account)
+    }
+
+    /// May `account`, holding `held` backups, make another?
+    pub fn admit_backup(&self, account: &AccountId, held: u32) -> Result<(), DenyReason> {
+        match self.max_backups_for(account) {
+            Some(limit) if held >= limit => Err(DenyReason::AccountBackupLimit { limit, held }),
+            _ => Ok(()),
+        }
     }
 
     /// How long a stopped server of `account` is kept before it is removed, or
@@ -331,7 +365,39 @@ mod tests {
             create_cooldown: Some(Duration::from_secs(30)),
             overrides: BTreeMap::new(),
             stopped_expiry: None,
+            max_backups_per_account: None,
         }
+    }
+
+    /// No cap unless the operator wrote one; the shared cap holds backups at the
+    /// limit exactly (the limit-th is allowed, the next is not); and an account's
+    /// own number replaces the shared one in either direction, or sets one where
+    /// there is none.
+    #[test]
+    fn the_backup_cap_is_off_until_written_and_an_accounts_own_number_wins() {
+        let uncapped = Quotas::new(policy());
+        assert_eq!(uncapped.max_backups_for(&account(1)), None);
+        assert!(uncapped.admit_backup(&account(1), 10_000).is_ok());
+
+        let mut p = policy();
+        p.max_backups_per_account = Some(3);
+        p.overrides.insert(account(2), AccountLimits { max_backups: Some(10), ..Default::default() });
+        p.overrides.insert(account(3), AccountLimits { max_backups: Some(1), ..Default::default() });
+        let q = Quotas::new(p);
+        assert!(q.admit_backup(&account(1), 2).is_ok(), "the third is allowed");
+        assert_eq!(
+            q.admit_backup(&account(1), 3).unwrap_err().to_string(),
+            "you already hold 3 of your 3 backups; delete one before making another"
+        );
+        assert!(q.admit_backup(&account(2), 9).is_ok(), "an account may be given more");
+        assert!(q.admit_backup(&account(2), 10).is_err());
+        assert!(q.admit_backup(&account(3), 1).is_err(), "or fewer");
+
+        let mut only_one = policy();
+        only_one.overrides.insert(account(4), AccountLimits { max_backups: Some(2), ..Default::default() });
+        let q = Quotas::new(only_one);
+        assert!(q.admit_backup(&account(4), 2).is_err(), "a cap for one account where there is none");
+        assert!(q.admit_backup(&account(5), 2).is_ok(), "and nobody else is capped");
     }
 
     #[test]

@@ -126,6 +126,11 @@ pub struct QuotaSettings {
     /// Remove a server stopped for this many days. Absent keeps stopped servers
     /// for ever. Removing takes the container, never the server's files.
     pub stopped_delete_after_days: Option<u64>,
+    /// Backups one account may hold across its servers. Absent is no cap; 0 is
+    /// refused (it would forbid every backup, and nothing an operator wrote
+    /// asks for that).
+    #[serde(default)]
+    pub max_backups_per_account: Option<u32>,
 }
 
 /// One account's rules, as an operator writes them. A field left out means
@@ -142,6 +147,9 @@ pub struct AccountSettings {
     /// Node classes this account may ask for. None listed means none allowed.
     #[serde(default)]
     pub classes: Vec<String>,
+    /// Backups this account may hold, in place of the shared cap. At least 1.
+    #[serde(default)]
+    pub max_backups: Option<u32>,
 }
 
 impl QuotaSettings {
@@ -154,7 +162,13 @@ impl QuotaSettings {
         if self.stopped_delete_after_days == Some(0) {
             return Err(anyhow!("stopped_delete_after_days must be at least 1"));
         }
+        if self.max_backups_per_account == Some(0) {
+            return Err(anyhow!("max_backups_per_account must be at least 1"));
+        }
         for (key, account) in &self.accounts {
+            if account.max_backups == Some(0) {
+                return Err(anyhow!("[quota.accounts.{key}] max_backups must be at least 1"));
+            }
             if let Some(bad) = account.classes.iter().find(|c| !valid_class(c)) {
                 return Err(anyhow!("[quota.accounts.{key}] names a class {bad:?} that is not a valid label"));
             }
@@ -186,6 +200,7 @@ impl Default for QuotaSettings {
             create_cooldown_secs: d.create_cooldown.map(|t| t.as_secs()),
             accounts: Default::default(),
             stopped_delete_after_days: None,
+            max_backups_per_account: None,
         }
     }
 }
@@ -202,6 +217,7 @@ impl From<&QuotaSettings> for QuotaPolicy {
             stopped_expiry: s
                 .stopped_delete_after_days
                 .map(|days| Duration::from_secs(days.saturating_mul(86_400))),
+            max_backups_per_account: s.max_backups_per_account,
             overrides: s
                 .accounts
                 .iter()
@@ -213,6 +229,7 @@ impl From<&QuotaSettings> for QuotaPolicy {
                             .map(|n| (n > 0).then(|| Duration::from_secs(n))),
                         never_reap: a.never_reap,
                         classes: a.classes.clone(),
+                        max_backups: a.max_backups,
                     };
                     (AccountId(key.to_ascii_lowercase()), limits)
                 })
@@ -866,6 +883,13 @@ impl Hosting {
 
     pub async fn backup_create(&self, account: &AccountId, instance_id: &str) -> Result<Backup> {
         let (_, node) = self.owned(account, instance_id).await?;
+        // Held to the account's cap, if there is one, before any node is asked
+        // to spend disk on a backup.
+        let quotas = Self::quotas(&self.config());
+        if quotas.max_backups_for(account).is_some() {
+            let held = self.backups_held(account).await?;
+            quotas.admit_backup(account, held).map_err(|e| anyhow!("{e}"))?;
+        }
         if let Some(dest) = Self::agent_dest(&node) {
             let dest = dest?;
             let client = self.agent_client().await.ok_or_else(|| {
@@ -879,6 +903,27 @@ impl Hosting {
         }
         let url = format!("{}/instances/{}/backups", node.api.trim_end_matches('/'), instance_id);
         self.node_json(self.http.post(&url), &node).await
+    }
+
+    /// How many backups `account` holds across all its servers. Every worker is
+    /// asked, and one that cannot be makes the count unknown, which is refused,
+    /// never read as zero: silence is not room. (`all_instances` skips a silent
+    /// worker so a listing survives an outage; a limit must not.)
+    async fn backups_held(&self, account: &AccountId) -> Result<u32> {
+        let config = self.config();
+        let mut held = 0u32;
+        for node in &config.nodes {
+            let rows = self.node_instances(node).await.map_err(|e| {
+                anyhow!("could not ask {} for your backups to check your limit: {e:#}", node.name)
+            })?;
+            for instance in rows.iter().filter(|i| i.owner.as_deref() == Some(account.0.as_str())) {
+                let listed = self.backups(account, &instance.instance_id).await.map_err(|e| {
+                    anyhow!("could not count your backups on {} to check your limit: {e:#}", node.name)
+                })?;
+                held = held.saturating_add(listed.backups.len() as u32);
+            }
+        }
+        Ok(held)
     }
 
     pub async fn backup_restore(&self, account: &AccountId, instance_id: &str, name: &str) -> Result<()> {
@@ -2100,8 +2145,10 @@ mod tests {
             create_cooldown_secs: None,
             accounts: Default::default(),
             stopped_delete_after_days: None,
+            max_backups_per_account: Some(4),
         };
         let p = QuotaPolicy::from(&s);
+        assert_eq!(p.max_backups_per_account, Some(4));
         assert_eq!(p.max_instances_per_account, 2);
         assert_eq!(p.idle_timeout, Some(std::time::Duration::from_secs(60)));
         assert_eq!(p.create_cooldown, None);
@@ -2441,6 +2488,29 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_cap_in_the_file_becomes_the_policy_and_a_zero_is_refused() {
+        let hash = "b7f20b85976ca7b7b6c56a883992fb9a";
+        let ok = hosting_file(
+            "gpp-index-backupcap-ok",
+            &format!("games = [\"x\"]\n[quota]\nmax_backups_per_account = 5\n[quota.accounts.{hash}]\nmax_backups = 12\n"),
+        );
+        let config = Hosting::load(&ok).unwrap();
+        let q = Quotas::new(QuotaPolicy::from(&config.quota));
+        assert_eq!(q.max_backups_for(&AccountId(hash.into())), Some(12));
+        assert_eq!(q.max_backups_for(&AccountId("c".repeat(32))), Some(5));
+        let _ = std::fs::remove_dir_all(ok.parent().unwrap());
+
+        for (dir, body) in [
+            ("gpp-index-backupcap-zero", "games = [\"x\"]\n[quota]\nmax_backups_per_account = 0\n".to_string()),
+            ("gpp-index-backupcap-zero-account", format!("[quota.accounts.{hash}]\nmax_backups = 0\n")),
+        ] {
+            let bad = hosting_file(dir, &body);
+            assert!(format!("{:#}", Hosting::load(&bad).unwrap_err()).contains("at least 1"), "{dir}");
+            let _ = std::fs::remove_dir_all(bad.parent().unwrap());
+        }
+    }
+
+    #[test]
     fn classes_in_the_file_reach_the_node_and_the_account_and_a_bad_one_is_refused() {
         let hash = "b7f20b85976ca7b7b6c56a883992fb9a";
         let ok = hosting_file(
@@ -2554,6 +2624,116 @@ mod tests {
         let by = |id: &str| rows.iter().find(|r| r.instance_id == id).unwrap().mesh_destination.clone();
         assert_eq!(by("up").as_deref(), Some("e322bda3b175b989de75f399a6abfba1"));
         assert_eq!(by("down"), None);
+    }
+
+    /// A loopback worker holding `servers` as `(id, owner, backups)`, recording
+    /// what it is asked.
+    async fn worker_with(servers: Vec<(&'static str, String, usize)>) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::extract::{Path, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        type Held = Arc<(Vec<(&'static str, String, usize)>, std::sync::Mutex<Vec<String>>)>;
+        async fn list(State(h): State<Held>) -> Json<serde_json::Value> {
+            Json(serde_json::Value::Array(
+                h.0.iter()
+                    .map(|(id, owner, _)| {
+                        serde_json::json!({
+                            "instance_id": id, "game_id": "sven-coop", "name": id, "state": "running",
+                            "port": null, "ports": [], "owner": owner, "uptime_secs": 5,
+                            "players_now": 0, "stopped_secs": null,
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        async fn backups(State(h): State<Held>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            h.1.lock().unwrap().push(format!("list {id}"));
+            let n = h.0.iter().find(|(i, ..)| *i == id).map_or(0, |(.., n)| *n);
+            Json(serde_json::Value::Array(
+                (0..n).map(|k| serde_json::json!({"name": format!("20261022-0000{k:02}.tar.gz"), "bytes": 1, "created_unix": 0})).collect(),
+            ))
+        }
+        async fn make(State(h): State<Held>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            h.1.lock().unwrap().push(format!("make {id}"));
+            Json(serde_json::json!({"name": "20261022-000099.tar.gz", "bytes": 1, "created_unix": 0}))
+        }
+        let state: Held = Arc::new((servers, Default::default()));
+        let app = Router::new()
+            .route("/instances", get(list))
+            .route("/instances/:id/backups", get(backups).post(make))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // The recorded hits live in the shared state; hand out a view of them.
+        let hits: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let (view, source) = (hits.clone(), state.clone());
+        tokio::spawn(async move {
+            loop {
+                *view.lock().unwrap() = source.1.lock().unwrap().clone();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// The cap counts an account's backups across **all** its servers on all
+    /// its workers, and never anybody else's. At the cap a backup is refused
+    /// before any worker is asked to make one; under it, it is made; with no
+    /// cap the index does not even count. A worker that cannot be asked makes
+    /// the count unknown, and unknown is refused, never zero.
+    #[tokio::test]
+    async fn a_backup_is_refused_at_the_accounts_cap_across_its_workers_and_never_counts_a_strangers() {
+        let me = "aa".repeat(16);
+        let stranger = "bb".repeat(16);
+        let (a, _) = worker_with(vec![("one", me.clone(), 2), ("theirs", stranger.clone(), 9)]).await;
+        let (b, hits_b) = worker_with(vec![("two", me.clone(), 1)]).await;
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(40));
+        let mine = AccountId(me.clone());
+
+        // No cap written: nothing is counted, the backup is made.
+        let h = Hosting::new(two_nodes_at(a, b));
+        h.backup_create(&mine, "two").await.expect("no cap, no count");
+        settle().await;
+        assert_eq!(*hits_b.lock().unwrap(), vec!["make two".to_string()], "an uncapped create counted anyway");
+
+        // Three held (2 + 1), cap 3: refused, and nothing was made.
+        let capped = |cap: u32, nodes: HostingConfig| {
+            let mut c = nodes;
+            c.quota.max_backups_per_account = Some(cap);
+            Hosting::new(c)
+        };
+        let (a, hits_a2) = worker_with(vec![("one", me.clone(), 2), ("theirs", stranger.clone(), 9)]).await;
+        let (b, hits_b2) = worker_with(vec![("two", me.clone(), 1)]).await;
+        let h = capped(3, two_nodes_at(a, b));
+        let err = h.backup_create(&mine, "one").await.unwrap_err().to_string();
+        assert_eq!(err, "you already hold 3 of your 3 backups; delete one before making another");
+        settle().await;
+        assert!(!hits_a2.lock().unwrap().iter().any(|x| x.starts_with("make")), "a refused backup was made");
+        assert!(!hits_b2.lock().unwrap().iter().any(|x| x.starts_with("make")));
+        assert!(
+            !hits_a2.lock().unwrap().iter().any(|x| x.contains("theirs")),
+            "a stranger's backups were counted: {:?}",
+            hits_a2.lock().unwrap()
+        );
+
+        // Cap 4: the same account may make one more, on the right worker.
+        let (a, hits_a3) = worker_with(vec![("one", me.clone(), 2), ("theirs", stranger.clone(), 9)]).await;
+        let (b, _) = worker_with(vec![("two", me.clone(), 1)]).await;
+        let h = capped(4, two_nodes_at(a, b));
+        h.backup_create(&mine, "one").await.expect("under the cap");
+        settle().await;
+        assert!(hits_a3.lock().unwrap().contains(&"make one".to_string()));
+
+        // A worker that is down: the count is unknown, so it is refused.
+        let (a, _) = worker_with(vec![("one", me.clone(), 0)]).await;
+        let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let h = capped(5, two_nodes_at(a, dead));
+        let err = format!("{:#}", h.backup_create(&mine, "one").await.unwrap_err());
+        assert!(err.contains("could not ask b for your backups"), "an unreachable worker was counted as none: {err}");
     }
 
     /// Someone else's server is "no such instance" for logs and backups too, and
