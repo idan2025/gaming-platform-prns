@@ -294,6 +294,11 @@ pub struct HostedInstance {
     /// than letting an idle one run.
     #[serde(default)]
     pub players_now: Option<u32>,
+    /// The server's mesh address as its node reports it: what an invite names
+    /// and a launcher joins. Passed through, never invented; absent while the
+    /// node has none (stopped, or no `[mesh]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_destination: Option<String>,
 }
 
 /// What a caller asks for.
@@ -500,6 +505,7 @@ impl Hosting {
                     stopped_secs: r.stopped_secs,
                     delete_in_secs: None,
                     players_now: r.players_now,
+                    mesh_destination: r.mesh_destination,
                 })
                 .collect());
         }
@@ -529,6 +535,7 @@ impl Hosting {
                 stopped_secs: r["stopped_secs"].as_u64(),
                 delete_in_secs: None,
                 players_now: r["players_now"].as_u64().map(|p| p as u32),
+                mesh_destination: r["mesh_destination"].as_str().map(str::to_string),
             })
             .collect())
     }
@@ -646,6 +653,7 @@ impl Hosting {
                 stopped_secs: None,
                 delete_in_secs: None,
                 players_now: Some(0),
+                mesh_destination: None,
             });
         }
 
@@ -694,6 +702,7 @@ impl Hosting {
             stopped_secs: None,
             delete_in_secs: None,
             players_now: Some(0),
+            mesh_destination: None,
         })
     }
 
@@ -1060,6 +1069,7 @@ impl Hosting {
             stopped_secs: None,
             delete_in_secs: None,
             players_now: None,
+            mesh_destination: None,
         })
     }
 
@@ -1911,6 +1921,7 @@ mod tests {
             owner: None,
             uptime_secs: None,
             players_now: None,
+            mesh_destination: None,
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
@@ -1931,6 +1942,7 @@ mod tests {
             owner: Some("acct".into()),
             uptime_secs: uptime,
             players_now: players,
+            mesh_destination: None,
         }
     }
 
@@ -2160,6 +2172,7 @@ mod tests {
             owner: Some(owner.into()),
             uptime_secs: None,
             players_now: None,
+            mesh_destination: None,
         }
     }
 
@@ -2513,6 +2526,34 @@ mod tests {
         let mut c = config();
         c.nodes[0].api = format!("http://{addr}");
         c
+    }
+
+    /// A server's mesh address reaches the owner through the index as its node
+    /// reported it, and a node that reports none leaves it absent: a controller
+    /// page needs it to show the address and make an invite.
+    #[tokio::test]
+    async fn a_servers_mesh_address_comes_through_the_index_as_the_node_said() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/instances",
+            get(|| async {
+                axum::Json(serde_json::json!([
+                    {"instance_id": "up", "game_id": "sven-coop", "name": "up", "state": "running", "port": 27100,
+                     "ports": [], "owner": "aa".repeat(16), "mesh_destination": "e322bda3b175b989de75f399a6abfba1"},
+                    {"instance_id": "down", "game_id": "sven-coop", "name": "down", "state": "stopped", "port": 27101,
+                     "ports": [], "owner": "aa".repeat(16)},
+                ]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let rows = Hosting::new(one_node_at(addr)).all_instances().await.unwrap();
+        let by = |id: &str| rows.iter().find(|r| r.instance_id == id).unwrap().mesh_destination.clone();
+        assert_eq!(by("up").as_deref(), Some("e322bda3b175b989de75f399a6abfba1"));
+        assert_eq!(by("down"), None);
     }
 
     /// Someone else's server is "no such instance" for logs and backups too, and

@@ -620,7 +620,11 @@ node that holds the server. **What the controller does not carry**, and what
 stays on the node's own page: console, map change, changing bots on a running
 server, chat, players, restart, world upload and backup download. The node
 refuses those on this route, so nothing that types at a server or moves its
-files is reachable from the controller. What the create form asks for travels
+files is reachable from the controller. With a controller the Games page offers the games the index hosts (this node's
+own setup does not count; the workers fetch the files), a server's row names its
+worker and shows its address, a stopped one has **Start** where a node has
+Restart, and what the controller does not carry is greyed out with the reason.
+What the create form asks for travels
 with the create: bots to start with, restart on crash, and a game's own
 choices (a Minecraft build, its heap, the EULA, world settings).
 
