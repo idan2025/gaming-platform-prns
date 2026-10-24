@@ -73,6 +73,16 @@ async fn logs(
     Ok("a line\n".into())
 }
 
+async fn stop(
+    State(s): State<Arc<FakeIndex>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    authorised(&s, &headers)?;
+    s.seen.lock().unwrap().push(format!("/instances/{id}/stop"));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Start an index with its own identity. Returns its address and identity hash.
 async fn serve_index(dir: &std::path::Path) -> (String, String, Arc<FakeIndex>) {
     let secret = personal_rns::load_or_create_identity_secret(&dir.join("index.identity")).unwrap();
@@ -89,6 +99,7 @@ async fn serve_index(dir: &std::path::Path) -> (String, String, Arc<FakeIndex>) 
         .route("/auth/verify", post(verify))
         .route("/instances", get(instances))
         .route("/instances/:id/logs", get(logs))
+        .route("/instances/:id/stop", post(stop))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -141,7 +152,9 @@ async fn a_revoked_session_is_renewed_once_and_the_request_goes_through() {
     assert_eq!(controller.forward(&Method::GET, "/instances", None).await.unwrap().status, 200);
 
     index.live.lock().unwrap().clear();
-    let reply = controller.forward(&Method::GET, "/instances", None).await.unwrap();
+    // Logs, not the list: the list is shared for a few seconds and would come
+    // from the node without asking the index at all.
+    let reply = controller.forward(&Method::GET, "/instances/sven-coop-1/logs", None).await.unwrap();
     assert_eq!(reply.status, 200, "the request must succeed after a fresh login");
 }
 
@@ -170,4 +183,33 @@ async fn a_plain_http_address_off_this_machine_is_refused_before_any_connection(
         &node_identity(dir.path()),
     );
     assert!(err.is_err());
+}
+
+/// Every page open on a node polls the server list. Through a controller each
+/// poll used to be one listing at the index, which asks every worker; pages
+/// polling together now cost one. A change sent through the controller makes
+/// the next list a fresh one, so a page never shows a stop it just made undone.
+#[tokio::test]
+async fn pages_polling_together_cost_the_index_one_listing_and_a_change_is_seen_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, index_hash, index) = serve_index(dir.path()).await;
+    let controller = Arc::new(
+        Controller::new(&ControllerConfig { url, identity: index_hash }, &node_identity(dir.path())).unwrap(),
+    );
+    let lists = |index: &FakeIndex| index.seen.lock().unwrap().iter().filter(|p| *p == "/instances").count();
+
+    let pages: Vec<_> = (0..6)
+        .map(|_| {
+            let c = controller.clone();
+            tokio::spawn(async move { c.forward(&Method::GET, "/instances", None).await.unwrap().status })
+        })
+        .collect();
+    for page in pages {
+        assert_eq!(page.await.unwrap(), 200);
+    }
+    assert_eq!(lists(&index), 1, "six pages polling together asked the index more than once");
+
+    assert_eq!(controller.forward(&Method::POST, "/instances/sven-coop-1/stop", None).await.unwrap().status, 204);
+    controller.forward(&Method::GET, "/instances", None).await.unwrap();
+    assert_eq!(lists(&index), 2, "the list after a stop came from before it");
 }
