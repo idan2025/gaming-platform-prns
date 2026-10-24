@@ -764,8 +764,9 @@ in-game warning; the reserve defaults to the larger of 10% of the disk and
 
 ## 13. Cluster: one controller, many worker nodes
 
-**Status (2026-10-23): items 1–7 built.** Map change and the console stay
-unbuilt on purpose (below). Nothing here is money, tiers or billing, and none of it may become a
+**Status (2026-10-24): items 1–7 built, and a move tested between two real
+workers** (LXC on a Proxmox host, through a real index and hub). Map change and
+the console stay unbuilt on purpose (below). Nothing here is money, tiers or billing, and none of it may become a
 dependency: a single node with no index must keep working exactly as today.
 
 **What.** An operator runs one **controller** (an index, `platform-index`) and
@@ -843,7 +844,9 @@ the owner stamped from the user's identity.
    (300 MiB of server files and a log written to while it ran): the move took
    18 s and the index logged `downtime_ms=478`. The first run logged 10275: a game
    that is PID 1 ignores SIGTERM and Docker waited out 10 s. Game containers now
-   run under Docker's init, so the stop ends on the signal.
+   run under Docker's init, so the stop ends on the signal. With the real Sven
+   Co-op server the move took 22 s and players lost it for 1.4 s, measured by
+   A2S from the LAN (boot included).
 
 **A decision, not a default.** The uplink must never gain a console route
 (`CLAUDE.md`: an index must not type at a node's servers). Moderation and the
@@ -869,9 +872,10 @@ real second machine.
 
 ## 14. QR codes on invite links
 
-**Status (2026-10-21): planned.** Copy invite already produces the web form
-link (`invite::WEB_PAGE`, `site/join/`, the invite in the fragment). Show it as
-a QR code in the launcher, desktop and Android, so a phone joins by scanning.
+**Status (2026-10-21): built** (#81, `invite_qr` in `launcher/src-tauri`,
+Android preview 12). Copy invite already produced the web form
+link (`invite::WEB_PAGE`, `site/join/`, the invite in the fragment); the
+launcher shows it as a QR code, desktop and Android, so a phone joins by scanning.
 The code is drawn locally and sent nowhere. The page the code opens applies
 the same validation as `invite::parse`: a scan selects a server and never joins
 one.
