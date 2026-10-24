@@ -731,3 +731,26 @@ async fn a_manual_game_says_where_its_files_go_and_which_folders_they_need() {
     }
     assert_eq!(content().await["missing"], serde_json::json!([]));
 }
+
+/// Placement reads the disk out of the capacity report, under the reserve the
+/// node itself keeps, so the two numbers must be the ones `/updates` shows.
+/// Report only one of them and an index would have nothing to compare it to.
+#[tokio::test(flavor = "multi_thread")]
+async fn capacity_reports_free_disk_and_the_reserve_it_is_held_to() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let cap: serde_json::Value =
+        client.get(format!("http://{addr}/capacity")).send().await.unwrap().json().await.unwrap();
+    let updates: serde_json::Value =
+        client.get(format!("http://{addr}/updates")).send().await.unwrap().json().await.unwrap();
+
+    let free = cap["disk_free_bytes"].as_u64().expect("free disk is reported");
+    assert!(free > 0, "{cap}");
+    assert_eq!(
+        cap["disk_reserve_bytes"], updates["reserve_bytes"],
+        "the capacity report and the updates page must name the same reserve"
+    );
+}

@@ -31,10 +31,14 @@ api = "http://127.0.0.1:4750"
 # api = "http://127.0.0.1:4750"   # unused while `agent` is set
 # agent = "<32 hex chars: the agent's platform-agent.control destination>"
 # priority = 10   # filled first; a node with a lower number takes the overflow
+# class = "gold"  # optional label. A classed node takes only creates that name
+#                 # its class; a node with none is the default pool. The index
+#                 # only matches the word: what a class is for is yours to say.
 #
 # Placement: among nodes with room, the highest priority wins, then the most
-# free memory, then the most free slots. A node that reports under 1 GiB free
-# is full, and a node that does not answer is always last.
+# free memory, then the most free disk above its reserve, then the most free
+# slots. A node under 1 GiB of free memory or under its own disk reserve is
+# full, and a node that does not answer is always last.
 
 [quota]
 max_instances_per_account = 3
@@ -55,3 +59,5 @@ create_cooldown_secs = 30
 # max_instances = 10
 # create_cooldown_secs = 0   # 0 = no cooldown for this account
 # never_reap = true          # idle servers of this account are not stopped
+# classes = ["gold"]         # node classes this account may ask for; none
+#                            # listed means none, so asking is never self-service

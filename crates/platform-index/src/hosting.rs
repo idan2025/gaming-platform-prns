@@ -86,6 +86,19 @@ pub struct NodeConfig {
     /// behind a rented one) is the one with a lower number.
     #[serde(default)]
     pub priority: i32,
+    /// An operator-chosen label. A node with one takes only creates that name
+    /// it; a node without one is the default pool. The index only matches the
+    /// word: what a class is for is the operator's business.
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
+/// A class label is data that is matched and shown, never run: short, lower
+/// case, digits, `-` and `_`. Refused, never repaired.
+pub fn valid_class(class: &str) -> bool {
+    !class.is_empty()
+        && class.len() <= 32
+        && class.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// The quota knobs, as an operator writes them. Any left out take the
@@ -118,6 +131,9 @@ pub struct AccountSettings {
     /// Never stop this account's servers for being idle.
     #[serde(default)]
     pub never_reap: bool,
+    /// Node classes this account may ask for. None listed means none allowed.
+    #[serde(default)]
+    pub classes: Vec<String>,
 }
 
 impl QuotaSettings {
@@ -129,6 +145,11 @@ impl QuotaSettings {
         // be a delete, and nothing an operator wrote asks for that.
         if self.stopped_delete_after_days == Some(0) {
             return Err(anyhow!("stopped_delete_after_days must be at least 1"));
+        }
+        for (key, account) in &self.accounts {
+            if let Some(bad) = account.classes.iter().find(|c| !valid_class(c)) {
+                return Err(anyhow!("[quota.accounts.{key}] names a class {bad:?} that is not a valid label"));
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for key in self.accounts.keys() {
@@ -183,6 +204,7 @@ impl From<&QuotaSettings> for QuotaPolicy {
                             .create_cooldown_secs
                             .map(|n| (n > 0).then(|| Duration::from_secs(n))),
                         never_reap: a.never_reap,
+                        classes: a.classes.clone(),
                     };
                     (AccountId(key.to_ascii_lowercase()), limits)
                 })
@@ -274,6 +296,10 @@ pub struct DeployRequest {
     /// here would be a second place the rule could drift.
     #[serde(default)]
     pub map: Option<String>,
+    /// Ask for a node of this class. Absent means the default pool, the nodes
+    /// with no class. Only an account the operator allowed it to may ask.
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 fn default_max_players() -> u8 {
@@ -329,6 +355,9 @@ impl Hosting {
         let config: HostingConfig =
             toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
         config.quota.validate().with_context(|| format!("in {}", path.display()))?;
+        if let Some(bad) = config.nodes.iter().filter_map(|n| n.class.as_deref()).find(|c| !valid_class(c)) {
+            return Err(anyhow!("a node's class {bad:?} is not a valid label")).with_context(|| format!("in {}", path.display()));
+        }
         Ok(config)
     }
 
@@ -498,13 +527,20 @@ impl Hosting {
         game_bridge::console::validate_server_name(&request.name)
             .map_err(|e| anyhow!("{e}"))?;
 
+        // Before any quota is spent. The same words whether or not such a class
+        // exists, so asking is no way to learn the operator's class names.
+        let quotas = Self::quotas(&config);
+        if let Some(class) = request.class.as_deref() {
+            if !valid_class(class) || !quotas.may_use_class(account, class) {
+                return Err(anyhow!("this account cannot place servers in that class"));
+            }
+        }
+
         let existing = self.all_instances().await?;
         let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
-        Self::quotas(&config)
-            .admit(account, &records, now)
-            .map_err(|e| anyhow!("{e}"))?;
+        quotas.admit(account, &records, now).map_err(|e| anyhow!("{e}"))?;
 
-        let node = self.pick_node(&config, &existing).await.ok_or_else(|| {
+        let node = self.pick_node(&config, &existing, request.class.as_deref()).await.ok_or_else(|| {
             anyhow!("no node with room for another instance")
         })?;
 
@@ -840,9 +876,16 @@ impl Hosting {
     /// the index's own count and ranks behind every node that did answer: an
     /// unreachable node is the least attractive place to put something, and
     /// "silence means room" is how an outage becomes a pile-up.
-    async fn pick_node<'c>(&self, config: &'c HostingConfig, existing: &[HostedInstance]) -> Option<&'c NodeConfig> {
+    async fn pick_node<'c>(
+        &self,
+        config: &'c HostingConfig,
+        existing: &[HostedInstance],
+        class: Option<&str>,
+    ) -> Option<&'c NodeConfig> {
         let mut best: Option<(&NodeConfig, Rank)> = None;
-        for node in &config.nodes {
+        // A classed node takes only creates that name its class, and a create
+        // that names none takes only the nodes that have none.
+        for node in config.nodes.iter().filter(|n| n.class.as_deref() == class) {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let Some(ranked) = rank_node(self.node_capacity(node).await, here, node.priority) else {
                 continue;
@@ -927,7 +970,7 @@ pub const MIN_FREE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// `(answered, priority, free memory in MiB, free slots)`, compared in that
 /// order. Higher is better.
-type Rank = (u8, i32, u64, usize);
+type Rank = (u8, i32, u64, u64, usize);
 
 /// How attractive a node is to place on. Higher is better; `None` means skip.
 ///
@@ -944,13 +987,23 @@ fn rank_node(capacity: Option<CapacityResp>, own_count: usize, priority: i32) ->
         // create, after the user has been told a node was chosen.
         Some(cap) if cap.running >= cap.max_instances => None,
         Some(cap) if cap.memory_available_bytes.is_some_and(|m| m < MIN_FREE_MEMORY_BYTES) => None,
+        // Under the node's own reserve is full: its disk is what a download or a
+        // server's files would fill, and the node refuses at the same line.
+        Some(cap) if matches!((cap.disk_free_bytes, cap.disk_reserve_bytes), (Some(free), Some(reserve)) if free < reserve) => None,
         Some(cap) => Some((
             1,
             priority,
             cap.memory_available_bytes.unwrap_or(0) / (1024 * 1024),
+            // Room above the reserve. A node that did not report disk counts as
+            // none, like memory, so a node that said more outranks one that said
+            // nothing.
+            match (cap.disk_free_bytes, cap.disk_reserve_bytes) {
+                (Some(free), Some(reserve)) => (free - reserve) / (1024 * 1024),
+                _ => 0,
+            },
             cap.max_instances - cap.running,
         )),
-        None => Some((0, priority, 0, usize::MAX - own_count)),
+        None => Some((0, priority, 0, 0, usize::MAX - own_count)),
     }
 }
 
@@ -978,6 +1031,7 @@ mod tests {
             nodes: vec![NodeConfig {
                 agent: None,
                 priority: 0,
+                class: None,
                 name: "local".to_string(),
                 api: "http://127.0.0.1:4750".to_string(),
             }],
@@ -1012,6 +1066,7 @@ mod tests {
                     name: "nope".into(),
                     max_players: 8,
                     map: None,
+                    class: None,
                 },
                 std::time::SystemTime::now(),
             )
@@ -1033,6 +1088,7 @@ mod tests {
                     name: "x".into(),
                     max_players: 8,
                     map: None,
+                    class: None,
                 },
                 std::time::SystemTime::now(),
             )
@@ -1055,6 +1111,7 @@ mod tests {
                     name: "fun +rcon_password mine".into(),
                     max_players: 8,
                     map: None,
+                    class: None,
                 },
                 std::time::SystemTime::now(),
             )
@@ -1114,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_is_picked_by_load() {
         let mut c = config();
-        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0 });
+        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0, class: None });
         let h = Hosting::new(c);
         let existing = vec![HostedInstance {
             instance_id: "a".into(),
@@ -1132,7 +1189,7 @@ mod tests {
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
-        assert_eq!(h.pick_node(&h.config(), &existing).await.unwrap().name, "second");
+        assert_eq!(h.pick_node(&h.config(), &existing, None).await.unwrap().name, "second");
     }
 
     fn hosted(id: &str, uptime: Option<u64>, players: Option<u32>) -> HostedInstance {
@@ -1215,6 +1272,8 @@ mod tests {
             memory_total_bytes: None,
             memory_available_bytes: None,
             cpus: None,
+            disk_free_bytes: None,
+            disk_reserve_bytes: None,
         }
     }
 
@@ -1492,5 +1551,123 @@ mod tests {
         let h = Hosting::new(c);
         assert!(h.expire_stopped().await.unwrap().is_empty());
         assert!(removed.lock().unwrap().is_empty());
+    }
+
+    fn with_disk(mut cap: CapacityResp, free_gib: u64, reserve_gib: u64) -> CapacityResp {
+        cap.disk_free_bytes = Some(free_gib << 30);
+        cap.disk_reserve_bytes = Some(reserve_gib << 30);
+        cap
+    }
+
+    /// A node under its own disk reserve is full, as one short of memory is;
+    /// the node refuses at the same line, so picking it only fails later.
+    #[test]
+    fn a_node_under_its_disk_reserve_is_full_and_one_that_did_not_say_is_not() {
+        assert_eq!(rank_node(Some(with_disk(cap(0, 8), 4, 5)), 0, 0), None);
+        assert!(rank_node(Some(with_disk(cap(0, 8), 5, 5)), 0, 0).is_some(), "at the reserve is not under it");
+        assert!(rank_node(Some(cap(0, 8)), 0, 0).is_some(), "an older agent reports no disk and is not full");
+    }
+
+    /// Priority and memory still decide first; disk breaks the tie, and a node
+    /// that reported room outranks one that reported nothing.
+    #[test]
+    fn among_equals_more_disk_above_the_reserve_wins_and_priority_still_beats_it() {
+        let more = rank_node(Some(with_disk(cap(0, 8), 60, 10)), 0, 0);
+        let less = rank_node(Some(with_disk(cap(0, 8), 20, 10)), 0, 0);
+        let silent_disk = rank_node(Some(cap(0, 8)), 0, 0);
+        assert!(more > less);
+        assert!(less > silent_disk);
+        let higher_priority = rank_node(Some(with_disk(cap(0, 8), 11, 10)), 0, 1);
+        assert!(higher_priority > more, "priority outranks disk");
+    }
+
+    fn classed(name: &str, class: Option<&str>) -> NodeConfig {
+        NodeConfig {
+            name: name.into(),
+            api: "http://127.0.0.1:1".into(),
+            agent: None,
+            priority: 0,
+            class: class.map(String::from),
+        }
+    }
+
+    /// Neither node answers, so both rank as unanswered and the class filter is
+    /// the only thing deciding who is eligible.
+    #[tokio::test]
+    async fn a_classed_node_takes_only_creates_naming_its_class() {
+        let mut c = config();
+        c.nodes = vec![classed("plain", None), classed("big", Some("gold"))];
+        let h = Hosting::new(c);
+        let config = h.config();
+        let pick = |class: Option<&'static str>| {
+            let h = &h;
+            let config = &config;
+            async move { h.pick_node(config, &[], class).await.map(|n| n.name.clone()) }
+        };
+        assert_eq!(pick(None).await.as_deref(), Some("plain"), "a plain create stays off the classed node");
+        assert_eq!(pick(Some("gold")).await.as_deref(), Some("big"));
+        assert_eq!(pick(Some("silver")).await, None, "no node of that class");
+    }
+
+    #[tokio::test]
+    async fn an_account_that_was_not_given_a_class_cannot_ask_for_it() {
+        let mut c = config();
+        c.nodes = vec![classed("big", Some("gold"))];
+        let h = Hosting::new(c);
+        let ask = |class: &str| DeployRequest {
+            game_id: "sven-coop".into(),
+            name: "x".into(),
+            max_players: 8,
+            map: None,
+            class: Some(class.into()),
+        };
+        for class in ["gold", "does-not-exist", "BAD CLASS"] {
+            let err = h
+                .deploy(&AccountId("aa".repeat(16)), &ask(class), std::time::SystemTime::now())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, "this account cannot place servers in that class", "{class}");
+        }
+    }
+
+    #[test]
+    fn class_labels_are_data_not_text_to_run() {
+        for good in ["gold", "eu-1", "home_2", "a"] {
+            assert!(valid_class(good), "{good}");
+        }
+        for bad in ["", "Gold", "a b", "a;b", "../x", &"x".repeat(33)] {
+            assert!(!valid_class(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn classes_in_the_file_reach_the_node_and_the_account_and_a_bad_one_is_refused() {
+        let hash = "b7f20b85976ca7b7b6c56a883992fb9a";
+        let ok = hosting_file(
+            "gpp-index-classes-ok",
+            &format!(
+                "games = [\"x\"]\n[[nodes]]\nname = \"big\"\napi = \"http://127.0.0.1:1\"\nclass = \"gold\"\n[quota.accounts.{hash}]\nclasses = [\"gold\"]\n"
+            ),
+        );
+        let config = Hosting::load(&ok).unwrap();
+        assert_eq!(config.nodes[0].class.as_deref(), Some("gold"));
+        let q = Quotas::new(QuotaPolicy::from(&config.quota));
+        assert!(q.may_use_class(&AccountId(hash.into()), "gold"));
+        let _ = std::fs::remove_dir_all(ok.parent().unwrap());
+
+        let bad_node = hosting_file(
+            "gpp-index-classes-bad-node",
+            "games = [\"x\"]\n[[nodes]]\nname = \"big\"\napi = \"http://127.0.0.1:1\"\nclass = \"Gold Plated\"\n",
+        );
+        assert!(format!("{:#}", Hosting::load(&bad_node).unwrap_err()).contains("not a valid label"));
+        let _ = std::fs::remove_dir_all(bad_node.parent().unwrap());
+
+        let bad_account = hosting_file(
+            "gpp-index-classes-bad-account",
+            &format!("[quota.accounts.{hash}]\nclasses = [\"x y\"]\n"),
+        );
+        assert!(format!("{:#}", Hosting::load(&bad_account).unwrap_err()).contains("not a valid label"));
+        let _ = std::fs::remove_dir_all(bad_account.parent().unwrap());
     }
 }

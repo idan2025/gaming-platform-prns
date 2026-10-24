@@ -148,6 +148,14 @@ pub struct CapacityResp {
     /// CPUs this agent may use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u32>,
+    /// Free space on the disk holding game files, and the reserve this node
+    /// keeps free (`updates::Settings::reserve`). Both or neither: absent from
+    /// an older agent and where free space cannot be read, which an index
+    /// reads as "not reported", never as room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_reserve_bytes: Option<u64>,
 }
 
 // ---- Envelope encode/decode -------------------------------------------------
