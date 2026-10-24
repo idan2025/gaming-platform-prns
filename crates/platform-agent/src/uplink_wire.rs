@@ -57,6 +57,29 @@ pub const OP_BACKUPS: u8 = 10;
 pub const OP_BACKUP_CREATE: u8 = 11;
 pub const OP_BACKUP_RESTORE: u8 = 12;
 pub const OP_BACKUP_DELETE: u8 = 13;
+/// What a server would be created from on another node (`Agent::spec`), so an
+/// index can move it (ROADMAP §13 item 7).
+pub const OP_SPEC: u8 = 14;
+/// A backup's file, one piece at a time: read from one node, written to
+/// another. The only ops whose replies or requests are bigger than a packet;
+/// they ride a Reticulum resource, and a piece is at most `TRANSFER_CHUNK`.
+pub const OP_BACKUP_READ: u8 = 15;
+pub const OP_BACKUP_WRITE: u8 = 16;
+/// What changed in a server's files since a time, made as a backup-shaped file
+/// that is read and written like one (`Agent::create_delta`), and laid over a
+/// stopped server's files (`Agent::merge_backup`): the second half of a move
+/// that copied while the server ran.
+pub const OP_DELTA_CREATE: u8 = 17;
+pub const OP_DELTA_MERGE: u8 = 18;
+/// A server's mesh identity, which is its address: read, and set on a stopped
+/// server so a moved one keeps it (`Agent::identity`, `set_identity`).
+pub const OP_IDENTITY_READ: u8 = 19;
+pub const OP_IDENTITY_SET: u8 = 20;
+
+/// The most file one `OP_BACKUP_READ` reply or `OP_BACKUP_WRITE` request
+/// carries. Big enough that the link set-up per piece is noise, small enough
+/// that neither end holds more than this of a file in memory.
+pub const TRANSFER_CHUNK: usize = 256 * 1024;
 
 // Deliberately absent: a map change. It types a line at the server's console,
 // and the uplink never gains a console route (CLAUDE.md). Decided by the owner
@@ -139,6 +162,50 @@ pub struct BackupReq {
     pub token: String,
     pub instance_id: String,
     pub name: String,
+}
+
+/// `OP_DELTA_CREATE`: the files of one server changed at or after `since`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaReq {
+    pub token: String,
+    pub instance_id: String,
+    pub since: i64,
+}
+
+/// `OP_IDENTITY_SET`: a server's identity as hex (64 bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentitySetReq {
+    pub token: String,
+    pub instance_id: String,
+    pub identity: String,
+}
+
+/// `OP_IDENTITY_READ`'s reply: the identity as hex, or none for a node with
+/// no mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityResp {
+    pub identity: Option<String>,
+}
+
+/// `OP_BACKUP_READ`: a piece of a named backup, from `offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupReadReq {
+    pub token: String,
+    pub instance_id: String,
+    pub name: String,
+    pub offset: u64,
+}
+
+/// `OP_BACKUP_WRITE`'s header: which upload, where this piece starts, and the
+/// whole file's length. The first piece has no `upload`; the node names it.
+/// The piece's bytes follow the header on the wire (`encode_write_body`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupWriteReq {
+    pub token: String,
+    pub instance_id: String,
+    pub upload: Option<String>,
+    pub offset: u64,
+    pub total: u64,
 }
 
 /// `OP_LIST` / `OP_CAPACITY`: read the node, with a session.
@@ -241,6 +308,45 @@ pub struct CapacityResp {
     pub disk_free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_reserve_bytes: Option<u64>,
+}
+
+// ---- File pieces -------------------------------------------------------------
+
+/// An `OP_BACKUP_READ` reply body: the file's whole length, then the piece.
+pub fn encode_chunk(total: u64, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + data.len());
+    body.extend_from_slice(&total.to_be_bytes());
+    body.extend_from_slice(data);
+    body
+}
+
+pub fn decode_chunk(body: &[u8]) -> Result<(u64, &[u8]), WireError> {
+    let (len, data) = body.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((u64::from_be_bytes(*len), data))
+}
+
+/// An `OP_BACKUP_WRITE` request body: the JSON header's length, the header,
+/// then the piece. The header carries the token like every other op's.
+pub fn encode_write_body(header: &BackupWriteReq, data: &[u8]) -> Result<Vec<u8>, WireError> {
+    let json = payload_bytes(header)?;
+    let mut body = Vec::with_capacity(4 + json.len() + data.len());
+    body.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    body.extend_from_slice(&json);
+    body.extend_from_slice(data);
+    Ok(body)
+}
+
+pub fn decode_write_body(body: &[u8]) -> Result<(BackupWriteReq, &[u8]), WireError> {
+    let (len, rest) = body.split_first_chunk::<4>().ok_or(WireError::Truncated)?;
+    let len = u32::from_be_bytes(*len) as usize;
+    if rest.len() < len || len > MAX_BODY_LEN {
+        return Err(WireError::Truncated);
+    }
+    let (json, data) = rest.split_at(len);
+    if data.len() > TRANSFER_CHUNK {
+        return Err(WireError::TooLarge(data.len()));
+    }
+    Ok((parse_payload(json)?, data))
 }
 
 // ---- Envelope encode/decode -------------------------------------------------
@@ -551,6 +657,7 @@ mod tests {
                 name: format!("20261022-{:06}.tar.gz", i),
                 bytes: 1024,
                 created_unix: Some(i),
+                started_unix: None,
             })
             .collect();
         let reply = encode_backups_resp(&made);
@@ -559,5 +666,33 @@ mod tests {
         assert_eq!(resp.backups.last().unwrap().name, "20261022-000199.tar.gz", "newest kept");
         assert!(resp.backups.len() < made.len());
         assert!(fits(body_of(&reply).len()).is_ok());
+    }
+
+    /// A file piece and its header survive the wire, and a piece bigger than
+    /// `TRANSFER_CHUNK` or a header that claims more than the body holds is
+    /// refused at decode, before anything reads it as a request.
+    #[test]
+    fn a_file_piece_round_trips_and_an_oversized_or_short_one_is_refused() {
+        let chunk = encode_chunk(70_000, b"abc");
+        let (total, data) = decode_chunk(&chunk).unwrap();
+        assert_eq!((total, data), (70_000, &b"abc"[..]));
+        assert_eq!(decode_chunk(&[0; 7]), Err(WireError::Truncated));
+
+        let header = BackupWriteReq {
+            token: "t".into(),
+            instance_id: "srv".into(),
+            upload: Some("0123456789abcdef".into()),
+            offset: 10,
+            total: 20,
+        };
+        let body = encode_write_body(&header, b"0123456789").unwrap();
+        let (back, data) = decode_write_body(&body).unwrap();
+        assert_eq!((back, data), (header.clone(), &b"0123456789"[..]));
+
+        let big = encode_write_body(&header, &vec![0; TRANSFER_CHUNK + 1]).unwrap();
+        assert_eq!(decode_write_body(&big), Err(WireError::TooLarge(TRANSFER_CHUNK + 1)));
+        let mut short = body.clone();
+        short[3] = 0xff;
+        assert_eq!(decode_write_body(&short), Err(WireError::Truncated));
     }
 }

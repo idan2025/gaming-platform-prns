@@ -133,6 +133,12 @@ pub fn router_full(
         .route("/instances/:id/backups/:name/restore", post(restore_backup))
         .route("/instances/:id/backup-schedule", get(backup_schedule).put(set_backup_schedule))
         .route("/instances/:id/backups/:name/file", get(download_backup))
+        .route("/instances/:id/spec", get(instance_spec))
+        // A move (ROADMAP §13 item 7): the files changed since a time, laid
+        // over a stopped server, and its mesh identity.
+        .route("/instances/:id/delta", post(create_delta))
+        .route("/instances/:id/backups/:name/merge", post(merge_backup))
+        .route("/instances/:id/identity", get(read_identity).put(set_identity))
         .route(
             "/instances/:id/backups/import",
             post(import_backup).layer(axum::extract::DefaultBodyLimit::disable()),
@@ -1013,6 +1019,64 @@ async fn create_backup(State(state): State<ApiState>, Path(id): Path<String>) ->
     state.agent.create_backup(&id).await.map(Json).map_err(|e| fail(StatusCode::CONFLICT, e))
 }
 
+#[derive(Deserialize)]
+struct DeltaBody {
+    since: i64,
+}
+
+/// The files changed since a time, for `merge_backup` on another node.
+async fn create_delta(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeltaBody>,
+) -> ApiResult<crate::backups::Backup> {
+    state.agent.create_delta(&id, body.since).await.map(Json).map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
+/// Lay a delta over a stopped server's files.
+async fn merge_backup(
+    State(state): State<ApiState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .merge_backup(&id, &name)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "merged": name })))
+        .map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
+/// A server's mesh identity as hex, or `null` for a node with no mesh.
+async fn read_identity(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<crate::uplink_wire::IdentityResp> {
+    state
+        .agent
+        .identity(&id)
+        .await
+        .map(|found| Json(crate::uplink_wire::IdentityResp { identity: found.map(hex::encode) }))
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct IdentityBody {
+    identity: String,
+}
+
+/// Give a stopped server another's mesh identity.
+async fn set_identity(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<IdentityBody>,
+) -> ApiResult<serde_json::Value> {
+    let bytes = hex::decode(&body.identity)
+        .map_err(|_| fail(StatusCode::BAD_REQUEST, anyhow::anyhow!("that is not a mesh identity")))?;
+    state
+        .agent
+        .set_identity(&id, &bytes)
+        .await
+        .map(|()| Json(json!({ "instance_id": id })))
+        .map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
 /// Put a backup back over a stopped server's files.
 async fn restore_backup(
     State(state): State<ApiState>,
@@ -1038,9 +1102,15 @@ async fn delete_backup(
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
 }
 
-/// The largest backup the node takes in. A server's own files (saves,
-/// settings, logs) are megabytes; this is a bound on a mistake, not a quota.
-const MAX_BACKUP_UPLOAD: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest backup the node takes in, the same bound the uplink holds an
+/// upload to.
+const MAX_BACKUP_UPLOAD: u64 = crate::backups::MAX_IMPORT_BYTES;
+
+/// What a server would be created from again on another node
+/// (`Agent::spec`): an index moving it reads this first.
+async fn instance_spec(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<crate::instance::InstanceSpec> {
+    state.agent.spec(&id).await.map(Json).map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
 
 /// A backup's file, for the operator to keep elsewhere. Streamed, never read
 /// whole into memory.

@@ -71,6 +71,10 @@ pub const AGENT_ASPECT: &str = "control";
 /// The single request endpoint every op rides on. One endpoint, op byte inside.
 pub const CONTROL_ENDPOINT_ID: &str = "/platform-agent/control/1";
 
+/// The largest request this destination reads: one `OP_BACKUP_WRITE` piece
+/// and room for its header and the envelope.
+const MAX_REQUEST_BYTES: u64 = (TRANSFER_CHUNK + 4 * 1024) as u64;
+
 /// State the request endpoint handler sees.
 struct UplinkState {
     agent: Arc<Agent>,
@@ -184,7 +188,13 @@ impl RequestEndpoint<Arc<UplinkState>> for ControlEndpoint {
         };
 
         let resp = dispatch(cx.state, op, body, now).await;
-        let _ = cx.respond(resp);
+        // Only a file piece or a spec outgrows a packet; every other reply is
+        // capped to one by its encoder, and goes exactly as it always did.
+        if resp.len() > MAX_BODY_LEN + 3 {
+            let _ = cx.respond_resource(resp);
+        } else {
+            let _ = cx.respond(resp);
+        }
         Ok(())
     }
 }
@@ -387,6 +397,124 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_SPEC => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_SPEC, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_SPEC, &msg);
+            }
+            match state.agent.spec(&req.instance_id).await {
+                Ok(spec) => match payload_bytes(&spec) {
+                    Ok(bytes) => encode_ok(OP_SPEC, &bytes),
+                    Err(e) => encode_err(OP_SPEC, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_SPEC, &format!("{e:#}")),
+            }
+        }
+
+        OP_DELTA_CREATE => {
+            let req: DeltaReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_DELTA_CREATE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_DELTA_CREATE, &msg);
+            }
+            match state.agent.create_delta(&req.instance_id, req.since).await {
+                Ok(made) => match payload_bytes(&made) {
+                    Ok(bytes) if fits(bytes.len()).is_ok() => encode_ok(OP_DELTA_CREATE, &bytes),
+                    Ok(bytes) => encode_err(OP_DELTA_CREATE, &WireError::TooLarge(bytes.len()).to_string()),
+                    Err(e) => encode_err(OP_DELTA_CREATE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_DELTA_CREATE, &format!("{e:#}")),
+            }
+        }
+
+        OP_DELTA_MERGE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_DELTA_MERGE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_DELTA_MERGE, &msg);
+            }
+            match state.agent.merge_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_DELTA_MERGE, &[]),
+                Err(e) => encode_err(OP_DELTA_MERGE, &format!("{e:#}")),
+            }
+        }
+
+        OP_IDENTITY_READ => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_IDENTITY_READ, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_IDENTITY_READ, &msg);
+            }
+            match state.agent.identity(&req.instance_id).await {
+                Ok(found) => match payload_bytes(&IdentityResp { identity: found.map(hex::encode) }) {
+                    Ok(bytes) => encode_ok(OP_IDENTITY_READ, &bytes),
+                    Err(e) => encode_err(OP_IDENTITY_READ, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_IDENTITY_READ, &format!("{e:#}")),
+            }
+        }
+
+        OP_IDENTITY_SET => {
+            let req: IdentitySetReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_IDENTITY_SET, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_IDENTITY_SET, &msg);
+            }
+            let Ok(bytes) = hex::decode(&req.identity) else {
+                return encode_err(OP_IDENTITY_SET, "that is not a mesh identity");
+            };
+            match state.agent.set_identity(&req.instance_id, &bytes).await {
+                Ok(()) => encode_ok(OP_IDENTITY_SET, &[]),
+                Err(e) => encode_err(OP_IDENTITY_SET, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_READ => {
+            let req: BackupReadReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_READ, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_READ, &msg);
+            }
+            match state.agent.backup_chunk(&req.instance_id, &req.name, req.offset, TRANSFER_CHUNK).await {
+                Ok((total, data)) => encode_ok(OP_BACKUP_READ, &encode_chunk(total, &data)),
+                Err(e) => encode_err(OP_BACKUP_READ, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_WRITE => {
+            let (req, data) = match decode_write_body(body) {
+                Ok(v) => v,
+                Err(e) => return encode_err(OP_BACKUP_WRITE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_WRITE, &msg);
+            }
+            match state
+                .agent
+                .backup_upload_chunk(&req.instance_id, req.upload.as_deref(), req.offset, req.total, data)
+                .await
+            {
+                Ok(progress) => match payload_bytes(&progress) {
+                    Ok(bytes) => encode_ok(OP_BACKUP_WRITE, &bytes),
+                    Err(e) => encode_err(OP_BACKUP_WRITE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_BACKUP_WRITE, &format!("{e:#}")),
+            }
+        }
+
         other => encode_err(other, "unknown op"),
     }
 }
@@ -491,7 +619,11 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
                     link_requests: LinkRequestPolicy::AcceptAll,
                     ratchet: RatchetPolicy::NoRatchets,
                     resource_strategy: ResourceStrategy::AcceptNone,
-                    maximum_request_bytes: Default::default(),
+                    // A request is read whole before anyone is asked who sent
+                    // it, so the biggest is bounded here: one file piece and
+                    // its header. Unlimited, anyone who could reach this
+                    // destination could make the node hold any size.
+                    maximum_request_bytes: prns_core::units::ByteLimit::Maximum(MAX_REQUEST_BYTES),
                     request_endpoints: ServeMyRequestEndpoints::Yes,
                 };
 
