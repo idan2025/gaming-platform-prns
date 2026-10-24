@@ -549,6 +549,32 @@ recomputes it each time; with them each instance gets its own cache. Remember
 that a writable path mounts an **empty** directory over the content, so name
 only directories that are empty in the install.
 
+## Adding a worker to an index
+
+A worker is an ordinary agent on another machine that an index places servers
+on. It needs no inbound port: it dials out to a hub, and the index reaches it
+over the mesh.
+
+On the worker, with Docker running and a built `platform-agent`:
+
+```
+scripts/setup-worker.sh --index <index identity hash> --hub <hub host:port> \
+    --name <node name> [--class <label>] [--priority <n>] [--service]
+```
+
+It writes `~/lanthorn-worker/agent.toml` that trusts the index, makes the
+worker's identity (`agent.identity`, owner-only), points the worker at the hub,
+and prints a `[[nodes]]` block. Paste that block into the index's hosting file;
+the index picks it up within 10 s. It starts nothing unless you pass `--service`,
+which writes a systemd user unit and leaves enabling it to you.
+
+Add a `[games.<id>]` section to `agent.toml` for each game the worker runs. A
+game with no entry cannot be placed there.
+
+The index's identity hash is in its log at start (`index identity ... identity=`).
+Nothing the script prints is secret: the two hashes are public, and the identity
+file never leaves the worker.
+
 ## Reaching the mesh: how anyone finds your server
 
 Reticulum has no global directory. A node reaches the mesh through an
