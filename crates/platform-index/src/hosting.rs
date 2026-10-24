@@ -302,6 +302,13 @@ pub struct DeployRequest {
     /// with no class. Only an account the operator allowed it to may ask.
     #[serde(default)]
     pub class: Option<String>,
+    /// The game's own choices: a Minecraft build, its heap, the EULA tick,
+    /// Bedrock's settings. Flattened, so a deploy body reads the same as a
+    /// node's own create. Passed through for the **node** to validate, as the
+    /// map is; the one thing set here is the EULA time, which is the index's
+    /// own clock and never a caller's.
+    #[serde(flatten, default)]
+    pub options: platform_agent::instance::InstanceOptions,
 }
 
 fn default_max_players() -> u8 {
@@ -553,6 +560,13 @@ impl Hosting {
         // The index picks the id. See DeployRequest.
         let instance_id = new_instance_id(&request.game_id)?;
 
+        let mut options = request.options.clone();
+        if options.eula_accepted_at.is_some() {
+            options.eula_accepted_at = Some(
+                now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            );
+        }
+
         // Remote agent over Reticulum, when the chosen node names one.
         if let Some(dest) = Self::agent_dest(node) {
             let dest = dest?;
@@ -578,7 +592,7 @@ impl Hosting {
                 bots: None,
                 restart_on_crash: false,
                 owner: None,
-                options: Default::default(),
+                options,
             };
             let created = client
                 .create(dest, spec, Some(account.0.clone()))
@@ -602,7 +616,7 @@ impl Hosting {
         }
 
         let url = format!("{}/instances", node.api.trim_end_matches('/'));
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "instance_id": instance_id,
             "game_id": request.game_id,
             "name": request.name,
@@ -610,6 +624,11 @@ impl Hosting {
             "map": request.map,
             "owner": account.0,
         });
+        if let (Some(body), Ok(serde_json::Value::Object(extra))) =
+            (body.as_object_mut(), serde_json::to_value(&options))
+        {
+            body.extend(extra);
+        }
         let response = self
             .http
             .post(&url)
@@ -1682,6 +1701,7 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    options: Default::default(),
                 },
                 std::time::SystemTime::now(),
             )
@@ -1704,6 +1724,7 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    options: Default::default(),
                 },
                 std::time::SystemTime::now(),
             )
@@ -1727,6 +1748,7 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    options: Default::default(),
                 },
                 std::time::SystemTime::now(),
             )
@@ -2235,6 +2257,7 @@ mod tests {
             max_players: 8,
             map: None,
             class: Some(class.into()),
+            options: Default::default(),
         };
         for class in ["gold", "does-not-exist", "BAD CLASS"] {
             let err = h
@@ -2528,6 +2551,65 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (addr, node)
+    }
+
+    /// A game's own choices (a Minecraft build, its heap, Bedrock's settings,
+    /// the EULA tick) used to stop at the index: the create it sent a node
+    /// carried none of them, so a hosted Minecraft server was refused for its
+    /// missing EULA. They reach the node, and the EULA time is the index's own
+    /// clock, never what the caller wrote.
+    #[tokio::test]
+    async fn a_games_own_choices_reach_the_node_and_the_eula_time_is_the_indexs() {
+        use axum::extract::State;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        type Seen = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        async fn create(State(seen): State<Seen>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            seen.lock().unwrap().push(body);
+            Json(serde_json::json!({ "state": "running", "port": 27100, "ports": [] }))
+        }
+        async fn none() -> Json<serde_json::Value> {
+            Json(serde_json::json!([]))
+        }
+        let seen: Seen = Default::default();
+        let app = Router::new()
+            .route("/instances", post(create).get(none))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut c = config();
+        c.nodes[0].api = format!("http://{addr}");
+        let h = Hosting::new(c);
+        let request: DeployRequest = serde_json::from_value(serde_json::json!({
+            "game_id": "sven-coop",
+            "name": "mine",
+            "content_version": "paper-26.3",
+            "memory": { "min_mb": 1024, "max_mb": 2048 },
+            "eula_accepted_at": 1,
+            "minecraft": { "pvp": false },
+        }))
+        .unwrap();
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        h.deploy(&AccountId("aa".repeat(16)), &request, now).await.unwrap();
+
+        let body = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["content_version"], "paper-26.3");
+        assert_eq!(body["memory"]["max_mb"], 2048);
+        assert_eq!(body["minecraft"]["pvp"], false);
+        assert_eq!(body["eula_accepted_at"], 1_800_000_000u64, "the caller's own time was kept");
+        assert_eq!(body["owner"], "aa".repeat(16));
+
+        // No tick, no stamp: the node refuses a pack that needs one.
+        let plain: DeployRequest =
+            serde_json::from_value(serde_json::json!({ "game_id": "sven-coop", "name": "plain" })).unwrap();
+        h.deploy(&AccountId("aa".repeat(16)), &plain, now).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() == 2 && seen[1].get("eula_accepted_at").is_none());
     }
 
     #[derive(Default)]
