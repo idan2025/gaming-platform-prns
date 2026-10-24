@@ -41,10 +41,11 @@ use platform_agent::backups::Backup;
 use platform_agent::backups::UploadProgress;
 use platform_agent::uplink_wire::{
     decode_chunk, decode_response, encode_request, encode_write_body, parse_payload, payload_bytes,
-    BackupReadReq, BackupReq, BackupWriteReq, BackupsResp, CapacityResp, CreateReq, InstanceReq,
-    ListResp, LogsReq, LogsResp, TokenReq, OP_BACKUPS, OP_BACKUP_CREATE, OP_BACKUP_DELETE,
-    OP_BACKUP_READ, OP_BACKUP_RESTORE, OP_BACKUP_WRITE, OP_CAPACITY, OP_CHALLENGE, OP_CREATE,
-    OP_LIST, OP_LOGS, OP_REMOVE, OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
+    BackupReadReq, BackupReq, BackupWriteReq, BackupsResp, CapacityResp, CreateReq, DeltaReq,
+    IdentityResp, IdentitySetReq, InstanceReq, ListResp, LogsReq, LogsResp, TokenReq, OP_BACKUPS,
+    OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_READ, OP_BACKUP_RESTORE, OP_BACKUP_WRITE,
+    OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_DELTA_CREATE, OP_DELTA_MERGE, OP_IDENTITY_READ,
+    OP_IDENTITY_SET, OP_LIST, OP_LOGS, OP_REMOVE, OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
 };
 use prns_core::engine::RequestResponseTimeout;
 use prns_core::units::DurationMillis;
@@ -152,6 +153,34 @@ impl AgentClient {
         let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
         let body = self.signed_op(agent, OP_BACKUP_DELETE, &payload_bytes(&req)?).await?;
         expect_empty(&body, OP_BACKUP_DELETE)
+    }
+
+    /// What changed in a server's files since `since` (the node's own clock).
+    pub async fn delta_create(&self, agent: DestinationHash, instance_id: &str, since: i64) -> Result<Backup> {
+        let req = DeltaReq { token: String::new(), instance_id: instance_id.to_string(), since };
+        let body = self.signed_op(agent, OP_DELTA_CREATE, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_DELTA_CREATE)
+    }
+
+    /// Lay a delta over a stopped server's files; the node deletes the delta.
+    pub async fn delta_merge(&self, agent: DestinationHash, instance_id: &str, name: &str) -> Result<()> {
+        let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
+        let body = self.signed_op(agent, OP_DELTA_MERGE, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_DELTA_MERGE)
+    }
+
+    /// A server's mesh identity (64 bytes), or none on a node with no mesh.
+    pub async fn identity_read(&self, agent: DestinationHash, instance_id: &str) -> Result<Option<Vec<u8>>> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_IDENTITY_READ, &payload_bytes(&req)?).await?;
+        let reply: IdentityResp = parse_ok(&body, OP_IDENTITY_READ)?;
+        reply.identity.map(|h| hex::decode(h).map_err(|_| anyhow!("the node sent an identity we cannot read"))).transpose()
+    }
+
+    pub async fn identity_set(&self, agent: DestinationHash, instance_id: &str, identity: &[u8]) -> Result<()> {
+        let req = IdentitySetReq { token: String::new(), instance_id: instance_id.to_string(), identity: hex::encode(identity) };
+        let body = self.signed_op(agent, OP_IDENTITY_SET, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_IDENTITY_SET)
     }
 
     /// What a server would be created from on another node.
@@ -377,7 +406,7 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
-        OP_STOP | OP_START | OP_REMOVE | OP_SPEC => {
+        OP_STOP | OP_START | OP_REMOVE | OP_SPEC | OP_IDENTITY_READ => {
             let mut r: InstanceReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
@@ -397,8 +426,18 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
-        OP_BACKUP_RESTORE | OP_BACKUP_DELETE => {
+        OP_BACKUP_RESTORE | OP_BACKUP_DELETE | OP_DELTA_MERGE => {
             let mut r: BackupReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_DELTA_CREATE => {
+            let mut r: DeltaReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_IDENTITY_SET => {
+            let mut r: IdentitySetReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }

@@ -827,14 +827,20 @@ the owner stamped from the user's identity.
    ROADMAP §13's console decision is still the owner's to make.
 7. **Moving a server between workers** (built, `Hosting::relocate`,
    `POST /instances/:id/relocate`, `HOSTING.md` "Moving a server to another
-   worker"). Stop, back up, carry the backup across in `TRANSFER_CHUNK` pieces
-   (`OP_SPEC`, `OP_BACKUP_READ`, `OP_BACKUP_WRITE`, riding Reticulum resources),
-   create the same server on the new worker, restore, start, and remove the old
-   one last; a failure before that removes what was made and starts the old one
-   again. The server gets a new id and a new mesh address. Caught by
+   worker"). Create the same server on the new worker held stopped, copy its
+   files while the old one runs (a full copy, then deltas of what changed,
+   `OP_BACKUP_*`, `OP_DELTA_CREATE`, `OP_DELTA_MERGE`, riding Reticulum
+   resources), stop the old one for the last delta, carry its identity
+   (`OP_IDENTITY_READ`, `OP_IDENTITY_SET`) so the address does not change,
+   start the new one, and remove the old one last. The old server is not
+   touched until that final pass. Caught by
    `a_server_moves_with_its_files_and_the_old_one_goes_last`,
-   `a_move_that_fails_on_the_new_node_leaves_the_old_server_running` and, live,
-   `a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplink`.
+   `a_move_that_fails_while_copying_never_stops_the_old_server`,
+   `a_move_that_fails_after_the_stop_starts_the_old_server_again` and, live,
+   `a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplink`
+   and `a_delta_and_an_identity_cross_the_uplink`. Downtime between two real
+   machines is still unmeasured: one Docker host cannot run both agents
+   without each seeing the other's servers.
 
 **A decision, not a default.** The uplink must never gain a console route
 (`CLAUDE.md`: an index must not type at a node's servers). Moderation and the

@@ -65,6 +65,16 @@ pub const OP_SPEC: u8 = 14;
 /// they ride a Reticulum resource, and a piece is at most `TRANSFER_CHUNK`.
 pub const OP_BACKUP_READ: u8 = 15;
 pub const OP_BACKUP_WRITE: u8 = 16;
+/// What changed in a server's files since a time, made as a backup-shaped file
+/// that is read and written like one (`Agent::create_delta`), and laid over a
+/// stopped server's files (`Agent::merge_backup`): the second half of a move
+/// that copied while the server ran.
+pub const OP_DELTA_CREATE: u8 = 17;
+pub const OP_DELTA_MERGE: u8 = 18;
+/// A server's mesh identity, which is its address: read, and set on a stopped
+/// server so a moved one keeps it (`Agent::identity`, `set_identity`).
+pub const OP_IDENTITY_READ: u8 = 19;
+pub const OP_IDENTITY_SET: u8 = 20;
 
 /// The most file one `OP_BACKUP_READ` reply or `OP_BACKUP_WRITE` request
 /// carries. Big enough that the link set-up per piece is noise, small enough
@@ -152,6 +162,29 @@ pub struct BackupReq {
     pub token: String,
     pub instance_id: String,
     pub name: String,
+}
+
+/// `OP_DELTA_CREATE`: the files of one server changed at or after `since`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaReq {
+    pub token: String,
+    pub instance_id: String,
+    pub since: i64,
+}
+
+/// `OP_IDENTITY_SET`: a server's identity as hex (64 bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentitySetReq {
+    pub token: String,
+    pub instance_id: String,
+    pub identity: String,
+}
+
+/// `OP_IDENTITY_READ`'s reply: the identity as hex, or none for a node with
+/// no mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityResp {
+    pub identity: Option<String>,
 }
 
 /// `OP_BACKUP_READ`: a piece of a named backup, from `offset`.
@@ -624,6 +657,7 @@ mod tests {
                 name: format!("20261022-{:06}.tar.gz", i),
                 bytes: 1024,
                 created_unix: Some(i),
+                started_unix: None,
             })
             .collect();
         let reply = encode_backups_resp(&made);

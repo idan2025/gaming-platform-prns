@@ -2253,6 +2253,17 @@ impl Agent {
     /// game may be writing a file at that moment, which the page says. Held
     /// to the disk reserve like a download, by the files' full size.
     pub async fn create_backup(&self, instance_id: &str) -> Result<crate::backups::Backup> {
+        self.make_backup(instance_id, None).await
+    }
+
+    /// What changed in a server's files since `since` (unix seconds on this
+    /// node's clock), as an archive for `merge_backup` (`backups::create_since`).
+    /// Made the same way as a backup, so a running world is held still too.
+    pub async fn create_delta(&self, instance_id: &str, since: i64) -> Result<crate::backups::Backup> {
+        self.make_backup(instance_id, Some(since)).await
+    }
+
+    async fn make_backup(&self, instance_id: &str, since: Option<i64>) -> Result<crate::backups::Backup> {
         let c = self.ensure_instance(instance_id).await?;
         let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
         let dir = self.backups_dir(instance_id)?;
@@ -2271,7 +2282,11 @@ impl Agent {
             self.hold_world(instance_id, console).await;
         }
         let name = crate::backups::new_name(&dir, now_unix());
-        let made = tokio::task::spawn_blocking(move || crate::backups::create(&writable, &dir, &name)).await;
+        let made = tokio::task::spawn_blocking(move || match since {
+            Some(since) => crate::backups::create_since(&writable, &dir, &name, since),
+            None => crate::backups::create(&writable, &dir, &name),
+        })
+        .await;
         if let Some(console) = console {
             for line in console.after_backup() {
                 if let Err(e) = self.docker.send_console_line(instance_id, line).await {
@@ -2337,6 +2352,70 @@ impl Agent {
         Ok(())
     }
 
+    /// Lay a delta (`create_delta`) over a stopped server's files, then delete
+    /// the delta: it is not a backup and restoring it later would drop files.
+    pub async fn merge_backup(&self, instance_id: &str, name: &str) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: its files cannot be changed while it runs"));
+        }
+        if self.is_moving(instance_id) {
+            return Err(anyhow!("this server is being moved to a new copy; try again when that is done"));
+        }
+        let archive = crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))?;
+        let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for a staging name: {e}"))?;
+        let staging = self.config.data_root.join("staging").join(format!("merge-{}", hex::encode(seed)));
+        let from = archive.clone();
+        tokio::task::spawn_blocking(move || crate::backups::merge(&from, &writable, &staging))
+            .await?
+            .map_err(|e| anyhow!("{e}"))?;
+        let _ = std::fs::remove_file(&archive);
+        tracing::info!(instance = %instance_id, backup = %name, "merged a delta into a server's files");
+        Ok(())
+    }
+
+    /// The server's mesh identity, which is its address. `None` for a node
+    /// with no mesh. Read only so a move can carry the address with the
+    /// files; it never leaves the node except to an index on `trusted_indexes`.
+    pub async fn identity(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
+        self.ensure_instance(instance_id).await?;
+        let path = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace a **stopped** server's mesh identity with `bytes`, so it
+    /// comes back at another server's address. Exactly the 64 bytes an
+    /// identity file holds, written beside and renamed, mode 0600.
+    pub async fn set_identity(&self, instance_id: &str, bytes: &[u8]) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: it announces under its identity while it runs"));
+        }
+        if bytes.len() != 64 {
+            return Err(anyhow!("that is not a mesh identity"));
+        }
+        let path = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        let partial = path.with_extension("identity.partial");
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&partial)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&partial, &path)?;
+        tracing::info!(instance = %instance_id, "gave a server another mesh identity");
+        Ok(())
+    }
+
     /// Delete one backup. The server need not exist any more: a removed
     /// server's backups stay until deleted. The id is still checked as an
     /// instance id and the name against the agent's own shape.
@@ -2397,7 +2476,7 @@ impl Agent {
         }
         let bytes = std::fs::metadata(dir.join(&name))?.len();
         tracing::info!(instance = %instance_id, backup = %name, bytes, "imported a backup");
-        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()) })
+        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()), started_unix: None })
     }
 
     /// What this server would be created from again on another node: its

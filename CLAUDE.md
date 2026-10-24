@@ -117,12 +117,25 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
 
 **A server moves between workers through the index** (2026-10-23,
-`Hosting::relocate`, ROADMAP §13 item 7). Rules a later change could quietly
-break:
-- **The old server is removed last.** Every step before it is undone on
-  failure (the new copy removed, the old one started again if it ran), so a
-  move that fails never loses a server. Caught by
-  `a_move_that_fails_on_the_new_node_leaves_the_old_server_running`.
+`Hosting::relocate`, ROADMAP §13 item 7; copies while running and keeps its
+address, 2026-10-24). Rules a later change could quietly break:
+- **The old server is removed last, and is not touched at all until the final
+  pass.** The new server is made and held stopped, the files are copied while
+  the old one still serves (a full copy, then up to three deltas of what
+  changed since the previous one), and only then is the old one stopped for
+  one last delta. A failure before the stop removes only the new copy; after
+  it, the new copy is removed and the old one started again. A move that
+  fails never loses a server. Caught by
+  `a_move_that_fails_while_copying_never_stops_the_old_server` and
+  `a_move_that_fails_after_the_stop_starts_the_old_server_again`.
+- **A delta is `since` the time the previous archive was *started*, on the
+  source's clock** (`Backup.started_unix`), never when it finished: a file
+  written while the archive was being made must be sent again. A delta
+  carries `backups::DELTA_INDEX`, the list of every path the server has, so
+  `backups::merge` can delete what is gone; it refuses a plain backup, which
+  would delete every file it lacks. Merge only onto a stopped server and
+  consumes the delta. Caught by `a_delta_laid_over_an_earlier_copy_gives_the_later_state`
+  and `a_backup_that_is_not_a_delta_is_never_merged`.
 - **The uplink reads a request whole before it knows who sent it**, so the
   control destination caps requests at one file piece
   (`uplink::MAX_REQUEST_BYTES`). Leaving it `Unlimited` lets anyone who can
@@ -130,8 +143,16 @@ break:
 - **An upload piece must start where the file ends**, and the first is held
   to `backups::MAX_IMPORT_BYTES` and the disk reserve by its declared total;
   the finished file goes through `import_backup`'s check like any upload.
-- **The server's identity does not travel.** It gets a new id and address;
-  carrying `mesh.identity` would put its secret through the index.
+- **The server's identity travels, through the index, in memory only**
+  (`OP_IDENTITY_READ` / `OP_IDENTITY_SET`, `Hosting::identity_on`): the
+  address is the identity, so a move that keeps it must carry the 64 secret
+  bytes, and two nodes reach each other only through the index. An index on a
+  node's `trusted_indexes` can already create, stop and remove there; this
+  adds impersonating that one server, and the old node's copy goes with its
+  folder. It is read and set per request under the same allowlist check as
+  every op, set only on a **stopped** server and only if exactly 64 bytes,
+  written beside and renamed at mode 0600. Never log it or write it on the
+  index. Caught by `a_delta_and_an_identity_cross_the_uplink`.
 
 **`StreamRelay` is built** (2026-08-31, `crates/game-bridge/src/stream.rs`): a
 pack declaring `transport = "tcp"` runs. It rides the link's **channel**, not

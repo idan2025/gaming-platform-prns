@@ -543,6 +543,220 @@ async fn a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplin
     outcome.expect("a backup should be carried in pieces over the uplink");
 }
 
+/// What a move that kept the server running relies on, live over the wire: a
+/// delta made on one server lands on another's stopped files, and a server's
+/// identity (its address) is read from one and set on another, only while that
+/// one is stopped and only if it is exactly an identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_and_an_identity_cross_the_uplink() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let Some(tn) = two_nodes(|idx| vec![idx.to_string()]).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let from = format!("upldf{}", std::process::id());
+    let to = format!("upldt{}", std::process::id());
+    docker_rm(&format!("gpp-{from}"));
+    docker_rm(&format!("gpp-{to}"));
+    let root = tn._dir.path().to_path_buf();
+    let outcome: Result<()> = async {
+        let spec = |id: &str| platform_agent::instance::InstanceSpec {
+            instance_id: id.to_string(),
+            game_id: "sven-coop".to_string(),
+            name: "Delta".to_string(),
+            max_players: 8,
+            port: None,
+            extra_ports: Default::default(),
+            map: None,
+            bots: None,
+            restart_on_crash: false,
+            owner: None,
+            options: Default::default(),
+        };
+        for id in [&from, &to] {
+            let made = with_retries(|| {
+                let spec = spec(id);
+                let client = tn.client.clone();
+                let dest = tn.agent_dest;
+                async move { client.create(dest, spec, Some(USER_IDENTITY_HEX.to_string())).await }
+            })
+            .await;
+            match made {
+                Ok(_) => {}
+                Err(e) if format!("{e:#}").contains("already exists") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let writable = |id: &str| root.join("instances").join(id).join("writable");
+        std::fs::write(writable(&from).join("fresh.txt"), b"made while it ran")?;
+        std::fs::write(writable(&to).join("stale.txt"), b"the server no longer has this")?;
+
+        // A delta of everything, carried and laid over the stopped copy.
+        let made = tn.client.delta_create(tn.agent_dest, &from, 0).await?;
+        assert!(made.started_unix.is_some());
+        let mut file = Vec::new();
+        loop {
+            let (total, data) = tn.client.backup_read(tn.agent_dest, &from, &made.name, file.len() as u64).await?;
+            file.extend_from_slice(&data);
+            if file.len() as u64 >= total {
+                break;
+            }
+        }
+        let early = tn.client.delta_merge(tn.agent_dest, &to, "20260101-000000.tar.gz").await;
+        assert!(early.is_err(), "a merge onto a running server must be refused");
+        tn.client.stop(tn.agent_dest, &to).await?;
+        let landed = tn
+            .client
+            .backup_write(tn.agent_dest, &to, None, 0, file.len() as u64, &file)
+            .await?
+            .backup
+            .ok_or_else(|| anyhow!("the delta did not land"))?;
+        tn.client.delta_merge(tn.agent_dest, &to, &landed.name).await?;
+        assert_eq!(std::fs::read(writable(&to).join("fresh.txt"))?, b"made while it ran");
+        assert!(!writable(&to).join("stale.txt").exists(), "a file the source lacks is removed");
+        assert!(
+            tn.client.delta_merge(tn.agent_dest, &to, &landed.name).await.is_err(),
+            "a merged delta is consumed"
+        );
+
+        // The address: read from one server, set on the other while stopped.
+        let identity_file = |id: &str| root.join("instances").join(id).join("mesh.identity");
+        if tn.client.identity_read(tn.agent_dest, &from).await?.is_none() {
+            std::fs::write(identity_file(&from), [7u8; 64])?;
+        }
+        let key = tn.client.identity_read(tn.agent_dest, &from).await?.ok_or_else(|| anyhow!("no identity"))?;
+        assert_eq!(key.len(), 64);
+        let running = tn.client.identity_set(tn.agent_dest, &from, &key).await;
+        assert!(running.is_err(), "an identity cannot be set on a running server");
+        let short = tn.client.identity_set(tn.agent_dest, &to, &key[..10]).await;
+        assert!(short.is_err(), "ten bytes are not an identity");
+        tn.client.identity_set(tn.agent_dest, &to, &key).await?;
+        assert_eq!(std::fs::read(identity_file(&to))?, key);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(identity_file(&to))?.permissions().mode() & 0o777, 0o600);
+
+        tn.client.remove(tn.agent_dest, &from).await?;
+        tn.client.remove(tn.agent_dest, &to).await?;
+        Ok(())
+    }
+    .await;
+    docker_rm(&format!("gpp-{from}"));
+    docker_rm(&format!("gpp-{to}"));
+    let mut tn = tn;
+    tn.agent_node.stop().await;
+    tn.index.stop().await;
+    outcome.expect("a delta and an identity should cross the uplink");
+}
+
+/// Not a check, a measurement: how long each phase of carrying a backup takes
+/// over the uplink between two agents on this host. Run with
+/// `MEASURE_MIB=64 cargo test -p platform-index --test uplink_roundtrip -- --ignored --nocapture a_backup_carry_is_timed`.
+/// A local hub has no real link in it, so this is the protocol's own ceiling.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn a_backup_carry_is_timed() {
+    use std::time::Instant;
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let Some(tn) = two_nodes(|idx| vec![idx.to_string()]).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let mib: usize = std::env::var("MEASURE_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let from = format!("uplmsf{}", std::process::id());
+    let to = format!("uplmst{}", std::process::id());
+    docker_rm(&format!("gpp-{from}"));
+    docker_rm(&format!("gpp-{to}"));
+    let root = tn._dir.path().to_path_buf();
+    let outcome: Result<()> = async {
+        let spec = |id: &str| platform_agent::instance::InstanceSpec {
+            instance_id: id.to_string(),
+            game_id: "sven-coop".to_string(),
+            name: "Timed move".to_string(),
+            max_players: 8,
+            port: None,
+            extra_ports: Default::default(),
+            map: None,
+            bots: None,
+            restart_on_crash: false,
+            owner: None,
+            options: Default::default(),
+        };
+        for id in [&from, &to] {
+            let made = with_retries(|| {
+                let spec = spec(id);
+                let client = tn.client.clone();
+                let dest = tn.agent_dest;
+                async move { client.create(dest, spec, Some(USER_IDENTITY_HEX.to_string())).await }
+            })
+            .await;
+            match made {
+                Ok(_) => {}
+                Err(e) if format!("{e:#}").contains("already exists") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut original = vec![0u8; mib * 1024 * 1024];
+        getrandom::getrandom(&mut original).map_err(|e| anyhow!("{e}"))?;
+        std::fs::write(root.join("instances").join(&from).join("writable/big.bin"), &original)?;
+
+        let t = Instant::now();
+        let made = tn.client.backup_create(tn.agent_dest, &from).await?;
+        let t_create = t.elapsed();
+
+        let t = Instant::now();
+        let mut file = Vec::new();
+        let mut pieces = 0;
+        loop {
+            let (total, data) = tn.client.backup_read(tn.agent_dest, &from, &made.name, file.len() as u64).await?;
+            file.extend_from_slice(&data);
+            pieces += 1;
+            if file.len() as u64 >= total {
+                break;
+            }
+        }
+        let t_read = t.elapsed();
+
+        tn.client.stop(tn.agent_dest, &to).await?;
+        let total = file.len() as u64;
+        let t = Instant::now();
+        let mut progress = None;
+        let mut sent = 0u64;
+        let mut landed = None;
+        for piece in file.chunks(platform_agent::uplink_wire::TRANSFER_CHUNK) {
+            let p = tn
+                .client
+                .backup_write(tn.agent_dest, &to, progress.as_ref().map(|p: &platform_agent::backups::UploadProgress| p.upload.as_str()), sent, total, piece)
+                .await?;
+            sent += piece.len() as u64;
+            landed = p.backup.clone();
+            progress = Some(p);
+        }
+        let t_write = t.elapsed();
+        let landed = landed.ok_or_else(|| anyhow!("no backup landed"))?;
+
+        let t = Instant::now();
+        tn.client.backup_restore(tn.agent_dest, &to, &landed.name).await?;
+        let t_restore = t.elapsed();
+
+        let rate = |d: std::time::Duration| total as f64 / 1_048_576.0 / d.as_secs_f64();
+        eprintln!("MEASURE backup {} bytes in {pieces} pieces (incompressible)", total);
+        eprintln!("MEASURE create  {:>8.2?}", t_create);
+        eprintln!("MEASURE read    {:>8.2?}  {:.2} MiB/s", t_read, rate(t_read));
+        eprintln!("MEASURE write   {:>8.2?}  {:.2} MiB/s", t_write, rate(t_write));
+        eprintln!("MEASURE restore {:>8.2?}", t_restore);
+        tn.client.remove(tn.agent_dest, &from).await?;
+        tn.client.remove(tn.agent_dest, &to).await?;
+        Ok(())
+    }
+    .await;
+    docker_rm(&format!("gpp-{from}"));
+    docker_rm(&format!("gpp-{to}"));
+    let mut tn = tn;
+    tn.agent_node.stop().await;
+    tn.index.stop().await;
+    outcome.expect("timed carry");
+}
+
 /// An index the operator did not list is refused on its very first request — it
 /// cannot even list. This is the allowlist gate, live over the wire: a stranger
 /// with a valid keypair and no path to the allowlist gets nothing.

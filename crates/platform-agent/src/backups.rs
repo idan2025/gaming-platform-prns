@@ -40,6 +40,11 @@ pub struct Backup {
     pub name: String,
     pub bytes: u64,
     pub created_unix: Option<i64>,
+    /// When this node began making it, on its own clock; only a file made now
+    /// carries it. A delta asked for since this time cannot miss a change made
+    /// while the file was being written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix: Option<i64>,
 }
 
 /// Whether `name` is one this module would have made.
@@ -91,7 +96,7 @@ pub fn list(dir: &Path) -> Vec<Backup> {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64);
-            Some(Backup { name, bytes: meta.len(), created_unix })
+            Some(Backup { name, bytes: meta.len(), created_unix, started_unix: None })
         })
         .collect();
     out.sort_by(|a, b| b.name.cmp(&a.name));
@@ -107,7 +112,25 @@ pub fn list(dir: &Path) -> Vec<Backup> {
 /// own files in from the shared copy that way, and makes the links again at
 /// every start.
 pub fn create(writable: &Path, dir: &Path, name: &str) -> std::io::Result<Backup> {
+    create_inner(writable, dir, name, None)
+}
+
+/// The file inside a delta that lists every path the server has now, so a
+/// merge can tell a file that was left alone from one that was deleted.
+pub const DELTA_INDEX: &str = ".gpp-delta-index";
+
+/// What changed since `since` (unix seconds, on this node's own clock): every
+/// directory, every link restore would take, and the files modified at or after
+/// `since` minus a second of slack, plus [`DELTA_INDEX`]. It is a backup that
+/// passes `check_archive`, so it travels like one, but it is meant for
+/// [`merge`] only: restoring it would drop every file it left out.
+pub fn create_since(writable: &Path, dir: &Path, name: &str, since: i64) -> std::io::Result<Backup> {
+    create_inner(writable, dir, name, Some(since))
+}
+
+fn create_inner(writable: &Path, dir: &Path, name: &str, since: Option<i64>) -> std::io::Result<Backup> {
     std::fs::create_dir_all(dir)?;
+    let started = crate::agent::now_unix();
     let path = dir.join(name);
     let partial = dir.join(format!(".{name}.partial"));
     let written = (|| {
@@ -116,7 +139,15 @@ pub fn create(writable: &Path, dir: &Path, name: &str) -> std::io::Result<Backup
         let mut tar = tar::Builder::new(gz);
         tar.follow_symlinks(false);
         if writable.is_dir() {
-            append_tree(&mut tar, writable, Path::new("writable"))?;
+            let mut listing = Vec::new();
+            let filter = since.map(|s| Since { at: s - 1, listing: &mut listing });
+            append_tree(&mut tar, writable, Path::new("writable"), filter)?;
+            if since.is_some() {
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o600);
+                header.set_size(listing.len() as u64);
+                tar.append_data(&mut header, Path::new("writable").join(DELTA_INDEX), listing.as_slice())?;
+            }
         } else {
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(tar::EntryType::Directory);
@@ -132,11 +163,24 @@ pub fn create(writable: &Path, dir: &Path, name: &str) -> std::io::Result<Backup
     }
     std::fs::rename(&partial, &path)?;
     let bytes = std::fs::metadata(&path)?.len();
-    Ok(Backup { name: name.to_string(), bytes, created_unix: Some(crate::agent::now_unix()) })
+    Ok(Backup { name: name.to_string(), bytes, created_unix: Some(crate::agent::now_unix()), started_unix: Some(started) })
+}
+
+/// A delta's filter: files older than `at` are left out, and every path that
+/// is kept or left out goes in `listing` (NUL-separated, relative to
+/// `writable`).
+struct Since<'a> {
+    at: i64,
+    listing: &'a mut Vec<u8>,
 }
 
 /// `append_dir_all`, minus the links restore would refuse.
-fn append_tree<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &Path, name: &Path) -> std::io::Result<()> {
+fn append_tree<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    dir: &Path,
+    name: &Path,
+    mut since: Option<Since<'_>>,
+) -> std::io::Result<()> {
     tar.append_dir(name, dir)?;
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
@@ -144,17 +188,109 @@ fn append_tree<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &Path, name: &
         let path = e.path();
         let inner = name.join(e.file_name());
         let kind = e.file_type()?;
+        let note = |since: &mut Option<Since<'_>>| {
+            if let Some(s) = since {
+                let rel = inner.strip_prefix("writable").unwrap_or(&inner);
+                s.listing.extend_from_slice(rel.to_string_lossy().as_bytes());
+                s.listing.push(0);
+            }
+        };
         if kind.is_symlink() {
             let target = std::fs::read_link(&path)?;
             let restorable = target.is_relative()
                 && !target.components().any(|c| matches!(c, std::path::Component::ParentDir));
             if restorable {
+                note(&mut since);
                 tar.append_path_with_name(&path, &inner)?;
             }
         } else if kind.is_dir() {
-            append_tree(tar, &path, &inner)?;
+            append_tree(tar, &path, &inner, since.as_mut().map(|s| Since { at: s.at, listing: &mut *s.listing }))?;
         } else if kind.is_file() {
-            tar.append_path_with_name(&path, &inner)?;
+            note(&mut since);
+            let fresh = match &since {
+                None => true,
+                Some(s) => {
+                    let modified = e
+                        .metadata()?
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    // A time that cannot be read is a file that is sent.
+                    modified.is_none_or(|m| m >= s.at)
+                }
+            };
+            if fresh {
+                tar.append_path_with_name(&path, &inner)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lay a delta over `writable` (a stopped server's): extract it into
+/// `staging` under `content::extract`'s checks, move what it carries over the
+/// files that are there, then take away every file and link the delta's index
+/// does not list. A directory directly under `writable` is never removed, so
+/// every mount the container has keeps its source.
+pub fn merge(archive: &Path, writable: &Path, staging: &Path) -> Result<(), String> {
+    let unpacked = staging.join("unpacked");
+    std::fs::create_dir_all(&unpacked).map_err(|e| format!("{e}"))?;
+    let done = (|| {
+        crate::content::extract(archive, &unpacked, 0).map_err(|e| format!("the delta could not be read: {e}"))?;
+        let carried = unpacked.join("writable");
+        let index = std::fs::read(carried.join(DELTA_INDEX))
+            .map_err(|_| "this is a backup, not a delta of a server's files".to_string())?;
+        std::fs::remove_file(carried.join(DELTA_INDEX)).map_err(|e| format!("{e}"))?;
+        let keep: std::collections::BTreeSet<PathBuf> =
+            index.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| PathBuf::from(String::from_utf8_lossy(p).into_owned())).collect();
+        std::fs::create_dir_all(writable).map_err(|e| format!("{e}"))?;
+        lay_over(&carried, writable).map_err(|e| format!("putting the delta in place: {e}"))?;
+        take_away(writable, Path::new(""), &keep, 0).map_err(|e| format!("removing what the server no longer has: {e}"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(staging);
+    done
+}
+
+/// Move everything under `from` onto `to`, replacing a file with a file and
+/// a different kind of thing with the new one.
+fn lay_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    for e in std::fs::read_dir(from)?.flatten() {
+        let src = e.path();
+        let dst = to.join(e.file_name());
+        let kind = e.file_type()?;
+        if kind.is_dir() {
+            if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                std::fs::remove_file(&dst)?;
+            }
+            std::fs::create_dir_all(&dst)?;
+            lay_over(&src, &dst)?;
+        } else {
+            match dst.symlink_metadata() {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dst)?,
+                Ok(_) => std::fs::remove_file(&dst)?,
+                Err(_) => {}
+            }
+            std::fs::rename(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove files and links under `dir` (at `rel` inside `writable`) that `keep`
+/// does not name, then directories left empty, below the first level.
+fn take_away(dir: &Path, rel: &Path, keep: &std::collections::BTreeSet<PathBuf>, depth: usize) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let path = e.path();
+        let inner = rel.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            take_away(&path, &inner, keep, depth + 1)?;
+            if depth >= 1 && std::fs::read_dir(&path)?.next().is_none() {
+                std::fs::remove_dir(&path)?;
+            }
+        } else if !keep.contains(&inner) {
+            std::fs::remove_file(&path)?;
         }
     }
     Ok(())
@@ -379,6 +515,74 @@ mod tests {
     }
 
     use super::*;
+
+    /// A delta carries only what changed, and laying it over a copy that holds
+    /// the earlier state gives the later one: a changed file replaced, a new
+    /// file and directory added, a deleted file and a now-empty directory
+    /// gone, an untouched file left exactly as it was.
+    #[test]
+    fn a_delta_laid_over_an_earlier_copy_gives_the_later_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path().join("source/writable");
+        std::fs::create_dir_all(w.join("world/region")).unwrap();
+        std::fs::create_dir_all(w.join("logs/old")).unwrap();
+        std::fs::write(w.join("world/region/r.0"), b"first").unwrap();
+        std::fs::write(w.join("world/level.dat"), b"unchanged").unwrap();
+        std::fs::write(w.join("logs/old/a.log"), b"gone soon").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in ["world/region/r.0", "world/level.dat", "logs/old/a.log"] {
+            std::fs::File::options().write(true).open(w.join(f)).unwrap().set_modified(long_ago).unwrap();
+        }
+        let dir = tmp.path().join("backups");
+        let copy = tmp.path().join("copy/writable");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        let full = create(&w, &dir, "20261024-000000.tar.gz").unwrap();
+        assert!(full.started_unix.is_some());
+        restore(&dir.join(&full.name), &copy, &tmp.path().join("staging1")).unwrap();
+
+        // Later: one file changes, one appears in a new directory, one goes.
+        let since = crate::agent::now_unix();
+        std::fs::write(w.join("world/region/r.0"), b"second, longer").unwrap();
+        std::fs::create_dir_all(w.join("world/DIM-1")).unwrap();
+        std::fs::write(w.join("world/DIM-1/r.0"), b"nether").unwrap();
+        std::fs::remove_file(w.join("logs/old/a.log")).unwrap();
+        std::fs::remove_dir(w.join("logs/old")).unwrap();
+        let delta = create_since(&w, &dir, "20261024-000001.tar.gz", since).unwrap();
+        assert!(delta.bytes < full.bytes + 200, "a delta is not a second full copy");
+
+        merge(&dir.join(&delta.name), &copy, &tmp.path().join("staging2")).unwrap();
+        assert_eq!(std::fs::read(copy.join("world/region/r.0")).unwrap(), b"second, longer");
+        assert_eq!(std::fs::read(copy.join("world/DIM-1/r.0")).unwrap(), b"nether");
+        assert_eq!(std::fs::read(copy.join("world/level.dat")).unwrap(), b"unchanged");
+        assert!(!copy.join("logs/old").exists(), "a directory the server no longer has is gone");
+        assert!(copy.join("logs").is_dir(), "a directory directly under writable stays, so its mount keeps a source");
+        assert!(!copy.join(DELTA_INDEX).exists());
+
+        // The file that was left alone really was left out of the delta.
+        let probe = tmp.path().join("probe");
+        std::fs::create_dir_all(&probe).unwrap();
+        crate::content::extract(&dir.join(&delta.name), &probe, 0).unwrap();
+        assert!(!probe.join("writable/world/level.dat").exists());
+        assert!(probe.join("writable/world/region/r.0").exists());
+    }
+
+    /// A full backup is not a delta, so merging one (which would delete every
+    /// file it does not carry) is refused before anything changes.
+    #[test]
+    fn a_backup_that_is_not_a_delta_is_never_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = tmp.path().join("writable");
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(w.join("keep.txt"), b"mine").unwrap();
+        let dir = tmp.path().join("backups");
+        let full = create(&w, &dir, "20261024-000000.tar.gz").unwrap();
+        let target = tmp.path().join("target/writable");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("other.txt"), b"theirs").unwrap();
+        let refused = merge(&dir.join(&full.name), &target, &tmp.path().join("staging"));
+        assert!(refused.is_err());
+        assert_eq!(std::fs::read(target.join("other.txt")).unwrap(), b"theirs");
+    }
 
     #[test]
     fn only_a_name_this_module_makes_names_a_file() {

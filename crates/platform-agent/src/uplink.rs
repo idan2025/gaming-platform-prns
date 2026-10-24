@@ -414,6 +414,72 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_DELTA_CREATE => {
+            let req: DeltaReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_DELTA_CREATE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_DELTA_CREATE, &msg);
+            }
+            match state.agent.create_delta(&req.instance_id, req.since).await {
+                Ok(made) => match payload_bytes(&made) {
+                    Ok(bytes) if fits(bytes.len()).is_ok() => encode_ok(OP_DELTA_CREATE, &bytes),
+                    Ok(bytes) => encode_err(OP_DELTA_CREATE, &WireError::TooLarge(bytes.len()).to_string()),
+                    Err(e) => encode_err(OP_DELTA_CREATE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_DELTA_CREATE, &format!("{e:#}")),
+            }
+        }
+
+        OP_DELTA_MERGE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_DELTA_MERGE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_DELTA_MERGE, &msg);
+            }
+            match state.agent.merge_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_DELTA_MERGE, &[]),
+                Err(e) => encode_err(OP_DELTA_MERGE, &format!("{e:#}")),
+            }
+        }
+
+        OP_IDENTITY_READ => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_IDENTITY_READ, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_IDENTITY_READ, &msg);
+            }
+            match state.agent.identity(&req.instance_id).await {
+                Ok(found) => match payload_bytes(&IdentityResp { identity: found.map(hex::encode) }) {
+                    Ok(bytes) => encode_ok(OP_IDENTITY_READ, &bytes),
+                    Err(e) => encode_err(OP_IDENTITY_READ, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_IDENTITY_READ, &format!("{e:#}")),
+            }
+        }
+
+        OP_IDENTITY_SET => {
+            let req: IdentitySetReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_IDENTITY_SET, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_IDENTITY_SET, &msg);
+            }
+            let Ok(bytes) = hex::decode(&req.identity) else {
+                return encode_err(OP_IDENTITY_SET, "that is not a mesh identity");
+            };
+            match state.agent.set_identity(&req.instance_id, &bytes).await {
+                Ok(()) => encode_ok(OP_IDENTITY_SET, &[]),
+                Err(e) => encode_err(OP_IDENTITY_SET, &format!("{e:#}")),
+            }
+        }
+
         OP_BACKUP_READ => {
             let req: BackupReadReq = match parse_payload(body) {
                 Ok(r) => r,
