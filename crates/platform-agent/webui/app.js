@@ -964,7 +964,7 @@ function openInstanceMenu(id, x, y) {
     action: () => onChat(id) });
   if (state.controllerOn) {
     items.push({ label: "Move to another worker…", icon: "restart",
-      title: "Stop it, carry its files to the worker with the most room, and start it there. It gets a new mesh address.",
+      title: "Copy its files to the worker with the most room while it runs, then switch over. It keeps its mesh address.",
       action: () => onRelocate(id, inst.name) });
   }
   items.push("sep");
@@ -2963,13 +2963,15 @@ async function onRemove(id, name) {
     "The server was not removed.", "Removed.");
 }
 
-// Through the controller only: it picks the worker, carries the files and
-// removes the old server once the new one stands.
+// Through the controller only: it picks the worker, copies the files while the
+// server runs, stops it for one last small copy, and removes the old server
+// once the new one stands (Hosting::relocate).
 async function onRelocate(id, name) {
   const confirmed = confirm(
     'Move "' + (name || id) + '" to another worker?\n\n' +
-    "It is stopped, its files are copied to the worker with the most room, and it is started there. " +
-    "Players on it are dropped, and it gets a new mesh address, so old invite links stop working.");
+    "Its files are copied to the worker with the most room while it keeps running. Then it stops for " +
+    "one last small copy and starts there, so players on it are dropped for that moment. " +
+    "It keeps its mesh address, so invite links keep working.");
   if (!confirmed) return;
   return rowAction(id, null, null,
     () => api("POST", "/instances/" + encodeURIComponent(id) + "/relocate"),
