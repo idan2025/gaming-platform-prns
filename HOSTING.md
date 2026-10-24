@@ -636,10 +636,31 @@ open pages cost the index what one does.
 ## Moving a server to another worker
 
 "Move to another worker…" in a server's menu (on a page with a controller), or
-`POST /instances/<id>/relocate` on the index, moves one of your servers to the
-worker with the most room among the workers of the same class. **The server
-keeps running while its files are copied**, and comes up on the new worker at
-the **same mesh address**. The index:
+`POST /instances/<id>/relocate` on the index (`{"node": "<worker>"}` to pick
+one), moves one of your servers to the worker you pick, or the one with the most
+room, **among the workers of its own region** and class
+(`GET /instances/<id>/move-targets` lists them). **The server keeps running
+while its files are copied**, and comes up on the new worker at the **same mesh
+address**.
+
+**Another region is asked for, not taken.** A server's region is the region of
+the worker it runs on, so the one it was created in is its home. To move it to
+another, its owner asks (`POST /instances/<id>/region-request`, or "Ask an
+admin" in the move dialog), and an admin of the index decides on the page's
+**Requests** tab (`/admin/region-requests/<id>/approve` or `/deny`). On
+approval the index moves it to the worker with the most room in that region,
+which becomes its home; going back is another request. An approval that finds
+no room leaves the request waiting and says why. Admins are identity hashes in
+the hosting file:
+
+```toml
+admins = ["<identity hash>"]   # who may decide region requests; nobody by default
+```
+
+Requests are kept in `region-requests.json` beside the hosting file. One
+request may wait per server, and its owner can take it back.
+
+The move itself:
 
 1. reads how the server was made and creates the same server on the new worker
    (the new worker picks the ports), held stopped;

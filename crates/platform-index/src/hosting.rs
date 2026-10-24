@@ -67,6 +67,10 @@ pub struct HostingConfig {
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub quota: QuotaSettings,
+    /// Accounts (identity hashes) that may decide region move requests. None
+    /// by default: with nobody to decide, a server stays in its region.
+    #[serde(default)]
+    pub admins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +320,10 @@ pub struct HostedInstance {
     /// node has none (stopped, or no `[mesh]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_destination: Option<String>,
+    /// The region of the worker it runs on, which is the server's home: a
+    /// move leaves it only by an approved request (`regions.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// What a caller asks for.
@@ -379,6 +387,40 @@ pub struct Hosting {
     /// Servers being moved right now (`relocate`), so a second move of the
     /// same one is refused rather than run beside the first.
     moving: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Region move requests waiting for, or decided by, an admin.
+    requests: crate::regions::RegionRequests,
+}
+
+/// Where a move may go. A server stays in its region unless an admin approved
+/// a request for another (`regions.rs`), which is the only way `Region` is used.
+#[derive(Debug, Clone, Copy)]
+pub enum MoveTarget<'a> {
+    /// The worker with the most room in the server's own region.
+    Auto,
+    /// This worker, which must be in the server's region.
+    Worker(&'a str),
+    /// The worker with the most room in this region: an approved request only.
+    Region(&'a str),
+}
+
+/// Where one server could be moved, for its owner to choose from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveTargets {
+    /// The worker it is on now.
+    pub worker: String,
+    /// Its region (its home); `None` is a worker with no region.
+    pub region: Option<String>,
+    /// The other workers in its region that take its class of server.
+    pub workers: Vec<MoveWorker>,
+    /// Regions it could be moved to by a request, other than its own.
+    pub regions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveWorker {
+    pub name: String,
+    /// `room`, `full`, or `silent` (it did not answer, so it is not offered).
+    pub room: String,
 }
 
 impl Hosting {
@@ -393,6 +435,7 @@ impl Hosting {
                 .unwrap_or_default(),
             agent_client: Mutex::new(None),
             moving: Default::default(),
+            requests: Default::default(),
         }
     }
 
@@ -423,6 +466,12 @@ impl Hosting {
         }
         if let Some(bad) = config.nodes.iter().filter_map(|n| n.region.as_deref()).find(|r| !valid_class(r)) {
             return Err(anyhow!("a node's region {bad:?} is not a valid label")).with_context(|| format!("in {}", path.display()));
+        }
+        // An admin decides other people's requests, so a key that can never
+        // match anybody is refused rather than kept: a typo would leave
+        // requests with nobody to decide them, unnoticed.
+        if let Some(bad) = config.admins.iter().find(|a| !(a.len() == 32 && a.bytes().all(|b| b.is_ascii_hexdigit()))) {
+            return Err(anyhow!("admin {bad:?} is not an identity hash (32 hex characters)")).with_context(|| format!("in {}", path.display()));
         }
         Ok(config)
     }
@@ -523,6 +572,7 @@ impl Hosting {
                     delete_in_secs: None,
                     players_now: r.players_now,
                     mesh_destination: r.mesh_destination,
+                    region: node.region.clone(),
                 })
                 .collect());
         }
@@ -553,6 +603,7 @@ impl Hosting {
                 delete_in_secs: None,
                 players_now: r["players_now"].as_u64().map(|p| p as u32),
                 mesh_destination: r["mesh_destination"].as_str().map(str::to_string),
+                region: node.region.clone(),
             })
             .collect())
     }
@@ -671,6 +722,7 @@ impl Hosting {
                 delete_in_secs: None,
                 players_now: Some(0),
                 mesh_destination: None,
+                region: None,
             });
         }
 
@@ -720,6 +772,7 @@ impl Hosting {
             delete_in_secs: None,
             players_now: Some(0),
             mesh_destination: None,
+            region: None,
         })
     }
 
@@ -996,17 +1049,18 @@ impl Hosting {
     /// gets a new instance id; players' invite links keep working because
     /// they name the address.
     pub async fn relocate(&self, account: &AccountId, instance_id: &str) -> Result<HostedInstance> {
+        self.relocate_to(account, instance_id, MoveTarget::Auto).await
+    }
+
+    /// [`relocate`](Self::relocate) to a chosen worker, or to another region
+    /// (an approved request only; see `MoveTarget`).
+    pub async fn relocate_to(&self, account: &AccountId, instance_id: &str, target: MoveTarget<'_>) -> Result<HostedInstance> {
         let config = self.config();
         let (found, from) = self.owned(account, instance_id).await?;
         let _held = MoveGuard::take(&self.moving, instance_id)
             .ok_or_else(|| anyhow!("this server is already being moved"))?;
         let existing = self.all_instances().await?;
-        let to = self
-            // Near the players it already has: the region it is leaving first.
-            .pick_node_except(&config, &existing, from.class.as_deref(), from.region.as_deref(), &from.name)
-            .await
-            .ok_or_else(|| anyhow!("no other node has room for it"))?
-            .clone();
+        let to = self.move_target(&config, &existing, &from, target).await?;
         let too_old = |node: &NodeConfig| anyhow!("node {} runs an agent too old to move servers; update it", node.name);
         let old_agent = |e: anyhow::Error, node: &NodeConfig| {
             if format!("{e:#}").contains("unknown op") { too_old(node) } else { e }
@@ -1099,6 +1153,10 @@ impl Hosting {
             tracing::warn!(instance = %instance_id, node = %from.name, error = %e, "moved, but the old server was not removed");
         }
         tracing::info!(from = %instance_id, to = %new_id, from_node = %from.name, to_node = %to.name, downtime_ms, "moved a server");
+        // A request waiting for this server follows it to its new id.
+        if let Err(e) = self.requests.retarget(instance_id, &new_id) {
+            tracing::warn!(error = %format!("{e:#}"), "a region request did not follow its server's move");
+        }
         Ok(HostedInstance {
             instance_id: new_id,
             node: to.name.clone(),
@@ -1115,7 +1173,189 @@ impl Hosting {
             delete_in_secs: None,
             players_now: None,
             mesh_destination: None,
+            region: None,
         })
+    }
+
+    /// The worker a move goes to. Only same-class workers, never the one it is
+    /// on, and only workers that answered: a move onto one that did not would
+    /// fail after the copy began. `Auto` and `Worker` stay in the server's
+    /// region; only an approved request moves it out (`Region`).
+    async fn move_target(
+        &self,
+        config: &HostingConfig,
+        existing: &[HostedInstance],
+        from: &NodeConfig,
+        target: MoveTarget<'_>,
+    ) -> Result<NodeConfig> {
+        let eligible = |n: &&NodeConfig| n.class == from.class && n.name != from.name;
+        let candidates: Vec<&NodeConfig> = match target {
+            MoveTarget::Auto => config.nodes.iter().filter(eligible).filter(|n| n.region == from.region).collect(),
+            MoveTarget::Worker(name) => {
+                let node = config.nodes.iter().find(|n| n.name == name).ok_or_else(|| anyhow!("no such worker"))?;
+                if node.name == from.name {
+                    return Err(anyhow!("it is already on that worker"));
+                }
+                if node.class != from.class {
+                    return Err(anyhow!("that worker takes another class of server"));
+                }
+                if node.region != from.region {
+                    return Err(anyhow!("that worker is in another region; ask an admin to move it there"));
+                }
+                vec![node]
+            }
+            MoveTarget::Region(region) => {
+                config.nodes.iter().filter(eligible).filter(|n| n.region.as_deref() == Some(region)).collect()
+            }
+        };
+        let mut best: Option<(&NodeConfig, Rank)> = None;
+        for node in candidates {
+            let here = existing.iter().filter(|i| i.node == node.name).count();
+            let rank = match rank_node(self.node_capacity(node).await, here, node.priority) {
+                Some(rank) if rank.0 == 1 => rank,
+                Some(_) if matches!(target, MoveTarget::Worker(_)) => return Err(anyhow!("that worker did not answer")),
+                None if matches!(target, MoveTarget::Worker(_)) => return Err(anyhow!("that worker has no room")),
+                _ => continue,
+            };
+            if best.is_none_or(|(_, current)| rank > current) {
+                best = Some((node, rank));
+            }
+        }
+        best.map(|(node, _)| node.clone()).ok_or_else(|| match target {
+            MoveTarget::Region(region) => anyhow!("no worker in region {region} has room for it"),
+            _ => anyhow!("no other worker in this server's region has room; ask an admin to move it to another region"),
+        })
+    }
+
+    /// The workers one of the caller's servers could move to, for them to pick.
+    pub async fn move_targets(&self, account: &AccountId, instance_id: &str) -> Result<MoveTargets> {
+        let config = self.config();
+        let (_, from) = self.owned(account, instance_id).await?;
+        let existing = self.all_instances().await?;
+        let mut workers = Vec::new();
+        for node in config.nodes.iter().filter(|n| n.class == from.class && n.name != from.name && n.region == from.region) {
+            let here = existing.iter().filter(|i| i.node == node.name).count();
+            let room = match rank_node(self.node_capacity(node).await, here, node.priority) {
+                Some(rank) if rank.0 == 1 => "room",
+                Some(_) => "silent",
+                None => "full",
+            };
+            workers.push(MoveWorker { name: node.name.clone(), room: room.to_string() });
+        }
+        let mut regions: Vec<String> = config
+            .nodes
+            .iter()
+            .filter(|n| n.class == from.class)
+            .filter_map(|n| n.region.clone())
+            .filter(|r| Some(r) != from.region.as_ref())
+            .collect();
+        regions.sort();
+        regions.dedup();
+        Ok(MoveTargets { worker: from.name.clone(), region: from.region.clone(), workers, regions })
+    }
+
+    pub fn is_admin(&self, account: &AccountId) -> bool {
+        self.config().admins.iter().any(|a| a.eq_ignore_ascii_case(&account.0))
+    }
+
+    fn admin_only(&self, account: &AccountId) -> Result<()> {
+        if self.is_admin(account) {
+            Ok(())
+        } else {
+            Err(anyhow!("only an admin of this index can decide region requests"))
+        }
+    }
+
+    /// The owner asks for one of their servers to move to another region.
+    pub async fn request_region(
+        &self,
+        account: &AccountId,
+        instance_id: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Result<crate::regions::RegionRequest> {
+        let config = self.config();
+        let (found, node) = self.owned(account, instance_id).await?;
+        if !valid_class(region) {
+            return Err(anyhow!("that is not a region name"));
+        }
+        if node.region.as_deref() == Some(region) {
+            return Err(anyhow!("this server is already in region {region}"));
+        }
+        if !config.nodes.iter().any(|n| n.class == node.class && n.region.as_deref() == Some(region)) {
+            return Err(anyhow!("no worker in region {region} takes this server"));
+        }
+        self.requests.create(crate::regions::RegionRequest {
+            id: String::new(),
+            instance_id: instance_id.to_string(),
+            owner: account.0.clone(),
+            game_id: found.game_id,
+            name: found.name,
+            from_region: node.region.clone(),
+            to_region: region.to_string(),
+            created_unix: unix(now),
+            state: crate::regions::RequestState::Pending,
+            decided_unix: None,
+            decided_by: None,
+            note: None,
+            moved_to: None,
+        })
+    }
+
+    pub fn region_requests_for(&self, account: &AccountId) -> Vec<crate::regions::RegionRequest> {
+        self.requests.for_owner(&account.0)
+    }
+
+    pub fn cancel_region_request(&self, account: &AccountId, id: &str) -> Result<crate::regions::RegionRequest> {
+        self.requests.cancel(&account.0, id)
+    }
+
+    pub fn all_region_requests(&self, admin: &AccountId) -> Result<Vec<crate::regions::RegionRequest>> {
+        self.admin_only(admin)?;
+        Ok(self.requests.all())
+    }
+
+    /// An admin approves: the server moves to a worker with room in the asked
+    /// region, which becomes its home. A move that cannot happen (no room
+    /// there now) leaves the request pending, saying why, for another try.
+    pub async fn approve_region_request(
+        &self,
+        admin: &AccountId,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<crate::regions::RegionRequest> {
+        self.admin_only(admin)?;
+        let request = self.requests.get(id).ok_or_else(|| anyhow!("no such request"))?;
+        if request.state != crate::regions::RequestState::Pending {
+            return Err(anyhow!("that request was already decided"));
+        }
+        let owner = AccountId(request.owner.clone());
+        match self.relocate_to(&owner, &request.instance_id, MoveTarget::Region(&request.to_region)).await {
+            Ok(moved) => self.requests.approve(id, &admin.0, unix(now), &moved.instance_id),
+            Err(e) => {
+                let why = format!("{e:#}");
+                let _ = self.requests.note_failure(id, &why);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn deny_region_request(
+        &self,
+        admin: &AccountId,
+        id: &str,
+        note: Option<String>,
+        now: SystemTime,
+    ) -> Result<crate::regions::RegionRequest> {
+        self.admin_only(admin)?;
+        self.requests.deny(id, &admin.0, unix(now), note)
+    }
+
+    /// Keep requests in `path` from now on (made on first write), reading any
+    /// already there.
+    pub fn keep_region_requests_in(mut self, path: &std::path::Path) -> Result<Self> {
+        self.requests = crate::regions::RegionRequests::load(path)?;
+        Ok(self)
     }
 
     /// One copy of a server's files from `from` onto the stopped new server
@@ -1755,6 +1995,11 @@ impl Drop for TempFile {
 
 /// A random, unguessable instance id, prefixed by the game so `docker ps` on the
 /// node reads sensibly.
+/// Seconds since the epoch; a clock before it reads as 0.
+fn unix(t: SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 fn new_instance_id(game_id: &str) -> Result<String> {
     let mut bytes = [0u8; 6];
     getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("no entropy: {e}"))?;
@@ -1793,6 +2038,7 @@ mod tests {
                 api: "http://127.0.0.1:4750".to_string(),
             }],
             quota: QuotaSettings::default(),
+            admins: Vec::new(),
         }
     }
 
@@ -1967,6 +2213,7 @@ mod tests {
             uptime_secs: None,
             players_now: None,
             mesh_destination: None,
+            region: None,
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
@@ -1988,6 +2235,7 @@ mod tests {
             uptime_secs: uptime,
             players_now: players,
             mesh_destination: None,
+            region: None,
         }
     }
 
@@ -2220,6 +2468,7 @@ mod tests {
             uptime_secs: None,
             players_now: None,
             mesh_destination: None,
+            region: None,
         }
     }
 
@@ -3107,13 +3356,113 @@ mod tests {
         assert!(to.servers.is_empty());
     }
 
+    fn nodes_in(nodes: &[(std::net::SocketAddr, &str, &str)]) -> HostingConfig {
+        let mut c = config();
+        c.nodes = nodes
+            .iter()
+            .map(|(addr, name, region)| NodeConfig {
+                region: Some(region.to_string()),
+                api: format!("http://{addr}"),
+                ..classed(name, None)
+            })
+            .collect();
+        c
+    }
+
+    /// The owner picks the worker, from those in the server's own region. A
+    /// worker in another region, the one it is on, or one that does not exist
+    /// is refused before anything is touched; the automatic choice never
+    /// leaves the region either.
+    #[tokio::test]
+    async fn a_move_goes_to_the_chosen_worker_and_never_leaves_its_region_unasked() {
+        let owner = AccountId("aa".repeat(16));
+        let (a, from) = moving_node(true, false).await;
+        let (b, to) = moving_node(false, false).await;
+        let (c, other) = moving_node(false, false).await;
+        let h = Hosting::new(nodes_in(&[(a, "a", "il"), (b, "b", "il"), (c, "c", "eu")]));
+
+        let targets = h.move_targets(&owner, "srv").await.unwrap();
+        assert_eq!((targets.worker.as_str(), targets.region.as_deref()), ("a", Some("il")));
+        assert_eq!(targets.workers.iter().map(|w| (w.name.as_str(), w.room.as_str())).collect::<Vec<_>>(), vec![("b", "room")]);
+        assert_eq!(targets.regions, vec!["eu".to_string()]);
+        assert!(h.move_targets(&AccountId("bb".repeat(16)), "srv").await.is_err(), "a stranger sees nothing");
+
+        for (worker, why) in [
+            ("c", "that worker is in another region; ask an admin to move it there"),
+            ("a", "it is already on that worker"),
+            ("nope", "no such worker"),
+        ] {
+            let err = h.relocate_to(&owner, "srv", MoveTarget::Worker(worker)).await.unwrap_err().to_string();
+            assert_eq!(err, why, "{worker}");
+        }
+        assert!(from.lock().unwrap().hits.is_empty(), "a refused move touched the server: {:?}", from.lock().unwrap().hits);
+
+        let moved = h.relocate_to(&owner, "srv", MoveTarget::Worker("b")).await.unwrap();
+        assert_eq!(moved.node, "b");
+        assert!(!to.lock().unwrap().hits.is_empty());
+        assert!(other.lock().unwrap().hits.is_empty(), "the other region's worker was used");
+
+        // Alone in its region, the automatic move goes nowhere.
+        let (a, from) = moving_node(true, false).await;
+        let (c, _) = moving_node(false, false).await;
+        let h = Hosting::new(nodes_in(&[(a, "a", "il"), (c, "c", "eu")]));
+        let err = h.relocate(&owner, "srv").await.unwrap_err().to_string();
+        assert!(err.contains("ask an admin"), "{err}");
+        assert!(from.lock().unwrap().hits.is_empty());
+    }
+
+    /// Another region is asked for and decided by an admin. The owner cannot
+    /// decide their own request; an approval moves the server there and makes
+    /// that its home, so going back is a new request; a denial moves nothing.
+    #[tokio::test]
+    async fn a_region_move_needs_an_admin_and_its_new_region_becomes_home() {
+        let owner = AccountId("aa".repeat(16));
+        let admin = AccountId("ad".repeat(16));
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let (a, from) = moving_node(true, false).await;
+        let (c, to) = moving_node(false, false).await;
+        let mut cfg = nodes_in(&[(a, "a", "il"), (c, "c", "eu")]);
+        cfg.admins = vec![admin.0.clone()];
+        let h = Hosting::new(cfg);
+
+        assert_eq!(h.request_region(&owner, "srv", "il", now).await.unwrap_err().to_string(), "this server is already in region il");
+        assert_eq!(h.request_region(&owner, "srv", "mars", now).await.unwrap_err().to_string(), "no worker in region mars takes this server");
+        assert_eq!(h.request_region(&owner, "srv", "EU West", now).await.unwrap_err().to_string(), "that is not a region name");
+        let asked = h.request_region(&owner, "srv", "eu", now).await.unwrap();
+        assert_eq!((asked.from_region.as_deref(), asked.to_region.as_str()), (Some("il"), "eu"));
+        assert!(h.request_region(&owner, "srv", "eu", now).await.is_err(), "a second pending request");
+        assert_eq!(h.region_requests_for(&owner).len(), 1);
+
+        let refused = h.approve_region_request(&owner, &asked.id, now).await.unwrap_err().to_string();
+        assert_eq!(refused, "only an admin of this index can decide region requests");
+        assert!(h.all_region_requests(&owner).is_err());
+        assert!(from.lock().unwrap().hits.is_empty(), "a refused approval touched the server");
+
+        let approved = h.approve_region_request(&admin, &asked.id, now).await.unwrap();
+        assert_eq!(approved.state, crate::regions::RequestState::Approved);
+        assert_eq!(approved.decided_by.as_deref(), Some(admin.0.as_str()));
+        let new_id = approved.moved_to.clone().unwrap();
+        assert!(!to.lock().unwrap().hits.is_empty());
+        let mine = h.instances_for(&owner).await.unwrap();
+        let moved = mine.iter().find(|i| i.instance_id == new_id).expect("the moved server");
+        assert_eq!((moved.node.as_str(), moved.region.as_deref()), ("c", Some("eu")), "its new region is its home");
+        assert!(h.approve_region_request(&admin, &asked.id, now).await.is_err(), "approved twice");
+
+        // Going back is a request again, and a denial moves nothing.
+        let back = h.request_region(&owner, &new_id, "il", now).await.unwrap();
+        let hits_before = to.lock().unwrap().hits.len();
+        let denied = h.deny_region_request(&admin, &back.id, Some("not this month".into()), now).unwrap();
+        assert_eq!(denied.state, crate::regions::RequestState::Denied);
+        assert_eq!(to.lock().unwrap().hits.len(), hits_before, "a denial touched the server");
+    }
+
     /// With nowhere to go, nothing is touched: the server is not even stopped.
     #[tokio::test]
     async fn a_move_with_no_other_node_touches_nothing() {
         let (a, from) = moving_node(true, false).await;
         let h = Hosting::new(one_node_at(a));
         let err = h.relocate(&AccountId("aa".repeat(16)), "srv").await.unwrap_err();
-        assert_eq!(err.to_string(), "no other node has room for it");
+        assert_eq!(err.to_string(), "no other worker in this server's region has room; ask an admin to move it to another region");
         assert!(from.lock().unwrap().hits.is_empty(), "{:?}", from.lock().unwrap().hits);
     }
 }

@@ -63,6 +63,13 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/instances/:id/stop", post(stop))
         .route("/instances/:id/start", post(start))
         .route("/instances/:id/relocate", post(relocate))
+        .route("/instances/:id/move-targets", get(move_targets))
+        .route("/instances/:id/region-request", post(region_request))
+        .route("/region-requests", get(my_region_requests))
+        .route("/region-requests/:rid", axum::routing::delete(cancel_region_request))
+        .route("/admin/region-requests", get(admin_region_requests))
+        .route("/admin/region-requests/:rid/approve", post(approve_region_request))
+        .route("/admin/region-requests/:rid/deny", post(deny_region_request))
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
@@ -406,14 +413,150 @@ async fn stop(
 /// Move one of the caller's own servers to another node, with its files
 /// (`Hosting::relocate`). The reply is the server as it now stands, under its
 /// new id.
+/// A move's body: `{"node": "<worker>"}` picks the worker; absent or empty,
+/// the worker with the most room in the server's region.
+#[derive(Deserialize, Default)]
+struct RelocateBody {
+    #[serde(default)]
+    node: Option<String>,
+}
+
 async fn relocate(
     State(state): State<Arc<IndexState>>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<RelocateBody>>,
 ) -> ApiResult<crate::hosting::HostedInstance> {
     let hosting = hosting_of(&state)?;
     let account = account_of(&state, &headers).await?;
-    hosting.relocate(&account, &id).await.map(Json).map_err(owner_op_failure)
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let target = match body.node.as_deref().filter(|n| !n.is_empty()) {
+        Some(node) => crate::hosting::MoveTarget::Worker(node),
+        None => crate::hosting::MoveTarget::Auto,
+    };
+    hosting.relocate_to(&account, &id, target).await.map(Json).map_err(owner_op_failure)
+}
+
+async fn move_targets(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<crate::hosting::MoveTargets> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.move_targets(&account, &id).await.map(Json).map_err(owner_op_failure)
+}
+
+#[derive(Deserialize)]
+struct RegionRequestBody {
+    region: String,
+}
+
+async fn region_request(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<RegionRequestBody>,
+) -> ApiResult<crate::regions::RegionRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .request_region(&account, &id, &body.region, std::time::SystemTime::now())
+        .await
+        .map(Json)
+        .map_err(owner_op_failure)
+}
+
+async fn my_region_requests(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::regions::RegionRequest>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    Ok(Json(hosting.region_requests_for(&account)))
+}
+
+/// A request id from a path is checked as one this index made before it is
+/// looked up: "no such request" either way, so asking reveals nothing.
+fn request_id(rid: &str) -> Result<&str, (StatusCode, Json<ApiError>)> {
+    if crate::regions::valid_request_id(rid) {
+        Ok(rid)
+    } else {
+        Err(fail(StatusCode::NOT_FOUND, "no such request"))
+    }
+}
+
+/// "Only an admin" is 403, "no such request" 404, anything else 400.
+fn region_failure(e: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    let text = format!("{e:#}");
+    if text.starts_with("only an admin") {
+        fail(StatusCode::FORBIDDEN, e)
+    } else if text == "no such request" || text == "no such instance" {
+        fail(StatusCode::NOT_FOUND, e)
+    } else {
+        fail(StatusCode::BAD_REQUEST, e)
+    }
+}
+
+async fn cancel_region_request(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(rid): axum::extract::Path<String>,
+) -> ApiResult<crate::regions::RegionRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let rid = request_id(&rid)?;
+    hosting.cancel_region_request(&account, rid).map(Json).map_err(region_failure)
+}
+
+async fn admin_region_requests(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::regions::RegionRequest>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.all_region_requests(&account).map(Json).map_err(region_failure)
+}
+
+async fn approve_region_request(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(rid): axum::extract::Path<String>,
+) -> ApiResult<crate::regions::RegionRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let rid = request_id(&rid)?;
+    hosting
+        .approve_region_request(&account, rid, std::time::SystemTime::now())
+        .await
+        .map(Json)
+        .map_err(region_failure)
+}
+
+#[derive(Deserialize, Default)]
+struct DenyBody {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn deny_region_request(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(rid): axum::extract::Path<String>,
+    body: Option<Json<DenyBody>>,
+) -> ApiResult<crate::regions::RegionRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let rid = request_id(&rid)?;
+    // A note is shown to the owner as text; held to one short line.
+    let note = body
+        .and_then(|Json(b)| b.note)
+        .map(|n| n.chars().filter(|c| !c.is_control()).take(300).collect::<String>())
+        .filter(|n| !n.trim().is_empty());
+    hosting
+        .deny_region_request(&account, rid, note, std::time::SystemTime::now())
+        .map(Json)
+        .map_err(region_failure)
 }
 
 #[derive(Deserialize)]

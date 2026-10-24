@@ -31,6 +31,7 @@ const state = {
   controllerOn: false,   // this page places servers through a controller (controller.rs)
   regions: [],           // the controller's regions, offered on the create form
   hostedGames: [],       // the games the controller hosts: what can be started through it
+  isAdmin: false,        // this node's identity may decide region requests on the controller
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
@@ -191,6 +192,8 @@ const CONTROLLER_ROUTES = [
   [/^\/instances\/[a-z0-9-]{1,64}\/backups$/, ["GET", "POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+$/, ["DELETE"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+\/restore$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/move-targets$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/region-request$/, ["POST"]],
 ];
 
 // The URL a request really goes to: through the controller when this page has
@@ -215,16 +218,22 @@ async function loadControllerStatus() {
     }
     state.regions = [];
     state.hostedGames = [];
+    state.isAdmin = false;
     if (state.controllerOn) {
       const h = await api("GET", "/controller/hosting").catch(() => null);
       if (h && Array.isArray(h.regions)) state.regions = h.regions.filter(r => typeof r === "string");
       if (h && Array.isArray(h.games)) state.hostedGames = h.games.filter(g => typeof g === "string");
+      // The index says who is admin: its list answers only an admin.
+      state.isAdmin = await api("GET", "/controller/admin/region-requests").then(() => true, () => false);
     }
   } catch (_) {
     state.controllerOn = false;
     state.regions = [];
     state.hostedGames = [];
+    state.isAdmin = false;
   }
+  const reqTab = $("tab-requests");
+  if (reqTab) reqTab.hidden = !state.controllerOn;
 }
 
 async function api(method, path, body) {
@@ -827,7 +836,7 @@ function renderInstances() {
     // keeps this list from stealing focus or scroll on a poll.
     row.querySelector(".cell-name").textContent = inst.name || inst.instance_id;
     row.querySelector(".cell-game").textContent = gameName(inst.game_id)
-      + (state.controllerOn && inst.node ? " · on " + inst.node : "");
+      + (state.controllerOn && inst.node ? " · on " + inst.node + (inst.region ? " (" + inst.region + ")" : "") : "");
     const pill = row.querySelector(".state-pill");
     const ending = exitWords(inst.last_exit);
     const crashed = inst.state === "stopped" && ending && ending.crash;
@@ -3050,19 +3059,209 @@ async function onRemove(id, name) {
     "The server was not removed.", "Removed.");
 }
 
-// Through the controller only: it picks the worker, copies the files while the
-// server runs, stops it for one last small copy, and removes the old server
-// once the new one stands (Hosting::relocate).
-async function onRelocate(id, name) {
-  const confirmed = confirm(
-    'Move "' + (name || id) + '" to another worker?\n\n' +
-    "Its files are copied to the worker with the most room while it keeps running. Then it stops for " +
-    "one last small copy and starts there, so players on it are dropped for that moment. " +
-    "It keeps its mesh address, so invite links keep working.");
-  if (!confirmed) return;
-  return rowAction(id, null, null,
-    () => api("POST", "/instances/" + encodeURIComponent(id) + "/relocate"),
-    "The server was not moved.", "Moved.");
+// Through the controller only. The owner picks a worker in the server's region
+// (its home), or asks an admin for another region (regions.rs on the index):
+// an approved request moves it there and makes that region its home.
+function onRelocate(id, name) {
+  openModal("move-dialog", null, async (body, close) => {
+    body.appendChild(el("h3", null, "Move \u201c" + (name || id) + "\u201d"));
+    const status = el("p", "muted small", "Asking the controller where it could go\u2026");
+    body.appendChild(status);
+    const actions = el("div", "form-actions");
+    const closeBtn = el("button", "btn", "Close");
+    closeBtn.type = "button";
+    closeBtn.onclick = close;
+    let t, mine;
+    try {
+      [t, mine] = await Promise.all([
+        api("GET", "/instances/" + encodeURIComponent(id) + "/move-targets"),
+        api("GET", "/controller/region-requests").catch(() => []),
+      ]);
+    } catch (e) {
+      status.textContent = (e && e.error) || "Could not ask the controller.";
+      actions.appendChild(closeBtn);
+      body.appendChild(actions);
+      return;
+    }
+    status.textContent = "On " + t.worker + (t.region ? ", in region " + t.region : ", in no region") +
+      ". Its files are copied while it runs; then it switches over, dropping players for a moment, and keeps its mesh address.";
+
+    body.appendChild(el("h4", null, t.region ? "Another worker in " + t.region : "Another worker"));
+    if (!t.workers.length) {
+      body.appendChild(el("p", "muted small", "No other worker is in this server's region."));
+    } else {
+      const roomy = t.workers.filter(w => w.room === "room");
+      const pick = selectField(body, "mv-worker", "Worker",
+        [["", "Any: the one with the most room"]].concat(t.workers.map(w =>
+          [w.name, w.name + (w.room === "room" ? "" : w.room === "full" ? " (full)" : " (not answering)")])), "");
+      for (const o of pick.options) {
+        const w = t.workers.find(x => x.name === o.value);
+        if (w && w.room !== "room") o.disabled = true;
+      }
+      const go = el("button", "btn btn-primary", "Move");
+      go.type = "button";
+      go.disabled = !roomy.length;
+      if (!roomy.length) go.title = "No worker in this region has room.";
+      go.onclick = async () => {
+        go.disabled = true;
+        go.textContent = "Moving\u2026";
+        try {
+          await withInFlight(api("POST", "/instances/" + encodeURIComponent(id) + "/relocate",
+            pick.value ? { node: pick.value } : {}));
+          close();
+          clearError();
+          toast("Moved.");
+          poll();
+        } catch (e) {
+          if (e && e.__auth) return;
+          showError((e && e.error) || "The server was not moved.");
+          go.disabled = false;
+          go.textContent = "Move";
+        }
+      };
+      const row = el("div", "form-actions");
+      row.style.justifyContent = "flex-start";
+      row.appendChild(go);
+      body.appendChild(row);
+    }
+
+    if (t.regions.length) {
+      body.appendChild(el("h4", null, "Another region"));
+      body.appendChild(el("p", "muted small",
+        "An admin of the controller decides. Once approved, the server moves to a worker in that region, " +
+        "and that region becomes its home: coming back is another request."));
+      const pending = (Array.isArray(mine) ? mine : []).find(r => r.instance_id === id && r.state === "pending");
+      if (pending) {
+        body.appendChild(el("p", null, "Waiting for an admin: move to " + pending.to_region + "." +
+          (pending.note ? " Last try: " + pending.note : "")));
+        const cancel = el("button", "btn", "Take the request back");
+        cancel.type = "button";
+        cancel.onclick = async () => {
+          try {
+            await withInFlight(api("DELETE", "/controller/region-requests/" + encodeURIComponent(pending.id)));
+            close();
+            toast("Request taken back.");
+          } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not taken back."); }
+        };
+        const row = el("div", "form-actions");
+        row.style.justifyContent = "flex-start";
+        row.appendChild(cancel);
+        body.appendChild(row);
+      } else {
+        const region = selectField(body, "mv-region", "Region", t.regions.map(r => [r, r]), t.regions[0]);
+        const ask = el("button", "btn", "Ask an admin");
+        ask.type = "button";
+        ask.onclick = async () => {
+          ask.disabled = true;
+          try {
+            await withInFlight(api("POST", "/instances/" + encodeURIComponent(id) + "/region-request", { region: region.value }));
+            close();
+            toast("Asked. An admin of the controller will decide.");
+            if (state.activeTab === "requests") loadRequests();
+          } catch (e) {
+            if (!(e && e.__auth)) showError((e && e.error) || "The request was not made.");
+            ask.disabled = false;
+          }
+        };
+        const row = el("div", "form-actions");
+        row.style.justifyContent = "flex-start";
+        row.appendChild(ask);
+        body.appendChild(row);
+      }
+    }
+    actions.appendChild(closeBtn);
+    body.appendChild(actions);
+  });
+}
+
+// ---------- region requests ----------
+
+function requestLine(r) {
+  const when = r.created_unix ? new Date(r.created_unix * 1000).toLocaleString() : "";
+  return (r.name || r.instance_id) + " \u00b7 " + (r.from_region || "no region") + " \u2192 " + r.to_region +
+    (when ? " \u00b7 asked " + when : "");
+}
+
+function requestCard(r, admin) {
+  const card = el("div", "req-card");
+  const head = el("div", "req-head");
+  head.appendChild(el("span", "req-line", requestLine(r)));
+  head.appendChild(el("span", "chip req-" + r.state, r.state));
+  card.appendChild(head);
+  if (admin) card.appendChild(el("p", "muted small", "Owner " + String(r.owner || "").slice(0, 12) + "\u2026"));
+  if (r.note) card.appendChild(el("p", "muted small", (r.state === "pending" ? "Last try: " : "Note: ") + r.note));
+  if (r.state === "pending") {
+    const row = el("div", "form-actions");
+    row.style.justifyContent = "flex-start";
+    if (admin) {
+      const approve = el("button", "btn btn-primary", "Approve and move");
+      approve.type = "button";
+      approve.onclick = async () => {
+        approve.disabled = true;
+        approve.textContent = "Moving\u2026";
+        try {
+          await withInFlight(api("POST", "/controller/admin/region-requests/" + encodeURIComponent(r.id) + "/approve"));
+          toast("Approved. The server moved to " + r.to_region + ".");
+          poll();
+        } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not approved."); }
+        loadRequests();
+      };
+      const deny = el("button", "btn", "Deny");
+      deny.type = "button";
+      deny.onclick = async () => {
+        const note = prompt("Why? The owner sees this (optional).", "");
+        if (note === null) return;
+        try {
+          await withInFlight(api("POST", "/controller/admin/region-requests/" + encodeURIComponent(r.id) + "/deny", note ? { note } : {}));
+          toast("Denied.");
+        } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not denied."); }
+        loadRequests();
+      };
+      row.append(approve, deny);
+    } else {
+      const cancel = el("button", "btn", "Take back");
+      cancel.type = "button";
+      cancel.onclick = async () => {
+        try {
+          await withInFlight(api("DELETE", "/controller/region-requests/" + encodeURIComponent(r.id)));
+          toast("Request taken back.");
+        } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not taken back."); }
+        loadRequests();
+      };
+      row.appendChild(cancel);
+    }
+    card.appendChild(row);
+  }
+  return card;
+}
+
+async function loadRequests() {
+  const adminBox = $("requests-admin");
+  const mineBox = $("requests-mine");
+  if (!adminBox || !mineBox) return;
+  const [all, mine] = await Promise.all([
+    state.isAdmin ? api("GET", "/controller/admin/region-requests").catch(() => null) : Promise.resolve(null),
+    api("GET", "/controller/region-requests").catch(() => []),
+  ]);
+  adminBox.textContent = "";
+  mineBox.textContent = "";
+  if (Array.isArray(all)) {
+    adminBox.appendChild(el("h3", null, "To decide"));
+    const pending = all.filter(r => r.state === "pending");
+    if (!pending.length) adminBox.appendChild(el("p", "muted small", "Nothing waiting."));
+    for (const r of pending) adminBox.appendChild(requestCard(r, true));
+    const decided = all.filter(r => r.state !== "pending").slice(0, 20);
+    if (decided.length) {
+      adminBox.appendChild(el("h3", null, "Decided"));
+      for (const r of decided) adminBox.appendChild(requestCard(r, true));
+    }
+    const n = $("nav-requests-count");
+    if (n) n.textContent = pending.length ? String(pending.length) : "";
+  }
+  mineBox.appendChild(el("h3", null, "Your requests"));
+  const own = Array.isArray(mine) ? mine : [];
+  if (!own.length) mineBox.appendChild(el("p", "muted small", "None yet. Ask from a server's menu: Move to another worker\u2026"));
+  for (const r of own) mineBox.appendChild(requestCard(r, false));
 }
 
 // Announce now, rather than at each announcer's next tick. Each announcer keeps
@@ -4236,8 +4435,8 @@ async function onDeleteUnused() {
 
 // ---------- tabs ----------
 
-const TABS = ["servers", "games", "installed", "interfaces"];
-const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh" };
+const TABS = ["servers", "games", "installed", "interfaces", "requests"];
+const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests" };
 
 function setActiveTab(name) {
   if (!TABS.includes(name)) name = "servers";
@@ -4256,6 +4455,7 @@ function setActiveTab(name) {
   if (name === "games") { renderGames(); loadOfficial(); }
   if (name === "servers") pollUsage();
   if (name === "installed") pollInstalled();
+  if (name === "requests") loadRequests();
 }
 
 function renderAll() {
@@ -4312,6 +4512,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   for (const t of TABS) $("tab-" + t).addEventListener("click", () => setActiveTab(t));
+  $("requests-refresh")?.addEventListener("click", loadRequests);
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
   $("add-game-btn").addEventListener("click", openAddGameDialog);
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));

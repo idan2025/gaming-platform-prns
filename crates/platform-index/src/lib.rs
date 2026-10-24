@@ -8,6 +8,7 @@ pub mod hosting;
 pub mod http;
 pub mod node;
 pub mod quota;
+pub mod regions;
 pub mod registry;
 
 // The codec and the query call live in `index-client`, so a launcher can ask an

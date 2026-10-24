@@ -488,3 +488,13 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .mod-form .field:nth-child(3), .mod-form .btn { grid-column: 1 / -1; }
 .modal select.field { height: 36px; }
 
+
+/* Region move requests (Requests tab, through a controller). */
+.req-card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.req-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; justify-content: space-between; }
+.req-line { font-weight: 550; overflow-wrap: anywhere; }
+.chip.req-pending { background: var(--warn-soft); color: var(--warn); }
+.chip.req-approved { background: var(--ok-soft); color: var(--ok); }
+.chip.req-denied { background: var(--bad-soft); color: var(--bad); }
+.req-card .form-actions { margin-top: 8px; }
+#tab-panel-requests h3 { margin: 18px 0 8px; font-size: 14px; }
