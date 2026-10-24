@@ -819,6 +819,7 @@ impl Hosting {
             return client
                 .backups(dest, instance_id)
                 .await
+                .map_err(|e| too_old_or(e, &node, "list backups"))
                 .with_context(|| format!("asking agent {} for its backups", node.name));
         }
         let url = format!("{}/instances/{}/backups", node.api.trim_end_matches('/'), instance_id);
@@ -836,6 +837,7 @@ impl Hosting {
             return client
                 .backup_create(dest, instance_id)
                 .await
+                .map_err(|e| too_old_or(e, &node, "make backups"))
                 .with_context(|| format!("asking agent {} to back up", node.name));
         }
         let url = format!("{}/instances/{}/backups", node.api.trim_end_matches('/'), instance_id);
@@ -864,6 +866,7 @@ impl Hosting {
                 Restore::Restore => client.backup_restore(dest, instance_id, name).await,
                 Restore::Delete => client.backup_delete(dest, instance_id, name).await,
             }
+            .map_err(|e| too_old_or(e, &node, "restore or delete backups"))
             .with_context(|| format!("asking agent {} about that backup", node.name));
         }
         let base = format!("{}/instances/{}/backups/{}", node.api.trim_end_matches('/'), instance_id, name);
@@ -1663,6 +1666,16 @@ fn new_instance_id(game_id: &str) -> Result<String> {
     Ok(format!("{prefix}-{}", hex::encode(bytes)))
 }
 
+/// An agent that predates an op answers "unknown op". Say what that means and
+/// what to do about it; any other error passes through unchanged.
+fn too_old_or(e: anyhow::Error, node: &NodeConfig, what: &str) -> anyhow::Error {
+    if format!("{e:#}").contains("unknown op") {
+        anyhow!("node {} runs an agent too old to {what}; update it", node.name)
+    } else {
+        e
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1679,6 +1692,17 @@ mod tests {
             }],
             quota: QuotaSettings::default(),
         }
+    }
+
+    /// An old agent's "unknown op" is turned into what the operator can do
+    /// about it; every other error is left as it was.
+    #[test]
+    fn an_agent_too_old_for_an_op_is_named_and_other_errors_pass_through() {
+        let node = &config().nodes[0];
+        let old = too_old_or(anyhow!("agent said: unknown op"), node, "make backups").to_string();
+        assert_eq!(old, "node local runs an agent too old to make backups; update it");
+        let other = too_old_or(anyhow!("the disk is full"), node, "make backups").to_string();
+        assert_eq!(other, "the disk is full");
     }
 
     /// The platform ships no list of hostable games. An operator who has not
