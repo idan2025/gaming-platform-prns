@@ -302,6 +302,14 @@ pub struct DeployRequest {
     /// with no class. Only an account the operator allowed it to may ask.
     #[serde(default)]
     pub class: Option<String>,
+    /// Bots to start with, when the caller asked for some. Passed through for
+    /// the node to judge (only a game whose pack has bots takes them); the
+    /// index never invents a number.
+    #[serde(default)]
+    pub bots: Option<u8>,
+    /// Restart the server if it crashes. Off unless the caller asked.
+    #[serde(default)]
+    pub restart_on_crash: bool,
     /// The game's own choices: a Minecraft build, its heap, the EULA tick,
     /// Bedrock's settings. Flattened, so a deploy body reads the same as a
     /// node's own create. Passed through for the **node** to validate, as the
@@ -585,12 +593,10 @@ impl Hosting {
                 port: None,
                 extra_ports: Default::default(),
                 map: request.map.clone(),
-                // The index does not decide this. Bots are something an
-                // operator or a player asks a running server for; a deploy
-                // request has no field for one, and inventing a default here
+                // Only what the caller asked for. Inventing a default here
                 // would put players in a game nobody asked to share.
-                bots: None,
-                restart_on_crash: false,
+                bots: request.bots,
+                restart_on_crash: request.restart_on_crash,
                 owner: None,
                 options,
             };
@@ -622,6 +628,8 @@ impl Hosting {
             "name": request.name,
             "max_players": request.max_players,
             "map": request.map,
+            "bots": request.bots,
+            "restart_on_crash": request.restart_on_crash,
             "owner": account.0,
         });
         if let (Some(body), Ok(serde_json::Value::Object(extra))) =
@@ -1701,6 +1709,8 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    bots: None,
+                    restart_on_crash: false,
                     options: Default::default(),
                 },
                 std::time::SystemTime::now(),
@@ -1724,6 +1734,8 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    bots: None,
+                    restart_on_crash: false,
                     options: Default::default(),
                 },
                 std::time::SystemTime::now(),
@@ -1748,6 +1760,8 @@ mod tests {
                     max_players: 8,
                     map: None,
                     class: None,
+                    bots: None,
+                    restart_on_crash: false,
                     options: Default::default(),
                 },
                 std::time::SystemTime::now(),
@@ -2257,6 +2271,8 @@ mod tests {
             max_players: 8,
             map: None,
             class: Some(class.into()),
+            bots: None,
+            restart_on_crash: false,
             options: Default::default(),
         };
         for class in ["gold", "does-not-exist", "BAD CLASS"] {
@@ -2554,7 +2570,7 @@ mod tests {
     }
 
     /// A game's own choices (a Minecraft build, its heap, Bedrock's settings,
-    /// the EULA tick) used to stop at the index: the create it sent a node
+    /// the EULA tick, bots, crash restart) used to stop at the index: the create it sent a node
     /// carried none of them, so a hosted Minecraft server was refused for its
     /// missing EULA. They reach the node, and the EULA time is the index's own
     /// clock, never what the caller wrote.
@@ -2592,6 +2608,8 @@ mod tests {
             "memory": { "min_mb": 1024, "max_mb": 2048 },
             "eula_accepted_at": 1,
             "minecraft": { "pvp": false },
+            "bots": 4,
+            "restart_on_crash": true,
         }))
         .unwrap();
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
@@ -2603,6 +2621,8 @@ mod tests {
         assert_eq!(body["minecraft"]["pvp"], false);
         assert_eq!(body["eula_accepted_at"], 1_800_000_000u64, "the caller's own time was kept");
         assert_eq!(body["owner"], "aa".repeat(16));
+        assert_eq!(body["bots"], 4, "the bots asked for were dropped");
+        assert_eq!(body["restart_on_crash"], true, "the crash restart asked for was dropped");
 
         // No tick, no stamp: the node refuses a pack that needs one.
         let plain: DeployRequest =
@@ -2610,6 +2630,7 @@ mod tests {
         h.deploy(&AccountId("aa".repeat(16)), &plain, now).await.unwrap();
         let seen = seen.lock().unwrap();
         assert!(seen.len() == 2 && seen[1].get("eula_accepted_at").is_none());
+        assert!(seen[1]["bots"].is_null() && seen[1]["restart_on_crash"] == false, "nothing invented");
     }
 
     #[derive(Default)]
