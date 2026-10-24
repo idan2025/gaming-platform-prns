@@ -559,7 +559,7 @@ On the worker, with Docker running and a built `platform-agent`:
 
 ```
 scripts/setup-worker.sh --index <index identity hash> --hub <hub host:port> \
-    --name <node name> [--class <label>] [--priority <n>] [--service]
+    --name <node name> [--class <label>] [--region <label>] [--priority <n>] [--service]
 ```
 
 It writes `~/lanthorn-worker/agent.toml` that trusts the index, makes the
@@ -570,6 +570,13 @@ which writes a systemd user unit and leaves enabling it to you.
 
 Add a `[games.<id>]` section to `agent.toml` for each game the worker runs. A
 game with no entry cannot be placed there.
+
+`--region` (`region = "eu"` in the node's block) says where the worker is. A
+create may ask for a region (`"region": "eu"`, or the Region field on a node
+page with a controller), and a worker there that answered is picked before any
+other; with none there that has room, the server goes wherever it would have
+gone. A move prefers the region it is leaving. The index lists its regions on
+`/hosting` and its page, never which worker is in which.
 
 The index's identity hash is in its log at start (`index identity ... identity=`),
 and on the page its HTTP address serves (`/`), which also says whether it hosts

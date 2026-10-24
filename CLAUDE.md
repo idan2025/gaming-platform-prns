@@ -94,7 +94,11 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   `priority`, then free memory (`MemAvailable`, reported by the node;
   unreported counts as none), then free slots, and a node under
   `MIN_FREE_MEMORY_BYTES` free is full. Priority never lifts a silent node
-  (`placement_follows_priority_then_memory_and_silence_still_loses`).
+  (`placement_follows_priority_then_memory_and_silence_still_loses`). A
+  create's `region` (2026-10-24) sits right after "answered" and before
+  priority: a node in it that answered wins, a silent one there still loses
+  to every node that answered, and a region nobody has is a wish that changes
+  nothing (`a_create_lands_in_its_region_when_a_node_there_answered`).
 - **The owner stamped over the uplink is the end-user's identity, not the
   index's.** The create request carries the user's identity hash; the agent sets
   `spec.owner` from it and stamps `OWNER_LABEL` unchanged. The authenticated

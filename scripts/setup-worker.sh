@@ -2,7 +2,7 @@
 # Set up one worker: a platform-agent that an index can place servers on.
 #
 #   scripts/setup-worker.sh --index <32 hex> [--hub HOST:PORT] [--name NAME]
-#       [--class LABEL] [--priority N] [--dir DIR] [--agent PATH]
+#       [--class LABEL] [--region LABEL] [--priority N] [--dir DIR] [--agent PATH]
 #       [--packs DIR] [--service]
 #
 # What it does, once:
@@ -22,7 +22,7 @@ set -euo pipefail
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "setup-worker: $*" >&2; exit 1; }
 
-INDEX=""; HUB=""; NAME=""; CLASS=""; PRIORITY="0"
+INDEX=""; HUB=""; NAME=""; CLASS=""; REGION=""; PRIORITY="0"
 DIR="${HOME}/lanthorn-worker"; AGENT=""; PACKS=""; SERVICE=0
 
 while [ $# -gt 0 ]; do
@@ -31,6 +31,7 @@ while [ $# -gt 0 ]; do
     --hub) HUB="${2:-}"; shift 2 ;;
     --name) NAME="${2:-}"; shift 2 ;;
     --class) CLASS="${2:-}"; shift 2 ;;
+    --region) REGION="${2:-}"; shift 2 ;;
     --priority) PRIORITY="${2:-}"; shift 2 ;;
     --dir) DIR="${2:-}"; shift 2 ;;
     --agent) AGENT="${2:-}"; shift 2 ;;
@@ -48,6 +49,9 @@ if [ -n "$HUB" ]; then
 fi
 if [ -n "$CLASS" ]; then
   [[ "$CLASS" =~ ^[a-z0-9_-]{1,32}$ ]] || die "--class must be 1-32 characters: lower case, digits, - and _"
+fi
+if [ -n "$REGION" ]; then
+  [[ "$REGION" =~ ^[a-z0-9_-]{1,32}$ ]] || die "--region must be 1-32 characters: lower case, digits, - and _"
 fi
 [[ "$PRIORITY" =~ ^-?[0-9]+$ ]] || die "--priority must be a whole number"
 [[ "$DIR" = /* ]] || DIR="$(pwd)/$DIR"
@@ -140,6 +144,7 @@ echo "api = \"http://127.0.0.1:4750\"   # unused while agent is set"
 echo "agent = \"$CONTROL\""
 echo "priority = $PRIORITY"
 [ -z "$CLASS" ] || echo "class = \"$CLASS\""
+[ -z "$REGION" ] || echo "region = \"$REGION\""
 if [ -z "$HUB" ]; then
   echo
   echo "No --hub given: this worker reaches the mesh only on a LAN it can auto-discover."

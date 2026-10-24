@@ -29,6 +29,7 @@ const MAP_NAME_RE = /^[A-Za-z0-9_.\/-]+$/;
 const state = {
   token: null,
   controllerOn: false,   // this page places servers through a controller (controller.rs)
+  regions: [],           // the controller's regions, offered on the create form
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
@@ -211,8 +212,14 @@ async function loadControllerStatus() {
       note.hidden = !state.controllerOn;
       note.textContent = state.controllerOn ? "Servers are placed through the controller at " + s.url + ", across every worker it drives." : "";
     }
+    state.regions = [];
+    if (state.controllerOn) {
+      const h = await api("GET", "/controller/hosting").catch(() => null);
+      if (h && Array.isArray(h.regions)) state.regions = h.regions.filter(r => typeof r === "string");
+    }
   } catch (_) {
     state.controllerOn = false;
+    state.regions = [];
   }
 }
 
@@ -1452,6 +1459,13 @@ function openStartDialog(gameId) {
         return out;
       };
     }
+    // Through a controller with workers in named regions: where to put it.
+    // A wish the controller keeps when a worker there has room.
+    let region = null;
+    if (state.controllerOn && state.regions.length) {
+      region = selectField(form, "sf-region", "Region",
+        [["", "Any: the worker with the most room"]].concat(state.regions.map(r => [r, r])), "");
+    }
     const adv = el("details");
     adv.appendChild(el("summary", "muted", "Advanced"));
     const advWrap = el("div", "advanced-wrap");
@@ -1498,6 +1512,7 @@ function openStartDialog(gameId) {
         name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value,
         bots: bots ? bots.value : "", fixedPort: port.value, restartOnCrash: crash.checked,
         eula: !!(eulaBox && eulaBox.checked), world: world ? world() : null,
+        region: region ? region.value : "",
       }, go, close);
     });
     body.appendChild(form);
@@ -1556,6 +1571,7 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
     restart_on_crash: !!f.restartOnCrash,
   };
   if (f.eula) body.eula_accepted_at = Math.floor(Date.now() / 1000);
+  if (f.region) body.region = f.region;
   if (f.world) {
     if (f.world.seed && !/^[A-Za-z0-9-]{1,32}$/.test(f.world.seed)) { showError("A seed may only hold letters, digits and '-', up to 32."); return; }
     body.minecraft = f.world;
