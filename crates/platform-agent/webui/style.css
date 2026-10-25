@@ -482,8 +482,8 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .verdict.bad { background: var(--bad-soft); }
 .verdict strong { font-weight: 650; }
 .warn-text { color: var(--warn); }
-.check.eula { align-items: flex-start; margin-top: 6px; padding: 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); }
-.check.eula input { margin-top: 2px; }
+.check.eula, .check.boxed { align-items: flex-start; margin-top: 6px; padding: 10px; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+.check.eula input, .check.boxed input { margin-top: 2px; }
 .moderation { display: flex; flex-direction: column; gap: 8px; }
 .moderation h4 { font-size: 13px; font-weight: 650; margin-top: 6px; }
 .mod-list { display: grid; gap: 6px; max-height: 220px; overflow: auto; }
