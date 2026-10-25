@@ -74,6 +74,99 @@ release, so a tag with no hand-made GitHub Release failed every job with
 release had been created by hand. The upload steps now create the release if it
 is missing, which makes pushing a tag sufficient on its own.
 
+## v0.2.46
+
+### Minecraft servers, and kick and ban for every game
+
+- A node can host **Minecraft: Java Edition** (vanilla, Paper, Fabric or
+  Forge, a version per server, 1.18.1 and newer) and **Bedrock Edition**.
+  Each Java build comes from its publisher's own site and is checked against
+  the publisher's digest; the owner accepts the EULA before a server is
+  made; memory and CPU are checked against the machine first, and each
+  server gets a hard memory cap. A world can be imported, and the old one is
+  backed up first. Bedrock servers report their player count.
+- Every game with a console has **kick and ban** on its node page.
+
+### Invites as a QR code
+
+- Next to Invite, the launcher shows the invite as a QR code, drawn on your
+  own computer, so a phone joins by scanning it.
+
+### Many machines, one place to start servers
+
+For people running servers on more than one machine (`HOSTING.md`):
+
+- **Workers.** `scripts/setup-worker.sh` turns a machine into a worker for an
+  index in one command. The index places each new server on the worker with
+  the most room, counting memory, disk and the operator's priority; a worker
+  that does not answer is never treated as empty.
+- **Your node's page can place servers across every worker**, through a
+  `[controller]` section: create, stop, start, remove, logs and backups, with
+  the create form's choices (bots, crash restart, a Minecraft build and its
+  settings) carried along. Several open pages share one list from the index.
+- **Moving a server to another worker** keeps it running while its files are
+  copied, then switches over and keeps its address, so invite links keep
+  working. A real Sven Co-op server with 300 MiB of files moved between two
+  machines in 22 seconds, and players lost it for 1.4 seconds. A move that
+  fails never loses the server.
+- **Regions and classes.** A worker can carry a region (`eu`), and a create
+  can ask for one; a worker can carry a class that only some creates use.
+- **More than one hub.** An index and a worker can each reach the mesh through
+  several hubs and keep working while any one is up.
+- **Quotas per account**, and stopped servers removed after a number of days,
+  with a countdown shown, if the operator turns it on.
+- **The index keeps its address** across restarts (`--identity FILE`), no
+  longer shows up as a server in the list, and its web address now shows a
+  page saying what it is and what it hosts.
+
+### Servers stop at once
+
+- A game server now stops in a quarter of a second instead of ten. Sven
+  Co-op and other servers that ignore the stop signal were killed after a
+  ten-second wait on every stop, restart and move; they now run under a small
+  init that passes the signal on. Sven Co-op also runs without Valve's
+  restart wrapper, which hid crashes from the node.
+- A removed server's address key is deleted with it (its files stay until you
+  delete them).
+
+### Accounts and roles on the node page
+
+- The node page signs in with a **username and password**, stored as Argon2id
+  hashes, with an optional authenticator code. The first account is made once
+  with the node's API token, and the token keeps working for everything else.
+- Sign-in is limited: five wrong passwords for a name lock it for five minutes,
+  and the page says the same thing for a wrong name and a wrong password.
+- Two roles. **Users run servers**: create, start, stop, remove, logs and
+  backups of their own. **Admins** also manage the node: its settings, the
+  account list, and the index's admins. A node from before roles keeps its
+  accounts as admins; the last admin cannot be demoted or removed.
+- **Each user account is its own identity at the index.** Its servers and
+  quotas are its own, so one account cannot stop or remove another's server.
+  Removing an account removes its servers and backups at the index first; if
+  the index cannot do that, the account stays.
+- A server's region is its worker's. A move stays in the region; moving to
+  another region needs an admin's approval, and the owner cannot approve their
+  own request.
+- Each account can have a backup cap across all its workers, set by the
+  operator (`[quota.accounts.<hash>] max_backups`).
+- Index admins are granted by an existing admin. Asking grants nothing.
+
+### Security hardening
+
+- The node page refuses browser requests from other sites (cross-site form
+  posts and DNS rebinding), and sends a content policy that allows no inline
+  scripts or styles. The index sends the same kind of headers.
+- Sign-in state is bounded. When it is full, sign-in answers 503 and does not
+  grow.
+- Every reachable RustSec advisory is cleared, and `cargo audit` now runs
+  daily and on every lockfile change, for both the workspace and the launcher.
+
+### Upgrading
+
+- The API token keeps working on every route, as before. Accounts are only
+  made where a token is configured, and the first one is made once, from the
+  node page, with the token.
+
 ## v0.2.45
 
 ### A Linux-hosted LAN race no longer ends as it starts
