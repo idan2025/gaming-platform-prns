@@ -24,6 +24,7 @@ pub mod official;
 pub mod pack_import;
 pub mod packs;
 pub mod ports;
+pub mod reports;
 pub mod resources;
 pub mod schedule;
 pub mod store;

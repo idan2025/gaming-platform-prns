@@ -460,6 +460,8 @@ pub struct Hosting {
     requests: crate::regions::RegionRequests,
     /// Admins granted here (beyond the hosting file's), and requests to be one.
     admin_store: crate::admins::AdminStore,
+    /// What admins did to owners' servers, and why (`notices.rs`).
+    notices: crate::notices::Notices,
     /// Join codes, and the hosting file a joining worker is written into.
     join_codes: crate::join::JoinStore,
     hosting_file: Option<std::path::PathBuf>,
@@ -522,6 +524,8 @@ pub struct AccountData {
     pub identity: String,
     pub servers: Vec<AccountServer>,
     pub region_requests: Vec<crate::regions::RegionRequest>,
+    /// What admins did to this account's servers, and why.
+    pub notices: Vec<crate::notices::Notice>,
     pub admin: AccountAdmin,
     /// Where the operator's hosting file names this account.
     pub named_in_hosting_file: Vec<String>,
@@ -598,6 +602,7 @@ impl Hosting {
             moving: Default::default(),
             requests: Default::default(),
             admin_store: Default::default(),
+            notices: Default::default(),
             join_codes: Default::default(),
             hosting_file: None,
             worker_states: Default::default(),
@@ -1217,6 +1222,7 @@ impl Hosting {
             identity: account.0.clone(),
             servers,
             region_requests: self.requests.for_owner(&account.0),
+            notices: self.notices.for_owner(&account.0),
             admin: AccountAdmin {
                 in_hosting_file: file_admin,
                 granted: self.admin_store.is_granted(&account.0),
@@ -1244,9 +1250,95 @@ impl Hosting {
             self.destroy(account, &instance.instance_id).await?;
             erased.servers_removed.push(instance.instance_id.clone());
         }
-        erased.records_forgotten = self.requests.forget(&account.0)? + self.admin_store.forget(&account.0)?;
+        erased.records_forgotten =
+            self.requests.forget(&account.0)? + self.admin_store.forget(&account.0)? + self.notices.forget(&account.0)?;
         erased.still_in_hosting_file = Self::named_in_file(&self.config(), account);
         Ok(erased)
+    }
+
+    /// Every server on every worker that answered, with its owner: what an
+    /// admin acts on when a server breaks the rules.
+    pub async fn admin_instances(&self, admin: &AccountId) -> Result<Vec<HostedInstance>> {
+        self.moderator_only(admin)?;
+        self.all_instances().await
+    }
+
+    /// An admin stops or removes anyone's server, with a reason its owner
+    /// reads (`notices.rs`). The reason is checked before anything is done,
+    /// and the notice is recorded only once the worker did it.
+    pub async fn moderate(
+        &self,
+        admin: &AccountId,
+        instance_id: &str,
+        action: crate::notices::Action,
+        reason: &str,
+        now: SystemTime,
+    ) -> Result<crate::notices::Notice> {
+        use crate::notices::Action;
+        self.moderator_only(admin)?;
+        if !crate::notices::valid_text(reason) {
+            return Err(anyhow!(
+                "give the owner a reason: up to {} characters of plain text",
+                crate::notices::MAX_TEXT
+            ));
+        }
+        let found = self
+            .all_instances()
+            .await?
+            .into_iter()
+            .find(|i| i.instance_id == instance_id)
+            .ok_or_else(|| anyhow!("no such instance"))?;
+        let node = self
+            .config()
+            .nodes
+            .iter()
+            .find(|n| n.name == found.node)
+            .cloned()
+            .ok_or_else(|| anyhow!("no such instance"))?;
+        match action {
+            Action::Stopped => self.stop_on(&node, instance_id).await?,
+            Action::Removed => self.remove_on(&node, instance_id).await?,
+        }
+        tracing::info!(admin = %admin.0, instance = %instance_id, ?action, "an admin acted on a server");
+        self.notices.record(crate::notices::Notice {
+            id: String::new(),
+            owner: found.owner.clone().unwrap_or_default(),
+            instance_id: instance_id.to_string(),
+            name: found.name.clone(),
+            action,
+            reason: reason.trim().to_string(),
+            created_unix: unix(now),
+            review_asked_unix: None,
+            review_note: None,
+        })
+    }
+
+    pub fn notices_for(&self, account: &AccountId) -> Vec<crate::notices::Notice> {
+        self.notices.for_owner(&account.0)
+    }
+
+    pub fn all_notices(&self, admin: &AccountId) -> Result<Vec<crate::notices::Notice>> {
+        self.moderator_only(admin)?;
+        Ok(self.notices.all())
+    }
+
+    /// The owner asks for an admin's action to be looked at again.
+    pub fn ask_review(&self, account: &AccountId, id: &str, note: &str, now: SystemTime) -> Result<crate::notices::Notice> {
+        if !crate::notices::valid_notice_id(id) {
+            return Err(anyhow!("no such notice"));
+        }
+        if !crate::notices::valid_text(note) {
+            return Err(anyhow!("say why, in up to {} characters of plain text", crate::notices::MAX_TEXT));
+        }
+        self.notices.ask_review(&account.0, id, note, unix(now))
+    }
+
+    fn moderator_only(&self, account: &AccountId) -> Result<()> {
+        if self.is_admin(account) {
+            Ok(())
+        } else {
+            Err(anyhow!("only an admin of this index can act on other people's servers"))
+        }
     }
 
     pub async fn backup_restore(&self, account: &AccountId, instance_id: &str, name: &str) -> Result<()> {
@@ -2005,6 +2097,7 @@ impl Hosting {
     pub fn keep_state_beside(mut self, hosting_file: &std::path::Path) -> Result<Self> {
         self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
         self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
+        self.notices = crate::notices::Notices::load(&hosting_file.with_file_name("notices.json"))?;
         self.join_codes = crate::join::JoinStore::load(&hosting_file.with_file_name("join-codes.json"))?;
         self.worker_states = crate::worker_state::WorkerStates::load(&hosting_file.with_file_name("worker-states.json"))?;
         self.hosting_file = Some(hosting_file.to_path_buf());
@@ -3716,9 +3809,14 @@ mod tests {
             held.1.push(format!("remove {id}"));
             "ok"
         }
+        async fn stop(State(h): State<Held>, Path(id): Path<String>) -> &'static str {
+            h.lock().unwrap().1.push(format!("stop {id}"));
+            "ok"
+        }
         let state: Held = Arc::new(std::sync::Mutex::new((servers, Vec::new())));
         let app = Router::new()
             .route("/instances", get(list))
+            .route("/instances/:id/stop", axum::routing::post(stop))
             .route("/instances/:id", delete(remove))
             .route("/instances/:id/backups", get(backups))
             .route("/instances/:id/backups/:name", delete(remove_backup))
@@ -3779,6 +3877,53 @@ mod tests {
         assert!(h.admin_store.latest_for(&me.0).is_none());
         assert!(h.admin_store.latest_for(&stranger).is_some());
         assert!(h.account_data(&me).await.unwrap().servers.is_empty());
+    }
+
+    /// An admin stops or removes anyone's server only with a reason, and the
+    /// owner, and nobody else, reads what was done and why and may ask once
+    /// for another look. Someone who is not an admin can do none of it, and
+    /// an erased account's notices go with it.
+    #[tokio::test]
+    async fn an_admin_acts_on_anyones_server_and_its_owner_is_told_why() {
+        use crate::notices::Action;
+        let admin = AccountId("ad".repeat(16));
+        let owner = AccountId("bb".repeat(16));
+        let other = AccountId("cc".repeat(16));
+        let (addr, held) = erasable_worker(vec![
+            ("theirs", owner.0.clone(), vec![]),
+            ("noisy", owner.0.clone(), vec![]),
+        ])
+        .await;
+        let mut c = one_node_at(addr);
+        c.admins = vec![admin.0.clone()];
+        let h = Hosting::new(c);
+        let now = std::time::SystemTime::now();
+
+        let err = h.moderate(&other, "theirs", Action::Removed, "spam", now).await.unwrap_err().to_string();
+        assert!(err.starts_with("only an admin"), "{err}");
+        assert!(h.admin_instances(&other).await.is_err());
+        assert!(h.moderate(&admin, "theirs", Action::Removed, "  ", now).await.is_err(), "no reason");
+        assert!(held.lock().unwrap().1.is_empty(), "something was done without a reason or by a non-admin");
+
+        assert_eq!(h.admin_instances(&admin).await.unwrap().len(), 2);
+        h.moderate(&admin, "noisy", Action::Stopped, "reported for hate speech in chat", now).await.unwrap();
+        let removed = h.moderate(&admin, "theirs", Action::Removed, "copyright report", now).await.unwrap();
+        let asked = held.lock().unwrap().1.clone();
+        assert_eq!(asked, ["stop noisy", "remove theirs"]);
+
+        let told = h.notices_for(&owner);
+        assert_eq!(told.len(), 2);
+        assert!(told.iter().any(|n| n.action == Action::Removed && n.reason == "copyright report"));
+        assert!(h.notices_for(&other).is_empty());
+        assert_eq!(h.all_notices(&admin).unwrap().len(), 2);
+
+        assert!(h.ask_review(&other, &removed.id, "not mine", now).is_err());
+        h.ask_review(&owner, &removed.id, "that map is my own work", now).unwrap();
+        assert!(h.ask_review(&owner, &removed.id, "again", now).is_err(), "asked twice");
+
+        // erase_account needs every worker to answer; this one does.
+        h.erase_account(&owner).await.unwrap();
+        assert!(h.notices_for(&owner).is_empty());
     }
 
     /// The cap counts an account's backups across **all** its servers on all

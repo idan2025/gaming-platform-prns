@@ -140,6 +140,18 @@ quietly break:
   the hosting file's lines are reported, never rewritten. A removed server's
   folder stays on its worker until that worker's leftover clean-up. Caught by
   `an_account_reads_and_erases_everything_kept_about_it_and_nobody_elses`.
+- **An index admin acts on anyone's server only with a reason its owner
+  reads** (`notices.rs`, `Hosting::moderate`, `POST /admin/instances/:id/stop|remove`).
+  The reason is checked before anything is done and the notice recorded only
+  once the worker did it; the owner (only) reads it at `GET /me/notices` and
+  may ask once for another look. Accounts have no email, so this is how an
+  owner is told (DSA Art. 17). Caught by
+  `an_admin_acts_on_anyones_server_and_its_owner_is_told_why`.
+- **Anyone may report a server on a node that takes sign-ups** (`reports.rs`,
+  `POST /reports`, no account): text only, sizes capped, 30 an hour and 500
+  open across everyone, owner-only file. Reading and closing them is an
+  admin's; `user_may` refuses `/reports` by name, because a report can carry
+  the reporter's contact.
 - **Sign-in state is bounded** (`platform-auth`: 10,000 challenges, 100,000
   sessions, 8 per identity, then `Busy`/503), and **the node refuses browser
   requests from other sites** (`api::browser_guard`: `Sec-Fetch-Site`,

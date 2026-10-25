@@ -9,6 +9,7 @@ pub mod hosting;
 pub mod http;
 pub mod join;
 pub mod node;
+pub mod notices;
 pub mod quota;
 pub mod regions;
 pub mod registry;

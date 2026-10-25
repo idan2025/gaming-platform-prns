@@ -918,4 +918,13 @@ fn a_route_nobody_listed_is_an_admins() {
     assert!(!platform_agent::api::user_may(&Method::POST, "/some/route/added/later"));
     assert!(!platform_agent::api::user_may(&Method::PUT, "/instances/srv/identity"));
     assert!(!platform_agent::api::user_may(&Method::POST, "/controller/admin-requests"));
+    // Reports carry reporters' contacts; acting on anyone's server is an
+    // admin's; a user reads their own notices and may ask for another look.
+    assert!(!platform_agent::api::user_may(&Method::GET, "/reports"));
+    assert!(!platform_agent::api::user_may(&Method::POST, "/reports/0123456789abcdef/close"));
+    assert!(!platform_agent::api::user_may(&Method::POST, "/controller/admin/instances/srv/remove"));
+    assert!(!platform_agent::api::user_may(&Method::GET, "/controller/admin/instances"));
+    assert!(platform_agent::api::user_may(&Method::GET, "/controller/me/notices"));
+    assert!(platform_agent::api::user_may(&Method::POST, "/controller/me/notices/0123456789abcdef/review"));
+    assert!(platform_agent::api::user_may(&Method::POST, "/auth/delete-me"));
 }

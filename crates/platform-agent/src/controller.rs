@@ -367,6 +367,17 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         // not here: removing the account does that (`Controller::erase`).
         ["me"] if *method == Method::GET && no_query() => Some("/me".into()),
         ["me", "data"] if *method == Method::GET && no_query() => Some("/me/data".into()),
+        // What admins did to this account's servers and why, and asking for
+        // another look; and an admin acting on anyone's server, with a reason.
+        ["me", "notices"] if *method == Method::GET && no_query() => Some("/me/notices".into()),
+        ["me", "notices", nid, "review"] if valid_request_id(nid) && *method == Method::POST && no_query() => {
+            Some(format!("/me/notices/{nid}/review"))
+        }
+        ["admin", "instances"] if *method == Method::GET && no_query() => Some("/admin/instances".into()),
+        ["admin", "instances", id, action @ ("stop" | "remove")] if valid_id(id) && *method == Method::POST && no_query() => {
+            Some(format!("/admin/instances/{id}/{action}"))
+        }
+        ["admin", "notices"] if *method == Method::GET && no_query() => Some("/admin/notices".into()),
         // Asking to become an admin of the index, and an admin deciding; the
         // admins, and the workers. The index checks who is admin.
         ["admin-requests"] if *method == Method::POST && no_query() => Some("/admin-requests".into()),

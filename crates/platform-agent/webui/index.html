@@ -63,6 +63,22 @@
       <label class="check eula"><input id="signup-age" type="checkbox"> <span>I am at least 16, or old enough to agree to them where I live.</span></label>
       <button type="submit" class="btn btn-primary btn-block">Create my account</button>
     </form>
+    <form id="report-form" hidden>
+      <label for="report-category">What is wrong</label>
+      <select id="report-category">
+        <option value="illegal">Illegal content</option>
+        <option value="abuse">Bullying, harassment or hate</option>
+        <option value="copyright">Copyright</option>
+        <option value="other">Something else</option>
+      </select>
+      <label for="report-target">Which server (its name or address)</label>
+      <input id="report-target" type="text" maxlength="200" required>
+      <label for="report-details">What happened</label>
+      <textarea id="report-details" rows="5" maxlength="2000" required></textarea>
+      <label for="report-contact">How to reach you (optional)</label>
+      <input id="report-contact" type="text" maxlength="200" autocomplete="email">
+      <button type="submit" class="btn btn-primary btn-block">Send the report</button>
+    </form>
     <form id="token-form" autocomplete="off" hidden>
       <label for="token-input">Access token</label>
       <input id="token-input" type="password" name="token" required>
@@ -71,6 +87,7 @@
     <p id="token-error" class="inline-error" aria-live="polite"></p>
     <p class="login-note" id="signup-switch-wrap" hidden><a href="#" id="signup-switch"></a></p>
     <p class="login-note"><a href="#" id="login-switch"></a></p>
+    <p class="login-note" id="report-switch-wrap" hidden><a href="#" id="report-switch"></a></p>
   </div>
 </section>
 

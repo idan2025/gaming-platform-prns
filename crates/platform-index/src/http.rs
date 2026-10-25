@@ -57,6 +57,11 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/auth/verify", post(verify))
         .route("/me", get(me).delete(erase_me))
         .route("/me/data", get(my_data))
+        .route("/me/notices", get(my_notices))
+        .route("/me/notices/:nid/review", post(ask_review))
+        .route("/admin/instances", get(admin_instances))
+        .route("/admin/instances/:id/:action", post(moderate))
+        .route("/admin/notices", get(admin_notices))
         // Hosting. Everything above works with these switched off.
         .route("/hosting", get(hosting_info))
         .route("/instances", get(my_instances).post(deploy))
@@ -352,6 +357,91 @@ async fn my_data(
         .await
         .map(|data| Json(json!(data)))
         .map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, e))
+}
+
+/// What admins did to the caller's servers, and why.
+async fn my_notices(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::notices::Notice>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    Ok(Json(hosting.notices_for(&account)))
+}
+
+#[derive(Deserialize)]
+struct ReviewRequest {
+    note: String,
+}
+
+async fn ask_review(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(nid): axum::extract::Path<String>,
+    Json(request): Json<ReviewRequest>,
+) -> ApiResult<crate::notices::Notice> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .ask_review(&account, &nid, &request.note, std::time::SystemTime::now())
+        .map(Json)
+        .map_err(moderation_failure)
+}
+
+async fn admin_instances(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::hosting::HostedInstance>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.admin_instances(&account).await.map(Json).map_err(moderation_failure)
+}
+
+#[derive(Deserialize)]
+struct ModerateRequest {
+    reason: String,
+}
+
+/// An admin stops or removes anyone's server, with a reason the owner reads.
+async fn moderate(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
+    Json(request): Json<ModerateRequest>,
+) -> ApiResult<crate::notices::Notice> {
+    use crate::notices::Action;
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let action = match action.as_str() {
+        "stop" => Action::Stopped,
+        "remove" => Action::Removed,
+        _ => return Err(fail(StatusCode::NOT_FOUND, "no such action")),
+    };
+    hosting
+        .moderate(&account, &id, action, &request.reason, std::time::SystemTime::now())
+        .await
+        .map(Json)
+        .map_err(moderation_failure)
+}
+
+async fn admin_notices(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::notices::Notice>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.all_notices(&account).map(Json).map_err(moderation_failure)
+}
+
+fn moderation_failure(e: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    let text = format!("{e:#}");
+    if text.starts_with("only an admin") {
+        fail(StatusCode::FORBIDDEN, e)
+    } else if text == "no such instance" || text == "no such notice" {
+        fail(StatusCode::NOT_FOUND, e)
+    } else {
+        fail(StatusCode::BAD_REQUEST, e)
+    }
 }
 
 #[derive(Deserialize)]

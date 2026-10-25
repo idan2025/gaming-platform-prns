@@ -67,6 +67,9 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 /// What the API needs besides the agent: the token, if one is configured.
 #[derive(Clone)]
 pub struct ApiState {
+    /// Reports of a hosted server from anyone (`reports.rs`); only on a node
+    /// that takes sign-ups.
+    pub reports: Option<Arc<crate::reports::Reports>>,
     pub agent: Arc<Agent>,
     /// Content installs running in the background.
     pub installs: Arc<crate::install::Installs>,
@@ -112,7 +115,20 @@ pub fn router_full(
             }
         }
     });
+    // Reports from the public, on a node that takes sign-ups. A file that
+    // cannot be read leaves the form off rather than starting empty.
+    let reports = agent.config().controller.as_ref().filter(|c| c.open_signup).and_then(|_| {
+        let path = agent.config().data_root.join("reports.json");
+        match crate::reports::Reports::load(&path) {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "reports are off until this file is fixed");
+                None
+            }
+        }
+    });
     let state = ApiState {
+        reports,
         agent: agent.clone(),
         installs: agent.installs(),
         token: token.map(Arc::new),
@@ -215,6 +231,8 @@ pub fn router_full(
         .route("/auth/users/:name/deny-admin", post(auth_user_deny_admin))
         .route("/auth/admin-request", post(auth_admin_request))
         .route("/auth/delete-me", post(auth_delete_me))
+        .route("/reports", get(reports_list))
+        .route("/reports/:id/close", post(report_close))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         // Signing in happens before there is anything to present, so these
         // sit outside the gate: what this node wants (`/auth/state`), a
@@ -223,6 +241,7 @@ pub fn router_full(
         .route("/auth/login", post(auth_login))
         .route("/auth/setup", post(auth_setup))
         .route("/auth/signup", post(auth_signup))
+        .route("/reports", post(report_file))
         // The web UI is served **outside** the auth layer, deliberately. A
         // login page that needed the token to load could never be reached, and
         // these three files are the same for every install — they contain no
@@ -407,6 +426,8 @@ pub fn user_may(method: &axum::http::Method, path: &str) -> bool {
         ["controller", "admin", ..] | ["controller", "admin-requests", ..] => false,
         // Who has an account here, and who asked to be an admin, is an admin's.
         ["auth", "users", ..] => false,
+        // Reports name who reported (a contact, if given) and what: an admin's.
+        ["reports", ..] => false,
         _ if *method == Method::GET => true,
         ["instances"] => *method == Method::POST,
         ["instances", _] => *method == Method::DELETE,
@@ -470,6 +491,7 @@ fn signup_notice(state: &ApiState) -> serde_json::Value {
     match config.controller.as_ref() {
         Some(c) if c.open_signup && state.accounts.as_ref().is_some_and(|a| a.any()) => serde_json::json!({
             "terms_url": c.terms_url, "privacy_url": c.privacy_url, "min_password": crate::accounts::MIN_PASSWORD_LEN,
+            "reports": state.reports.is_some(),
         }),
         _ => serde_json::Value::Null,
     }
@@ -719,6 +741,59 @@ async fn auth_delete_me(
     remove_account(&state, &name).await?;
     tracing::info!(user = %name, "a page account removed itself");
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn reports_of(state: &ApiState) -> Result<&Arc<crate::reports::Reports>, (StatusCode, Json<ApiError>)> {
+    state.reports.as_ref().ok_or_else(|| fail(StatusCode::NOT_FOUND, "this node takes no reports"))
+}
+
+#[derive(Deserialize)]
+struct ReportReq {
+    category: crate::reports::Category,
+    target: String,
+    details: String,
+    #[serde(default)]
+    contact: Option<String>,
+}
+
+/// Anyone reports a hosted server, with or without an account.
+async fn report_file(State(state): State<ApiState>, Json(req): Json<ReportReq>) -> ApiResult<serde_json::Value> {
+    let made = reports_of(&state)?
+        .file(req.category, &req.target, &req.details, req.contact.as_deref(), unix_now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(report = %made.id, category = ?made.category, "a report came in");
+    // The reporter gets the id only: nothing else about the node or other
+    // reports.
+    Ok(Json(json!({ "id": made.id })))
+}
+
+async fn reports_list(State(state): State<ApiState>) -> ApiResult<Vec<crate::reports::Report>> {
+    Ok(Json(reports_of(&state)?.all()))
+}
+
+#[derive(Deserialize)]
+struct CloseReq {
+    outcome: String,
+}
+
+async fn report_close(
+    State(state): State<ApiState>,
+    caller: Option<axum::Extension<Caller>>,
+    Path(id): Path<String>,
+    Json(req): Json<CloseReq>,
+) -> ApiResult<crate::reports::Report> {
+    if !crate::reports::valid_report_id(&id) {
+        return Err(fail(StatusCode::NOT_FOUND, "no such report"));
+    }
+    let by = caller.and_then(|c| c.username.clone()).unwrap_or_else(|| "token".to_string());
+    reports_of(&state)?
+        .close(&id, &by, &req.outcome, unix_now())
+        .map(Json)
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 #[derive(Deserialize)]

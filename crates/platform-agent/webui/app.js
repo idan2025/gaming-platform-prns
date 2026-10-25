@@ -387,6 +387,9 @@ function renderLoginMode() {
   $("login-form").hidden = loginMode !== "account";
   $("setup-form").hidden = loginMode !== "setup";
   $("signup-form").hidden = loginMode !== "signup";
+  $("report-form").hidden = loginMode !== "report";
+  $("report-switch-wrap").hidden = !(authState && authState.signup && authState.signup.reports);
+  $("report-switch").textContent = loginMode === "report" ? "Back to sign in" : "Report a server";
   $("token-form").hidden = loginMode !== "token";
   // Sign-up, where this node takes it: always with its two notices linked.
   const signup = authState && authState.signup;
@@ -396,7 +399,8 @@ function renderLoginMode() {
     $("signup-terms-link").href = signup.terms_url;
     $("signup-privacy-link").href = signup.privacy_url;
   }
-  $("login-help").textContent = loginMode === "signup" ? "Create an account to run servers here."
+  $("login-help").textContent = loginMode === "report" ? "Tell the admins about a server here that carries illegal content or breaks the rules. No account needed."
+    : loginMode === "signup" ? "Create an account to run servers here."
     : loginMode === "account" ? "Sign in to this node."
     : loginMode === "setup" ? "Make the account you will sign in with from now on. The API token proves this is your node: it is in the file named by api_token_file in the agent's config. You need it only this once."
     : "Paste this node's API token, from the file named by api_token_file in the agent's config.";
@@ -405,7 +409,7 @@ function renderLoginMode() {
   sw.parentElement.hidden = !canAccounts;
   sw.textContent = loginMode === "token" ? (authState && authState.has_accounts ? "Sign in with an account instead" : "Make an account instead")
     : "Use the API token instead";
-  const first = { account: "login-user", setup: "setup-token", signup: "signup-user", token: "token-input" }[loginMode];
+  const first = { account: "login-user", setup: "setup-token", signup: "signup-user", report: "report-target", token: "token-input" }[loginMode];
   $(first)?.focus();
 }
 
@@ -474,6 +478,21 @@ async function onSignupSubmit(e) {
   loginMode = "account";
   renderLoginMode();
   $("login-form").requestSubmit();
+}
+
+async function onReportSubmit(e) {
+  e.preventDefault();
+  const err = $("token-error");
+  err.textContent = "";
+  let resp, out = {};
+  try {
+    resp = await fetch("/reports", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ category: $("report-category").value, target: $("report-target").value, details: $("report-details").value, contact: $("report-contact").value }) });
+    out = await resp.json().catch(() => ({}));
+  } catch (_) { err.textContent = "Could not reach this node."; return; }
+  if (!resp.ok) { err.textContent = out.error || "The report was not sent."; return; }
+  for (const id of ["report-target", "report-details", "report-contact"]) $(id).value = "";
+  err.textContent = "Thank you. The report was received (" + out.id + ").";
 }
 
 function showMainUI() {
@@ -3441,9 +3460,10 @@ function admRoutes() {
   const out = [];
   const me = adm.data.me;
   if (state.controllerOn) {
-    if (me && me.admin) out.push(["workers", "Workers"], ["requests", "Requests"], ["admins", "Admins"]);
+    if (me && me.admin) out.push(["workers", "Workers"], ["servers", "Servers"], ["requests", "Requests"], ["admins", "Admins"]);
     else out.push(["admins", "Access"]);
   }
+  if (authState && authState.signup && authState.signup.reports) out.push(["reports", "Reports"]);
   if (authState && authState.accounts) out.push(["accounts", "Accounts"]);
   return out;
 }
@@ -3503,10 +3523,13 @@ async function admFetch() {
     // The counts on the nav need these whichever view is open.
     want("moves", "/controller/admin/region-requests");
     want("asks", "/controller/admin/admin-requests");
+    want("notices", "/controller/admin/notices");
     if (r === "workers") want("workers", "/controller/admin/workers");
+    if (r === "servers") want("all", "/controller/admin/instances");
     if (r === "admins") want("admins", "/controller/admin/admins");
     if (r === "add-worker") { want("codes", "/controller/admin/join-codes"); want("info", "/controller/admin/join-info"); want("workers", "/controller/admin/workers"); }
   }
+  if (authState && authState.signup && authState.signup.reports) want("reports", "/reports");
   if (authState && authState.accounts) {
     want("users", "/auth/users");
     want("self", "/auth/me");
@@ -3554,6 +3577,8 @@ function admPendingCount() {
   if (d.moves) n += d.moves.filter((r) => r.state === "pending").length;
   if (d.asks) n += d.asks.filter((r) => r.state === "pending").length;
   if (d.users) n += d.users.filter((u) => u.admin_requested_unix).length;
+  if (d.reports) n += d.reports.filter((r) => !r.closed_unix).length;
+  if (d.notices) n += d.notices.filter((x) => x.review_asked_unix).length;
   return n;
 }
 
@@ -3590,7 +3615,16 @@ function admRender(force) {
       const b = el("button", "adm-tab" + (key === adm.route ? " active" : ""), label);
       b.type = "button";
       b.onclick = () => admGo(key);
-      if (key === "requests" && pending) b.appendChild(el("span", "adm-badge", String(adm.data.moves ? admPendingBy("moves") + admPendingBy("asks") : pending)));
+      const requestsWaiting = admPendingBy("moves") + admPendingBy("asks");
+      if (key === "requests" && requestsWaiting) b.appendChild(el("span", "adm-badge", String(requestsWaiting)));
+      if (key === "reports" && adm.data.reports) {
+        const open = adm.data.reports.filter((r) => !r.closed_unix).length;
+        if (open) b.appendChild(el("span", "adm-badge", String(open)));
+      }
+      if (key === "servers" && adm.data.notices) {
+        const asked = adm.data.notices.filter((x) => x.review_asked_unix).length;
+        if (asked) b.appendChild(el("span", "adm-badge", String(asked)));
+      }
       if (key === "accounts" && adm.data.users) {
         const asked = adm.data.users.filter((u) => u.admin_requested_unix).length;
         if (asked) b.appendChild(el("span", "adm-badge", String(asked)));
@@ -3605,7 +3639,9 @@ function admRender(force) {
   const sig = JSON.stringify([adm.route, adm.route === "add-worker" ? [adm.code && adm.code.id, adm.done, adm.method] : null,
     adm.route === "workers" ? workersSig(d.workers) : null, adm.route === "requests" ? [d.moves, d.asks] : null,
     adm.route === "admins" ? [d.admins, d.me] : null, adm.route === "accounts" ? [d.users, d.self] : null,
-    adm.route === "add-worker" ? (d.codes || []).map((c) => [c.id, c.state]) : null]);
+    adm.route === "add-worker" ? (d.codes || []).map((c) => [c.id, c.state]) : null,
+    adm.route === "servers" ? [(d.all || []).map((i) => [i.instance_id, i.state, i.node, i.owner]), d.notices] : null,
+    adm.route === "reports" ? d.reports : null]);
   if (!force && sig === adm.sig.view) { admLive(); return; }
   const focused = document.activeElement;
   if (!force && focused && adm.shell.view.contains(focused) && /^(INPUT|SELECT|TEXTAREA)$/.test(focused.tagName)) return;
@@ -3622,6 +3658,8 @@ function admRender(force) {
   switch (adm.route) {
     case "workers": view = admWorkersView(); break;
     case "requests": view = admRequestsView(); break;
+    case "servers": view = admServersView(); break;
+    case "reports": view = admReportsView(); break;
     case "admins": view = admAdminsView(); break;
     case "accounts": view = admAccountsView(); break;
     case "add-worker": view = admWizardView(); break;
@@ -3758,6 +3796,110 @@ function admWorkersView() {
 }
 
 // -- requests --
+
+// -- every server, for acting on a report or a breach --
+
+function admServersView() {
+  const all = adm.data.all || [];
+  const root = el("div", "adm-stack");
+  const panel = el("div", "panel");
+  panel.appendChild(titled("All servers", "Every server on every worker that answered, whoever owns it. Stop or remove one that breaks the rules: you give a reason, and its owner sees what was done and why on their Account tab, and may ask you to look again."));
+  if (!all.length) {
+    panel.appendChild(el("p", "empty", adm.data.all_failed ? "The controller did not answer." : "No servers."));
+  } else {
+    const wrap = el("div", "table-wrap");
+    const table = el("table", "adm-table");
+    const head = el("tr");
+    for (const h of ["Server", "Game", "Owner", "Worker", "State", ""]) head.appendChild(el("th", null, h));
+    table.appendChild(head);
+    for (const i of all) {
+      const tr = el("tr");
+      tr.append(el("td", null, i.name || i.instance_id), el("td", null, gameName(i.game_id)),
+        el("td", "mono small", String(i.owner || "").slice(0, 12) + (i.owner ? "\u2026" : "")),
+        el("td", null, i.node || ""), el("td", null, i.state || ""));
+      const td = el("td", "row-actions");
+      const act = el("button", "btn btn-sm", "Act\u2026");
+      act.type = "button";
+      const moderate = (action, label) => () => {
+        const reason = prompt(label + " \u201c" + (i.name || i.instance_id) + "\u201d. The owner reads this reason:", "");
+        if (reason === null) return;
+        if (!reason.trim()) { showError("Give the owner a reason."); return; }
+        admDo(() => api("POST", "/controller/admin/instances/" + encodeURIComponent(i.instance_id) + "/" + action, { reason }),
+          action === "stop" ? "Stopped. The owner was told why." : "Removed. The owner was told why.");
+      };
+      act.onclick = (e) => {
+        e.stopPropagation();
+        admMenu(act, [["Stop with a reason\u2026", moderate("stop", "Stop")], ["Remove with a reason\u2026", moderate("remove", "Remove"), true]]);
+      };
+      td.appendChild(act);
+      tr.appendChild(td);
+      table.appendChild(tr);
+    }
+    wrap.appendChild(table);
+    panel.appendChild(wrap);
+  }
+  root.appendChild(panel);
+
+  const notices = adm.data.notices || [];
+  if (notices.length) {
+    const np = el("div", "panel");
+    np.appendChild(titled("What admins did", "Each stop or removal and its reason, as the owner sees it. One whose owner asked for another look says what they wrote."));
+    for (const n of notices) np.appendChild(noticeCard(n, true));
+    root.appendChild(np);
+  }
+  return root;
+}
+
+function noticeCard(n, admin) {
+  const card = el("div", "req-card");
+  const head = el("div", "req-head");
+  head.appendChild(el("span", "req-line", (n.action === "removed" ? "Removed " : "Stopped ") + (n.name || n.instance_id) +
+    " \u00b7 " + new Date(n.created_unix * 1000).toLocaleString()));
+  if (n.review_asked_unix) head.appendChild(chip("look again asked", "warn"));
+  card.appendChild(head);
+  if (admin) card.appendChild(el("p", "muted small", "Owner " + String(n.owner || "").slice(0, 12) + "\u2026"));
+  card.appendChild(el("p", "notice-text", "Reason: " + n.reason));
+  if (n.review_note) card.appendChild(el("p", "notice-text", "Owner wrote: " + n.review_note));
+  return card;
+}
+
+// -- reports from anyone --
+
+function admReportsView() {
+  const reports = adm.data.reports || [];
+  const root = el("div", "adm-stack");
+  const panel = el("div", "panel");
+  panel.appendChild(titled("Reports", "Anyone can report a server from the sign-in page, without an account. Look at the server, act on it from Servers if it breaks the rules (the owner is told why), then close the report saying what was done."));
+  if (!reports.length) panel.appendChild(el("p", "empty", adm.data.reports_failed ? "Reports could not be read." : "No reports."));
+  for (const r of reports) {
+    const card = el("div", "req-card");
+    const head = el("div", "req-head");
+    head.appendChild(el("span", "req-line", r.target + " \u00b7 " + new Date(r.created_unix * 1000).toLocaleString()));
+    head.appendChild(chip(r.category, r.category === "illegal" ? "bad" : "info"));
+    if (r.closed_unix) head.appendChild(chip("closed", "muted"));
+    card.appendChild(head);
+    card.appendChild(el("p", "notice-text", r.details));
+    if (r.contact) card.appendChild(el("p", "muted small", "Contact: " + r.contact));
+    if (r.closed_unix) {
+      card.appendChild(el("p", "muted small", "Closed by " + (r.closed_by || "?") + ": " + (r.outcome || "")));
+    } else {
+      const row = el("div", "form-actions start");
+      const close = el("button", "btn", "Close\u2026");
+      close.type = "button";
+      close.onclick = () => {
+        const outcome = prompt("What was done?", "");
+        if (outcome === null) return;
+        if (!outcome.trim()) { showError("Say what was done."); return; }
+        admDo(() => api("POST", "/reports/" + encodeURIComponent(r.id) + "/close", { outcome }), "Report closed.");
+      };
+      row.appendChild(close);
+      card.appendChild(row);
+    }
+    panel.appendChild(card);
+  }
+  root.appendChild(panel);
+  return root;
+}
 
 function admRequestsView() {
   const root = el("div", "adm-stack");
@@ -4210,6 +4352,32 @@ async function loadAccount() {
         code.focus();
       };
       const r4 = el("div", "form-actions"); r4.style.justifyContent = "flex-start"; r4.appendChild(begin); tf.appendChild(r4);
+    }
+  }
+
+  if (isAccount && me.role === "user" && state.controllerOn) {
+    let notices = [];
+    try { notices = await api("GET", "/controller/me/notices"); } catch (_) { notices = null; }
+    if (notices && notices.length) {
+      const nb = section(root, "Notices", "When an admin stops or removes one of your servers, this says what and why. If you think it was a mistake, ask them to look again, once per notice.");
+      for (const n of notices) {
+        const card = noticeCard(n, false);
+        if (!n.review_asked_unix) {
+          const row = el("div", "form-actions start");
+          const ask = el("button", "btn", "Ask to look again\u2026");
+          ask.type = "button";
+          ask.onclick = async () => {
+            const note = prompt("Why should the admins look again?", "");
+            if (note === null) return;
+            if (!note.trim()) { showError("Say why."); return; }
+            try { await withInFlight(api("POST", "/controller/me/notices/" + encodeURIComponent(n.id) + "/review", { note })); toast("Asked. An admin will look again."); loadAccount(); }
+            catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That was not sent."); }
+          };
+          row.appendChild(ask);
+          card.appendChild(row);
+        }
+        nb.appendChild(card);
+      }
     }
   }
 
@@ -5575,6 +5743,13 @@ document.addEventListener("DOMContentLoaded", () => {
   $("login-form").addEventListener("submit", onLoginSubmit);
   $("setup-form").addEventListener("submit", onSetupSubmit);
   $("signup-form").addEventListener("submit", onSignupSubmit);
+  $("report-form").addEventListener("submit", onReportSubmit);
+  $("report-switch").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("token-error").textContent = "";
+    loginMode = loginMode === "report" ? (authState && authState.has_accounts ? "account" : "token") : "report";
+    renderLoginMode();
+  });
   $("signup-switch").addEventListener("click", (e) => {
     e.preventDefault();
     $("token-error").textContent = "";
