@@ -36,6 +36,9 @@ pub struct JoinSpec {
     pub class: Option<String>,
     #[serde(default)]
     pub priority: i32,
+    /// An account the worker is reserved for (`NodeConfig::reserved_for`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +290,7 @@ mod tests {
     use super::*;
 
     fn spec() -> JoinSpec {
-        JoinSpec { name: None, region: Some("eu".into()), class: None, priority: 1 }
+        JoinSpec { name: None, region: Some("eu".into()), class: None, priority: 1, reserved_for: None }
     }
 
     /// A code works once, only before it expires, and is the same refusal

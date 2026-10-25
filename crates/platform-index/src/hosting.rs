@@ -121,6 +121,12 @@ pub struct NodeConfig {
     /// class.
     #[serde(default)]
     pub region: Option<String>,
+    /// An account (identity hash) this worker is reserved for: only its own
+    /// servers are placed here, and it takes none of the shared pool's. Without
+    /// one the worker is in the pool, and an account that has a reserved worker
+    /// is placed on its own workers only.
+    #[serde(default)]
+    pub reserved_for: Option<String>,
 }
 
 /// A class label is data that is matched and shown, never run: short, lower
@@ -129,6 +135,11 @@ pub fn valid_class(class: &str) -> bool {
     !class.is_empty()
         && class.len() <= 32
         && class.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// An identity hash as the index writes and reads it: 32 lower-case hex.
+pub fn is_identity_hash(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `host:port`, as a hub address a worker dials. A host name or IPv4 address.
@@ -467,6 +478,9 @@ pub struct WorkerView {
     pub region: Option<String>,
     pub class: Option<String>,
     pub priority: i32,
+    /// The account it is reserved for, if any (identity hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_for: Option<String>,
     /// Whether it answered just now. A silent worker reports nothing else.
     pub answered: bool,
     /// Servers the index sees on it.
@@ -564,6 +578,9 @@ impl Hosting {
         // requests with nobody to decide them, unnoticed.
         if let Some(bad) = config.admins.iter().find(|a| !(a.len() == 32 && a.bytes().all(|b| b.is_ascii_hexdigit()))) {
             return Err(anyhow!("admin {bad:?} is not an identity hash (32 hex characters)"));
+        }
+        if let Some(bad) = config.nodes.iter().filter_map(|n| n.reserved_for.as_deref()).find(|a| !is_identity_hash(a)) {
+            return Err(anyhow!("a node's reserved_for {bad:?} is not an identity hash (32 hex characters)"));
         }
         if let Some(bad) = config.join.hubs.iter().find(|h| !valid_hub(h)) {
             return Err(anyhow!("join hub {bad:?} is not host:port"));
@@ -764,8 +781,12 @@ impl Hosting {
                 return Err(anyhow!("that is not a region name"));
             }
         }
-        let node = self.pick_node(&config, &existing, request.class.as_deref(), request.region.as_deref()).await.ok_or_else(|| {
-            anyhow!("no node with room for another instance")
+        let reservation = Self::reservation_of(&config, account);
+        let node = self.pick_node(&config, &existing, request.class.as_deref(), request.region.as_deref(), reservation).await.ok_or_else(|| {
+            match reservation {
+                Some(_) => anyhow!("your reserved worker has no room for another instance"),
+                None => anyhow!("no node with room for another instance"),
+            }
         })?;
 
         // The index picks the id. See DeployRequest.
@@ -1288,7 +1309,9 @@ impl Hosting {
         from: &NodeConfig,
         target: MoveTarget<'_>,
     ) -> Result<NodeConfig> {
-        let eligible = |n: &&NodeConfig| n.class == from.class && n.name != from.name;
+        // A move stays with its reservation: a reserved server moves between its
+        // owner's workers, and a pool server never lands on a reserved one.
+        let eligible = |n: &&NodeConfig| n.class == from.class && n.name != from.name && n.reserved_for == from.reserved_for;
         let candidates: Vec<&NodeConfig> = match target {
             MoveTarget::Auto => config.nodes.iter().filter(eligible).filter(|n| n.region == from.region).collect(),
             MoveTarget::Worker(name) => {
@@ -1298,6 +1321,9 @@ impl Hosting {
                 }
                 if node.class != from.class {
                     return Err(anyhow!("that worker takes another class of server"));
+                }
+                if node.reserved_for != from.reserved_for {
+                    return Err(anyhow!("that worker is reserved for another account"));
                 }
                 if node.region != from.region {
                     return Err(anyhow!("that worker is in another region; ask an admin to move it there"));
@@ -1333,7 +1359,7 @@ impl Hosting {
         let (_, from) = self.owned(account, instance_id).await?;
         let existing = self.all_instances().await?;
         let mut workers = Vec::new();
-        for node in config.nodes.iter().filter(|n| n.class == from.class && n.name != from.name && n.region == from.region) {
+        for node in config.nodes.iter().filter(|n| n.class == from.class && n.name != from.name && n.region == from.region && n.reserved_for == from.reserved_for) {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let room = match rank_node(self.node_capacity(node).await, here, node.priority) {
                 Some(rank) if rank.0 == 1 => "room",
@@ -1445,6 +1471,7 @@ impl Hosting {
                 region: node.region.clone(),
                 class: node.class.clone(),
                 priority: node.priority,
+                reserved_for: node.reserved_for.clone(),
                 answered: capacity.is_some(),
                 servers: instances.map(|i| i.len()).unwrap_or(0),
                 capacity,
@@ -1576,6 +1603,11 @@ impl Hosting {
                 return Err(anyhow!("a worker's name is 1-64 characters: letters, digits, . _ -"));
             }
         }
+        if let Some(who) = spec.reserved_for.as_deref() {
+            if !is_identity_hash(who) {
+                return Err(anyhow!("reserved_for is an account's identity hash: 32 lower-case hex characters"));
+            }
+        }
         for (what, v) in [("region", &spec.region), ("class", &spec.class)] {
             if let Some(v) = v {
                 if !valid_class(v) {
@@ -1677,6 +1709,9 @@ impl Hosting {
         );
         if let Some(class) = &spec.class {
             block.push_str(&format!("class = \"{class}\"\n"));
+        }
+        if let Some(who) = &spec.reserved_for {
+            block.push_str(&format!("reserved_for = \"{who}\"\n"));
         }
         if let Some(region) = &spec.region {
             block.push_str(&format!("region = \"{region}\"\n"));
@@ -2138,14 +2173,21 @@ impl Hosting {
     /// the index's own count and ranks behind every node that did answer: an
     /// unreachable node is the least attractive place to put something, and
     /// "silence means room" is how an outage becomes a pile-up.
+    /// The reservation an account places under: its own identity if a worker is
+    /// reserved for it, else `None` (the shared pool).
+    fn reservation_of<'c>(config: &HostingConfig, account: &'c AccountId) -> Option<&'c str> {
+        config.nodes.iter().any(|n| n.reserved_for.as_deref() == Some(account.0.as_str())).then_some(account.0.as_str())
+    }
+
     async fn pick_node<'c>(
         &self,
         config: &'c HostingConfig,
         existing: &[HostedInstance],
         class: Option<&str>,
         region: Option<&str>,
+        reservation: Option<&str>,
     ) -> Option<&'c NodeConfig> {
-        self.pick_node_except(config, existing, class, region, "").await
+        self.pick_node_except(config, existing, class, region, reservation, "").await
     }
 
     /// [`pick_node`](Self::pick_node) leaving out the node named `except`, the
@@ -2156,6 +2198,7 @@ impl Hosting {
         existing: &[HostedInstance],
         class: Option<&str>,
         region: Option<&str>,
+        reservation: Option<&str>,
         except: &str,
     ) -> Option<&'c NodeConfig> {
         // The asked-for region comes right after "answered": a node in it
@@ -2164,7 +2207,13 @@ impl Hosting {
         let mut best: Option<(&NodeConfig, (u8, bool, Rank))> = None;
         // A classed node takes only creates that name its class, and a create
         // that names none takes only the nodes that have none.
-        for node in config.nodes.iter().filter(|n| n.class.as_deref() == class && n.name != except) {
+        // A reserved worker takes its account's creates and no one else's; the
+        // pool takes everyone else's, and never a reserved worker.
+        for node in config
+            .nodes
+            .iter()
+            .filter(|n| n.class.as_deref() == class && n.name != except && n.reserved_for.as_deref() == reservation)
+        {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let Some(rank) = rank_node(self.node_capacity(node).await, here, node.priority) else {
                 continue;
@@ -2385,6 +2434,7 @@ mod tests {
                 priority: 0,
                 class: None,
                 region: None,
+                reserved_for: None,
                 name: "local".to_string(),
                 api: "http://127.0.0.1:4750".to_string(),
             }],
@@ -2549,7 +2599,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_is_picked_by_load() {
         let mut c = config();
-        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0, class: None, region: None });
+        c.nodes.push(NodeConfig { name: "second".into(), api: "http://127.0.0.1:4751".into(), agent: None, priority: 0, class: None, region: None, reserved_for: None });
         let h = Hosting::new(c);
         let existing = vec![HostedInstance {
             instance_id: "a".into(),
@@ -2569,7 +2619,7 @@ mod tests {
         }];
         // Neither node answers `/capacity` here — nothing is listening — so
         // both fall back to the index's own count and the emptier one wins.
-        assert_eq!(h.pick_node(&h.config(), &existing, None, None).await.unwrap().name, "second");
+        assert_eq!(h.pick_node(&h.config(), &existing, None, None, None).await.unwrap().name, "second");
     }
 
     fn hosted(id: &str, uptime: Option<u64>, players: Option<u32>) -> HostedInstance {
@@ -2975,7 +3025,36 @@ mod tests {
             priority: 0,
             class: class.map(String::from),
             region: None,
+            reserved_for: None,
         }
+    }
+
+    /// A reserved worker takes its owner's creates and nobody else's, and the
+    /// pool never gets it: an account with a reserved worker is placed on its
+    /// own workers only, and a stranger never lands on one.
+    #[tokio::test]
+    async fn a_reserved_worker_takes_its_owners_servers_and_the_pool_never_does() {
+        let owner = AccountId("aa".repeat(16));
+        let other = AccountId("bb".repeat(16));
+        let stranger = AccountId("cc".repeat(16));
+        let mut mine = classed("mine", None);
+        mine.reserved_for = Some(owner.0.clone());
+        let mut theirs = classed("theirs", None);
+        theirs.reserved_for = Some(other.0.clone());
+        let mut c = config();
+        c.nodes = vec![classed("pool", None), mine, theirs];
+        let h = Hosting::new(c);
+        let config = h.config();
+        let placed = |who: &AccountId| {
+            let reservation = Hosting::reservation_of(&config, who).map(str::to_string);
+            let (h, config) = (&h, &config);
+            async move { h.pick_node(config, &[], None, None, reservation.as_deref()).await.map(|n| n.name.clone()) }
+        };
+        assert_eq!(placed(&owner).await.as_deref(), Some("mine"));
+        assert_eq!(placed(&other).await.as_deref(), Some("theirs"));
+        assert_eq!(placed(&stranger).await.as_deref(), Some("pool"), "the pool, never a reserved worker");
+        assert!(Hosting::reservation_of(&config, &stranger).is_none());
+        assert!(!is_identity_hash("AA"), "a reservation is an identity hash");
     }
 
     /// Neither node answers, so both rank as unanswered and the class filter is
@@ -2989,7 +3068,7 @@ mod tests {
         let pick = |class: Option<&'static str>| {
             let h = &h;
             let config = &config;
-            async move { h.pick_node(config, &[], class, None).await.map(|n| n.name.clone()) }
+            async move { h.pick_node(config, &[], class, None, None).await.map(|n| n.name.clone()) }
         };
         assert_eq!(pick(None).await.as_deref(), Some("plain"), "a plain create stays off the classed node");
         assert_eq!(pick(Some("gold")).await.as_deref(), Some("big"));
@@ -3023,6 +3102,7 @@ mod tests {
     async fn a_create_lands_in_its_region_when_a_node_there_answered() {
         let at = |name: &str, api: &str, region: &str| NodeConfig {
             region: Some(region.into()),
+            reserved_for: None,
             api: api.into(),
             ..classed(name, None)
         };
@@ -3034,7 +3114,7 @@ mod tests {
         let config = h.config();
         let pick = |region: Option<&'static str>| {
             let (h, config) = (&h, &config);
-            async move { h.pick_node(config, &[], None, region).await.map(|n| n.name.clone()) }
+            async move { h.pick_node(config, &[], None, region, None).await.map(|n| n.name.clone()) }
         };
         assert_eq!(pick(Some("eu")).await.as_deref(), Some("near"));
         assert_eq!(pick(Some("us")).await.as_deref(), Some("far"));
@@ -3046,7 +3126,7 @@ mod tests {
         let h = Hosting::new(c);
         let config = h.config();
         assert_eq!(
-            h.pick_node(&config, &[], None, Some("eu")).await.map(|n| n.name.clone()).as_deref(),
+            h.pick_node(&config, &[], None, Some("eu"), None).await.map(|n| n.name.clone()).as_deref(),
             Some("far"),
             "a silent node in the region beat one that answered"
         );
@@ -3714,6 +3794,7 @@ mod tests {
             .iter()
             .map(|(addr, name, region)| NodeConfig {
                 region: Some(region.to_string()),
+                reserved_for: None,
                 api: format!("http://{addr}"),
                 ..classed(name, None)
             })
@@ -3830,7 +3911,7 @@ mod tests {
         )
         .unwrap();
         let h = Hosting::new(Hosting::load(&file).unwrap()).keep_state_beside(&file).unwrap();
-        let eu = crate::join::JoinSpec { name: None, region: Some("eu".into()), class: None, priority: 2 };
+        let eu = crate::join::JoinSpec { name: None, region: Some("eu".into()), class: None, priority: 2, reserved_for: None };
 
         assert!(h.create_join_code(&root, eu.clone(), 60, now).unwrap_err().to_string().contains("[join] hubs"), "no hub to give a worker");
         let mut text = std::fs::read_to_string(&file).unwrap();

@@ -100,6 +100,13 @@ quietly break:
   - **`/join` is not on a controller's allowlist.** A node page makes and
     revokes codes (an admin of the index, checked there); a machine joins
     directly. Codes need `[join] hubs` or none can be made.
+  - **A reserved worker is only its owner's, and the pool never gets one**
+    (`NodeConfig::reserved_for`, `Hosting::reservation_of`, `pick_node_except`).
+    An account with a reserved worker places only on its own workers, with no
+    fallback; a shared server never lands on a reserved one, and a move keeps a
+    server with its reservation. Worded as a placement rule only, no price or
+    tier, which live in the private repo. Caught by
+    `a_reserved_worker_takes_its_owners_servers_and_the_pool_never_does`.
   - **The workers view never waits for a silent worker**: each is asked at
     once and held to 8 s, so a worker that has just joined (or is down) is a
     row that says "no", not an empty table.

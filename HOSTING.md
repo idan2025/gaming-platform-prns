@@ -644,6 +644,24 @@ game's image is the machine's operator's choice, so a joined worker takes **no
 game** until you add a `[games.<id>]` section to its `agent.toml` (and the
 game's files), exactly as for a worker made with `setup-worker.sh`.
 
+### A worker reserved for one account
+
+A worker can be **reserved** for one account, identity hash, so that only that
+account's servers are placed on it:
+
+```toml
+[[nodes]]
+name = "w-alice"
+agent = "<control address>"
+reserved_for = "<account identity hash>"
+```
+
+A reserved account is placed on its own workers and on no other: when they
+have no room the create says so, and it does not fall back to the shared pool.
+The shared pool never takes a reserved worker. A move keeps a server with its
+reservation. On the page, the Admin tab's join codes take the same field
+(`reserved_for` in the request), so a worker can join already reserved.
+
 ## Placing servers through a controller
 
 A worker's page shows one machine. Add a `[controller]` section and the same

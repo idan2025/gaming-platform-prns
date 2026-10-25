@@ -655,6 +655,9 @@ struct JoinCodeBody {
     /// How long the code lasts, in minutes. Default an hour.
     #[serde(default)]
     valid_minutes: Option<u64>,
+    /// An account the worker is reserved for, by identity hash.
+    #[serde(default)]
+    reserved_for: Option<String>,
 }
 
 fn blank_is_none(v: Option<String>) -> Option<String> {
@@ -675,6 +678,7 @@ async fn make_join_code(
         region: blank_is_none(b.region),
         class: blank_is_none(b.class),
         priority: b.priority,
+        reserved_for: blank_is_none(b.reserved_for),
     };
     let (code, token) = hosting
         .create_join_code(&account, spec, b.valid_minutes.unwrap_or(60), std::time::SystemTime::now())
