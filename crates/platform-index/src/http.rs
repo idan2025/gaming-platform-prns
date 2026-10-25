@@ -77,6 +77,7 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/admin/admins", get(admins_list))
         .route("/admin/admins/:identity", axum::routing::delete(revoke_admin))
         .route("/admin/workers", get(workers))
+        .route("/admin/workers/:name/:action", post(worker_action))
         .route("/admin/join-codes", get(join_codes).post(make_join_code))
         .route("/admin/join-codes/:id", axum::routing::delete(revoke_join_code))
         .route("/admin/join-info", get(join_info))
@@ -763,6 +764,44 @@ async fn join(
 /// argument, not part of the text.
 async fn join_script() -> ([(header::HeaderName, &'static str); 1], &'static str) {
     ([(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], include_str!("../../../scripts/join-worker.sh"))
+}
+
+/// An admin sets a worker aside, drains it, puts it back, or restarts its
+/// servers. Restart takes a while, so it runs on after the answer; the worker's
+/// note says how far it got.
+async fn worker_action(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path((name, action)): axum::extract::Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    use crate::worker_state::WorkerState;
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    if !crate::hosting::valid_node_name(&name) {
+        return Err(fail(StatusCode::NOT_FOUND, "no such worker"));
+    }
+    let not_found = |e: anyhow::Error| {
+        if format!("{e:#}") == "no such worker" { fail(StatusCode::NOT_FOUND, e) } else { region_failure(e) }
+    };
+    match action.as_str() {
+        "cordon" => hosting.set_worker_state(&account, &name, WorkerState::Cordoned).map_err(not_found)?,
+        "uncordon" => hosting.set_worker_state(&account, &name, WorkerState::Active).map_err(not_found)?,
+        "drain" => hosting.set_worker_state(&account, &name, WorkerState::Draining).map_err(not_found)?,
+        "restart" => {
+            // Checked now, so a stranger or a missing worker hears at once.
+            hosting.worker_for_action(&account, &name).map_err(not_found)?;
+            let background = state.clone();
+            tokio::spawn(async move {
+                if let Some(h) = &background.hosting {
+                    if let Err(e) = h.restart_worker_servers(&account, &name).await {
+                        tracing::warn!(error = %format!("{e:#}"), "restarting a worker's servers failed");
+                    }
+                }
+            });
+        }
+        _ => return Err(fail(StatusCode::NOT_FOUND, "no such action")),
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize, Default)]

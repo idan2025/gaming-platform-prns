@@ -30,6 +30,9 @@ const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the hosting file is checked for edits.
 const HOSTING_RELOAD_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long between passes that move servers off a draining worker.
+const DRAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 const USAGE: &str = "\
 platform-index — an optional announce indexer and HTTP front door
 
@@ -166,6 +169,20 @@ async fn main() -> Result<()> {
                     if let Err(e) = hosting.reload_from(&path) {
                         tracing::warn!(error = %format!("{e:#}"), "hosting config not reloaded; keeping the one in force");
                     }
+                }
+            }
+        });
+    }
+
+    // Workers an admin is draining get their servers moved off, one at a time
+    // and a move at a time. The state is in a file, so a restart resumes it.
+    if state.hosting.is_some() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(DRAIN_EVERY).await;
+                if let Some(hosting) = &state.hosting {
+                    hosting.drain_pass().await;
                 }
             }
         });

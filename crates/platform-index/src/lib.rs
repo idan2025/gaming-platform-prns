@@ -12,6 +12,7 @@ pub mod node;
 pub mod quota;
 pub mod regions;
 pub mod registry;
+pub mod worker_state;
 
 // The codec and the query call live in `index-client`, so a launcher can ask an
 // index without depending on one. Re-exported rather than duplicated: both ends

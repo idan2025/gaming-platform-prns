@@ -107,6 +107,15 @@ quietly break:
     server with its reservation. Worded as a placement rule only, no price or
     tier, which live in the private repo. Caught by
     `a_reserved_worker_takes_its_owners_servers_and_the_pool_never_does`.
+  - **A cordoned or draining worker takes no new server, and a drain moves
+    servers only the way a move does** (`worker_state.rs`, `Hosting::drain_pass`,
+    `worker-states.json`). The state gates `pick_node_except` and every move
+    target, so neither a create nor a move can land on it; a drain never leaves
+    a server's region, class or reservation and never removes one that could not
+    move. The state is a file beside the hosting file, not a rewrite of it, and a
+    file that does not parse is an error (an empty one would put every draining
+    worker back in service). "Restart" restarts games, not the agent process.
+    Caught by `a_drained_worker_loses_its_servers_and_takes_no_new_ones`.
   - **The workers view never waits for a silent worker**: each is asked at
     once and held to 8 s, so a worker that has just joined (or is down) is a
     row that says "no", not an empty table.

@@ -662,6 +662,28 @@ The shared pool never takes a reserved worker. A move keeps a server with its
 reservation. On the page, the Admin tab's join codes take the same field
 (`reserved_for` in the request), so a worker can join already reserved.
 
+### Taking a worker out of service: cordon, drain, restart
+
+On the Admin tab's Workers table (or `POST /admin/workers/<name>/<action>` on
+the index, an admin only):
+
+- **cordon**: the worker takes no new server, by create or by move. Its own
+  servers keep running. **uncordon** puts it back.
+- **drain**: cordon, and the index moves the worker's servers to other workers,
+  one at a time (every 15 s, and again after an index restart: the state is in
+  `worker-states.json` beside the hosting file). Each server moves the way any
+  move does, so it stays within its region, class and reservation; a server
+  with nowhere to go stays where it is and the worker's line names it. When it
+  is empty the line says so, and the worker can be removed from the hosting
+  file with nothing on it.
+- **restart**: stops and starts each running server on the worker, one at a
+  time (players are dropped). A stopped server stays stopped. This restarts the
+  games, not the agent on the machine, which the index cannot reach: restart
+  that with `systemctl` or `docker restart` on the machine.
+
+To replace a worker: make a join code for the new one, drain the old one, wait
+for "drained and empty", then remove its block from the hosting file.
+
 ## Placing servers through a controller
 
 A worker's page shows one machine. Add a `[controller]` section and the same

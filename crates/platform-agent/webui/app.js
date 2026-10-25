@@ -3431,20 +3431,58 @@ async function loadAdmin() {
       box.appendChild(el("h4", null, "Workers"));
       const table = el("table", "admin-workers");
       const head = el("tr");
-      for (const h of ["Worker", "Region", "Class", "Answers", "Servers", "Running", "Free memory", "Free disk"]) head.appendChild(el("th", null, h));
+      for (const h of ["Worker", "Region", "Class", "State", "Answers", "Servers", "Running", "Free memory", "Free disk", ""]) head.appendChild(el("th", null, h));
       table.appendChild(head);
+      let busy = false;
       for (const w of workers) {
         const c = w.capacity || {};
         const tr = el("tr");
-        for (const v of [w.name, w.region || "\u2014", w.class || "\u2014", w.answered ? "yes" : "no", String(w.servers),
+        const state = w.state || "active";
+        if (state === "draining") busy = true;
+        if (w.note && /restarting/.test(w.note)) busy = true;
+        for (const v of [w.name + (w.reserved_for ? " (reserved)" : ""), w.region || "\u2014", w.class || "\u2014"]) tr.appendChild(el("td", null, v));
+        const st = el("td", null, state + (w.note ? " \u00b7 " + w.note : ""));
+        st.style.whiteSpace = "normal";
+        st.style.minWidth = "180px";
+        tr.appendChild(st);
+        for (const v of [w.answered ? "yes" : "no", String(w.servers),
           c.max_instances != null ? c.running + " of " + c.max_instances : "\u2014",
           c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : "\u2014",
           c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : "\u2014"]) tr.appendChild(el("td", null, v));
+        const acts = el("td");
+        const act = (label, action, ask) => {
+          const b = el("button", "btn", label);
+          b.type = "button";
+          b.style.marginRight = "6px";
+          b.onclick = async () => {
+            if (ask && !confirm(ask)) return;
+            try { await withInFlight(api("POST", "/controller/admin/workers/" + encodeURIComponent(w.name) + "/" + action)); loadAdmin(); }
+            catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
+          };
+          acts.appendChild(b);
+        };
+        if (state === "active") {
+          act("Cordon", "cordon", "Stop " + w.name + " taking new servers? Its servers keep running.");
+          act("Drain", "drain", "Drain " + w.name + "? It takes no new servers and its servers are moved to other workers, one at a time.");
+        } else {
+          act("Put back in service", "uncordon");
+          if (state === "cordoned") act("Drain", "drain", "Move " + w.name + "'s servers to other workers, one at a time?");
+        }
+        act("Restart servers", "restart", "Restart every running server on " + w.name + ", one at a time? Players on them are dropped.");
+        tr.appendChild(acts);
         table.appendChild(tr);
       }
       const wrap = el("div", "table-wrap");
       wrap.appendChild(table);
       box.appendChild(wrap);
+      box.appendChild(el("p", "muted small", "Cordon keeps a worker from getting new servers. Drain also moves its servers off, within each one's region, class and reservation; a server with nowhere to go stays and is named here. A drained, empty worker can be removed from the hosting file. Restart servers restarts the games, not the agent on the machine."));
+      // Moves take a while: keep the table fresh while one is going, unless a field is being typed in.
+      if (busy) {
+        setTimeout(() => {
+          const body = $("admin-body");
+          if (body && document.body.contains(body) && !body.contains(document.activeElement) && !joinShown) loadAdmin();
+        }, 10000);
+      }
 
       box.appendChild(el("h4", null, "Add a worker"));
       box.appendChild(joinWizard(workers, joinInfo, joinCodes));

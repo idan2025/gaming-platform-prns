@@ -446,6 +446,10 @@ pub struct Hosting {
     /// Join codes, and the hosting file a joining worker is written into.
     join_codes: crate::join::JoinStore,
     hosting_file: Option<std::path::PathBuf>,
+    /// Workers set aside (cordoned, draining), kept beside the hosting file.
+    worker_states: crate::worker_state::WorkerStates,
+    /// What an admin's last action on a worker is doing or did, shown beside it.
+    notes: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Held while the hosting file is read, changed and written back.
     file_lock: std::sync::Mutex<()>,
 }
@@ -481,6 +485,12 @@ pub struct WorkerView {
     /// The account it is reserved for, if any (identity hash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_for: Option<String>,
+    /// `active`, `cordoned` (takes no new server) or `draining` (and its servers
+    /// are being moved off).
+    pub state: String,
+    /// What the last action on it is doing or did, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// Whether it answered just now. A silent worker reports nothing else.
     pub answered: bool,
     /// Servers the index sees on it.
@@ -537,6 +547,8 @@ impl Hosting {
             admin_store: Default::default(),
             join_codes: Default::default(),
             hosting_file: None,
+            worker_states: Default::default(),
+            notes: Default::default(),
             file_lock: Default::default(),
         }
     }
@@ -1311,7 +1323,12 @@ impl Hosting {
     ) -> Result<NodeConfig> {
         // A move stays with its reservation: a reserved server moves between its
         // owner's workers, and a pool server never lands on a reserved one.
-        let eligible = |n: &&NodeConfig| n.class == from.class && n.name != from.name && n.reserved_for == from.reserved_for;
+        let eligible = |n: &&NodeConfig| {
+            n.class == from.class
+                && n.name != from.name
+                && n.reserved_for == from.reserved_for
+                && self.worker_states.get(&n.name).takes_new_servers()
+        };
         let candidates: Vec<&NodeConfig> = match target {
             MoveTarget::Auto => config.nodes.iter().filter(eligible).filter(|n| n.region == from.region).collect(),
             MoveTarget::Worker(name) => {
@@ -1324,6 +1341,9 @@ impl Hosting {
                 }
                 if node.reserved_for != from.reserved_for {
                     return Err(anyhow!("that worker is reserved for another account"));
+                }
+                if !self.worker_states.get(&node.name).takes_new_servers() {
+                    return Err(anyhow!("that worker is not taking new servers"));
                 }
                 if node.region != from.region {
                     return Err(anyhow!("that worker is in another region; ask an admin to move it there"));
@@ -1359,7 +1379,7 @@ impl Hosting {
         let (_, from) = self.owned(account, instance_id).await?;
         let existing = self.all_instances().await?;
         let mut workers = Vec::new();
-        for node in config.nodes.iter().filter(|n| n.class == from.class && n.name != from.name && n.region == from.region && n.reserved_for == from.reserved_for) {
+        for node in config.nodes.iter().filter(|n| n.class == from.class && n.name != from.name && n.region == from.region && n.reserved_for == from.reserved_for && self.worker_states.get(&n.name).takes_new_servers()) {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let room = match rank_node(self.node_capacity(node).await, here, node.priority) {
                 Some(rank) if rank.0 == 1 => "room",
@@ -1472,6 +1492,8 @@ impl Hosting {
                 class: node.class.clone(),
                 priority: node.priority,
                 reserved_for: node.reserved_for.clone(),
+                state: self.worker_states.get(&node.name).word().to_string(),
+                note: self.notes.lock().unwrap_or_else(|e| e.into_inner()).get(&node.name).cloned(),
                 answered: capacity.is_some(),
                 servers: instances.map(|i| i.len()).unwrap_or(0),
                 capacity,
@@ -1734,12 +1756,116 @@ impl Hosting {
         Ok(Enrolled { name, region: spec.region.clone(), class: spec.class.clone(), priority: spec.priority, hubs })
     }
 
+    fn note(&self, worker: &str, text: impl Into<String>) {
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).insert(worker.to_string(), text.into());
+    }
+
+    fn worker_named(&self, name: &str) -> Result<NodeConfig> {
+        self.config().nodes.iter().find(|n| n.name == name).cloned().ok_or_else(|| anyhow!("no such worker"))
+    }
+
+    /// Cordon a worker (no new server, by create or move; its own keep running),
+    /// drain it (cordoned, and the index moves its servers to other workers) or
+    /// put it back in service. A worker draining or cordoned stays so across an
+    /// index restart.
+    pub fn set_worker_state(&self, admin: &AccountId, name: &str, state: crate::worker_state::WorkerState) -> Result<()> {
+        self.admin_for(admin, "change a worker's state")?;
+        self.worker_named(name)?;
+        self.worker_states.set(name, state)?;
+        self.note(name, match state {
+            crate::worker_state::WorkerState::Active => "back in service".to_string(),
+            crate::worker_state::WorkerState::Cordoned => "taking no new servers".to_string(),
+            crate::worker_state::WorkerState::Draining => "draining: moving its servers off".to_string(),
+        });
+        tracing::info!(worker = %name, state = state.word(), by = %admin.0, "a worker's state was set");
+        Ok(())
+    }
+
+    /// Check an action on a worker is the caller's to take and the worker exists.
+    pub fn worker_for_action(&self, admin: &AccountId, name: &str) -> Result<()> {
+        self.admin_for(admin, "restart a worker's servers")?;
+        self.worker_named(name).map(|_| ())
+    }
+
+    /// Restart the running servers on a worker, one at a time: stop, then start.
+    /// A stopped server stays stopped. This restarts the games, not the agent
+    /// process on the machine, which the index has no way to reach.
+    pub async fn restart_worker_servers(&self, admin: &AccountId, name: &str) -> Result<()> {
+        self.admin_for(admin, "restart a worker's servers")?;
+        let node = self.worker_named(name)?;
+        let running: Vec<HostedInstance> = self.node_instances(&node).await?.into_iter().filter(|i| i.state == "running").collect();
+        let total = running.len();
+        let mut failed = Vec::new();
+        for (n, instance) in running.iter().enumerate() {
+            self.note(name, format!("restarting servers: {} of {total}", n + 1));
+            let result = async {
+                self.stop_on(&node, &instance.instance_id).await?;
+                self.start_on(&node, &instance.instance_id).await
+            }
+            .await;
+            if let Err(e) = result {
+                failed.push(format!("{}: {e:#}", instance.name));
+            }
+        }
+        self.note(
+            name,
+            if failed.is_empty() { format!("restarted {total} server(s)") } else { format!("restarted {} of {total}; failed: {}", total - failed.len(), failed.join("; ")) },
+        );
+        Ok(())
+    }
+
+    /// One pass over the workers being drained: move one server off each, to a
+    /// worker that fits it (same class, region and reservation, taking new
+    /// servers). A server with nowhere to go stays and is named; an empty worker
+    /// is said to be safe to remove. Run on a timer; one move at a time.
+    pub async fn drain_pass(&self) {
+        let config = self.config();
+        for (name, state) in self.worker_states.set_aside() {
+            if state != crate::worker_state::WorkerState::Draining {
+                continue;
+            }
+            let Some(node) = config.nodes.iter().find(|n| n.name == name) else { continue };
+            let instances = match self.node_instances(node).await {
+                Ok(rows) => rows,
+                Err(_) => {
+                    self.note(&name, "draining: the worker did not answer");
+                    continue;
+                }
+            };
+            if instances.is_empty() {
+                self.note(&name, "drained and empty: safe to remove from the hosting file");
+                continue;
+            }
+            let mut stuck = Vec::new();
+            let mut moved = false;
+            for instance in &instances {
+                let Some(owner) = instance.owner.clone() else {
+                    stuck.push(format!("{} has no owner", instance.name));
+                    continue;
+                };
+                match self.relocate(&AccountId(owner), &instance.instance_id).await {
+                    Ok(_) => {
+                        moved = true;
+                        break;
+                    }
+                    Err(e) => stuck.push(format!("{}: {e:#}", instance.name)),
+                }
+            }
+            if moved {
+                self.note(&name, format!("draining: moved one, {} to go", instances.len() - 1));
+            } else {
+                self.note(&name, format!("draining: {} stuck, {}", stuck.len(), stuck.first().cloned().unwrap_or_default()));
+            }
+        }
+    }
+
     /// Keep region requests and granted admins in files beside the hosting
     /// file from now on (made on first write), reading any already there.
     pub fn keep_state_beside(mut self, hosting_file: &std::path::Path) -> Result<Self> {
         self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
         self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
         self.join_codes = crate::join::JoinStore::load(&hosting_file.with_file_name("join-codes.json"))?;
+        self.worker_states = crate::worker_state::WorkerStates::load(&hosting_file.with_file_name("worker-states.json"))?;
         self.hosting_file = Some(hosting_file.to_path_buf());
         Ok(self)
     }
@@ -2213,6 +2339,7 @@ impl Hosting {
             .nodes
             .iter()
             .filter(|n| n.class.as_deref() == class && n.name != except && n.reserved_for.as_deref() == reservation)
+            .filter(|n| self.worker_states.get(&n.name).takes_new_servers())
         {
             let here = existing.iter().filter(|i| i.node == node.name).count();
             let Some(rank) = rank_node(self.node_capacity(node).await, here, node.priority) else {
@@ -3749,6 +3876,42 @@ mod tests {
         assert_eq!(to.lock().unwrap().imported, b"the server's files");
         assert_eq!(to.lock().unwrap().identity, "ab".repeat(64), "the address did not travel");
         assert!(from.lock().unwrap().servers.is_empty());
+    }
+
+    /// A cordoned worker takes no server by move or create and keeps its own;
+    /// draining moves them off and says when it is empty; only an admin sets a
+    /// state, and putting it back in service lets it take servers again.
+    #[tokio::test]
+    async fn a_drained_worker_loses_its_servers_and_takes_no_new_ones() {
+        use crate::worker_state::WorkerState;
+        let (a, from) = moving_node(true, false).await;
+        let (b, to) = moving_node(false, false).await;
+        let root = AccountId("ad".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+        let mut cfg = two_nodes_at(a, b);
+        cfg.admins = vec![root.0.clone()];
+        let h = Hosting::new(cfg);
+        let owner = AccountId("aa".repeat(16));
+
+        assert!(h.set_worker_state(&stranger, "b", WorkerState::Cordoned).is_err(), "only an admin sets a state");
+        assert!(h.set_worker_state(&root, "nowhere", WorkerState::Cordoned).is_err());
+        h.set_worker_state(&root, "b", WorkerState::Cordoned).unwrap();
+        let refused = h.relocate(&owner, "srv").await.unwrap_err().to_string();
+        assert!(refused.contains("no other worker"), "a cordoned worker takes no move: {refused}");
+        assert_eq!(from.lock().unwrap().servers.len(), 1, "and the server stayed");
+        let view = h.workers(&root).await.unwrap();
+        assert_eq!(view.iter().map(|w| w.state.as_str()).collect::<Vec<_>>(), ["active", "cordoned"]);
+
+        h.set_worker_state(&root, "b", WorkerState::Active).unwrap();
+        h.set_worker_state(&root, "a", WorkerState::Draining).unwrap();
+        h.drain_pass().await;
+        assert!(from.lock().unwrap().servers.is_empty(), "the server left the draining worker");
+        assert_eq!(to.lock().unwrap().servers.len(), 1, "and arrived on the other");
+        h.drain_pass().await;
+        let view = h.workers(&root).await.unwrap();
+        let drained = view.iter().find(|w| w.name == "a").unwrap();
+        assert_eq!(drained.state, "draining");
+        assert!(drained.note.as_deref().unwrap().contains("safe to remove"), "{:?}", drained.note);
     }
 
     /// A move that fails on the new node removes what it made there. The old
