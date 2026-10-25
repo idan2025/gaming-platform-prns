@@ -52,6 +52,20 @@ struct Totp {
     last_step: u64,
 }
 
+/// What an account may do on the page. An admin manages accounts, game files,
+/// interfaces and packs, and acts as an admin of the index through a
+/// controller; a user runs servers. The API token counts as an admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// The default for an account written before roles existed: every account
+    /// could do everything then, and taking that away on upgrade would lock
+    /// an operator out of their own node.
+    #[default]
+    Admin,
+    User,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct User {
     username: String,
@@ -60,6 +74,11 @@ struct User {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     totp: Option<Totp>,
     created_unix: u64,
+    #[serde(default)]
+    role: Role,
+    /// A user asked to become an admin, at this time. Decided by an admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admin_requested_unix: Option<u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -73,6 +92,10 @@ pub struct AccountView {
     pub username: String,
     pub totp_enabled: bool,
     pub created_unix: u64,
+    pub role: Role,
+    /// Set while this user's request to become an admin waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_requested_unix: Option<u64>,
 }
 
 /// A sign-in that did not succeed.
@@ -175,8 +198,12 @@ impl Accounts {
     }
 
     /// Add an account. The caller decides who may (the first needs the API
-    /// token; later ones a signed-in account).
+    /// token; later ones an admin).
     pub fn create(&self, username: &str, password: &str, now: SystemTime) -> Result<AccountView> {
+        self.create_with_role(username, password, Role::Admin, now)
+    }
+
+    pub fn create_with_role(&self, username: &str, password: &str, role: Role, now: SystemTime) -> Result<AccountView> {
         if !valid_username(username) {
             return Err(anyhow!("a username is 1 to 32 characters: lower case, digits, '.', '_' and '-'"));
         }
@@ -186,7 +213,14 @@ impl Accounts {
         if store.users.iter().any(|u| u.username == username) {
             return Err(anyhow!("that username is taken"));
         }
-        store.users.push(User { username: username.into(), password: hashed, totp: None, created_unix: unix(now) });
+        store.users.push(User {
+            username: username.into(),
+            password: hashed,
+            totp: None,
+            created_unix: unix(now),
+            role,
+            admin_requested_unix: None,
+        });
         self.save(&store)?;
         Ok(view(store.users.last().expect("just pushed")))
     }
@@ -201,11 +235,61 @@ impl Accounts {
         if store.users.len() == 1 {
             return Err(anyhow!("this is the last account; add another before removing it"));
         }
+        if is_last_admin(&store, username) {
+            return Err(anyhow!("this is the last admin; make another account an admin first"));
+        }
         store.users.retain(|u| u.username != username);
         self.save(&store)?;
         drop(store);
         self.end_sessions_of(username);
         Ok(())
+    }
+
+    /// The role of an account, if it exists.
+    pub fn role(&self, username: &str) -> Option<Role> {
+        self.lock_store().users.iter().find(|u| u.username == username).map(|u| u.role)
+    }
+
+    /// Make an account an admin or a user. The last admin is never made a user,
+    /// or nobody could manage the node without the token. Settles any request
+    /// to become an admin.
+    pub fn set_role(&self, username: &str, role: Role) -> Result<AccountView> {
+        let mut store = self.lock_store();
+        if role == Role::User && is_last_admin(&store, username) {
+            return Err(anyhow!("this is the last admin; make another account an admin first"));
+        }
+        let user = store.users.iter_mut().find(|u| u.username == username).ok_or_else(|| anyhow!("no such account"))?;
+        user.role = role;
+        user.admin_requested_unix = None;
+        let out = view(user);
+        self.save(&store)?;
+        Ok(out)
+    }
+
+    /// A user asks to become an admin. An admin asking is refused (nothing to
+    /// ask for); asking twice keeps the first time.
+    pub fn request_admin(&self, username: &str, now: SystemTime) -> Result<AccountView> {
+        let mut store = self.lock_store();
+        let user = store.users.iter_mut().find(|u| u.username == username).ok_or_else(|| anyhow!("no such account"))?;
+        if user.role == Role::Admin {
+            return Err(anyhow!("this account is already an admin"));
+        }
+        user.admin_requested_unix.get_or_insert(unix(now));
+        let out = view(user);
+        self.save(&store)?;
+        Ok(out)
+    }
+
+    /// An admin turns a request down: the user stays a user.
+    pub fn deny_admin(&self, username: &str) -> Result<AccountView> {
+        let mut store = self.lock_store();
+        let user = store.users.iter_mut().find(|u| u.username == username).ok_or_else(|| anyhow!("no such account"))?;
+        if user.admin_requested_unix.take().is_none() {
+            return Err(anyhow!("that account has not asked to become an admin"));
+        }
+        let out = view(user);
+        self.save(&store)?;
+        Ok(out)
     }
 
     /// Check a sign-in and, if it holds, start a session. Returns the session
@@ -368,7 +452,14 @@ fn view(u: &User) -> AccountView {
         username: u.username.clone(),
         totp_enabled: u.totp.as_ref().is_some_and(|t| t.enabled),
         created_unix: u.created_unix,
+        role: u.role,
+        admin_requested_unix: u.admin_requested_unix,
     }
+}
+
+fn is_last_admin(store: &Store, username: &str) -> bool {
+    store.users.iter().any(|u| u.username == username && u.role == Role::Admin)
+        && store.users.iter().filter(|u| u.role == Role::Admin).count() == 1
 }
 
 fn unix(t: SystemTime) -> u64 {
@@ -598,6 +689,37 @@ mod tests {
         a.create("second", "another long password", now).unwrap();
         a.remove("op").unwrap();
         assert!(a.session(&mine).is_none(), "a removed account's sessions end");
+    }
+
+    /// A user asks to become an admin and an admin decides; the last admin is
+    /// never made a user or removed; an account written before roles existed
+    /// reads as an admin, so an upgrade locks nobody out.
+    #[test]
+    fn a_user_becomes_an_admin_only_by_an_admin_and_the_last_admin_stays() {
+        let (dir, a) = accounts();
+        let now = SystemTime::now();
+        a.create("op", "correct horse battery", now).unwrap();
+        a.create_with_role("guest", "another long password", Role::User, now).unwrap();
+        assert_eq!(a.role("guest"), Some(Role::User));
+        assert!(a.request_admin("op", now).is_err(), "an admin has nothing to ask for");
+        let asked = a.request_admin("guest", now).unwrap();
+        assert!(asked.admin_requested_unix.is_some());
+        a.deny_admin("guest").unwrap();
+        assert!(a.get("guest").unwrap().admin_requested_unix.is_none());
+        assert!(a.deny_admin("guest").is_err(), "nothing left to deny");
+
+        assert!(a.set_role("op", Role::User).is_err(), "the last admin");
+        a.request_admin("guest", now).unwrap();
+        let promoted = a.set_role("guest", Role::Admin).unwrap();
+        assert_eq!(promoted.role, Role::Admin);
+        assert!(promoted.admin_requested_unix.is_none(), "promotion settles the request");
+        a.set_role("op", Role::User).unwrap();
+        assert!(a.remove("guest").is_err(), "now guest is the last admin");
+
+        // An account file from before roles: every account was an admin then.
+        let path = dir.path().join("old.json");
+        std::fs::write(&path, br#"{"users":[{"username":"old","password":"$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaA","created_unix":1}]}"#).unwrap();
+        assert_eq!(Accounts::load(&path).unwrap().role("old"), Some(Role::Admin));
     }
 
     #[test]

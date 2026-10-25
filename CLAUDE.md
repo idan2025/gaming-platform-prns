@@ -66,6 +66,22 @@ quietly break:
   (every other session of the account) and when an account is removed; the
   last account cannot be removed. The token is no account: it changes no
   password and turns on no codes (403).
+- **A user account runs servers; everything else is an admin's** (2026-10-25,
+  `accounts::Role`, `api::user_may`, checked in `require_token`). A route
+  `user_may` does not name is refused to a user, so a new route is an admin's
+  until someone decides otherwise; a server's identity, a move's plumbing,
+  the account list and acting as the node at its controller are refused by
+  name. An account file from before roles reads as admins (the safe
+  direction for the people who already ran the node), and the last admin can
+  be neither demoted nor removed. Caught by
+  `a_user_runs_servers_only_until_an_admin_makes_them_one` and
+  `a_route_nobody_listed_is_an_admins`.
+- **An index admin is the hosting file's or granted by an admin**
+  (`platform-index/src/admins.rs`, `index-admins.json` beside the hosting
+  file). Asking grants nothing; only an identity that is already an admin
+  approves, a grant can be revoked and a file admin cannot (edit the file).
+  A store that does not parse is an error, never an empty list. Caught by
+  `an_account_becomes_an_index_admin_only_by_an_admin`.
 
 **The agent handles SIGTERM itself** (2026-09-23). As PID 1 in a container it
 gets no default action for a signal it has no handler for, so without one every

@@ -102,6 +102,10 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
         <span>Mesh</span>
       </button>
+      <button id="tab-admin" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-admin" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg>
+        <span>Admin</span><span class="nav-count" id="nav-admin-count"></span>
+      </button>
       <button id="tab-account" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-account" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>
         <span>Account</span>
@@ -297,7 +301,7 @@
         </div>
       </section>
       <section id="tab-panel-requests" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-requests">
-        <p class="muted small">A move to another region is asked for here and decided by an admin of the controller. Once approved, the server moves to a worker in that region, which becomes its home; coming back is another request.</p>
+        <p class="muted small">A move to another region is asked for from a server's menu (Move to another worker…) and decided by an admin of the controller, on the Admin tab. Once approved, the server moves to a worker in that region, which becomes its home; coming back is another request.</p>
         <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">
           <button id="requests-refresh" type="button" class="btn">Refresh</button>
         </div>
@@ -306,6 +310,12 @@
       </section>
       <section id="tab-panel-account" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-account">
         <div id="account-body"></div>
+      </section>
+      <section id="tab-panel-admin" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-admin">
+        <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">
+          <button id="admin-refresh" type="button" class="btn">Refresh</button>
+        </div>
+        <div id="admin-body"></div>
       </section>
     </main>
   </div>

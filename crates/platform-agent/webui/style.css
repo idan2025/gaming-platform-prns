@@ -506,3 +506,10 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 #tab-panel-account .req-card input { width: 100%; max-width: 360px; }
 #login-code-wrap { margin-top: 4px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; overflow-wrap: anywhere; }
+
+/* Admin tab: the controller's workers. */
+.table-wrap { overflow-x: auto; }
+.admin-workers { width: 100%; border-collapse: collapse; font-size: 13px; }
+.admin-workers th, .admin-workers td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.admin-workers th { color: var(--text-2); font-weight: 550; }
+#tab-panel-admin h4 { margin: 16px 0 6px; }

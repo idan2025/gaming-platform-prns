@@ -70,6 +70,13 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/admin/region-requests", get(admin_region_requests))
         .route("/admin/region-requests/:rid/approve", post(approve_region_request))
         .route("/admin/region-requests/:rid/deny", post(deny_region_request))
+        .route("/admin-requests", post(ask_admin))
+        .route("/admin/admin-requests", get(admin_requests))
+        .route("/admin/admin-requests/:rid/approve", post(approve_admin_request))
+        .route("/admin/admin-requests/:rid/deny", post(deny_admin_request))
+        .route("/admin/admins", get(admins_list))
+        .route("/admin/admins/:identity", axum::routing::delete(revoke_admin))
+        .route("/admin/workers", get(workers))
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
@@ -311,7 +318,15 @@ async fn me(
     let identity = auth
         .authenticate(&token, std::time::SystemTime::now())
         .map_err(|e| fail(StatusCode::UNAUTHORIZED, e))?;
-    Ok(Json(json!({ "identity": hex::encode(identity.as_bytes()) })))
+    let identity = hex::encode(identity.as_bytes());
+    drop(auth);
+    // Whether this account is an admin, and its latest request to become one,
+    // where this index hosts: a page needs both to offer the right thing.
+    let (admin, admin_request) = match &state.hosting {
+        Some(h) => h.admin_status(&crate::quota::AccountId(identity.clone())),
+        None => (false, None),
+    };
+    Ok(Json(json!({ "identity": identity, "admin": admin, "admin_request": admin_request })))
 }
 
 /// What this index will host, if anything. **Unauthenticated on purpose**: a
@@ -533,6 +548,94 @@ async fn approve_region_request(
         .map_err(region_failure)
 }
 
+/// A note or reason from a request body, held to one short line of text.
+fn short_text(text: Option<String>) -> Option<String> {
+    text.map(|n| n.chars().filter(|c| !c.is_control()).take(300).collect::<String>())
+        .filter(|n| !n.trim().is_empty())
+}
+
+#[derive(Deserialize, Default)]
+struct AskAdminBody {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Any account asks to become an admin of this index; an admin decides.
+async fn ask_admin(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    body: Option<Json<AskAdminBody>>,
+) -> ApiResult<crate::admins::AdminRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let note = short_text(body.and_then(|Json(b)| b.note));
+    hosting.request_admin(&account, note, std::time::SystemTime::now()).map(Json).map_err(region_failure)
+}
+
+async fn admin_requests(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::admins::AdminRequest>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.admin_requests(&account).map(Json).map_err(region_failure)
+}
+
+async fn approve_admin_request(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(rid): axum::extract::Path<String>,
+) -> ApiResult<crate::admins::AdminRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let rid = request_id(&rid)?;
+    hosting.approve_admin_request(&account, rid, std::time::SystemTime::now()).map(Json).map_err(region_failure)
+}
+
+async fn deny_admin_request(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(rid): axum::extract::Path<String>,
+    body: Option<Json<DenyBody>>,
+) -> ApiResult<crate::admins::AdminRequest> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let rid = request_id(&rid)?;
+    let reason = short_text(body.and_then(|Json(b)| b.note));
+    hosting.deny_admin_request(&account, rid, reason, std::time::SystemTime::now()).map(Json).map_err(region_failure)
+}
+
+async fn admins_list(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::hosting::AdminView>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.admins(&account).map(Json).map_err(region_failure)
+}
+
+async fn revoke_admin(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(identity): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    if !(identity.len() == 32 && identity.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(fail(StatusCode::NOT_FOUND, "no such admin"));
+    }
+    hosting.revoke_admin(&account, &identity).map(|()| Json(json!({ "revoked": identity }))).map_err(region_failure)
+}
+
+async fn workers(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::hosting::WorkerView>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.workers(&account).await.map(Json).map_err(region_failure)
+}
+
 #[derive(Deserialize, Default)]
 struct DenyBody {
     #[serde(default)]
@@ -549,10 +652,7 @@ async fn deny_region_request(
     let account = account_of(&state, &headers).await?;
     let rid = request_id(&rid)?;
     // A note is shown to the owner as text; held to one short line.
-    let note = body
-        .and_then(|Json(b)| b.note)
-        .map(|n| n.chars().filter(|c| !c.is_control()).take(300).collect::<String>())
-        .filter(|n| !n.trim().is_empty());
+    let note = short_text(body.and_then(|Json(b)| b.note));
     hosting
         .deny_region_request(&account, rid, note, std::time::SystemTime::now())
         .map(Json)

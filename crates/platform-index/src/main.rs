@@ -100,10 +100,9 @@ async fn main() -> Result<()> {
                     "{path} does not enable hosting: it needs both a games list and a node"
                 );
             }
-            // Region move requests live beside the hosting file, so they
-            // survive a restart (regions.rs).
-            let requests = std::path::Path::new(path).with_file_name("region-requests.json");
-            Some(platform_index::hosting::Hosting::new(config).keep_region_requests_in(&requests)?)
+            // Region move requests and granted admins live beside the
+            // hosting file, so they survive a restart (regions.rs, admins.rs).
+            Some(platform_index::hosting::Hosting::new(config).keep_state_beside(std::path::Path::new(path))?)
         }
     };
 

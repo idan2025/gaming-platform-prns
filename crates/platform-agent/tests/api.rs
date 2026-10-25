@@ -808,3 +808,69 @@ async fn the_page_signs_in_with_an_account_made_once_with_the_token() {
     let file = std::fs::read_to_string(dir.path().join("web-accounts.json")).unwrap();
     assert!(!file.contains("correct horse"), "a password reached the file in clear");
 }
+
+/// A user runs servers and nothing else; asks to become an admin; an admin
+/// promotes them, and their very next request has the admin's reach, with no
+/// new sign-in. The node enforces it, not the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_runs_servers_only_until_an_admin_makes_them_one() {
+    let token = "t".repeat(32);
+    let Some((addr, _dir)) = serve_with_token(&token).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let c = reqwest::Client::new();
+    let url = |p: &str| format!("http://{addr}{p}");
+    let setup = c.post(url("/auth/setup")).json(&serde_json::json!({"token": token, "username": "op", "password": "correct horse battery"}));
+    assert_eq!(setup.send().await.unwrap().status(), 200);
+    let login = |user: &'static str, pass: &'static str| {
+        let c = c.clone();
+        let u = url("/auth/login");
+        async move {
+            let r: serde_json::Value = c.post(u).json(&serde_json::json!({"username": user, "password": pass})).send().await.unwrap().json().await.unwrap();
+            r["session"].as_str().unwrap().to_string()
+        }
+    };
+    let admin = login("op", "correct horse battery").await;
+    let added = c.post(url("/auth/users")).bearer_auth(&admin).json(&serde_json::json!({"username": "guest", "password": "another long password"}));
+    let added: serde_json::Value = added.send().await.unwrap().json().await.unwrap();
+    assert_eq!(added["role"], "user", "a new account is a user unless asked otherwise");
+
+    let guest = login("guest", "another long password").await;
+    let status = |s: &str, m: reqwest::Method, p: &str| c.request(m, url(p)).bearer_auth(s.to_string()).send();
+    assert_eq!(status(&guest, reqwest::Method::GET, "/instances").await.unwrap().status(), 200, "a user sees servers");
+    for (m, p) in [
+        (reqwest::Method::POST, "/orphans/clean"),
+        (reqwest::Method::GET, "/instances/x/identity"),
+        (reqwest::Method::POST, "/packs"),
+        (reqwest::Method::GET, "/controller/admin/region-requests"),
+        (reqwest::Method::POST, "/auth/users/guest/role"),
+        (reqwest::Method::GET, "/auth/users"),
+    ] {
+        assert_eq!(status(&guest, m.clone(), p).await.unwrap().status(), 403, "{m} {p} is an admin's");
+    }
+
+    let asked = c.post(url("/auth/admin-request")).bearer_auth(&guest).send().await.unwrap();
+    assert_eq!(asked.status(), 200);
+    let users: serde_json::Value = c.get(url("/auth/users")).bearer_auth(&admin).send().await.unwrap().json().await.unwrap();
+    let g = users.as_array().unwrap().iter().find(|u| u["username"] == "guest").unwrap();
+    assert!(g["admin_requested_unix"].is_u64(), "the admin sees the request");
+
+    let promote = c.post(url("/auth/users/guest/role")).bearer_auth(&admin).json(&serde_json::json!({"role": "admin"}));
+    assert_eq!(promote.send().await.unwrap().status(), 200);
+    assert_ne!(status(&guest, reqwest::Method::POST, "/orphans/clean").await.unwrap().status(), 403, "the same session now reaches it");
+    let demote_last = c.post(url("/auth/users/op/role")).bearer_auth(&admin).json(&serde_json::json!({"role": "user"}));
+    assert_eq!(demote_last.send().await.unwrap().status(), 200, "op may step down now that guest is an admin");
+    let me: serde_json::Value = c.get(url("/auth/me")).bearer_auth(&admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(me["role"], "user");
+}
+
+#[test]
+fn a_route_nobody_listed_is_an_admins() {
+    use axum::http::Method;
+    assert!(platform_agent::api::user_may(&Method::POST, "/instances/srv/stop"));
+    assert!(platform_agent::api::user_may(&Method::POST, "/controller/instances/srv/relocate"));
+    assert!(!platform_agent::api::user_may(&Method::POST, "/some/route/added/later"));
+    assert!(!platform_agent::api::user_may(&Method::PUT, "/instances/srv/identity"));
+    assert!(!platform_agent::api::user_may(&Method::POST, "/controller/admin-requests"));
+}

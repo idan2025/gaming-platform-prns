@@ -32,6 +32,7 @@ const state = {
   regions: [],           // the controller's regions, offered on the create form
   hostedGames: [],       // the games the controller hosts: what can be started through it
   isAdmin: false,        // this node's identity may decide region requests on the controller
+  role: "admin",         // this page's role here: the token and an admin account are "admin" (accounts.rs)
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
@@ -734,6 +735,10 @@ async function tryConnect(token) {
     // The Account tab exists where this node has accounts.
     const acct = $("tab-account");
     if (acct) acct.hidden = !(authState ? authState.accounts : !!token);
+    // A user runs servers; an admin also manages the node (api::user_may).
+    const me = await api("GET", "/auth/me").catch(() => ({ role: "admin" }));
+    state.role = me && me.role === "user" ? "user" : "admin";
+    applyRole();
     const insts = await api("GET", "/instances");
     state.instances = Array.isArray(insts) ? insts : [];
     clearError();
@@ -1194,9 +1199,13 @@ function buildGameCard(g) {
   removeBtn.appendChild(icon("trash"));
   removeBtn.addEventListener("click", () => onRemovePack(g));
   actions.append(startBtn);
-  if (!state.controllerOn) actions.append(installBtn);
+  // Game files and packs are an admin's (api::user_may); through a controller
+  // the workers fetch them.
+  const manages = state.role === "admin";
+  if (!state.controllerOn && manages) actions.append(installBtn);
   body.appendChild(actions);
-  card.append(removeBtn, body);
+  if (manages) card.appendChild(removeBtn);
+  card.appendChild(body);
   return card;
 }
 
@@ -3257,6 +3266,192 @@ function onRelocate(id, name) {
   });
 }
 
+// ---------- roles and the Admin tab ----------
+
+// What this page shows for its role. The node refuses a user's admin request
+// anyway (api::user_may); this only stops offering what would be refused.
+function applyRole() {
+  const admin = state.role === "admin";
+  for (const id of ["tab-admin", "tab-installed", "tab-interfaces"]) {
+    const t = $(id);
+    if (!t) continue;
+    if (id === "tab-admin") t.hidden = !admin || !(authState ? authState.accounts || state.controllerOn : true);
+    else t.hidden = !admin;
+  }
+  if (!admin && ["admin", "installed", "interfaces"].includes(state.activeTab)) setActiveTab("servers");
+  $("games-grid").dataset.sig = "";
+  renderGames();
+}
+
+// Built off the page and swapped in whole, so a refresh never shows half a
+// tab and two overlapping loads never write into the same one.
+let adminLoads = 0;
+async function loadAdmin() {
+  const target = $("admin-body");
+  if (!target) return;
+  const run = ++adminLoads;
+  const root = el("div");
+  let pending = 0;
+
+  // This node's accounts and their roles.
+  if (authState && authState.accounts) {
+    const box = section(root, "Accounts on this node");
+    let users = [];
+    try { users = await api("GET", "/auth/users"); } catch (e) { box.appendChild(el("p", "muted small", (e && e.error) || "Could not read the accounts.")); }
+    const me = await api("GET", "/auth/me").catch(() => ({}));
+    for (const u of users) {
+      const line = el("div", "req-head");
+      line.style.marginTop = "8px";
+      const asked = u.admin_requested_unix ? " \u00b7 asked to become an admin" : "";
+      line.appendChild(el("span", "req-line", u.username + " \u00b7 " + u.role + (u.totp_enabled ? " \u00b7 codes on" : "") + asked));
+      const acts = el("span");
+      const btn = (label, fn, primary) => {
+        const b = el("button", "btn" + (primary ? " btn-primary" : ""), label);
+        b.type = "button";
+        b.style.marginLeft = "6px";
+        b.onclick = async () => {
+          try { await withInFlight(fn()); clearError(); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
+        };
+        acts.appendChild(b);
+      };
+      const path = "/auth/users/" + encodeURIComponent(u.username);
+      if (u.admin_requested_unix) {
+        pending++;
+        btn("Approve", () => api("POST", path + "/role", { role: "admin" }), true);
+        btn("Deny", () => api("POST", path + "/deny-admin"));
+      } else if (u.role === "user") {
+        btn("Make admin", () => api("POST", path + "/role", { role: "admin" }));
+      } else if (u.username !== me.username) {
+        btn("Make user", () => api("POST", path + "/role", { role: "user" }));
+      }
+      if (u.username !== me.username) {
+        btn("Remove", () => confirm("Remove the account " + u.username + "? It is signed out everywhere.")
+          ? api("DELETE", path) : Promise.reject({ error: "Not removed." }));
+      }
+      line.appendChild(acts);
+      box.appendChild(line);
+    }
+    const nu = field(box, "adm-add-user", "New username", { type: "text", autocapitalize: "none", spellcheck: false });
+    const np = field(box, "adm-add-pass", "Its password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
+    const nr = selectField(box, "adm-add-role", "Role", [["user", "User: runs servers"], ["admin", "Admin: also manages this node"]], "user");
+    const add = el("button", "btn", "Add account");
+    add.type = "button";
+    add.onclick = async () => {
+      try { await withInFlight(api("POST", "/auth/users", { username: nu.value.trim(), password: np.value, role: nr.value })); toast("Account added."); loadAdmin(); }
+      catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not added."); }
+    };
+    const r = el("div", "form-actions"); r.style.justifyContent = "flex-start"; r.appendChild(add); box.appendChild(r);
+  }
+
+  // The controller: this node's standing there, and an admin's work.
+  if (state.controllerOn) {
+    const box = section(root, "The controller");
+    const me = await api("GET", "/controller/me").catch(() => null);
+    if (!me) {
+      box.appendChild(el("p", "muted small", "The controller did not answer."));
+    } else if (!me.admin) {
+      box.appendChild(el("p", "muted small", "This node is not an admin of the controller. An admin there decides region moves and who else is one."));
+      const r = me.admin_request;
+      if (r && r.state === "pending") {
+        box.appendChild(el("p", null, "Asked to become an admin; waiting for one to decide."));
+      } else {
+        if (r && r.state === "denied") box.appendChild(el("p", "muted small", "The last request was turned down" + (r.reason ? ": " + r.reason : ".")));
+        const note = field(box, "adm-ask-note", "A note for the admins (optional)", { type: "text", maxLength: 300 });
+        const ask = el("button", "btn btn-primary", "Ask to become an admin");
+        ask.type = "button";
+        ask.onclick = async () => {
+          try { await withInFlight(api("POST", "/controller/admin-requests", note.value.trim() ? { note: note.value.trim() } : {})); toast("Asked."); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not made."); }
+        };
+        const rr = el("div", "form-actions"); rr.style.justifyContent = "flex-start"; rr.appendChild(ask); box.appendChild(rr);
+      }
+    } else {
+      box.appendChild(el("p", "muted small", "This node is an admin of the controller."));
+      const [moves, asks, admins, workers] = await Promise.all([
+        api("GET", "/controller/admin/region-requests").catch(() => []),
+        api("GET", "/controller/admin/admin-requests").catch(() => []),
+        api("GET", "/controller/admin/admins").catch(() => []),
+        api("GET", "/controller/admin/workers").catch(() => []),
+      ]);
+      const waitingMoves = moves.filter(r => r.state === "pending");
+      pending += waitingMoves.length;
+      box.appendChild(el("h4", null, "Region moves to decide"));
+      if (!waitingMoves.length) box.appendChild(el("p", "muted small", "Nothing waiting."));
+      for (const r of waitingMoves) box.appendChild(requestCard(r, true));
+
+      const waitingAdmins = asks.filter(r => r.state === "pending");
+      pending += waitingAdmins.length;
+      box.appendChild(el("h4", null, "Asking to become admins"));
+      if (!waitingAdmins.length) box.appendChild(el("p", "muted small", "Nothing waiting."));
+      for (const r of waitingAdmins) {
+        const card = el("div", "req-card");
+        card.appendChild(el("span", "req-line", r.identity.slice(0, 12) + "\u2026 \u00b7 asked " + new Date(r.created_unix * 1000).toLocaleString()));
+        if (r.note) card.appendChild(el("p", "muted small", "\u201c" + r.note + "\u201d"));
+        const row = el("div", "form-actions"); row.style.justifyContent = "flex-start";
+        const ok = el("button", "btn btn-primary", "Make admin");
+        ok.type = "button";
+        ok.onclick = async () => {
+          try { await withInFlight(api("POST", "/controller/admin/admin-requests/" + r.id + "/approve")); toast("Made an admin."); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not approved."); }
+        };
+        const no = el("button", "btn", "Turn down");
+        no.type = "button";
+        no.onclick = async () => {
+          const why = prompt("Why? They see this (optional).", "");
+          if (why === null) return;
+          try { await withInFlight(api("POST", "/controller/admin/admin-requests/" + r.id + "/deny", why ? { note: why } : {})); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not turned down."); }
+        };
+        row.append(ok, no);
+        card.appendChild(row);
+        box.appendChild(card);
+      }
+
+      box.appendChild(el("h4", null, "Admins"));
+      for (const a of admins) {
+        const line = el("div", "req-head");
+        line.appendChild(el("span", "req-line", a.identity.slice(0, 12) + "\u2026" + (a.identity === me.identity ? " (this node)" : "") +
+          (a.source === "file" ? " \u00b7 in the hosting file" : " \u00b7 granted")));
+        if (a.source === "granted") {
+          const rv = el("button", "btn", "Revoke");
+          rv.type = "button";
+          rv.onclick = async () => {
+            if (!confirm("Stop " + a.identity.slice(0, 12) + "\u2026 being an admin of the controller?")) return;
+            try { await withInFlight(api("DELETE", "/controller/admin/admins/" + a.identity)); loadAdmin(); }
+            catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not revoked."); }
+          };
+          line.appendChild(rv);
+        }
+        box.appendChild(line);
+      }
+
+      box.appendChild(el("h4", null, "Workers"));
+      const table = el("table", "admin-workers");
+      const head = el("tr");
+      for (const h of ["Worker", "Region", "Class", "Answers", "Servers", "Running", "Free memory", "Free disk"]) head.appendChild(el("th", null, h));
+      table.appendChild(head);
+      for (const w of workers) {
+        const c = w.capacity || {};
+        const tr = el("tr");
+        for (const v of [w.name, w.region || "\u2014", w.class || "\u2014", w.answered ? "yes" : "no", String(w.servers),
+          c.max_instances != null ? c.running + " of " + c.max_instances : "\u2014",
+          c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : "\u2014",
+          c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : "\u2014"]) tr.appendChild(el("td", null, v));
+        table.appendChild(tr);
+      }
+      const wrap = el("div", "table-wrap");
+      wrap.appendChild(table);
+      box.appendChild(wrap);
+    }
+  }
+  for (const input of root.querySelectorAll("input")) input.classList.add("field");
+  if (run !== adminLoads) return;
+  target.replaceChildren(...root.childNodes);
+  const n = $("nav-admin-count");
+  if (n) n.textContent = pending ? String(pending) : "";
+}
+
 // ---------- account (accounts.rs) ----------
 
 function section(parent, title) {
@@ -3270,10 +3465,9 @@ async function loadAccount() {
   const root = $("account-body");
   if (!root) return;
   root.textContent = "";
-  let me = { via: "token" }, users = [];
+  let me = { via: "token" };
   try {
     me = await api("GET", "/auth/me");
-    users = await api("GET", "/auth/users");
   } catch (e) {
     if (!(e && e.__auth)) root.appendChild(el("p", "muted small", (e && e.error) || "Could not read the accounts."));
     return;
@@ -3342,31 +3536,23 @@ async function loadAccount() {
     }
   }
 
-  const us = section(root, "Accounts on this node");
-  for (const u of users) {
-    const line = el("div", "req-head");
-    line.appendChild(el("span", "req-line", u.username + (u.totp_enabled ? " \u00b7 codes on" : "")));
-    if (users.length > 1 && !(isAccount && u.username === me.username)) {
-      const rm = el("button", "btn", "Remove");
-      rm.type = "button";
-      rm.onclick = async () => {
-        if (!confirm("Remove the account " + u.username + "? It is signed out everywhere.")) return;
-        try { await withInFlight(api("DELETE", "/auth/users/" + encodeURIComponent(u.username))); loadAccount(); }
-        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not removed."); }
+  if (isAccount && me.role === "user") {
+    const ad = section(root, "Becoming an admin");
+    if (me.admin_requested_unix) {
+      ad.appendChild(el("p", "muted small", "You asked to become an admin of this node; an admin will decide."));
+    } else {
+      ad.appendChild(el("p", "muted small", "You run servers here. An admin also manages accounts, game files and the mesh. Ask, and an admin decides."));
+      const ask = el("button", "btn", "Ask to become an admin");
+      ask.type = "button";
+      ask.onclick = async () => {
+        try { await withInFlight(api("POST", "/auth/admin-request")); toast("Asked. An admin will decide."); loadAccount(); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not made."); }
       };
-      line.appendChild(rm);
+      const r6 = el("div", "form-actions"); r6.style.justifyContent = "flex-start"; r6.appendChild(ask); ad.appendChild(r6);
     }
-    us.appendChild(line);
+  } else if (me.role !== "user") {
+    root.appendChild(el("p", "muted small", "Accounts on this node, and who is an admin, are on the Admin tab."));
   }
-  const nu = field(us, "acct-add-user", "New username", { type: "text", autocapitalize: "none", spellcheck: false });
-  const np = field(us, "acct-add-pass", "Its password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
-  const add = el("button", "btn", "Add account");
-  add.type = "button";
-  add.onclick = async () => {
-    try { await withInFlight(api("POST", "/auth/users", { username: nu.value.trim(), password: np.value })); toast("Account added."); loadAccount(); }
-    catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not added."); }
-  };
-  const r5 = el("div", "form-actions"); r5.style.justifyContent = "flex-start"; r5.appendChild(add); us.appendChild(r5);
   for (const input of root.querySelectorAll("input")) input.classList.add("field");
 }
 
@@ -3436,7 +3622,8 @@ async function loadRequests() {
   const mineBox = $("requests-mine");
   if (!adminBox || !mineBox) return;
   const [all, mine] = await Promise.all([
-    state.isAdmin ? api("GET", "/controller/admin/region-requests").catch(() => null) : Promise.resolve(null),
+    // Deciding is on the Admin tab; this tab is the account's own requests.
+    Promise.resolve(null),
     api("GET", "/controller/region-requests").catch(() => []),
   ]);
   adminBox.textContent = "";
@@ -4631,8 +4818,8 @@ async function onDeleteUnused() {
 
 // ---------- tabs ----------
 
-const TABS = ["servers", "games", "installed", "interfaces", "requests", "account"];
-const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests", account: "Account" };
+const TABS = ["servers", "games", "installed", "interfaces", "requests", "admin", "account"];
+const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests", admin: "Admin", account: "Account" };
 
 function setActiveTab(name) {
   if (!TABS.includes(name)) name = "servers";
@@ -4653,6 +4840,7 @@ function setActiveTab(name) {
   if (name === "installed") pollInstalled();
   if (name === "requests") loadRequests();
   if (name === "account") loadAccount();
+  if (name === "admin") loadAdmin();
 }
 
 function renderAll() {
@@ -4724,6 +4912,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   for (const t of TABS) $("tab-" + t).addEventListener("click", () => setActiveTab(t));
   $("requests-refresh")?.addEventListener("click", loadRequests);
+  $("admin-refresh")?.addEventListener("click", loadAdmin);
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
   $("add-game-btn").addEventListener("click", openAddGameDialog);
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));

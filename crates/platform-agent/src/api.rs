@@ -211,6 +211,9 @@ pub fn router_full(
         .route("/auth/totp/disable", post(auth_totp_disable))
         .route("/auth/users", get(auth_users).post(auth_user_add))
         .route("/auth/users/:name", delete(auth_user_remove))
+        .route("/auth/users/:name/role", post(auth_user_role))
+        .route("/auth/users/:name/deny-admin", post(auth_user_deny_admin))
+        .route("/auth/admin-request", post(auth_admin_request))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         // Signing in happens before there is anything to present, so these
         // sit outside the gate: what this node wants (`/auth/state`), a
@@ -279,13 +282,54 @@ async fn require_token(
         return Ok(next.run(request).await);
     };
     let presented = presented_token(request.headers());
-    // The API token, or a live session from signing in with an account.
-    let by_token = constant_time_eq(presented.as_bytes(), expected.as_bytes());
-    let by_session = !by_token && state.accounts.as_ref().is_some_and(|a| a.session(presented).is_some());
-    if !by_token && !by_session {
+    // The API token (an admin), or a live session from signing in with an
+    // account, which acts with that account's role.
+    let role = if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        Some(crate::accounts::Role::Admin)
+    } else {
+        state.accounts.as_ref().and_then(|a| a.session(presented).and_then(|user| a.role(&user)))
+    };
+    let Some(role) = role else {
         return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
+    };
+    if role == crate::accounts::Role::User && !user_may(request.method(), request.uri().path()) {
+        return Err(fail(StatusCode::FORBIDDEN, "only an admin of this node can do that"));
     }
     Ok(next.run(request).await)
+}
+
+/// What an account with the user role may do: run servers. Everything else
+/// needs an admin, **including any route added later until it is listed here**,
+/// so a new route cannot be opened to users by forgetting it.
+pub fn user_may(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match seg.as_slice() {
+        // A server's identity is its address (its secret); spec, delta and merge
+        // are a move's plumbing, driven by an index with the token.
+        ["instances", _, "identity" | "spec" | "delta"] | ["instances", _, "backups", _, "merge"] => false,
+        // Acting as an admin of the index, or asking to become one, through a
+        // controller: the node has one identity there, so only its admins.
+        ["controller", "admin", ..] | ["controller", "admin-requests", ..] => false,
+        // Who has an account here, and who asked to be an admin, is an admin's.
+        ["auth", "users", ..] => false,
+        _ if *method == Method::GET => true,
+        ["instances"] => *method == Method::POST,
+        ["instances", _] => *method == Method::DELETE,
+        ["instances", _, action] => matches!(
+            *action,
+            "stop" | "start" | "restart" | "map" | "console" | "chat" | "bots" | "moderation"
+                | "restart-on-crash" | "restart-schedule" | "backups" | "backup-schedule" | "world"
+        ),
+        ["instances", _, "chat", "mute"] | ["instances", _, "backups", "import"] => true,
+        ["instances", _, "backups", _] => *method == Method::DELETE,
+        ["instances", _, "backups", _, "restore"] => true,
+        ["mesh", "announce"] => true,
+        ["auth", "logout" | "password" | "admin-request"] | ["auth", "totp", _] => true,
+        // Servers through a controller; the controller's own allowlist applies.
+        ["controller", ..] => true,
+        _ => false,
+    }
 }
 
 fn presented_token(headers: &HeaderMap) -> &str {
@@ -398,8 +442,11 @@ async fn auth_logout(State(state): State<ApiState>, headers: HeaderMap) -> Statu
 async fn auth_me(State(state): State<ApiState>, headers: HeaderMap) -> Json<serde_json::Value> {
     let user = state.accounts.as_ref().and_then(|a| a.session(presented_token(&headers)).and_then(|u| a.get(&u)));
     Json(match user {
-        Some(u) => serde_json::json!({ "via": "account", "username": u.username, "totp_enabled": u.totp_enabled }),
-        None => serde_json::json!({ "via": "token" }),
+        Some(u) => serde_json::json!({
+            "via": "account", "username": u.username, "totp_enabled": u.totp_enabled,
+            "role": u.role, "admin_requested_unix": u.admin_requested_unix,
+        }),
+        None => serde_json::json!({ "via": "token", "role": "admin" }),
     })
 }
 
@@ -467,14 +514,53 @@ async fn auth_users(State(state): State<ApiState>) -> ApiResult<Vec<crate::accou
 struct UserReq {
     username: String,
     password: String,
+    /// `user` unless an admin asks for `admin`.
+    #[serde(default)]
+    role: Option<crate::accounts::Role>,
 }
 
 async fn auth_user_add(State(state): State<ApiState>, Json(req): Json<UserReq>) -> ApiResult<crate::accounts::AccountView> {
+    let role = req.role.unwrap_or(crate::accounts::Role::User);
     let made = accounts_of(&state)?
-        .create(&req.username, &req.password, std::time::SystemTime::now())
+        .create_with_role(&req.username, &req.password, role, std::time::SystemTime::now())
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     tracing::info!(user = %made.username, "a page account was added");
     Ok(Json(made))
+}
+
+#[derive(Deserialize)]
+struct RoleReq {
+    role: crate::accounts::Role,
+}
+
+/// An admin makes an account an admin or a user (admin only, by `user_may`).
+async fn auth_user_role(
+    State(state): State<ApiState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(req): Json<RoleReq>,
+) -> ApiResult<crate::accounts::AccountView> {
+    let changed = accounts_of(&state)?.set_role(&name, req.role).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %name, role = ?req.role, "a page account's role changed");
+    Ok(Json(changed))
+}
+
+async fn auth_user_deny_admin(
+    State(state): State<ApiState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> ApiResult<crate::accounts::AccountView> {
+    let denied = accounts_of(&state)?.deny_admin(&name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %name, "a page account's request to become an admin was turned down");
+    Ok(Json(denied))
+}
+
+/// A user asks to become an admin of this node; an admin decides.
+async fn auth_admin_request(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<crate::accounts::AccountView> {
+    let user = signed_in(&state, &headers)?;
+    let asked = accounts_of(&state)?
+        .request_admin(&user, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account asked to become an admin");
+    Ok(Json(asked))
 }
 
 async fn auth_user_remove(
