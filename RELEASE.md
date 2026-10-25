@@ -129,6 +129,44 @@ For people running servers on more than one machine (`HOSTING.md`):
 - A removed server's address key is deleted with it (its files stay until you
   delete them).
 
+### Accounts and roles on the node page
+
+- The node page signs in with a **username and password**, stored as Argon2id
+  hashes, with an optional authenticator code. The first account is made once
+  with the node's API token, and the token keeps working for everything else.
+- Sign-in is limited: five wrong passwords for a name lock it for five minutes,
+  and the page says the same thing for a wrong name and a wrong password.
+- Two roles. **Users run servers**: create, start, stop, remove, logs and
+  backups of their own. **Admins** also manage the node: its settings, the
+  account list, and the index's admins. A node from before roles keeps its
+  accounts as admins; the last admin cannot be demoted or removed.
+- **Each user account is its own identity at the index.** Its servers and
+  quotas are its own, so one account cannot stop or remove another's server.
+  Removing an account removes its servers and backups at the index first; if
+  the index cannot do that, the account stays.
+- A server's region is its worker's. A move stays in the region; moving to
+  another region needs an admin's approval, and the owner cannot approve their
+  own request.
+- Each account can have a backup cap across all its workers, set by the
+  operator (`[quota.accounts.<hash>] max_backups`).
+- Index admins are granted by an existing admin. Asking grants nothing.
+
+### Security hardening
+
+- The node page refuses browser requests from other sites (cross-site form
+  posts and DNS rebinding), and sends a content policy that allows no inline
+  scripts or styles. The index sends the same kind of headers.
+- Sign-in state is bounded. When it is full, sign-in answers 503 and does not
+  grow.
+- Every reachable RustSec advisory is cleared, and `cargo audit` now runs
+  daily and on every lockfile change, for both the workspace and the launcher.
+
+### Upgrading
+
+- The API token keeps working on every route, as before. Accounts are only
+  made where a token is configured, and the first one is made once, from the
+  node page, with the token.
+
 ## v0.2.45
 
 ### A Linux-hosted LAN race no longer ends as it starts
