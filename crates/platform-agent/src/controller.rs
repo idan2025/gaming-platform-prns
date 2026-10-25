@@ -246,6 +246,22 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         {
             Some(format!("/admin/region-requests/{rid}/{action}"))
         }
+        // Who this node is to the index, and whether it is an admin there.
+        ["me"] if *method == Method::GET && no_query() => Some("/me".into()),
+        // Asking to become an admin of the index, and an admin deciding; the
+        // admins, and the workers. The index checks who is admin.
+        ["admin-requests"] if *method == Method::POST && no_query() => Some("/admin-requests".into()),
+        ["admin", "admin-requests"] if *method == Method::GET && no_query() => Some("/admin/admin-requests".into()),
+        ["admin", "admin-requests", rid, action @ ("approve" | "deny")]
+            if valid_request_id(rid) && *method == Method::POST && no_query() =>
+        {
+            Some(format!("/admin/admin-requests/{rid}/{action}"))
+        }
+        ["admin", "admins"] if *method == Method::GET && no_query() => Some("/admin/admins".into()),
+        ["admin", "admins", identity] if valid_identity(identity) && *method == Method::DELETE && no_query() => {
+            Some(format!("/admin/admins/{identity}"))
+        }
+        ["admin", "workers"] if *method == Method::GET && no_query() => Some("/admin/workers".into()),
         ["instances"] => match *method {
             Method::GET | Method::POST if no_query() => Some("/instances".into()),
             _ => None,
@@ -281,6 +297,11 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// An identity hash: thirty-two lower-case hex characters.
+fn valid_identity(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A region request id the index made: sixteen lower-case hex characters.
@@ -349,6 +370,19 @@ mod tests {
         ] {
             assert_eq!(allowed_path(&method, &rest).as_deref(), Some(want.as_str()), "{method} {rest}");
         }
+        let who = "ab".repeat(16);
+        for (method, rest, want) in [
+            (Method::GET, "me".to_string(), "/me".to_string()),
+            (Method::POST, "admin-requests".to_string(), "/admin-requests".to_string()),
+            (Method::GET, "admin/admin-requests".to_string(), "/admin/admin-requests".to_string()),
+            (Method::POST, format!("admin/admin-requests/{rid}/approve"), format!("/admin/admin-requests/{rid}/approve")),
+            (Method::GET, "admin/admins".to_string(), "/admin/admins".to_string()),
+            (Method::DELETE, format!("admin/admins/{who}"), format!("/admin/admins/{who}")),
+            (Method::GET, "admin/workers".to_string(), "/admin/workers".to_string()),
+        ] {
+            assert_eq!(allowed_path(&method, &rest).as_deref(), Some(want.as_str()), "{method} {rest}");
+        }
+        assert_eq!(allowed_path(&Method::DELETE, "admin/admins/not-an-identity"), None);
         for bad in ["admin/region-requests/../x/approve", "admin/region-requests/ABCDEF0123456789/approve", "admin/users"] {
             assert_eq!(allowed_path(&Method::POST, bad), None, "{bad}");
         }

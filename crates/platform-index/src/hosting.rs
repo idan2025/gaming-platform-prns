@@ -389,6 +389,33 @@ pub struct Hosting {
     moving: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Region move requests waiting for, or decided by, an admin.
     requests: crate::regions::RegionRequests,
+    /// Admins granted here (beyond the hosting file's), and requests to be one.
+    admin_store: crate::admins::AdminStore,
+}
+
+/// One admin of the index and where the role comes from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminView {
+    pub identity: String,
+    /// `file` (the hosting file's `admins`, changed only there) or `granted`.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<String>,
+}
+
+/// A worker as an admin sees it: where it is and what it reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerView {
+    pub name: String,
+    pub region: Option<String>,
+    pub class: Option<String>,
+    pub priority: i32,
+    /// Whether it answered just now. A silent worker reports nothing else.
+    pub answered: bool,
+    /// Servers the index sees on it.
+    pub servers: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<platform_agent::uplink_wire::CapacityResp>,
 }
 
 /// Where a move may go. A server stays in its region unless an admin approved
@@ -436,6 +463,7 @@ impl Hosting {
             agent_client: Mutex::new(None),
             moving: Default::default(),
             requests: Default::default(),
+            admin_store: Default::default(),
         }
     }
 
@@ -1254,8 +1282,98 @@ impl Hosting {
         Ok(MoveTargets { worker: from.name.clone(), region: from.region.clone(), workers, regions })
     }
 
+    /// An admin from the hosting file, or one granted here.
     pub fn is_admin(&self, account: &AccountId) -> bool {
-        self.config().admins.iter().any(|a| a.eq_ignore_ascii_case(&account.0))
+        self.config().admins.iter().any(|a| a.eq_ignore_ascii_case(&account.0)) || self.admin_store.is_granted(&account.0)
+    }
+
+    /// Ask to become an admin of this index. An admin already is one.
+    pub fn request_admin(&self, account: &AccountId, note: Option<String>, now: SystemTime) -> Result<crate::admins::AdminRequest> {
+        if self.is_admin(account) {
+            return Err(anyhow!("you are already an admin of this index"));
+        }
+        self.admin_store.ask(&account.0, note, unix(now))
+    }
+
+    /// The caller's admin status and their latest request to become one.
+    pub fn admin_status(&self, account: &AccountId) -> (bool, Option<crate::admins::AdminRequest>) {
+        (self.is_admin(account), self.admin_store.latest_for(&account.0))
+    }
+
+    pub fn admin_requests(&self, admin: &AccountId) -> Result<Vec<crate::admins::AdminRequest>> {
+        self.admin_only(admin)?;
+        Ok(self.admin_store.requests())
+    }
+
+    pub fn approve_admin_request(&self, admin: &AccountId, id: &str, now: SystemTime) -> Result<crate::admins::AdminRequest> {
+        self.admin_only(admin)?;
+        let approved = self.admin_store.approve(id, &admin.0, unix(now))?;
+        tracing::info!(identity = %approved.identity, by = %admin.0, "an account was made an admin of this index");
+        Ok(approved)
+    }
+
+    pub fn deny_admin_request(
+        &self,
+        admin: &AccountId,
+        id: &str,
+        reason: Option<String>,
+        now: SystemTime,
+    ) -> Result<crate::admins::AdminRequest> {
+        self.admin_only(admin)?;
+        self.admin_store.deny(id, &admin.0, unix(now), reason)
+    }
+
+    /// Every admin: the hosting file's, then the ones granted here.
+    pub fn admins(&self, admin: &AccountId) -> Result<Vec<AdminView>> {
+        self.admin_only(admin)?;
+        let mut out: Vec<AdminView> = self
+            .config()
+            .admins
+            .iter()
+            .map(|a| AdminView { identity: a.to_ascii_lowercase(), source: "file".into(), granted_by: None })
+            .collect();
+        for g in self.admin_store.granted() {
+            if !out.iter().any(|a| a.identity.eq_ignore_ascii_case(&g.identity)) {
+                out.push(AdminView { identity: g.identity, source: "granted".into(), granted_by: Some(g.granted_by) });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Take away an admin granted here. One from the hosting file is changed
+    /// there; and the last admin stays, or nobody could decide anything.
+    pub fn revoke_admin(&self, admin: &AccountId, identity: &str) -> Result<()> {
+        self.admin_only(admin)?;
+        if self.config().admins.iter().any(|a| a.eq_ignore_ascii_case(identity)) {
+            return Err(anyhow!("that admin is written in the hosting file; remove it there"));
+        }
+        if self.admins(admin)?.len() <= 1 {
+            return Err(anyhow!("that is the last admin of this index"));
+        }
+        self.admin_store.revoke(identity)?;
+        tracing::info!(identity = %identity, by = %admin.0, "an admin of this index was revoked");
+        Ok(())
+    }
+
+    /// Every worker as an admin sees it, asked now.
+    pub async fn workers(&self, admin: &AccountId) -> Result<Vec<WorkerView>> {
+        self.admin_only(admin)?;
+        let config = self.config();
+        let existing = self.all_instances().await?;
+        let mut out = Vec::new();
+        for node in &config.nodes {
+            let capacity = self.node_capacity(node).await;
+            out.push(WorkerView {
+                name: node.name.clone(),
+                region: node.region.clone(),
+                class: node.class.clone(),
+                priority: node.priority,
+                answered: capacity.is_some(),
+                servers: existing.iter().filter(|i| i.node == node.name).count(),
+                capacity,
+            });
+        }
+        Ok(out)
     }
 
     fn admin_only(&self, account: &AccountId) -> Result<()> {
@@ -1351,10 +1469,11 @@ impl Hosting {
         self.requests.deny(id, &admin.0, unix(now), note)
     }
 
-    /// Keep requests in `path` from now on (made on first write), reading any
-    /// already there.
-    pub fn keep_region_requests_in(mut self, path: &std::path::Path) -> Result<Self> {
-        self.requests = crate::regions::RegionRequests::load(path)?;
+    /// Keep region requests and granted admins in files beside the hosting
+    /// file from now on (made on first write), reading any already there.
+    pub fn keep_state_beside(mut self, hosting_file: &std::path::Path) -> Result<Self> {
+        self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
+        self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
         Ok(self)
     }
 
@@ -3454,6 +3573,47 @@ mod tests {
         let denied = h.deny_region_request(&admin, &back.id, Some("not this month".into()), now).unwrap();
         assert_eq!(denied.state, crate::regions::RequestState::Denied);
         assert_eq!(to.lock().unwrap().hits.len(), hits_before, "a denial touched the server");
+    }
+
+    /// Becoming an admin of the index: anyone may ask, only an admin decides; an
+    /// approval makes them one at once; a file admin is the file's and the last
+    /// admin stays; the workers view is an admin's.
+    #[tokio::test]
+    async fn an_account_becomes_an_index_admin_only_by_an_admin() {
+        let root = AccountId("ad".repeat(16));
+        let asker = AccountId("aa".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let mut cfg = config();
+        cfg.admins = vec![root.0.clone()];
+        let h = Hosting::new(cfg);
+
+        assert!(h.request_admin(&root, None, now).is_err(), "an admin has nothing to ask for");
+        let asked = h.request_admin(&asker, Some("I run the eu workers".into()), now).unwrap();
+        assert!(h.request_admin(&asker, None, now).is_err(), "one pending request");
+        assert_eq!(h.admin_status(&asker), (false, Some(asked.clone())));
+        assert!(h.approve_admin_request(&stranger, &asked.id, now).is_err(), "only an admin decides");
+        assert!(h.admin_requests(&asker).is_err());
+        assert!(h.workers(&asker).await.is_err(), "the workers view is an admin's");
+
+        h.approve_admin_request(&root, &asked.id, now).unwrap();
+        assert!(h.is_admin(&asker), "an approval makes them one at once");
+        assert!(h.workers(&asker).await.is_ok());
+        let admins = h.admins(&asker).unwrap();
+        assert_eq!(admins.iter().map(|a| a.source.as_str()).collect::<Vec<_>>(), vec!["file", "granted"]);
+
+        assert_eq!(
+            h.revoke_admin(&asker, &root.0).unwrap_err().to_string(),
+            "that admin is written in the hosting file; remove it there"
+        );
+        h.revoke_admin(&root, &asker.0).unwrap();
+        assert!(!h.is_admin(&asker));
+
+        // Granted admins only: the last one stays.
+        let other = AccountId("cc".repeat(16));
+        let h = Hosting::new(config());
+        let r = h.request_admin(&other, None, now).unwrap();
+        assert!(h.approve_admin_request(&other, &r.id, now).is_err(), "no admin at all yet: nobody can grant");
     }
 
     /// With nowhere to go, nothing is touched: the server is not even stopped.

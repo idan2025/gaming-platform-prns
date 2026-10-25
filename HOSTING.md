@@ -670,6 +670,38 @@ admins = ["<identity hash>"]   # who may decide region requests; nobody by defau
 Requests are kept in `region-requests.json` beside the hosting file. One
 request may wait per server, and its owner can take it back.
 
+**More admins are asked for, too.** An account of the index (for a node, the
+identity it signs in to its controller with) asks with `POST /admin-requests`
+(`{"note": "…"}`, optional), or "Ask to become an admin" on the node page's
+**Admin** tab; an admin decides at `/admin/admin-requests/<id>/approve` or
+`/deny`. A grant is kept in `index-admins.json` beside the hosting file and
+can be revoked (`DELETE /admin/admins/<identity>`); an admin written in the
+hosting file is changed only there. `GET /admin/admins` lists both kinds and
+`GET /admin/workers` shows each worker's region, class, whether it answered,
+its servers and its room. `GET /me` says whether the caller is an admin and
+how their last request went.
+
+## Accounts and roles on the node page
+
+The node page signs in with accounts once the agent has an API token (the
+first account is made with the token, at the page's first visit). Each account
+is an **admin** or a **user**:
+
+- an **admin** has the token's reach: every route, accounts, packs, content,
+  the mesh interfaces;
+- a **user** runs servers: create, start, stop, restart, remove, maps, the
+  console, bots, chat, moderation, backups, schedules and the server's world,
+  and through a controller whatever the controller allows. Reading is open,
+  except the account list. Everything else (installing games, packs, cleaning
+  leftovers, the mesh, a server's identity, acting as the node at its
+  controller) answers 403.
+
+Accounts from before roles existed are admins. A user can ask to become an
+admin (Account tab); an admin approves or turns it down on the Admin tab, and
+can change a role at any time. The last admin cannot be made a user or
+removed. The rule is one function, `api::user_may`, and a route it does not
+name is an admin's.
+
 The move itself:
 
 1. reads how the server was made and creates the same server on the new worker
