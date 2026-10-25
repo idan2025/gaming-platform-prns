@@ -151,14 +151,15 @@ impl JoinStore {
         let partial = path.with_extension("json.partial");
         {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&partial)
-                .with_context(|| format!("writing {}", partial.display()))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // Owner-only where the platform has modes; elsewhere the folder's own rules.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&partial).with_context(|| format!("writing {}", partial.display()))?;
             f.write_all(&serde_json::to_vec_pretty(store)?)?;
         }
         std::fs::rename(&partial, path).with_context(|| format!("writing {}", path.display()))?;

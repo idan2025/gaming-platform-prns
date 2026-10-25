@@ -144,6 +144,7 @@ pub async fn run(opts: &Options) -> Result<bool> {
     }
     let data = opts.dir.join("data");
     std::fs::create_dir_all(&data).with_context(|| format!("making {}", data.display()))?;
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&opts.dir, std::fs::Permissions::from_mode(0o700))?;
@@ -255,13 +256,14 @@ fn write_config(opts: &Options, accepted: &Accepted, data: &Path, identity: &Pat
     let partial = opts.dir.join("agent.toml.partial");
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&partial)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&partial)?;
         f.write_all(text.as_bytes())?;
     }
     std::fs::rename(&partial, opts.config_path()).context("writing agent.toml")?;
