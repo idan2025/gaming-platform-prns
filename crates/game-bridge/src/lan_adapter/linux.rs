@@ -77,7 +77,11 @@ impl TunDevice {
     /// Wrap a descriptor from [`open_configured`]. Must be called inside a
     /// tokio runtime.
     pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
-        Ok(Self { fd: AsyncFd::new(fd)? })
+        // SAFETY: an `OwnedFd` is open, owned by the `AsyncFd` from here, and
+        // closed only when it is dropped, so it is the same descriptor for the
+        // `AsyncFd`'s whole life.
+        let fd = unsafe { AsyncFd::register(fd) }.map_err(|e| e.into_parts().1)?;
+        Ok(Self { fd })
     }
 
     /// The next packet the machine sent into the room.
