@@ -60,6 +60,10 @@ pub struct QuotaPolicy {
     /// but is not stopped by this (the schedule has its own `keep`).
     #[serde(default)]
     pub max_backups_per_account: Option<u32>,
+    /// The most players one server may be made for. `None` is no cap beyond
+    /// what the game and the request allow.
+    #[serde(default)]
+    pub max_players_per_server: Option<u32>,
 }
 
 /// What one account is allowed beyond (or below) the shared rules. Every field
@@ -90,6 +94,10 @@ pub struct AccountLimits {
     /// Can be higher than the shared cap, and applies even where there is none.
     #[serde(default)]
     pub max_backups: Option<u32>,
+    /// Players per server for this account, in place of
+    /// `max_players_per_server`. Can be higher, and applies where there is none.
+    #[serde(default)]
+    pub max_players: Option<u32>,
 }
 
 impl Default for QuotaPolicy {
@@ -105,6 +113,7 @@ impl Default for QuotaPolicy {
             overrides: BTreeMap::new(),
             stopped_expiry: None,
             max_backups_per_account: None,
+            max_players_per_server: None,
         }
     }
 }
@@ -131,6 +140,7 @@ pub enum DenyReason {
     NodeInstanceLimit { limit: u32, held: u32 },
     Cooldown { retry_after: Duration },
     AccountBackupLimit { limit: u32, held: u32 },
+    PlayerLimit { limit: u32, asked: u32 },
 }
 
 impl core::fmt::Display for DenyReason {
@@ -153,6 +163,10 @@ impl core::fmt::Display for DenyReason {
                 f,
                 "you already hold {held} of your {limit} backups; \
                  delete one before making another"
+            ),
+            Self::PlayerLimit { limit, asked } => write!(
+                f,
+                "a server here can be made for up to {limit} players, not {asked}"
             ),
         }
     }
@@ -213,6 +227,23 @@ impl Quotas {
             .get(account)
             .and_then(|o| o.max_backups)
             .or(self.policy.max_backups_per_account)
+    }
+
+    /// The most players a server of `account` may be made for, or `None`.
+    pub fn max_players_for(&self, account: &AccountId) -> Option<u32> {
+        self.policy
+            .overrides
+            .get(account)
+            .and_then(|o| o.max_players)
+            .or(self.policy.max_players_per_server)
+    }
+
+    /// May `account` make a server for `players`?
+    pub fn admit_players(&self, account: &AccountId, players: u32) -> Result<(), DenyReason> {
+        match self.max_players_for(account) {
+            Some(limit) if players > limit => Err(DenyReason::PlayerLimit { limit, asked: players }),
+            _ => Ok(()),
+        }
     }
 
     /// May `account`, holding `held` backups, make another?
@@ -366,6 +397,7 @@ mod tests {
             overrides: BTreeMap::new(),
             stopped_expiry: None,
             max_backups_per_account: None,
+            max_players_per_server: None,
         }
     }
 

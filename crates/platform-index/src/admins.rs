@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::regions::RequestState;
 
+/// What a grant says granted it once the admin who did has asked to be
+/// forgotten.
+pub const FORGOTTEN: &str = "a removed account";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     /// The account made an admin, by identity hash.
@@ -181,6 +185,35 @@ impl AdminStore {
         let out = r.clone();
         self.save(&store)?;
         Ok(out)
+    }
+
+    /// An account asked to be forgotten: its grant and its requests go, and
+    /// where it granted or decided for someone else, that record stays without
+    /// its name. A file admin is the hosting file's, not this store's. Returns
+    /// how many records went.
+    pub fn forget(&self, identity: &str) -> Result<usize> {
+        let mut store = self.lock();
+        let before = store.granted.len() + store.requests.len();
+        store.granted.retain(|g| !g.identity.eq_ignore_ascii_case(identity));
+        store.requests.retain(|r| !r.identity.eq_ignore_ascii_case(identity));
+        let removed = before - store.granted.len() - store.requests.len();
+        let mut changed = removed > 0;
+        for g in store.granted.iter_mut() {
+            if g.granted_by.eq_ignore_ascii_case(identity) {
+                g.granted_by = FORGOTTEN.to_string();
+                changed = true;
+            }
+        }
+        for r in store.requests.iter_mut() {
+            if r.decided_by.as_deref().is_some_and(|by| by.eq_ignore_ascii_case(identity)) {
+                r.decided_by = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&store)?;
+        }
+        Ok(removed)
     }
 
     /// Take a grant away. A file admin is not here to take.

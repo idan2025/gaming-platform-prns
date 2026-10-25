@@ -187,6 +187,10 @@ pub struct QuotaSettings {
     /// asks for that).
     #[serde(default)]
     pub max_backups_per_account: Option<u32>,
+    /// The most players one server may be made for. Absent is no cap; 0 is
+    /// refused.
+    #[serde(default)]
+    pub max_players_per_server: Option<u32>,
 }
 
 /// One account's rules, as an operator writes them. A field left out means
@@ -206,6 +210,10 @@ pub struct AccountSettings {
     /// Backups this account may hold, in place of the shared cap. At least 1.
     #[serde(default)]
     pub max_backups: Option<u32>,
+    /// Players per server for this account, in place of the shared cap. At
+    /// least 1.
+    #[serde(default)]
+    pub max_players: Option<u32>,
 }
 
 impl QuotaSettings {
@@ -221,9 +229,15 @@ impl QuotaSettings {
         if self.max_backups_per_account == Some(0) {
             return Err(anyhow!("max_backups_per_account must be at least 1"));
         }
+        if self.max_players_per_server == Some(0) {
+            return Err(anyhow!("max_players_per_server must be at least 1"));
+        }
         for (key, account) in &self.accounts {
             if account.max_backups == Some(0) {
                 return Err(anyhow!("[quota.accounts.{key}] max_backups must be at least 1"));
+            }
+            if account.max_players == Some(0) {
+                return Err(anyhow!("[quota.accounts.{key}] max_players must be at least 1"));
             }
             if let Some(bad) = account.classes.iter().find(|c| !valid_class(c)) {
                 return Err(anyhow!("[quota.accounts.{key}] names a class {bad:?} that is not a valid label"));
@@ -257,6 +271,7 @@ impl Default for QuotaSettings {
             accounts: Default::default(),
             stopped_delete_after_days: None,
             max_backups_per_account: None,
+            max_players_per_server: None,
         }
     }
 }
@@ -274,6 +289,7 @@ impl From<&QuotaSettings> for QuotaPolicy {
                 .stopped_delete_after_days
                 .map(|days| Duration::from_secs(days.saturating_mul(86_400))),
             max_backups_per_account: s.max_backups_per_account,
+            max_players_per_server: s.max_players_per_server,
             overrides: s
                 .accounts
                 .iter()
@@ -286,6 +302,7 @@ impl From<&QuotaSettings> for QuotaPolicy {
                         never_reap: a.never_reap,
                         classes: a.classes.clone(),
                         max_backups: a.max_backups,
+                        max_players: a.max_players,
                     };
                     (AccountId(key.to_ascii_lowercase()), limits)
                 })
@@ -497,6 +514,42 @@ pub struct WorkerView {
     pub servers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<platform_agent::uplink_wire::CapacityResp>,
+}
+
+/// What `GET /me/data` answers: everything kept about one account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountData {
+    pub identity: String,
+    pub servers: Vec<AccountServer>,
+    pub region_requests: Vec<crate::regions::RegionRequest>,
+    pub admin: AccountAdmin,
+    /// Where the operator's hosting file names this account.
+    pub named_in_hosting_file: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountServer {
+    pub server: HostedInstance,
+    pub backups: Vec<Backup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountAdmin {
+    pub in_hosting_file: bool,
+    pub granted: bool,
+    pub requests: Vec<crate::admins::AdminRequest>,
+}
+
+/// What an erase removed, and what it could not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Erased {
+    pub servers_removed: Vec<String>,
+    pub backups_deleted: u32,
+    /// Region and admin records.
+    pub records_forgotten: usize,
+    /// Lines of the hosting file that still name the account: the operator's
+    /// to remove.
+    pub still_in_hosting_file: Vec<String>,
 }
 
 /// Where a move may go. A server stays in its region unless an admin approved
@@ -783,6 +836,8 @@ impl Hosting {
                 return Err(anyhow!("this account cannot place servers in that class"));
             }
         }
+
+        quotas.admit_players(account, u32::from(request.max_players)).map_err(|e| anyhow!("{e}"))?;
 
         let existing = self.all_instances().await?;
         let records: Vec<InstanceRecord> = existing.iter().map(|i| record_for(i, now)).collect();
@@ -1110,6 +1165,88 @@ impl Hosting {
             }
         }
         Ok(held)
+    }
+
+    /// The account's servers on every worker, each worker asked itself. One
+    /// that cannot answer fails the whole call: an export or an erase that
+    /// skipped a worker would read as complete and not be.
+    async fn owned_everywhere(&self, account: &AccountId, why: &str) -> Result<Vec<HostedInstance>> {
+        let config = self.config();
+        let mut owned = Vec::new();
+        for node in &config.nodes {
+            let rows = self
+                .node_instances(node)
+                .await
+                .map_err(|e| anyhow!("could not ask {} for your servers to {why}; try again later: {e:#}", node.name))?;
+            owned.extend(rows.into_iter().filter(|i| i.owner.as_deref() == Some(account.0.as_str())));
+        }
+        Ok(owned)
+    }
+
+    /// Where the hosting file names this account. The operator wrote those
+    /// lines, so an erase reports them and never rewrites them.
+    fn named_in_file(config: &HostingConfig, account: &AccountId) -> Vec<String> {
+        let mut named = Vec::new();
+        if config.admins.iter().any(|a| a.eq_ignore_ascii_case(&account.0)) {
+            named.push("admins".to_string());
+        }
+        if config.quota.accounts.keys().any(|k| k.eq_ignore_ascii_case(&account.0)) {
+            named.push(format!("[quota.accounts.{}]", account.0));
+        }
+        for node in &config.nodes {
+            if node.reserved_for.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&account.0)) {
+                named.push(format!("worker {} reserved_for", node.name));
+            }
+        }
+        named
+    }
+
+    /// Everything this index and its workers hold about one account, for that
+    /// account to read: its servers with their backups, its region requests,
+    /// whether it is or asked to be an admin, and where the hosting file names
+    /// it. The account is its identity hash; nothing else is kept.
+    pub async fn account_data(&self, account: &AccountId) -> Result<AccountData> {
+        let mut servers = Vec::new();
+        for instance in self.owned_everywhere(account, "list what is kept about you").await? {
+            let backups = self.backups(account, &instance.instance_id).await?.backups;
+            servers.push(AccountServer { server: instance, backups });
+        }
+        let config = self.config();
+        let file_admin = config.admins.iter().any(|a| a.eq_ignore_ascii_case(&account.0));
+        Ok(AccountData {
+            identity: account.0.clone(),
+            servers,
+            region_requests: self.requests.for_owner(&account.0),
+            admin: AccountAdmin {
+                in_hosting_file: file_admin,
+                granted: self.admin_store.is_granted(&account.0),
+                requests: self.admin_store.requests().into_iter().filter(|r| r.identity == account.0).collect(),
+            },
+            named_in_hosting_file: Self::named_in_file(&config, account),
+        })
+    }
+
+    /// Remove everything this index and its workers hold about one account:
+    /// every backup of every server it owns, then the servers, then its region
+    /// and admin records. Nothing is touched unless every worker answered, and
+    /// a failure part way stops there; asking again carries on from what is
+    /// left. A server's files stay on its worker until that worker's leftover
+    /// clean-up, as for any removed server; the hosting file's lines are
+    /// reported, never rewritten.
+    pub async fn erase_account(&self, account: &AccountId) -> Result<Erased> {
+        let owned = self.owned_everywhere(account, "remove them").await?;
+        let mut erased = Erased::default();
+        for instance in &owned {
+            for backup in self.backups(account, &instance.instance_id).await?.backups {
+                self.backup_delete(account, &instance.instance_id, &backup.name).await?;
+                erased.backups_deleted += 1;
+            }
+            self.destroy(account, &instance.instance_id).await?;
+            erased.servers_removed.push(instance.instance_id.clone());
+        }
+        erased.records_forgotten = self.requests.forget(&account.0)? + self.admin_store.forget(&account.0)?;
+        erased.still_in_hosting_file = Self::named_in_file(&self.config(), account);
+        Ok(erased)
     }
 
     pub async fn backup_restore(&self, account: &AccountId, instance_id: &str, name: &str) -> Result<()> {
@@ -2927,6 +3064,7 @@ mod tests {
             accounts: Default::default(),
             stopped_delete_after_days: None,
             max_backups_per_account: Some(4),
+            max_players_per_server: Some(12),
         };
         let p = QuotaPolicy::from(&s);
         assert_eq!(p.max_backups_per_account, Some(4));
@@ -3289,6 +3427,47 @@ mod tests {
         }
     }
 
+    /// A server is made for at most the players the operator allows, and an
+    /// account's own number replaces the shared one either way. Refused before
+    /// any worker is asked, so a refused create costs the workers nothing.
+    #[tokio::test]
+    async fn a_server_is_made_for_no_more_players_than_its_account_may_have() {
+        let roomy = "b7f20b85976ca7b7b6c56a883992fb9a";
+        let mut c = config();
+        c.nodes = vec![classed("w", None)];
+        c.quota.max_players_per_server = Some(12);
+        c.quota.accounts.insert(roomy.into(), AccountSettings { max_players: Some(32), ..Default::default() });
+        let h = Hosting::new(c);
+        let ask = |max_players: u8| DeployRequest {
+            game_id: "sven-coop".into(),
+            name: "x".into(),
+            max_players,
+            map: None,
+            class: None,
+            region: None,
+            bots: None,
+            restart_on_crash: false,
+            options: Default::default(),
+        };
+        let now = std::time::SystemTime::now();
+        let err = h.deploy(&AccountId("aa".repeat(16)), &ask(13), now).await.unwrap_err().to_string();
+        assert_eq!(err, "a server here can be made for up to 12 players, not 13");
+        let err = h.deploy(&AccountId(roomy.into()), &ask(33), now).await.unwrap_err().to_string();
+        assert_eq!(err, "a server here can be made for up to 32 players, not 33");
+        // At the cap the create goes on, to fail later only for want of a
+        // worker that answers.
+        for (account, players) in [("aa".repeat(16), 12), (roomy.to_string(), 32)] {
+            let err = h.deploy(&AccountId(account), &ask(players), now).await.unwrap_err().to_string();
+            assert!(!err.contains("players"), "{err}");
+        }
+
+        for body in ["max_players_per_server = 0", "[quota.accounts.b7f20b85976ca7b7b6c56a883992fb9a]\nmax_players = 0"] {
+            let path = hosting_file("gpp-index-playercap-zero", &format!("games = [\"x\"]\n[quota]\n{body}\n"));
+            assert!(Hosting::load(&path).is_err(), "{body}");
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
     #[test]
     fn class_labels_are_data_not_text_to_run() {
         for good in ["gold", "eu-1", "home_2", "a"] {
@@ -3490,6 +3669,116 @@ mod tests {
             }
         });
         (addr, hits)
+    }
+
+    /// A worker whose servers and backups can be removed, recording the order
+    /// it was asked in.
+    async fn erasable_worker(
+        servers: Vec<(&'static str, String, Vec<&'static str>)>,
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<(Vec<(&'static str, String, Vec<&'static str>)>, Vec<String>)>>) {
+        use axum::extract::{Path, State};
+        use axum::routing::{delete, get};
+        use axum::{Json, Router};
+
+        type Held = Arc<std::sync::Mutex<(Vec<(&'static str, String, Vec<&'static str>)>, Vec<String>)>>;
+        async fn list(State(h): State<Held>) -> Json<serde_json::Value> {
+            let held = h.lock().unwrap();
+            Json(serde_json::Value::Array(
+                held.0
+                    .iter()
+                    .map(|(id, owner, _)| {
+                        serde_json::json!({
+                            "instance_id": id, "game_id": "sven-coop", "name": id, "state": "stopped",
+                            "port": null, "ports": [], "owner": owner,
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        async fn backups(State(h): State<Held>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            let held = h.lock().unwrap();
+            let names = held.0.iter().find(|(i, ..)| *i == id).map(|(.., b)| b.clone()).unwrap_or_default();
+            Json(serde_json::Value::Array(
+                names.iter().map(|n| serde_json::json!({"name": n, "bytes": 1, "created_unix": 0})).collect(),
+            ))
+        }
+        async fn remove_backup(State(h): State<Held>, Path((id, name)): Path<(String, String)>) -> &'static str {
+            let mut held = h.lock().unwrap();
+            if let Some(s) = held.0.iter_mut().find(|(i, ..)| *i == id) {
+                s.2.retain(|b| *b != name);
+            }
+            held.1.push(format!("delete {id} {name}"));
+            "ok"
+        }
+        async fn remove(State(h): State<Held>, Path(id): Path<String>) -> &'static str {
+            let mut held = h.lock().unwrap();
+            held.0.retain(|(i, ..)| *i != id);
+            held.1.push(format!("remove {id}"));
+            "ok"
+        }
+        let state: Held = Arc::new(std::sync::Mutex::new((servers, Vec::new())));
+        let app = Router::new()
+            .route("/instances", get(list))
+            .route("/instances/:id", delete(remove))
+            .route("/instances/:id/backups", get(backups))
+            .route("/instances/:id/backups/:name", delete(remove_backup))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, state)
+    }
+
+    /// An account can read everything kept about it and have it removed: its
+    /// servers' backups first, then the servers, then its region and admin
+    /// records, and never a stranger's. With a worker that cannot be asked,
+    /// both are refused and nothing is touched: an export or an erase that
+    /// skipped a worker would read as complete and not be.
+    #[tokio::test]
+    async fn an_account_reads_and_erases_everything_kept_about_it_and_nobody_elses() {
+        let me = AccountId("aa".repeat(16));
+        let stranger = "bb".repeat(16);
+        let (addr, held) = erasable_worker(vec![
+            ("mine-1", me.0.clone(), vec!["20261022-000001.tar.gz", "20261022-000002.tar.gz"]),
+            ("mine-2", me.0.clone(), vec![]),
+            ("theirs", stranger.clone(), vec!["20261022-000003.tar.gz"]),
+        ])
+        .await;
+
+        let mut silent = one_node_at(addr);
+        let mut down = silent.nodes[0].clone();
+        down.name = "down".into();
+        down.api = "http://127.0.0.1:9".into();
+        silent.nodes.push(down);
+        let h = Hosting::new(silent);
+        assert!(h.account_data(&me).await.is_err());
+        assert!(h.erase_account(&me).await.is_err());
+        assert!(held.lock().unwrap().1.is_empty(), "something was removed with a worker silent");
+
+        let h = Hosting::new(one_node_at(addr));
+        h.admin_store.ask(&me.0, None, 1).unwrap();
+        h.admin_store.ask(&stranger, None, 1).unwrap();
+        let data = h.account_data(&me).await.unwrap();
+        let mut ids: Vec<_> = data.servers.iter().map(|s| s.server.instance_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["mine-1", "mine-2"]);
+        assert_eq!(data.servers.iter().map(|s| s.backups.len()).sum::<usize>(), 2);
+        assert_eq!(data.admin.requests.len(), 1);
+
+        let erased = h.erase_account(&me).await.unwrap();
+        assert_eq!(erased.backups_deleted, 2);
+        assert_eq!(erased.records_forgotten, 1);
+        let asked = held.lock().unwrap().1.clone();
+        let removed_at = asked.iter().position(|a| a == "remove mine-1").unwrap();
+        assert!(asked[..removed_at].iter().filter(|a| a.starts_with("delete mine-1")).count() == 2, "{asked:?}");
+        assert!(asked.contains(&"remove mine-2".to_string()));
+        assert!(!asked.iter().any(|a| a.contains("theirs")), "a stranger's server was touched: {asked:?}");
+        assert_eq!(held.lock().unwrap().0.len(), 1);
+        assert!(h.admin_store.latest_for(&me.0).is_none());
+        assert!(h.admin_store.latest_for(&stranger).is_some());
+        assert!(h.account_data(&me).await.unwrap().servers.is_empty());
     }
 
     /// The cap counts an account's backups across **all** its servers on all

@@ -392,3 +392,66 @@ async fn the_front_page_says_what_this_index_is_and_names_no_worker() {
     assert!(page.contains("&lt;script&gt;"));
     assert!(!page.contains("worker-in-the-basement") && !page.contains("3ba38d2b"), "a worker was named");
 }
+
+/// An account reads what is kept about it, and removing it needs the identity
+/// typed back, ends every session it holds, and never reports done while a
+/// worker that may hold its servers could not be asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_sees_its_data_and_erasing_it_ends_its_sessions() {
+    let user = key(7);
+    let identity = hex::encode(user.identity_hash().as_bytes());
+    let client = reqwest::Client::new();
+
+    let (addr, index_key) = serve().await;
+    let first = token_for(addr, &index_key, &user).await;
+    let second = token_for(addr, &index_key, &user).await;
+    let data: serde_json::Value = client
+        .get(format!("http://{addr}/me/data"))
+        .bearer_auth(&first)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["identity"], serde_json::json!(identity));
+
+    let wrong = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&first)
+        .json(&serde_json::json!({ "confirm": "00".repeat(16) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 400);
+    let done: serde_json::Value = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&first)
+        .json(&serde_json::json!({ "confirm": identity }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["sessions_ended"], serde_json::json!(2));
+    for token in [&first, &second] {
+        let me = client.get(format!("http://{addr}/me")).bearer_auth(token).send().await.unwrap();
+        assert_eq!(me.status(), 401);
+    }
+
+    // A hosting index whose worker does not answer refuses, and the session
+    // stays: nothing was removed, so nothing is reported removed.
+    let (addr, index_key) = serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let token = token_for(addr, &index_key, &user).await;
+    let refused = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "confirm": identity }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    let me = client.get(format!("http://{addr}/me")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(me.status(), 200);
+}
