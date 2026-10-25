@@ -1193,7 +1193,10 @@ fn extract_zip_stripped(archive: &Path, dest: &Path, strip_components: u8) -> Re
         let mut entry = zip
             .by_index(i)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip entry {i}: {e}")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zip entry {i}: {e}")))?
+            .to_string();
         let relative = safe_relative(Path::new(&name), &name)?;
         if entry.is_symlink() {
             return Err(ProvisionError::UnsafeEntry { entry: name, reason: "a link" });
