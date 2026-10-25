@@ -236,7 +236,7 @@ fn default_max_instances() -> usize {
 /// A controller, from this node's side. The node logs in to it with its uplink
 /// identity, so the operator's servers on that index belong to this node's
 /// identity, and the quotas that index keeps apply to it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerConfig {
     /// The index's front door: `https://…`, or `http://` to loopback only. The
@@ -246,6 +246,29 @@ pub struct ControllerConfig {
     /// The index's identity hash. The login's signature is bound to it, so a
     /// server that is not this index cannot use this node's login.
     pub identity: String,
+    /// Let people make their own account on this node's page, always with the
+    /// user role. Off unless written. Each such account runs servers as its
+    /// own identity at the index, under the index's quotas, so the index's
+    /// limits are what bound it. Needs `terms_url` and `privacy_url`: nobody
+    /// signs up without being shown both.
+    #[serde(default)]
+    pub open_signup: bool,
+    /// The terms a person accepts by signing up, `https://` only.
+    #[serde(default)]
+    pub terms_url: Option<String>,
+    /// The privacy notice shown beside them, `https://` only.
+    #[serde(default)]
+    pub privacy_url: Option<String>,
+}
+
+/// Whether `url` may be shown on the page as a link to the node's terms or
+/// privacy notice: `https://`, a host, and only characters that need no
+/// escaping in an attribute.
+pub fn notice_url_is_acceptable(url: &str) -> bool {
+    url.len() <= 512
+        && url.strip_prefix("https://").is_some_and(|rest| !authority_host(rest).is_empty())
+        && url.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&()*+,;=%".contains(&b))
+        && !url.contains(['\'', '"', '<', '>'])
 }
 
 /// Whether `url` may carry this node's login: https anywhere, or http to this
@@ -493,6 +516,24 @@ impl AgentConfig {
                     "identity {:?} is not a 32-character hex identity hash",
                     c.identity
                 )));
+            }
+            for (name, url) in [("terms_url", &c.terms_url), ("privacy_url", &c.privacy_url)] {
+                match url {
+                    Some(u) if !notice_url_is_acceptable(u) => {
+                        return Err(ConfigError::BadController(format!("{name} {u:?} must be a plain https:// address")));
+                    }
+                    None if c.open_signup => {
+                        return Err(ConfigError::BadController(format!(
+                            "open_signup needs {name}: nobody signs up without being shown it"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            if c.open_signup && !self.api_is_authenticated() {
+                return Err(ConfigError::BadController(
+                    "open_signup needs an api_token: accounts exist only where one is set".into(),
+                ));
             }
         }
         if let Some(uplink) = &self.uplink {
@@ -1021,5 +1062,27 @@ cpus = 1.5
         assert!(AgentConfig::parse(&with_uplink("https://idx.example.org", id)).is_ok());
         assert!(AgentConfig::parse(&with_uplink("http://idx.example.org", id)).is_err());
         assert!(AgentConfig::parse(&with_uplink("https://idx.example.org", "NOT-HEX")).is_err());
+    }
+
+    /// Sign-up needs a token (accounts exist only with one) and both notices,
+    /// each a plain https address: nobody signs up without being shown them.
+    #[test]
+    fn open_sign_up_needs_a_token_and_both_notices() {
+        let config = |token: bool, extra: &str| {
+            format!(
+                "data_root = \"/var/lib/x\"\n{}[port_range]\nstart = 27100\nend = 27199\n\
+                 [uplink]\nidentity_secret_path = \"/var/lib/x/id\"\ntrusted_indexes = []\n\
+                 [controller]\nurl = \"https://idx.example.org\"\nidentity = \"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"\n{extra}",
+                if token { "api_token = \"0123456789abcdef0123456789abcdef\"\n" } else { "" }
+            )
+        };
+        let both = "open_signup = true\nterms_url = \"https://example.org/terms\"\nprivacy_url = \"https://example.org/privacy\"\n";
+        assert!(AgentConfig::parse(&config(true, both)).is_ok());
+        assert!(AgentConfig::parse(&config(false, both)).is_err(), "sign-up with no token");
+        assert!(AgentConfig::parse(&config(true, "open_signup = true\nterms_url = \"https://example.org/terms\"\n")).is_err());
+        for bad in ["http://example.org/terms", "https://example.org/\"onmouseover=x", "javascript:alert(1)"] {
+            let text = format!("open_signup = true\nterms_url = '{bad}'\nprivacy_url = \"https://example.org/privacy\"\n");
+            assert!(AgentConfig::parse(&config(true, &text)).is_err(), "{bad}");
+        }
     }
 }

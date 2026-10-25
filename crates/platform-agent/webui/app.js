@@ -368,7 +368,7 @@ async function showTokenScreen() {
   stopPolling();
   $("token-screen").classList.remove("hidden");
   $("main-ui").classList.add("hidden");
-  for (const id of ["token-input", "login-user", "login-pass", "login-code", "setup-token", "setup-user", "setup-pass", "setup-pass2"]) {
+  for (const id of ["token-input", "login-user", "login-pass", "login-code", "setup-token", "setup-user", "setup-pass", "setup-pass2", "signup-user", "signup-pass", "signup-pass2"]) {
     const e = $(id);
     if (e) e.value = "";
   }
@@ -386,8 +386,18 @@ async function showTokenScreen() {
 function renderLoginMode() {
   $("login-form").hidden = loginMode !== "account";
   $("setup-form").hidden = loginMode !== "setup";
+  $("signup-form").hidden = loginMode !== "signup";
   $("token-form").hidden = loginMode !== "token";
-  $("login-help").textContent = loginMode === "account" ? "Sign in to this node."
+  // Sign-up, where this node takes it: always with its two notices linked.
+  const signup = authState && authState.signup;
+  $("signup-switch-wrap").hidden = !signup || (loginMode !== "account" && loginMode !== "signup");
+  $("signup-switch").textContent = loginMode === "signup" ? "I have an account: sign in" : "New here? Create an account";
+  if (signup) {
+    $("signup-terms-link").href = signup.terms_url;
+    $("signup-privacy-link").href = signup.privacy_url;
+  }
+  $("login-help").textContent = loginMode === "signup" ? "Create an account to run servers here."
+    : loginMode === "account" ? "Sign in to this node."
     : loginMode === "setup" ? "Make the account you will sign in with from now on. The API token proves this is your node: it is in the file named by api_token_file in the agent's config. You need it only this once."
     : "Paste this node's API token, from the file named by api_token_file in the agent's config.";
   const sw = $("login-switch");
@@ -395,7 +405,7 @@ function renderLoginMode() {
   sw.parentElement.hidden = !canAccounts;
   sw.textContent = loginMode === "token" ? (authState && authState.has_accounts ? "Sign in with an account instead" : "Make an account instead")
     : "Use the API token instead";
-  const first = { account: "login-user", setup: "setup-token", token: "token-input" }[loginMode];
+  const first = { account: "login-user", setup: "setup-token", signup: "signup-user", token: "token-input" }[loginMode];
   $(first)?.focus();
 }
 
@@ -444,6 +454,28 @@ async function onSetupSubmit(e) {
   renderLoginMode();
   $("login-form").requestSubmit();
 }
+async function onSignupSubmit(e) {
+  e.preventDefault();
+  const err = $("token-error");
+  err.textContent = "";
+  const username = $("signup-user").value.trim();
+  const password = $("signup-pass").value;
+  if (password !== $("signup-pass2").value) { err.textContent = "The two passwords are not the same."; return; }
+  if (!$("signup-terms").checked || !$("signup-age").checked) { err.textContent = "Tick both boxes to create an account."; return; }
+  let resp, out = {};
+  try {
+    resp = await fetch("/auth/signup", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password, accept_terms: true, old_enough: true }) });
+    out = await resp.json().catch(() => ({}));
+  } catch (_) { err.textContent = "Could not reach this node."; return; }
+  if (!resp.ok) { err.textContent = out.error || "The account was not made."; return; }
+  $("login-user").value = username;
+  $("login-pass").value = password;
+  loginMode = "account";
+  renderLoginMode();
+  $("login-form").requestSubmit();
+}
+
 function showMainUI() {
   $("token-screen").classList.add("hidden");
   $("main-ui").classList.remove("hidden");
@@ -4181,6 +4213,50 @@ async function loadAccount() {
     }
   }
 
+  if (isAccount) {
+    const data = section(root, "Your data", state.controllerOn
+      ? "Everything kept about you: this account, and at the controller your servers, their backups and your requests, as one file."
+      : "Everything this node keeps about this account, as one file.");
+    const dl = el("button", "btn", "Download my data");
+    dl.type = "button";
+    dl.onclick = async () => {
+      try {
+        const out = { account: me };
+        if (state.controllerOn) out.controller = await withInFlight(api("GET", "/controller/me/data"));
+        const blob = new Blob([JSON.stringify(out, null, 2)], { type: "application/json" });
+        const a = el("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "lanthorn-" + me.username + "-data.json";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Your data could not be read."); }
+    };
+    const r7 = el("div", "form-actions start"); r7.appendChild(dl); data.appendChild(r7);
+
+    const del = section(root, "Delete my account", me.role === "user" && state.controllerOn
+      ? "Removes your servers, their backups and everything the controller keeps about you, then this account. It cannot be undone."
+      : "Removes this account. It cannot be undone.");
+    const pass = field(del, "acct-del-pass", "Your password", { type: "password", autocomplete: "current-password" });
+    const go = el("button", "btn btn-danger", "Delete my account");
+    go.type = "button";
+    go.onclick = async () => {
+      if (!pass.value) { showError("Type your password to delete the account."); return; }
+      if (!confirm("Delete your account and everything kept about it? This cannot be undone.")) return;
+      go.disabled = true;
+      try {
+        await withInFlight(api("POST", "/auth/delete-me", { password: pass.value }));
+        toast("Your account was deleted.");
+        $("disconnect-btn").click();
+      } catch (e) {
+        go.disabled = false;
+        if (!(e && e.__auth)) showError((e && e.error) || "The account was not deleted.");
+      }
+    };
+    const r8 = el("div", "form-actions start"); r8.appendChild(go); del.appendChild(r8);
+  }
+
   if (isAccount && me.role === "user") {
     const ad = section(root, "Admin access", "You run servers here. An admin also manages accounts, game files and the mesh. Ask, and an admin decides.");
     if (me.admin_requested_unix) {
@@ -5498,6 +5574,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   $("login-form").addEventListener("submit", onLoginSubmit);
   $("setup-form").addEventListener("submit", onSetupSubmit);
+  $("signup-form").addEventListener("submit", onSignupSubmit);
+  $("signup-switch").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("token-error").textContent = "";
+    loginMode = loginMode === "signup" ? "account" : "signup";
+    renderLoginMode();
+  });
   $("login-switch").addEventListener("click", (e) => {
     e.preventDefault();
     $("token-error").textContent = "";

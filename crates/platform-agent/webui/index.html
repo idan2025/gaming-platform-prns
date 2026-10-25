@@ -29,7 +29,7 @@
         <rect x="344" y="696" width="336" height="58" rx="20" fill="#e3eae7"/>
       </svg>
     <h1 id="token-heading">Lanthorn Host</h1>
-    <p id="login-help" class="help"></p>
+    <p id="login-help" class="login-note"></p>
     <form id="login-form" hidden>
       <label for="login-user">Username</label>
       <input id="login-user" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
@@ -52,13 +52,25 @@
       <input id="setup-pass2" type="password" autocomplete="new-password" required>
       <button type="submit" class="btn btn-primary btn-block">Create the account</button>
     </form>
+    <form id="signup-form" hidden>
+      <label for="signup-user">Username</label>
+      <input id="signup-user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="signup-pass">Password (at least 10 characters)</label>
+      <input id="signup-pass" type="password" autocomplete="new-password" required>
+      <label for="signup-pass2">The password again</label>
+      <input id="signup-pass2" type="password" autocomplete="new-password" required>
+      <label class="check eula"><input id="signup-terms" type="checkbox"> <span>I accept the <a id="signup-terms-link" target="_blank" rel="noopener noreferrer">terms</a> and the <a id="signup-privacy-link" target="_blank" rel="noopener noreferrer">privacy notice</a>.</span></label>
+      <label class="check eula"><input id="signup-age" type="checkbox"> <span>I am at least 16, or old enough to agree to them where I live.</span></label>
+      <button type="submit" class="btn btn-primary btn-block">Create my account</button>
+    </form>
     <form id="token-form" autocomplete="off" hidden>
       <label for="token-input">Access token</label>
       <input id="token-input" type="password" name="token" required>
       <button type="submit" class="btn btn-primary btn-block">Sign in</button>
     </form>
     <p id="token-error" class="inline-error" aria-live="polite"></p>
-    <p class="help"><a href="#" id="login-switch"></a></p>
+    <p class="login-note" id="signup-switch-wrap" hidden><a href="#" id="signup-switch"></a></p>
+    <p class="login-note"><a href="#" id="login-switch"></a></p>
   </div>
 </section>
 

@@ -15,6 +15,7 @@
 //! world upload and backup download are not on it, and they stay on the node:
 //! the controller never gains a console route (`CLAUDE.md`).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -56,13 +57,76 @@ pub struct Controller {
     index: IdentityHash,
     secret: Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>,
     http: reqwest::Client,
-    /// The session token, held in memory only. Dropped on a refusal, so the
-    /// next request logs in again.
-    token: Mutex<Option<String>>,
-    /// The last server list and when it came. Held while a list is fetched, so
-    /// pages that poll together wait for one request rather than send one
-    /// each; dropped by any change sent through the controller.
-    list: Mutex<Option<(Instant, Forwarded)>>,
+    /// Session tokens by who they act as ([`Acting::key`]), held in memory
+    /// only. One is dropped on a refusal, so the next request logs in again.
+    tokens: Mutex<HashMap<String, String>>,
+    /// The last server list of each identity and when it came. Held while a
+    /// list is fetched, so pages that poll together wait for one request
+    /// rather than send one each; dropped by any change sent through the
+    /// controller.
+    lists: Mutex<HashMap<String, (Instant, Forwarded)>>,
+}
+
+/// Who a request through the controller acts as at the index.
+///
+/// The node's admins act as the node, as they always have: its servers, and
+/// whatever the index lets the node do as an admin there. Each account with
+/// the user role acts as **its own identity**, derived from the node's key and
+/// the account ([`account_secret`]), so the index keeps every account's
+/// servers apart by the same owner check it applies to anyone, and its quotas
+/// count each account on its own. Before this every account was the node at
+/// the index, and any user could stop, remove or restore another's server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Acting {
+    Node,
+    Account { username: String, salt: String },
+}
+
+impl Acting {
+    fn key(&self) -> String {
+        match self {
+            Acting::Node => String::new(),
+            Acting::Account { username, .. } => format!("account:{username}"),
+        }
+    }
+}
+
+/// An account's identity secret at a controller: two HMAC-SHA256 blocks keyed
+/// by the node's own secret over a fixed label, the account's name and its
+/// salt. Only the node can make it, it is the same every time for the same
+/// account, and a removed account's name taken again gets a new salt and so a
+/// new identity. Never written anywhere.
+pub fn account_secret(node: &[u8], username: &str, salt: &str) -> Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]> {
+    let mut out = Zeroizing::new([0u8; IDENTITY_SECRET_KEY_LEN]);
+    for (i, chunk) in out.chunks_mut(32).enumerate() {
+        let mut msg = Vec::with_capacity(64 + username.len() + salt.len());
+        msg.extend_from_slice(b"lanthorn/controller-account/v1\0");
+        msg.extend_from_slice(username.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(salt.as_bytes());
+        msg.push(i as u8 + 1);
+        chunk.copy_from_slice(&hmac_sha256(node, &msg)[..chunk.len()]);
+    }
+    out
+}
+
+/// HMAC-SHA256 (RFC 2104).
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
 }
 
 impl Controller {
@@ -92,54 +156,64 @@ impl Controller {
             index,
             secret,
             http,
-            token: Mutex::new(None),
-            list: Mutex::new(None),
+            tokens: Mutex::new(HashMap::new()),
+            lists: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Send one request to the controller, logging in first if needed. The
-    /// server list is shared by every page for [`LIST_FRESH`]; any other
-    /// request that is not a read drops it, before and after, so the list a
-    /// page sees next includes the change.
+    /// Send one request to the controller as the node. See [`forward_as`].
     pub async fn forward(&self, method: &Method, path: &str, body: Option<&[u8]>) -> Result<Forwarded> {
+        self.forward_as(&Acting::Node, method, path, body).await
+    }
+
+    /// Send one request to the controller as `acting`, logging in first if
+    /// needed. Each identity's server list is shared by its pages for
+    /// [`LIST_FRESH`]; any other request that is not a read drops that list,
+    /// before and after, so the list a page sees next includes the change.
+    pub async fn forward_as(&self, acting: &Acting, method: &Method, path: &str, body: Option<&[u8]>) -> Result<Forwarded> {
+        let key = acting.key();
         if *method == Method::GET && path == "/instances" {
-            let mut list = self.list.lock().await;
-            if let Some((at, reply)) = list.as_ref() {
+            let mut lists = self.lists.lock().await;
+            if let Some((at, reply)) = lists.get(&key) {
                 if at.elapsed() < LIST_FRESH {
                     return Ok(reply.clone());
                 }
             }
-            let reply = self.forward_now(method, path, body).await?;
-            *list = (reply.status == 200).then(|| (Instant::now(), reply.clone()));
+            let reply = self.forward_now(acting, method, path, body).await?;
+            if reply.status == 200 {
+                lists.insert(key, (Instant::now(), reply.clone()));
+            } else {
+                lists.remove(&key);
+            }
             return Ok(reply);
         }
         if *method == Method::GET {
-            return self.forward_now(method, path, body).await;
+            return self.forward_now(acting, method, path, body).await;
         }
-        *self.list.lock().await = None;
-        let reply = self.forward_now(method, path, body).await;
-        *self.list.lock().await = None;
+        self.lists.lock().await.remove(&key);
+        let reply = self.forward_now(acting, method, path, body).await;
+        self.lists.lock().await.remove(&key);
         reply
     }
 
     /// One request, no cache. A refusal that looks like an expired session is
     /// retried once after a fresh login.
-    async fn forward_now(&self, method: &Method, path: &str, body: Option<&[u8]>) -> Result<Forwarded> {
-        let token = self.token_or_login().await?;
+    async fn forward_now(&self, acting: &Acting, method: &Method, path: &str, body: Option<&[u8]>) -> Result<Forwarded> {
+        let token = self.token_or_login(acting).await?;
         let first = self.send(method, path, body, &token).await?;
         if first.status != 401 {
             return Ok(first);
         }
-        *self.token.lock().await = None;
-        let token = self.login().await?;
+        self.tokens.lock().await.remove(&acting.key());
+        let token = self.login(acting).await?;
         self.send(method, path, body, &token).await
     }
 
-    async fn token_or_login(&self) -> Result<String> {
-        if let Some(t) = self.token.lock().await.clone() {
+    async fn token_or_login(&self, acting: &Acting) -> Result<String> {
+        if let Some(t) = self.tokens.lock().await.get(&acting.key()).cloned() {
             return Ok(t);
         }
-        self.login().await
+        self.login(acting).await
     }
 
     async fn send(&self, method: &Method, path: &str, body: Option<&[u8]>, token: &str) -> Result<Forwarded> {
@@ -170,7 +244,7 @@ impl Controller {
     }
 
     /// Challenge, sign bound to the pinned index, verify, and keep the token.
-    async fn login(&self) -> Result<String> {
+    async fn login(&self, acting: &Acting) -> Result<String> {
         let challenge: Challenge = self
             .http
             .post(format!("{}/auth/challenge", self.base))
@@ -182,8 +256,8 @@ impl Controller {
             .json()
             .await
             .context("reading the controller's challenge")?;
-        let identity = PrivateIdentityMaterial::from_slice(&self.secret[..])
-            .map_err(|e| anyhow!("the node's identity key: {e:?}"))?;
+        let identity = PrivateIdentityMaterial::from_slice(&self.secret_of(acting)[..])
+            .map_err(|e| anyhow!("the identity key: {e:?}"))?;
         let response: ChallengeResponse =
             answer_challenge(&challenge, &self.index, &identity).map_err(|e| anyhow!("{e}"))?;
         let session: Session = self
@@ -198,8 +272,50 @@ impl Controller {
             .json()
             .await
             .context("reading the controller's session")?;
-        *self.token.lock().await = Some(session.token.clone());
+        self.tokens.lock().await.insert(acting.key(), session.token.clone());
         Ok(session.token)
+    }
+
+    fn secret_of(&self, acting: &Acting) -> Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]> {
+        match acting {
+            Acting::Node => self.secret.clone(),
+            Acting::Account { username, salt } => account_secret(&self.secret[..], username, salt),
+        }
+    }
+
+    /// The identity hash `acting` has at the index, hex: what an admin there
+    /// names to reserve a worker or give an account its own limits.
+    pub fn identity_of(&self, acting: &Acting) -> Result<String> {
+        let identity = PrivateIdentityMaterial::from_slice(&self.secret_of(acting)[..])
+            .map_err(|e| anyhow!("the identity key: {e:?}"))?;
+        Ok(hex::encode(identity.identity_hash().as_bytes()))
+    }
+
+    /// Have the index remove everything it keeps about an account: its
+    /// servers, their backups and its records (`DELETE /me`). Refused for the
+    /// node itself, whose servers are its admins'. The index refuses when one
+    /// of its workers cannot answer, and that refusal is this one's.
+    pub async fn erase(&self, acting: &Acting) -> Result<serde_json::Value> {
+        if *acting == Acting::Node {
+            return Err(anyhow!("the node's own servers are its admins', not one account's"));
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "confirm": self.identity_of(acting)? }))?;
+        let reply = self.forward_now(acting, &Method::DELETE, "/me", Some(&body)).await?;
+        if reply.status != 200 {
+            let why = serde_json::from_slice::<serde_json::Value>(&reply.body)
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("the controller answered {}", reply.status));
+            return Err(anyhow!("{why}"));
+        }
+        self.forget(acting).await;
+        serde_json::from_slice(&reply.body).context("reading the controller's answer")
+    }
+
+    /// Forget an identity's session and list: its account was removed.
+    pub async fn forget(&self, acting: &Acting) {
+        self.tokens.lock().await.remove(&acting.key());
+        self.lists.lock().await.remove(&acting.key());
     }
 }
 
@@ -246,8 +362,11 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         {
             Some(format!("/admin/region-requests/{rid}/{action}"))
         }
-        // Who this node is to the index, and whether it is an admin there.
+        // Who this node (or this account) is to the index, whether it is an
+        // admin there, and everything the index keeps about it. Erasing it is
+        // not here: removing the account does that (`Controller::erase`).
         ["me"] if *method == Method::GET && no_query() => Some("/me".into()),
+        ["me", "data"] if *method == Method::GET && no_query() => Some("/me/data".into()),
         // Asking to become an admin of the index, and an admin deciding; the
         // admins, and the workers. The index checks who is admin.
         ["admin-requests"] if *method == Method::POST && no_query() => Some("/admin-requests".into()),

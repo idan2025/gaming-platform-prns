@@ -119,6 +119,35 @@ quietly break:
   - **The workers view never waits for a silent worker**: each is asked at
     once and held to 8 s, so a worker that has just joined (or is down) is a
     row that says "no", not an empty table.
+- **Each user account is its own identity at the controller** (2026-10-25,
+  `controller::Acting`, `account_secret`). An account with the user role
+  signs in to the index as an identity derived (HMAC-SHA256) from the node's
+  key, its name and a random per-account `key_salt`; admins and the token act
+  as the node. So the index's owner check keeps accounts' servers apart and
+  its quotas count each one. Before this every account was the node there and
+  any user could stop or remove another's server. A name taken again gets a
+  new salt, never the old account's servers. Removing a user account (by an
+  admin or `/auth/delete-me`) first has the index erase that identity
+  (`DELETE /me`); if the index cannot, the account stays. Lists are cached per
+  identity. Caught by `each_user_account_is_its_own_identity_at_the_controller`.
+- **Sign-up is off unless `[controller] open_signup`**, which needs a token and
+  both `terms_url` and `privacy_url` (plain https), ticks for terms and age,
+  and is held to `SIGNUPS_PER_HOUR` and `MAX_ACCOUNTS`. A sign-up is always a
+  user and records when the terms were accepted.
+- **An account reads and erases what the index keeps about it**
+  (`GET /me/data`, `DELETE /me` with its identity typed back). Both ask every
+  worker itself and refuse when one is silent; backups go before servers;
+  the hosting file's lines are reported, never rewritten. A removed server's
+  folder stays on its worker until that worker's leftover clean-up. Caught by
+  `an_account_reads_and_erases_everything_kept_about_it_and_nobody_elses`.
+- **Sign-in state is bounded** (`platform-auth`: 10,000 challenges, 100,000
+  sessions, 8 per identity, then `Busy`/503), and **the node refuses browser
+  requests from other sites** (`api::browser_guard`: `Sec-Fetch-Site`,
+  `Origin`, and on a tokenless node a non-loopback `Host`, against CSRF and DNS
+  rebinding) and sends a CSP with no inline script or style and
+  `frame-ancestors 'none'`. Inline `style=` in the page is refused by it. The
+  page's prose paragraphs must not use the class `help` (the `?` tooltip).
+  Caught by `another_site_cannot_drive_a_loopback_node_through_a_browser`.
 - **An index admin is the hosting file's or granted by an admin**
   (`platform-index/src/admins.rs`, `index-admins.json` beside the hosting
   file). Asking grants nothing; only an identity that is already an admin

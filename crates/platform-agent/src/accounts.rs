@@ -36,6 +36,10 @@ pub const MAX_FAILURES: usize = 5;
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub const LOCKOUT: Duration = Duration::from_secs(5 * 60);
 pub const MIN_PASSWORD_LEN: usize = 10;
+/// New accounts a node takes by sign-up in an hour, across everyone.
+pub const SIGNUPS_PER_HOUR: usize = 30;
+/// Accounts a node holds before sign-up is refused.
+pub const MAX_ACCOUNTS: usize = 10_000;
 const TOTP_STEP: u64 = 30;
 const TOTP_DIGITS: u32 = 6;
 
@@ -79,6 +83,17 @@ struct User {
     /// A user asked to become an admin, at this time. Decided by an admin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admin_requested_unix: Option<u64>,
+    /// Random, made once per account: what makes this account's own identity
+    /// at a controller its own (`controller::account_secret`). A name taken
+    /// again after its account was removed gets a new one, so it never
+    /// inherits the old account's servers. Written the first time it is asked
+    /// for on an account from before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_salt: Option<String>,
+    /// When the account signed itself up and accepted the node's terms, if it
+    /// did. An account an admin made has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_terms_unix: Option<u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -96,6 +111,9 @@ pub struct AccountView {
     /// Set while this user's request to become an admin waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_requested_unix: Option<u64>,
+    /// When it signed itself up and accepted the node's terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_terms_unix: Option<u64>,
 }
 
 /// A sign-in that did not succeed.
@@ -141,6 +159,8 @@ pub struct Accounts {
     store: Mutex<Store>,
     sessions: Mutex<HashMap<String, Session>>,
     failures: Mutex<HashMap<String, Vec<Instant>>>,
+    /// When the last sign-ups happened, for [`SIGNUPS_PER_HOUR`].
+    signups: Mutex<Vec<Instant>>,
     /// A hash checked when the username does not exist, so a miss costs the
     /// same time as a wrong password.
     decoy: String,
@@ -161,6 +181,7 @@ impl Accounts {
             store: Mutex::new(store),
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
+            signups: Mutex::new(Vec::new()),
             decoy: hash_password("not a real account, only spent time")?,
         })
     }
@@ -220,24 +241,80 @@ impl Accounts {
             created_unix: unix(now),
             role,
             admin_requested_unix: None,
+            key_salt: Some(new_salt()?),
+            accepted_terms_unix: None,
         });
         self.save(&store)?;
         Ok(view(store.users.last().expect("just pushed")))
+    }
+
+    /// Someone signing themselves up on a node that allows it: always a user,
+    /// with the time they accepted the node's terms. Held to
+    /// [`SIGNUPS_PER_HOUR`] across everyone and [`MAX_ACCOUNTS`] in all, since
+    /// a sign-up needs nothing but a name: past either it is refused, never
+    /// queued.
+    pub fn sign_up(&self, username: &str, password: &str, now: SystemTime) -> Result<AccountView> {
+        {
+            let mut recent = self.signups.lock().unwrap_or_else(|e| e.into_inner());
+            let hour_ago = Instant::now().checked_sub(Duration::from_secs(3600));
+            recent.retain(|t| hour_ago.is_none_or(|h| *t > h));
+            if recent.len() >= SIGNUPS_PER_HOUR {
+                return Err(anyhow!("too many new accounts lately; try again in an hour"));
+            }
+            if self.lock_store().users.len() >= MAX_ACCOUNTS {
+                return Err(anyhow!("this node takes no new accounts"));
+            }
+            recent.push(Instant::now());
+        }
+        self.create_with_role(username, password, Role::User, now)?;
+        let mut store = self.lock_store();
+        let user = store.users.iter_mut().find(|u| u.username == username).ok_or_else(|| anyhow!("no such account"))?;
+        user.accepted_terms_unix = Some(unix(now));
+        let out = view(user);
+        self.save(&store)?;
+        Ok(out)
+    }
+
+    /// This account's salt for its identity at a controller, made and written
+    /// now if it has none yet.
+    pub fn key_salt(&self, username: &str) -> Result<String> {
+        let mut store = self.lock_store();
+        let user = store.users.iter_mut().find(|u| u.username == username).ok_or_else(|| anyhow!("no such account"))?;
+        if let Some(salt) = &user.key_salt {
+            return Ok(salt.clone());
+        }
+        let salt = new_salt()?;
+        user.key_salt = Some(salt.clone());
+        self.save(&store)?;
+        Ok(salt)
+    }
+
+    /// Whether `password` is this account's, for a step that needs it typed
+    /// again (removing one's own account). Counts toward the same throttle as
+    /// a sign-in.
+    pub fn check_password_of(&self, username: &str, password: &str) -> bool {
+        if self.throttled(username).is_some() {
+            return false;
+        }
+        let hash = self.lock_store().users.iter().find(|u| u.username == username).map(|u| u.password.clone());
+        let ok = verify_password(password, hash.as_deref().unwrap_or(&self.decoy)) && hash.is_some();
+        if !ok {
+            self.note_failure(username);
+        }
+        ok
+    }
+
+    /// Whether [`remove`](Self::remove) would remove this account, without
+    /// removing it: for a caller with something to do first.
+    pub fn check_removable(&self, username: &str) -> Result<()> {
+        removable(&self.lock_store(), username)
     }
 
     /// Remove an account and end its sessions. The last account is kept, or
     /// nobody could sign in without the token.
     pub fn remove(&self, username: &str) -> Result<()> {
         let mut store = self.lock_store();
-        if !store.users.iter().any(|u| u.username == username) {
-            return Err(anyhow!("no such account"));
-        }
-        if store.users.len() == 1 {
-            return Err(anyhow!("this is the last account; add another before removing it"));
-        }
-        if is_last_admin(&store, username) {
-            return Err(anyhow!("this is the last admin; make another account an admin first"));
-        }
+        removable(&store, username)?;
         store.users.retain(|u| u.username != username);
         self.save(&store)?;
         drop(store);
@@ -454,7 +531,27 @@ fn view(u: &User) -> AccountView {
         created_unix: u.created_unix,
         role: u.role,
         admin_requested_unix: u.admin_requested_unix,
+        accepted_terms_unix: u.accepted_terms_unix,
     }
+}
+
+fn new_salt() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("no entropy: {e}"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn removable(store: &Store, username: &str) -> Result<()> {
+    if !store.users.iter().any(|u| u.username == username) {
+        return Err(anyhow!("no such account"));
+    }
+    if store.users.len() == 1 {
+        return Err(anyhow!("this is the last account; add another before removing it"));
+    }
+    if is_last_admin(store, username) {
+        return Err(anyhow!("this is the last admin; make another account an admin first"));
+    }
+    Ok(())
 }
 
 fn is_last_admin(store: &Store, username: &str) -> bool {
@@ -672,6 +769,35 @@ mod tests {
         assert!(a.disable_totp("op", "123", t2).is_err());
         a.disable_totp("op", &code(t2), t2).unwrap();
         assert!(a.login("op", "correct horse battery", None, t2).is_ok());
+    }
+
+    /// A sign-up is always a user, with the time the terms were accepted, and
+    /// sign-ups stop at the hourly limit across everyone. Each account's salt
+    /// is made once and kept; one from before salts gets one when asked; a
+    /// name taken again after removal gets a new one.
+    #[test]
+    fn a_sign_up_is_a_user_and_each_account_keeps_a_salt_of_its_own() {
+        let (dir, a) = accounts();
+        let now = SystemTime::now();
+        a.create("admin", "correct horse battery", now).unwrap();
+        let made = a.sign_up("player", "correct horse battery", now).unwrap();
+        assert_eq!(made.role, Role::User);
+        assert!(made.accepted_terms_unix.is_some());
+        for i in 1..SIGNUPS_PER_HOUR {
+            a.sign_up(&format!("p{i}"), "correct horse battery", now).unwrap();
+        }
+        assert!(a.sign_up("one-too-many", "correct horse battery", now).is_err());
+
+        let salt = a.key_salt("player").unwrap();
+        let again = Accounts::load(&dir.path().join("web-accounts.json")).unwrap();
+        assert_eq!(again.key_salt("player").unwrap(), salt, "a salt changed across a restart");
+        again.remove("player").unwrap();
+        again.create_with_role("player", "correct horse battery", Role::User, now).unwrap();
+        assert_ne!(again.key_salt("player").unwrap(), salt, "a name taken again kept the old account's salt");
+
+        assert!(again.check_password_of("admin", "correct horse battery"));
+        assert!(!again.check_password_of("admin", "wrong wrong wrong"));
+        assert!(!again.check_password_of("nobody", "correct horse battery"));
     }
 
     #[test]
