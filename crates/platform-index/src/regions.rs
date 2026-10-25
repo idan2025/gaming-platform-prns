@@ -184,6 +184,27 @@ impl RegionRequests {
         self.update_pending(id, |r| r.state = RequestState::Cancelled)
     }
 
+    /// An account's servers were erased: its own requests go, and where it
+    /// decided someone else's, the request stays without its name. Returns how
+    /// many requests went.
+    pub fn forget(&self, identity: &str) -> Result<usize> {
+        let mut list = self.lock();
+        let before = list.len();
+        list.retain(|r| !r.owner.eq_ignore_ascii_case(identity));
+        let removed = before - list.len();
+        let mut changed = removed > 0;
+        for r in list.iter_mut() {
+            if r.decided_by.as_deref().is_some_and(|by| by.eq_ignore_ascii_case(identity)) {
+                r.decided_by = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&list)?;
+        }
+        Ok(removed)
+    }
+
     /// A server moved and got a new id: a pending request for it follows.
     pub fn retarget(&self, old: &str, new: &str) -> Result<()> {
         let mut list = self.lock();

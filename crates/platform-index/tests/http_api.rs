@@ -388,3 +388,67 @@ async fn the_front_page_says_what_this_index_is_and_names_no_worker() {
     assert!(page.contains("&lt;script&gt;"));
     assert!(!page.contains("worker-in-the-basement") && !page.contains("3ba38d2b"), "a worker was named");
 }
+
+/// Nothing the index answers may be framed, sniffed or made to run script: the
+/// status page is the only HTML it serves, and it has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_answer_says_it_may_not_be_framed_or_run_script() {
+    let (addr, _) = serve().await;
+    for path in ["/", "/health", "/servers"] {
+        let res = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        let csp = res.headers()["content-security-policy"].to_str().unwrap().to_string();
+        assert!(csp.contains("frame-ancestors 'none'") && csp.contains("default-src 'none'") && !csp.contains("script-src"), "{path}: {csp}");
+        assert_eq!(res.headers()["x-frame-options"], "DENY", "{path}");
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{path}");
+    }
+}
+
+/// Erasing needs the identity typed back, ends every session the account holds,
+/// and is refused (503) with sessions left alone while a worker that may hold
+/// its servers cannot be asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn erasing_an_account_ends_its_sessions_and_a_silent_worker_refuses_it() {
+    let user = key(7);
+    let identity = hex::encode(user.identity_hash().as_bytes());
+    let client = reqwest::Client::new();
+
+    let (addr, index_key) = serve().await;
+    let first = token_for(addr, &index_key, &user).await;
+    let second = token_for(addr, &index_key, &user).await;
+    let wrong = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&first)
+        .json(&serde_json::json!({ "confirm": "00".repeat(16) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 400);
+    let done: serde_json::Value = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&first)
+        .json(&serde_json::json!({ "confirm": identity }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["sessions_ended"], serde_json::json!(2));
+    for token in [&first, &second] {
+        let me = client.get(format!("http://{addr}/me")).bearer_auth(token).send().await.unwrap();
+        assert_eq!(me.status(), 401);
+    }
+
+    let (addr, index_key) = serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let token = token_for(addr, &index_key, &user).await;
+    let refused = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "confirm": identity }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    let me = client.get(format!("http://{addr}/me")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(me.status(), 200);
+}

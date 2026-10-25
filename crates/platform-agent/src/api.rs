@@ -352,9 +352,17 @@ async fn ui_css() -> Response {
 /// operator's own machine is a loopback client, and so is every other program
 /// on it. An exemption there would mean the token protects the network and
 /// nothing else.
+/// Who a request that passed [`require_token`] is: an account by name, or the
+/// API token (no name).
+#[derive(Clone)]
+struct Caller {
+    username: Option<String>,
+    role: crate::accounts::Role,
+}
+
 async fn require_token(
     State(state): State<ApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let Some(expected) = &state.token else {
@@ -365,17 +373,20 @@ async fn require_token(
     let presented = presented_token(request.headers());
     // The API token (an admin), or a live session from signing in with an
     // account, which acts with that account's role.
-    let role = if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        Some(crate::accounts::Role::Admin)
+    let caller = if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        Some(Caller { username: None, role: crate::accounts::Role::Admin })
     } else {
-        state.accounts.as_ref().and_then(|a| a.session(presented).and_then(|user| a.role(&user)))
+        state.accounts.as_ref().and_then(|a| {
+            a.session(presented).and_then(|user| a.role(&user).map(|role| Caller { username: Some(user), role }))
+        })
     };
-    let Some(role) = role else {
+    let Some(caller) = caller else {
         return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
     };
-    if role == crate::accounts::Role::User && !user_may(request.method(), request.uri().path()) {
+    if caller.role == crate::accounts::Role::User && !user_may(request.method(), request.uri().path()) {
         return Err(fail(StatusCode::FORBIDDEN, "only an admin of this node can do that"));
     }
+    request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
 }
 
@@ -648,9 +659,30 @@ async fn auth_user_remove(
     State(state): State<ApiState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    accounts_of(&state)?.remove(&name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    remove_account(&state, &name).await?;
     tracing::info!(user = %name, "a page account was removed");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a page account, and first, for a user on a node with a controller,
+/// everything the index keeps under that account's own identity (its servers
+/// and their backups). If the index cannot do that (one of its workers is not
+/// answering), the account stays, so its servers are never left running with
+/// nobody able to reach them.
+async fn remove_account(state: &ApiState, name: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let accounts = accounts_of(state)?;
+    let role = accounts.role(name).ok_or_else(|| fail(StatusCode::BAD_REQUEST, "no such account"))?;
+    // The account rules (last account, last admin) first, so nothing is erased
+    // for a removal that would be refused anyway.
+    accounts.check_removable(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    if let (Some(controller), crate::accounts::Role::User) = (state.agent.controller(), role) {
+        let caller = Caller { username: Some(name.to_string()), role };
+        let acting = acting_for(state, Some(&caller))?;
+        controller.erase(&acting).await.map_err(|e| {
+            fail(StatusCode::BAD_GATEWAY, format!("the account's servers could not be removed at the controller, so the account stays: {e:#}"))
+        })?;
+    }
+    accounts.remove(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 
 /// Compare without leaking where the first difference is.
@@ -1152,17 +1184,35 @@ async fn controller_status(State(state): State<ApiState>) -> Json<serde_json::Va
     })
 }
 
+/// Who a request acts as at the controller: an account with the user role as
+/// its own identity, everyone else (admins, the token, a node with no token)
+/// as the node (`controller::Acting`).
+fn acting_for(state: &ApiState, caller: Option<&Caller>) -> Result<crate::controller::Acting, (StatusCode, Json<ApiError>)> {
+    match caller {
+        Some(Caller { username: Some(username), role: crate::accounts::Role::User }) => {
+            let salt = accounts_of(state)?.key_salt(username).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(crate::controller::Acting::Account { username: username.clone(), salt })
+        }
+        _ => Ok(crate::controller::Acting::Node),
+    }
+}
+
 /// Pass one request through to the controller, if its path is on the allowlist
 /// (`controller::allowed_path`). Anything else is refused here, before a login
 /// is attempted, so a request the list does not name never reaches the index.
 async fn controller_proxy(
     State(state): State<ApiState>,
+    caller: Option<axum::Extension<Caller>>,
     method: axum::http::Method,
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Response {
     let Some(controller) = state.agent.controller() else {
         return fail(StatusCode::NOT_FOUND, "this node has no controller").into_response();
+    };
+    let acting = match acting_for(&state, caller.as_deref()) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
     };
     let rest = uri.path().strip_prefix("/controller/").unwrap_or_default();
     let rest = match uri.query() {
@@ -1177,7 +1227,7 @@ async fn controller_proxy(
         .into_response();
     };
     let body = (!body.is_empty()).then_some(&body[..]);
-    match controller.forward(&method, &path, body).await {
+    match controller.forward_as(&acting, &method, &path, body).await {
         Ok(reply) => {
             let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::builder().status(status);

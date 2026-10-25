@@ -79,6 +79,13 @@ struct User {
     /// A user asked to become an admin, at this time. Decided by an admin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admin_requested_unix: Option<u64>,
+    /// Random, made once per account: what makes this account's own identity
+    /// at a controller its own (`controller::account_secret`). A name taken
+    /// again after its account was removed gets a new one, so it never
+    /// inherits the old account's servers. Written the first time it is asked
+    /// for on an account from before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_salt: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -220,24 +227,37 @@ impl Accounts {
             created_unix: unix(now),
             role,
             admin_requested_unix: None,
+            key_salt: Some(new_salt()?),
         });
         self.save(&store)?;
         Ok(view(store.users.last().expect("just pushed")))
+    }
+
+    /// This account's salt for its identity at a controller, made and written
+    /// now if it has none yet.
+    pub fn key_salt(&self, username: &str) -> Result<String> {
+        let mut store = self.lock_store();
+        let user = store.users.iter_mut().find(|u| u.username == username).ok_or_else(|| anyhow!("no such account"))?;
+        if let Some(salt) = &user.key_salt {
+            return Ok(salt.clone());
+        }
+        let salt = new_salt()?;
+        user.key_salt = Some(salt.clone());
+        self.save(&store)?;
+        Ok(salt)
+    }
+
+    /// Whether [`remove`](Self::remove) would remove this account, without
+    /// removing it: for a caller with something to do first.
+    pub fn check_removable(&self, username: &str) -> Result<()> {
+        removable(&self.lock_store(), username)
     }
 
     /// Remove an account and end its sessions. The last account is kept, or
     /// nobody could sign in without the token.
     pub fn remove(&self, username: &str) -> Result<()> {
         let mut store = self.lock_store();
-        if !store.users.iter().any(|u| u.username == username) {
-            return Err(anyhow!("no such account"));
-        }
-        if store.users.len() == 1 {
-            return Err(anyhow!("this is the last account; add another before removing it"));
-        }
-        if is_last_admin(&store, username) {
-            return Err(anyhow!("this is the last admin; make another account an admin first"));
-        }
+        removable(&store, username)?;
         store.users.retain(|u| u.username != username);
         self.save(&store)?;
         drop(store);
@@ -457,6 +477,25 @@ fn view(u: &User) -> AccountView {
     }
 }
 
+fn new_salt() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("no entropy: {e}"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn removable(store: &Store, username: &str) -> Result<()> {
+    if !store.users.iter().any(|u| u.username == username) {
+        return Err(anyhow!("no such account"));
+    }
+    if store.users.len() == 1 {
+        return Err(anyhow!("this is the last account; add another before removing it"));
+    }
+    if is_last_admin(store, username) {
+        return Err(anyhow!("this is the last admin; make another account an admin first"));
+    }
+    Ok(())
+}
+
 fn is_last_admin(store: &Store, username: &str) -> bool {
     store.users.iter().any(|u| u.username == username && u.role == Role::Admin)
         && store.users.iter().filter(|u| u.role == Role::Admin).count() == 1
@@ -672,6 +711,26 @@ mod tests {
         assert!(a.disable_totp("op", "123", t2).is_err());
         a.disable_totp("op", &code(t2), t2).unwrap();
         assert!(a.login("op", "correct horse battery", None, t2).is_ok());
+    }
+
+    /// Each account keeps a salt of its own, made once and kept across a
+    /// restart (it is what makes its identity at a controller its own); one
+    /// from before salts gets one when asked; a name taken again after removal
+    /// gets a new one, so it never inherits the old account's servers.
+    #[test]
+    fn each_account_keeps_a_salt_of_its_own() {
+        let (dir, a) = accounts();
+        let now = SystemTime::now();
+        a.create("admin", "correct horse battery", now).unwrap();
+        a.create_with_role("player", "correct horse battery", Role::User, now).unwrap();
+        let salt = a.key_salt("player").unwrap();
+        assert_ne!(salt, a.key_salt("admin").unwrap());
+        let again = Accounts::load(&dir.path().join("web-accounts.json")).unwrap();
+        assert_eq!(again.key_salt("player").unwrap(), salt, "a salt changed across a restart");
+        again.remove("player").unwrap();
+        again.create_with_role("player", "correct horse battery", Role::User, now).unwrap();
+        assert_ne!(again.key_salt("player").unwrap(), salt, "a name taken again kept the old account's salt");
+        assert!(again.key_salt("nobody").is_err());
     }
 
     #[test]
