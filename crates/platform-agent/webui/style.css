@@ -513,3 +513,9 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .admin-workers th, .admin-workers td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .admin-workers th { color: var(--text-2); font-weight: 550; }
 #tab-panel-admin h4 { margin: 16px 0 6px; }
+
+/* Spacing the markup once set inline; inline styles are refused by the page's
+   content security policy. */
+.mt-14 { margin-top: 14px; }
+.mb-12 { margin-bottom: 12px; }
+.form-actions.start { justify-content: flex-start; }

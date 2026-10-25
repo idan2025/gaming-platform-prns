@@ -233,7 +233,88 @@ pub fn router_full(
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
         .with_state(state)
+}
+
+/// What the page may load: its own three files, game art from the hosts a
+/// pack's `art` may name (`game_bridge::pack::ART_HOSTS`), and the QR code the
+/// node draws for codes. No inline script or style, no plugin, no frame, and
+/// nothing may frame the page, so a page elsewhere cannot overlay it and have
+/// an admin click its buttons.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     img-src 'self' data: https://upload.wikimedia.org https://cdn.cloudflare.steamstatic.com \
+     https://shared.cloudflare.steamstatic.com https://cdn.akamai.steamstatic.com; \
+     connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// Requests only a page of this node's own may make, and the headers every
+/// answer carries.
+///
+/// A browser on the operator's machine can be made to reach a loopback API by
+/// any website it opens: a form or `fetch` with no custom header is sent
+/// without asking (a POST with no body needs no preflight), and DNS rebinding
+/// makes a site's own name answer with `127.0.0.1`. So a request a browser
+/// marks as coming from another site, an `Origin` that is not this host, and,
+/// on a node with no token, a `Host` that is not a loopback name are refused
+/// before any route runs. Programs that are not browsers send none of these
+/// headers and are unaffected.
+async fn browser_guard(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    if let Some(why) = refuse_from_browser(request.headers(), state.token.is_none()) {
+        return (StatusCode::FORBIDDEN, Json(ApiError { error: why.to_string() })).into_response();
+    }
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    h.insert("cross-origin-opener-policy", header::HeaderValue::from_static("same-origin"));
+    h.insert("cross-origin-resource-policy", header::HeaderValue::from_static("same-origin"));
+    response
+}
+
+fn refuse_from_browser(headers: &HeaderMap, loopback_only: bool) -> Option<&'static str> {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // `same-site` is another port or subdomain of the same site: still
+    // another origin, so still refused.
+    let host = text("host");
+    if let Some(site) = text("sec-fetch-site") {
+        if site != "same-origin" && site != "none" {
+            return Some("refused: a request from another site");
+        }
+    } else if let Some(origin) = text("origin") {
+        // An older browser: compare what it says it came from with where it
+        // sent the request. (A browser that sends `Sec-Fetch-Site` has already
+        // made this comparison, and a proxy that rewrites `Host` would make
+        // it fail for a page of this node's own.)
+        let authority = origin.split_once("://").map(|(_, rest)| rest);
+        if authority.is_none() || authority != host {
+            return Some("refused: a request from another site");
+        }
+    }
+    if loopback_only {
+        let host = host?;
+        if !is_loopback_host(host) {
+            return Some("refused: this node answers only to its loopback address");
+        }
+    }
+    None
+}
+
+/// `localhost`, `127.x.x.x` or `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, after)) if after.is_empty() || after.starts_with(':') => inside,
+            _ => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    if name.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 const UI_INDEX: &str = include_str!("../webui/index.html");
