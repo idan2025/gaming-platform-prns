@@ -512,4 +512,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .admin-workers { width: 100%; border-collapse: collapse; font-size: 13px; }
 .admin-workers th, .admin-workers td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .admin-workers th { color: var(--text-2); font-weight: 550; }
+.admin-workers td.worker-acts { white-space: normal; min-width: 320px; }
+.admin-workers td.worker-acts .worker-acts { min-width: 0; }
+.worker-acts .btn { margin: 2px 6px 2px 0; padding: 4px 10px; font-size: 12px; }
 #tab-panel-admin h4 { margin: 16px 0 6px; }

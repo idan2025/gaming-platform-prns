@@ -1772,11 +1772,15 @@ impl Hosting {
         self.admin_for(admin, "change a worker's state")?;
         self.worker_named(name)?;
         self.worker_states.set(name, state)?;
-        self.note(name, match state {
-            crate::worker_state::WorkerState::Active => "back in service".to_string(),
-            crate::worker_state::WorkerState::Cordoned => "taking no new servers".to_string(),
-            crate::worker_state::WorkerState::Draining => "draining: moving its servers off".to_string(),
-        });
+        // A note says what the last action is doing; back in service has nothing
+        // left to say, so an old note must not stay beside it.
+        match state {
+            crate::worker_state::WorkerState::Active => {
+                self.notes.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+            }
+            crate::worker_state::WorkerState::Cordoned => self.note(name, "taking no new servers"),
+            crate::worker_state::WorkerState::Draining => self.note(name, "draining: moving its servers off"),
+        }
         tracing::info!(worker = %name, state = state.word(), by = %admin.0, "a worker's state was set");
         Ok(())
     }

@@ -3449,15 +3449,17 @@ async function loadAdmin() {
           c.max_instances != null ? c.running + " of " + c.max_instances : "\u2014",
           c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : "\u2014",
           c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : "\u2014"]) tr.appendChild(el("td", null, v));
-        const acts = el("td");
+        const acts = el("td", "worker-acts");
         const act = (label, action, ask) => {
           const b = el("button", "btn", label);
           b.type = "button";
-          b.style.marginRight = "6px";
+          // One request at a time: a second click before the answer is ignored,
+          // not sent again.
           b.onclick = async () => {
-            if (ask && !confirm(ask)) return;
+            if (b.disabled || (ask && !confirm(ask))) return;
+            b.disabled = true;
             try { await withInFlight(api("POST", "/controller/admin/workers/" + encodeURIComponent(w.name) + "/" + action)); loadAdmin(); }
-            catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
+            catch (e) { b.disabled = false; if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
           };
           acts.appendChild(b);
         };
