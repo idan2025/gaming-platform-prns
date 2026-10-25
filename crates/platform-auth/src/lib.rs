@@ -60,6 +60,19 @@ pub const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(60);
 /// How long a session lasts before the holder must prove the key again.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(60 * 60 * 12);
 
+/// Challenges held at once. Asking for one needs no account, so without a
+/// ceiling anyone could make the verifier hold any number of them for a minute
+/// each. Past it, a challenge is refused until some expire or are answered.
+pub const MAX_PENDING_CHALLENGES: usize = 10_000;
+
+/// Sessions held at once, across every identity. An identity is a keypair
+/// anyone can generate, so this is the ceiling a script making identities hits.
+pub const MAX_SESSIONS: usize = 100_000;
+
+/// Sessions one identity holds at once. A new one past this ends that
+/// identity's oldest, so one key signing in over and over holds a handful.
+pub const MAX_SESSIONS_PER_IDENTITY: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     /// No such challenge. Either it was never issued, it expired and was swept,
@@ -78,6 +91,9 @@ pub enum AuthError {
     /// The OS could not supply randomness. Refusing is the only safe answer;
     /// a predictable nonce is not a degraded nonce, it is no nonce.
     NoEntropy,
+    /// The verifier holds as many challenges or sessions as it will. Nothing
+    /// is wrong with the request; it may be tried again shortly.
+    Busy,
 }
 
 impl core::fmt::Display for AuthError {
@@ -92,6 +108,7 @@ impl core::fmt::Display for AuthError {
             Self::SessionExpired => write!(f, "session expired"),
             Self::ClockWentBackwards => write!(f, "the system clock moved backwards"),
             Self::NoEntropy => write!(f, "no entropy available to issue a challenge"),
+            Self::Busy => write!(f, "too many sign-ins in progress; try again shortly"),
         }
     }
 }
@@ -172,6 +189,7 @@ struct PendingChallenge {
 
 struct ActiveSession {
     identity: IdentityHash,
+    created_at: SystemTime,
     expires_at: SystemTime,
 }
 
@@ -210,6 +228,9 @@ impl Authenticator {
 
     pub fn issue_challenge(&mut self, now: SystemTime) -> Result<Challenge, AuthError> {
         self.sweep(now);
+        if self.pending.len() >= MAX_PENDING_CHALLENGES {
+            return Err(AuthError::Busy);
+        }
         let nonce = random_bytes::<NONCE_LEN>()?;
         self.pending.insert(
             nonce,
@@ -262,10 +283,28 @@ impl Authenticator {
         // Derived, never taken from the request.
         let identity = public.identity_hash();
 
+        // This identity's oldest sessions make room for the new one; only
+        // then is the ceiling across everyone checked, so a key that is
+        // already signed in can always sign in again.
+        let mut own: Vec<([u8; TOKEN_LEN], SystemTime)> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.identity == identity)
+            .map(|(t, s)| (*t, s.created_at))
+            .collect();
+        if own.len() >= MAX_SESSIONS_PER_IDENTITY {
+            own.sort_by_key(|(_, created)| *created);
+            for (token, _) in own.iter().take(own.len() + 1 - MAX_SESSIONS_PER_IDENTITY) {
+                self.sessions.remove(token);
+            }
+        } else if self.sessions.len() >= MAX_SESSIONS {
+            return Err(AuthError::Busy);
+        }
+
         let token = random_bytes::<TOKEN_LEN>()?;
         self.sessions.insert(
             token,
-            ActiveSession { identity, expires_at: now + self.session_ttl },
+            ActiveSession { identity, created_at: now, expires_at: now + self.session_ttl },
         );
         Ok(Session {
             token: hex::encode(token),
@@ -293,6 +332,14 @@ impl Authenticator {
         if let Some(token) = decode_fixed::<TOKEN_LEN>(token_hex) {
             self.sessions.remove(&token);
         }
+    }
+
+    /// End every session of one identity: it asked to be forgotten, or was
+    /// removed. Returns how many ended.
+    pub fn revoke_identity(&mut self, identity: &IdentityHash) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|_, s| s.identity != *identity);
+        before - self.sessions.len()
     }
 
     /// Drop anything expired. Called on every operation, so an idle process
@@ -374,6 +421,45 @@ mod tests {
             auth.authenticate(&session.token, t0()).unwrap(),
             key.identity_hash()
         );
+    }
+
+    /// Asking for a challenge needs no account, so the verifier holds a bounded
+    /// number: past the ceiling it refuses, and room comes back as they expire.
+    #[test]
+    fn challenges_stop_at_the_ceiling_and_come_back_as_they_expire() {
+        let mut auth = verifier(9);
+        for _ in 0..MAX_PENDING_CHALLENGES {
+            auth.issue_challenge(t0()).unwrap();
+        }
+        assert_eq!(auth.issue_challenge(t0()), Err(AuthError::Busy));
+        let later = t0() + DEFAULT_CHALLENGE_TTL + Duration::from_secs(1);
+        assert!(auth.issue_challenge(later).is_ok());
+        assert_eq!(auth.pending_challenges(), 1);
+    }
+
+    /// One key signing in again and again holds a handful of sessions: each
+    /// past the limit ends that key's oldest, never another identity's.
+    #[test]
+    fn one_identity_holds_a_handful_of_sessions_and_the_oldest_goes_first() {
+        let mut auth = verifier(9);
+        let other = {
+            let c = auth.issue_challenge(t0()).unwrap();
+            auth.verify(&answer_challenge(&c, &auth.audience(), &secret(2)).unwrap(), t0()).unwrap()
+        };
+        let mut tokens = Vec::new();
+        for i in 0..=MAX_SESSIONS_PER_IDENTITY as u64 {
+            let at = t0() + Duration::from_secs(i);
+            let c = auth.issue_challenge(at).unwrap();
+            let s = auth.verify(&answer_challenge(&c, &auth.audience(), &secret(1)).unwrap(), at).unwrap();
+            tokens.push(s.token);
+        }
+        let now = t0() + Duration::from_secs(60);
+        assert_eq!(auth.authenticate(&tokens[0], now), Err(AuthError::UnknownSession));
+        for token in &tokens[1..] {
+            assert!(auth.authenticate(token, now).is_ok());
+        }
+        assert!(auth.authenticate(&other.token, now).is_ok());
+        assert_eq!(auth.active_sessions(), MAX_SESSIONS_PER_IDENTITY + 1);
     }
 
     /// A challenge is one-shot. Replaying a captured response must not work.

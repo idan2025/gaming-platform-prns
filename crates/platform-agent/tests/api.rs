@@ -240,6 +240,51 @@ async fn the_web_ui_loads_without_a_token_but_the_api_still_does_not() {
     assert_eq!(status, 401);
 }
 
+/// A website the operator opens can make their browser send a request to a
+/// loopback node: a POST with no body needs no preflight, and DNS rebinding
+/// gives a site's own name the address `127.0.0.1`. A node with no token has
+/// nothing else in the way, so a request the browser marks as another site's,
+/// an `Origin` that is not the node, and a `Host` that is not a loopback name
+/// are refused before any route runs. A program that sends none of these is
+/// unaffected, and the page itself still works.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_site_cannot_drive_a_loopback_node_through_a_browser() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let clean = format!("http://{addr}/orphans/clean");
+    let port = addr.port();
+
+    let refused = [
+        client.post(&clean).header("sec-fetch-site", "cross-site"),
+        client.post(&clean).header("sec-fetch-site", "same-site"),
+        client.post(&clean).header("origin", "http://evil.example"),
+        client.post(&clean).header("origin", "null"),
+        client.post(&clean).header("host", format!("evil.example:{port}")),
+    ];
+    for request in refused {
+        assert_eq!(request.send().await.unwrap().status(), 403);
+    }
+
+    for request in [
+        client.get(format!("http://{addr}/instances")),
+        client.get(format!("http://{addr}/instances")).header("sec-fetch-site", "same-origin"),
+        client.get(format!("http://{addr}/instances")).header("origin", format!("http://{addr}")),
+        client.get(format!("http://localhost:{port}/instances")),
+    ] {
+        assert_eq!(request.send().await.unwrap().status(), 200);
+    }
+
+    // The page says what it may load and that nothing may frame it.
+    let page = client.get(format!("http://{addr}/")).send().await.unwrap();
+    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(csp.contains("frame-ancestors 'none'") && csp.contains("script-src 'self'"), "{csp}");
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
+    assert_eq!(page.headers()["x-content-type-options"], "nosniff");
+}
+
 /// Importing a pack must take effect on a *running* node — "add a game" that
 /// needed a restart would not be one click. The reload goes through the
 /// operator's trust policy, so this also proves the import did not bypass it.

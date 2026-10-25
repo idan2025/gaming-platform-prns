@@ -600,3 +600,9 @@ pre.code { background: var(--surface-2); border: 1px solid var(--line); border-r
   .form-grid { grid-template-columns: 1fr; }
   .panel { padding: 14px; }
 }
+
+/* Spacing the markup once set inline; inline styles are refused by the page's
+   content security policy. */
+.mt-14 { margin-top: 14px; }
+.mb-12 { margin-bottom: 12px; }
+.form-actions.start { justify-content: flex-start; }
