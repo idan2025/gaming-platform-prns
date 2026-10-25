@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::response::Html;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use game_bridge::browse::{BrowseFilter, BrowseQuery, SortBy};
@@ -77,6 +77,12 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/admin/admins", get(admins_list))
         .route("/admin/admins/:identity", axum::routing::delete(revoke_admin))
         .route("/admin/workers", get(workers))
+        .route("/admin/join-codes", get(join_codes).post(make_join_code))
+        .route("/admin/join-codes/:id", axum::routing::delete(revoke_join_code))
+        .route("/admin/join-info", get(join_info))
+        // A new machine joining as a worker. Open: the join code is the proof.
+        .route("/join", post(join))
+        .route("/join.sh", get(join_script))
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
@@ -634,6 +640,125 @@ async fn workers(
     let hosting = hosting_of(&state)?;
     let account = account_of(&state, &headers).await?;
     hosting.workers(&account).await.map(Json).map_err(region_failure)
+}
+
+#[derive(Deserialize, Default)]
+struct JoinCodeBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    priority: i32,
+    /// How long the code lasts, in minutes. Default an hour.
+    #[serde(default)]
+    valid_minutes: Option<u64>,
+}
+
+fn blank_is_none(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// An admin makes a join code. The secret is in this response and nowhere else.
+async fn make_join_code(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    body: Option<Json<JoinCodeBody>>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let spec = crate::join::JoinSpec {
+        name: blank_is_none(b.name),
+        region: blank_is_none(b.region),
+        class: blank_is_none(b.class),
+        priority: b.priority,
+    };
+    let (code, token) = hosting
+        .create_join_code(&account, spec, b.valid_minutes.unwrap_or(60), std::time::SystemTime::now())
+        .map_err(region_failure)?;
+    let index = hex::encode(state.auth.lock().await.audience().as_bytes());
+    let info = hosting.config().join.clone();
+    Ok(Json(json!({ "code": code, "token": token, "index": index, "hubs": info.hubs, "public_url": info.public_url })))
+}
+
+async fn join_codes(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::join::JoinView>> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.join_codes(&account).map(Json).map_err(region_failure)
+}
+
+async fn revoke_join_code(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.revoke_join_code(&account, &id).map(|()| Json(json!({ "revoked": id }))).map_err(|e| {
+        if format!("{e:#}") == "no such join code" { fail(StatusCode::NOT_FOUND, e) } else { region_failure(e) }
+    })
+}
+
+/// What a join command needs besides a code: the hubs and the address to give.
+async fn join_info(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    let info = hosting.join_info(&account).map_err(region_failure)?;
+    let index = hex::encode(state.auth.lock().await.audience().as_bytes());
+    Ok(Json(json!({ "index": index, "hubs": info.hubs, "public_url": info.public_url })))
+}
+
+#[derive(Deserialize)]
+struct JoinBody {
+    token: String,
+    agent: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A new machine presents a join code and becomes a worker. No account: the
+/// code is the proof, it works once, and a wrong one is throttled.
+async fn join(
+    State(state): State<Arc<IndexState>>,
+    Json(body): Json<JoinBody>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let enrolled = hosting
+        .enroll(body.token.trim(), body.agent.trim(), body.name.as_deref(), std::time::SystemTime::now())
+        .map_err(|e| {
+            let text = format!("{e:#}");
+            if text.contains("not valid") {
+                fail(StatusCode::FORBIDDEN, e)
+            } else if text.contains("too many") {
+                fail(StatusCode::TOO_MANY_REQUESTS, e)
+            } else {
+                fail(StatusCode::BAD_REQUEST, e)
+            }
+        })?;
+    let index = hex::encode(state.auth.lock().await.audience().as_bytes());
+    Ok(Json(json!({
+        "index": index,
+        "name": enrolled.name,
+        "region": enrolled.region,
+        "class": enrolled.class,
+        "priority": enrolled.priority,
+        "hubs": enrolled.hubs,
+    })))
+}
+
+/// The script a join command downloads. It holds no secret: the code is an
+/// argument, not part of the text.
+async fn join_script() -> ([(header::HeaderName, &'static str); 1], &'static str) {
+    ([(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], include_str!("../../../scripts/join-worker.sh"))
 }
 
 #[derive(Deserialize, Default)]

@@ -3368,11 +3368,13 @@ async function loadAdmin() {
       }
     } else {
       box.appendChild(el("p", "muted small", "This node is an admin of the controller."));
-      const [moves, asks, admins, workers] = await Promise.all([
+      const [moves, asks, admins, workers, joinInfo, joinCodes] = await Promise.all([
         api("GET", "/controller/admin/region-requests").catch(() => []),
         api("GET", "/controller/admin/admin-requests").catch(() => []),
         api("GET", "/controller/admin/admins").catch(() => []),
         api("GET", "/controller/admin/workers").catch(() => []),
+        api("GET", "/controller/admin/join-info").catch(() => null),
+        api("GET", "/controller/admin/join-codes").catch(() => []),
       ]);
       const waitingMoves = moves.filter(r => r.state === "pending");
       pending += waitingMoves.length;
@@ -3443,6 +3445,9 @@ async function loadAdmin() {
       const wrap = el("div", "table-wrap");
       wrap.appendChild(table);
       box.appendChild(wrap);
+
+      box.appendChild(el("h4", null, "Add a worker"));
+      box.appendChild(joinWizard(workers, joinInfo, joinCodes));
     }
   }
   for (const input of root.querySelectorAll("input")) input.classList.add("field");
@@ -3450,6 +3455,176 @@ async function loadAdmin() {
   target.replaceChildren(...root.childNodes);
   const n = $("nav-admin-count");
   if (n) n.textContent = pending ? String(pending) : "";
+}
+
+// ---------- adding a worker (join codes, join.rs on the index) ----------
+
+// What a join code just made shows: the code is not kept by the index, so it is
+// held here, in memory, until it is used, dismissed or runs out. A refresh of
+// the tab rebuilds the page around it and does not lose it.
+let joinShown = null;
+let joinTimer = null;
+
+function stopJoinWatch() {
+  if (joinTimer) clearInterval(joinTimer);
+  joinTimer = null;
+}
+
+function joinCommands(url, token) {
+  const dir = '"$HOME/lanthorn-worker"';
+  return {
+    script: "curl -fsSL " + url + "/join.sh | bash -s -- --url " + url + " --token " + token,
+    docker: "mkdir -p " + dir + " && docker run -d --name lanthorn-worker --restart unless-stopped \\\n" +
+      "  --user \"$(id -u):$(id -g)\" --group-add \"$(getent group docker | cut -d: -f3)\" \\\n" +
+      "  -v /var/run/docker.sock:/var/run/docker.sock -v " + dir + ":" + dir + " \\\n" +
+      "  ghcr.io/idan2025/gaming-platform-prns:latest \\\n" +
+      "  platform-agent join --url " + url + " --token " + token + " --dir " + dir + " --run",
+    binary: "platform-agent join --url " + url + " --token " + token + " --run",
+  };
+}
+
+function joinWizard(workers, info, codes) {
+  const root = el("div");
+  if (!info) {
+    root.appendChild(el("p", "muted small", "The controller did not answer."));
+    return root;
+  }
+  if (!info.hubs || !info.hubs.length) {
+    root.appendChild(el("p", "muted small", "Not set up yet. Add a hub that new workers can reach to the index's hosting file, then reload this tab:"));
+    const pre = el("pre", "mono small", '[join]\nhubs = ["host:4790"]\npublic_url = "http://host:4761"');
+    root.appendChild(pre);
+    return root;
+  }
+  root.appendChild(el("p", "muted small", "A join code is good for one machine, once. It fixes where the worker sits; the machine only says who it is. The worker takes no games until you add them on that machine."));
+
+  const form = el("div");
+  const name = field(form, "jw-name", "Name (optional; the machine's host name if empty)", { type: "text", maxLength: 64, placeholder: "basement-pi" });
+  const region = field(form, "jw-region", "Region (optional)", { type: "text", maxLength: 32, placeholder: "eu, il, us-east" });
+  const regions = [...new Set((workers || []).map(w => w.region).filter(Boolean))].sort();
+  const list = el("datalist");
+  list.id = "jw-regions";
+  for (const r of regions) { const o = el("option"); o.value = r; list.appendChild(o); }
+  region.setAttribute("list", "jw-regions");
+  form.appendChild(list);
+  const klass = field(form, "jw-class", "Class (optional)", { type: "text", maxLength: 32 });
+  const prio = field(form, "jw-priority", "Priority (higher fills first)", { type: "number", step: "1", value: "0" });
+  const life = el("select");
+  life.id = "jw-life";
+  life.classList.add("field");
+  for (const [m, label] of [[15, "15 minutes"], [60, "1 hour"], [240, "4 hours"], [1440, "1 day"]]) {
+    const o = el("option", null, label); o.value = String(m); if (m === 60) o.selected = true; life.appendChild(o);
+  }
+  const ll = el("label", null, "The code works for"); ll.htmlFor = "jw-life";
+  form.append(ll, life);
+  const make = el("button", "btn btn-primary", "Make a join code");
+  make.type = "button";
+  make.onclick = async () => {
+    try {
+      const made = await withInFlight(api("POST", "/controller/admin/join-codes", {
+        name: name.value.trim(), region: region.value.trim(), class: klass.value.trim(),
+        priority: parseInt(prio.value, 10) || 0, valid_minutes: parseInt(life.value, 10),
+      }));
+      joinShown = { id: made.code.id, token: made.token, url: made.public_url || "", spec: made.code.spec, expires: made.code.expires_unix, method: "script" };
+      loadAdmin();
+    } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "No code was made."); }
+  };
+  const row = el("div", "form-actions"); row.style.justifyContent = "flex-start"; row.style.marginTop = "8px";
+  row.appendChild(make);
+  form.appendChild(row);
+  root.appendChild(form);
+
+  const shown = el("div");
+  shown.id = "join-result";
+  root.appendChild(shown);
+  if (joinShown) renderJoinShown(shown);
+
+  const rest = (codes || []).filter(c => c.state === "pending" && !(joinShown && joinShown.id === c.id));
+  const used = (codes || []).filter(c => c.state === "used").slice(0, 5);
+  if (rest.length || used.length) root.appendChild(el("h4", null, "Join codes"));
+  const when = (u) => new Date(u * 1000).toLocaleString();
+  for (const c of rest) {
+    const line = el("div", "req-head");
+    const where = [c.spec.name, c.spec.region && ("region " + c.spec.region), c.spec.class && ("class " + c.spec.class)].filter(Boolean).join(" \u00b7 ") || "any";
+    line.appendChild(el("span", "req-line", "Waiting \u00b7 " + where + " \u00b7 until " + when(c.expires_unix)));
+    const rv = el("button", "btn", "Revoke");
+    rv.type = "button";
+    rv.onclick = async () => {
+      try { await withInFlight(api("DELETE", "/controller/admin/join-codes/" + c.id)); loadAdmin(); }
+      catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not revoked."); }
+    };
+    line.appendChild(rv);
+    root.appendChild(line);
+  }
+  for (const c of used) {
+    root.appendChild(el("p", "muted small", "Used " + when(c.used_unix) + " \u00b7 joined as " + (c.used_name || "a worker") + (c.spec.region ? " in " + c.spec.region : "")));
+  }
+  return root;
+}
+
+// The three ways to run it, with the address the new machine reaches the index
+// at (editable: the page cannot know it), and a watch for the machine joining.
+function renderJoinShown(box) {
+  box.textContent = "";
+  const j = joinShown;
+  const card = el("div", "req-card");
+  const where = [j.spec.name, j.spec.region && ("region " + j.spec.region), j.spec.class && ("class " + j.spec.class)].filter(Boolean).join(" \u00b7 ");
+  card.appendChild(el("h3", null, "Run one of these on the new machine"));
+  card.appendChild(el("p", "muted small", (where ? "It will join as " + where + ". " : "") + "The code works once and is shown only here; it ends " + new Date(j.expires * 1000).toLocaleString() + "."));
+  const url = field(card, "jw-url", "The index's address, as the new machine reaches it", { type: "text", value: j.url, placeholder: "http://192.168.1.10:4761" });
+  const tabs = el("div", "form-actions"); tabs.style.justifyContent = "flex-start"; tabs.style.margin = "8px 0";
+  const pre = el("pre", "mono small");
+  pre.style.whiteSpace = "pre-wrap";
+  const draw = () => {
+    j.url = url.value.trim().replace(/\/+$/, "");
+    const ok = /^https?:\/\/[A-Za-z0-9.:-]+$/.test(j.url);
+    const cmd = ok ? joinCommands(j.url, j.token)[j.method] : "Type the index's address above.";
+    pre.textContent = cmd;
+    copy.disabled = !ok;
+    for (const b of tabs.querySelectorAll("button[data-m]")) b.classList.toggle("btn-primary", b.dataset.m === j.method);
+  };
+  for (const [m, label] of [["script", "Script (wget/curl)"], ["docker", "Docker"], ["binary", "platform-agent"]]) {
+    const b = el("button", "btn", label);
+    b.type = "button"; b.dataset.m = m;
+    b.onclick = () => { j.method = m; draw(); };
+    tabs.appendChild(b);
+  }
+  const copy = el("button", "btn", "Copy");
+  copy.type = "button";
+  copy.onclick = () => copyValue(pre.textContent);
+  url.oninput = draw;
+  card.append(tabs, pre);
+  const acts = el("div", "form-actions"); acts.style.justifyContent = "flex-start"; acts.style.marginTop = "8px";
+  const done = el("button", "btn", "Dismiss");
+  done.type = "button";
+  done.onclick = () => { stopJoinWatch(); joinShown = null; loadAdmin(); };
+  acts.append(copy, done);
+  card.appendChild(acts);
+  const status = el("p", "muted small", "Waiting for the machine to join\u2026");
+  card.appendChild(status);
+  box.appendChild(card);
+  draw();
+
+  // Watch the code: when it is used the machine is a worker, and the table
+  // below shows it once the index has asked it for its room.
+  stopJoinWatch();
+  joinTimer = setInterval(async () => {
+    if (!document.body.contains(box)) { stopJoinWatch(); return; }
+    if (Date.now() / 1000 > j.expires) { status.textContent = "This code has run out. Make a new one."; stopJoinWatch(); return; }
+    let codes;
+    try { codes = await api("GET", "/controller/admin/join-codes"); } catch (_) { return; }
+    const mine = codes.find(c => c.id === j.id);
+    if (mine && mine.state === "used") {
+      stopJoinWatch();
+      joinShown = null;
+      toast((mine.used_name || "A worker") + " joined.");
+      loadAdmin();
+      // A new worker needs a few seconds to dial its hub before it answers.
+      for (const ms of [8000, 20000]) setTimeout(() => { if ($("admin-body") && !joinShown) loadAdmin(); }, ms);
+    } else if (mine && mine.state !== "pending") {
+      status.textContent = "This code was " + mine.state + ".";
+      stopJoinWatch();
+    }
+  }, 3000);
 }
 
 // ---------- account (accounts.rs) ----------

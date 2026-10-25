@@ -22,6 +22,7 @@ const USAGE: &str = "\
 platform-agent — run many game servers on one host
 
 usage: platform-agent <config.toml> [pack-dir]
+       platform-agent join --url <index> --token <join code> [--run]  (see `join --help`)
        platform-agent --help | --version
 
   <config.toml>  this node's settings: data root, port range, per-game runtimes.
@@ -56,7 +57,7 @@ async fn main() -> Result<()> {
     tracing_init();
 
     let mut args = std::env::args().skip(1);
-    let config_path = args.next().ok_or_else(|| anyhow::anyhow!("{USAGE}"))?;
+    let mut config_path = args.next().ok_or_else(|| anyhow::anyhow!("{USAGE}"))?;
     // Before anything is loaded: an operator asking what this is should not be
     // told their `--help` is a missing config file.
     if matches!(config_path.as_str(), "-h" | "--help") {
@@ -71,7 +72,19 @@ async fn main() -> Result<()> {
         let path = args.next().ok_or_else(|| anyhow::anyhow!("--control-address needs a config file"))?;
         return print_control_address(std::path::Path::new(&path));
     }
-    let pack_dir = args.next().unwrap_or_else(|| "packs".to_string());
+    let pack_dir = if config_path == "join" {
+        // A machine joining an index as a worker; with --run it then starts
+        // as one, on the config the join wrote.
+        let opts = platform_agent::join::Options::parse(args)?;
+        platform_agent::join::run(&opts).await?;
+        if !opts.run {
+            return Ok(());
+        }
+        config_path = opts.config_path().to_string_lossy().into_owned();
+        opts.packs
+    } else {
+        args.next().unwrap_or_else(|| "packs".to_string())
+    };
 
     let config = AgentConfig::load(std::path::Path::new(&config_path))
         .map_err(|e| anyhow::anyhow!("{e}"))

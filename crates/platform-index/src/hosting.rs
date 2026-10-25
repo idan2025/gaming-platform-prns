@@ -71,6 +71,24 @@ pub struct HostingConfig {
     /// by default: with nobody to decide, a server stays in its region.
     #[serde(default)]
     pub admins: Vec<String>,
+    /// How a new machine joins as a worker. Off until `hubs` is written.
+    #[serde(default)]
+    pub join: JoinSettings,
+}
+
+/// The `[join]` table: what a machine joining as a worker is told, and where
+/// an admin's join command points it (`join.rs`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinSettings {
+    /// Hubs a new worker dials, `host:port`, as the worker's machine reaches
+    /// them (not as the index does). Empty means join codes cannot be made.
+    #[serde(default)]
+    pub hubs: Vec<String>,
+    /// The index's HTTP address as a new machine reaches it, for the join
+    /// command (`http://203.0.113.5:4761`). The page lets an admin edit it.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +129,29 @@ pub fn valid_class(class: &str) -> bool {
     !class.is_empty()
         && class.len() <= 32
         && class.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// `host:port`, as a hub address a worker dials. A host name or IPv4 address.
+pub fn valid_hub(hub: &str) -> bool {
+    let Some((host, port)) = hub.rsplit_once(':') else { return false };
+    !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && port.parse::<u16>().is_ok_and(|p| p != 0)
+}
+
+/// An `http://` or `https://` base address with nothing after the host:port.
+pub fn valid_public_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else { return false };
+    let rest = rest.trim_end_matches('/');
+    !rest.is_empty()
+        && rest.len() <= 253
+        && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
+}
+
+/// A worker's name: what the hosting file calls it and the page shows.
+pub fn valid_node_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
 /// The quota knobs, as an operator writes them. Any left out take the
@@ -391,6 +432,22 @@ pub struct Hosting {
     requests: crate::regions::RegionRequests,
     /// Admins granted here (beyond the hosting file's), and requests to be one.
     admin_store: crate::admins::AdminStore,
+    /// Join codes, and the hosting file a joining worker is written into.
+    join_codes: crate::join::JoinStore,
+    hosting_file: Option<std::path::PathBuf>,
+    /// Held while the hosting file is read, changed and written back.
+    file_lock: std::sync::Mutex<()>,
+}
+
+/// What a worker is told when its join code is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Enrolled {
+    pub name: String,
+    pub region: Option<String>,
+    pub class: Option<String>,
+    pub priority: i32,
+    /// Hubs to dial, as the index's operator wrote them for new workers.
+    pub hubs: Vec<String>,
 }
 
 /// One admin of the index and where the role comes from.
@@ -464,6 +521,9 @@ impl Hosting {
             moving: Default::default(),
             requests: Default::default(),
             admin_store: Default::default(),
+            join_codes: Default::default(),
+            hosting_file: None,
+            file_lock: Default::default(),
         }
     }
 
@@ -486,20 +546,32 @@ impl Hosting {
     /// hosting off.
     pub fn load(path: &std::path::Path) -> Result<HostingConfig> {
         let src = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: HostingConfig =
-            toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
-        config.quota.validate().with_context(|| format!("in {}", path.display()))?;
+        Self::parse(&src).with_context(|| format!("in {}", path.display()))
+    }
+
+    /// Parse and check hosting config text; what `load` does with a file.
+    pub fn parse(src: &str) -> Result<HostingConfig> {
+        let config: HostingConfig = toml::from_str(src).context("parsing")?;
+        config.quota.validate()?;
         if let Some(bad) = config.nodes.iter().filter_map(|n| n.class.as_deref()).find(|c| !valid_class(c)) {
-            return Err(anyhow!("a node's class {bad:?} is not a valid label")).with_context(|| format!("in {}", path.display()));
+            return Err(anyhow!("a node's class {bad:?} is not a valid label"));
         }
         if let Some(bad) = config.nodes.iter().filter_map(|n| n.region.as_deref()).find(|r| !valid_class(r)) {
-            return Err(anyhow!("a node's region {bad:?} is not a valid label")).with_context(|| format!("in {}", path.display()));
+            return Err(anyhow!("a node's region {bad:?} is not a valid label"));
         }
         // An admin decides other people's requests, so a key that can never
         // match anybody is refused rather than kept: a typo would leave
         // requests with nobody to decide them, unnoticed.
         if let Some(bad) = config.admins.iter().find(|a| !(a.len() == 32 && a.bytes().all(|b| b.is_ascii_hexdigit()))) {
-            return Err(anyhow!("admin {bad:?} is not an identity hash (32 hex characters)")).with_context(|| format!("in {}", path.display()));
+            return Err(anyhow!("admin {bad:?} is not an identity hash (32 hex characters)"));
+        }
+        if let Some(bad) = config.join.hubs.iter().find(|h| !valid_hub(h)) {
+            return Err(anyhow!("join hub {bad:?} is not host:port"));
+        }
+        if let Some(url) = config.join.public_url.as_deref() {
+            if !valid_public_url(url) {
+                return Err(anyhow!("join public_url {url:?} is not an http:// or https:// address"));
+            }
         }
         Ok(config)
     }
@@ -1359,21 +1431,27 @@ impl Hosting {
     pub async fn workers(&self, admin: &AccountId) -> Result<Vec<WorkerView>> {
         self.admin_only(admin)?;
         let config = self.config();
-        let existing = self.all_instances().await?;
-        let mut out = Vec::new();
-        for node in &config.nodes {
-            let capacity = self.node_capacity(node).await;
-            out.push(WorkerView {
+        // Every worker at once, each held to a few seconds: a silent one is a
+        // row that says so, not a table that waits for it (a worker that has
+        // just joined may not be up yet).
+        let rows = futures_util::future::join_all(config.nodes.iter().map(|node| async move {
+            let probe = async { tokio::join!(self.node_capacity(node), self.node_instances(node)) };
+            let (capacity, instances) = tokio::time::timeout(Duration::from_secs(8), probe)
+                .await
+                .map(|(c, i)| (c, i.ok()))
+                .unwrap_or((None, None));
+            WorkerView {
                 name: node.name.clone(),
                 region: node.region.clone(),
                 class: node.class.clone(),
                 priority: node.priority,
                 answered: capacity.is_some(),
-                servers: existing.iter().filter(|i| i.node == node.name).count(),
+                servers: instances.map(|i| i.len()).unwrap_or(0),
                 capacity,
-            });
-        }
-        Ok(out)
+            }
+        }))
+        .await;
+        Ok(rows)
     }
 
     fn admin_only(&self, account: &AccountId) -> Result<()> {
@@ -1469,11 +1547,165 @@ impl Hosting {
         self.requests.deny(id, &admin.0, unix(now), note)
     }
 
+    fn admin_for(&self, account: &AccountId, what: &str) -> Result<()> {
+        if self.is_admin(account) {
+            Ok(())
+        } else {
+            Err(anyhow!("only an admin of this index can {what}"))
+        }
+    }
+
+    /// Make a join code (`join.rs`): a one-time way for a new machine to become
+    /// the worker `spec` describes. Returns the code's record and its secret,
+    /// which is not kept and is shown once.
+    pub fn create_join_code(
+        &self,
+        admin: &AccountId,
+        spec: crate::join::JoinSpec,
+        ttl_minutes: u64,
+        now: SystemTime,
+    ) -> Result<(crate::join::JoinView, String)> {
+        self.admin_for(admin, "make join codes")?;
+        if self.config().join.hubs.is_empty() {
+            return Err(anyhow!(
+                "write [join] hubs = [\"host:port\"] in the hosting file first: a hub a new worker can reach"
+            ));
+        }
+        if let Some(name) = spec.name.as_deref() {
+            if !valid_node_name(name) {
+                return Err(anyhow!("a worker's name is 1-64 characters: letters, digits, . _ -"));
+            }
+        }
+        for (what, v) in [("region", &spec.region), ("class", &spec.class)] {
+            if let Some(v) = v {
+                if !valid_class(v) {
+                    return Err(anyhow!("a worker's {what} is 1-32 characters: lower case, digits, - and _"));
+                }
+            }
+        }
+        let (view, token) = self.join_codes.create(spec, ttl_minutes.saturating_mul(60), &admin.0, unix(now))?;
+        tracing::info!(code = %view.id, by = %admin.0, "a join code was made");
+        Ok((view, token))
+    }
+
+    pub fn join_codes(&self, admin: &AccountId) -> Result<Vec<crate::join::JoinView>> {
+        self.admin_for(admin, "see join codes")?;
+        Ok(self.join_codes.list(unix(SystemTime::now())))
+    }
+
+    pub fn revoke_join_code(&self, admin: &AccountId, id: &str) -> Result<()> {
+        self.admin_for(admin, "revoke join codes")?;
+        self.join_codes.revoke(id)
+    }
+
+    /// What a join command needs besides the code.
+    pub fn join_info(&self, admin: &AccountId) -> Result<JoinSettings> {
+        self.admin_for(admin, "see join settings")?;
+        Ok(self.config().join.clone())
+    }
+
+    /// A new machine presents a join code and its control address, and becomes a
+    /// worker: a `[[nodes]]` block is added to the hosting file and put in
+    /// force at once. Needs no account: the code is the proof.
+    ///
+    /// The code decides where the worker sits; the machine only says who it is
+    /// (`agent`, its public address, and optionally a name). A worker that
+    /// could not be added gives the code back.
+    pub fn enroll(&self, token: &str, agent: &str, asked_name: Option<&str>, now: SystemTime) -> Result<Enrolled> {
+        let path = self.hosting_file.clone().ok_or_else(|| anyhow!("this index has no hosting file to add a worker to"))?;
+        if !(agent.len() == 32 && agent.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())) {
+            return Err(anyhow!("agent must be the worker's control address: 32 lower-case hex characters"));
+        }
+        if let Some(name) = asked_name {
+            if !valid_node_name(name) {
+                return Err(anyhow!("name is 1-64 characters: letters, digits, . _ -"));
+            }
+        }
+        let now_unix = unix(now);
+        let (code_id, spec) = self.join_codes.claim(token, now_unix)?;
+        match self.add_worker(&path, &code_id, &spec, agent, asked_name, now_unix) {
+            Ok(enrolled) => {
+                let _ = self.join_codes.finish(&code_id, agent, &enrolled.name);
+                tracing::info!(worker = %enrolled.name, region = ?enrolled.region, code = %code_id, "a worker joined");
+                Ok(enrolled)
+            }
+            Err(e) => {
+                let _ = self.join_codes.release(&code_id);
+                Err(e)
+            }
+        }
+    }
+
+    fn add_worker(
+        &self,
+        path: &std::path::Path,
+        code_id: &str,
+        spec: &crate::join::JoinSpec,
+        agent: &str,
+        asked_name: Option<&str>,
+        now_unix: u64,
+    ) -> Result<Enrolled> {
+        // One writer at a time, and the file is read again under the lock: an
+        // admin may have edited it since this index last looked.
+        let _held = self.file_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let config = Self::parse(&text).with_context(|| format!("in {}", path.display()))?;
+        if config.nodes.iter().any(|n| n.agent.as_deref() == Some(agent)) {
+            return Err(anyhow!("that machine is already a worker here"));
+        }
+        let taken = |name: &str| config.nodes.iter().any(|n| n.name == name);
+        let name = match (&spec.name, asked_name) {
+            (Some(fixed), _) if taken(fixed) => return Err(anyhow!("a worker named {fixed} already exists")),
+            (Some(fixed), _) => fixed.clone(),
+            (None, asked) => {
+                let base = asked.map(str::to_string).unwrap_or_else(|| format!("worker-{}", &agent[..4]));
+                let mut name = base.clone();
+                let mut n = 2;
+                while taken(&name) {
+                    name = format!("{base}-{n}");
+                    n += 1;
+                }
+                name
+            }
+        };
+        if config.join.hubs.is_empty() {
+            return Err(anyhow!("this index has no [join] hubs to give a worker"));
+        }
+        let mut block = format!(
+            "\n# Joined with code {code_id} at unix time {now_unix}.\n[[nodes]]\nname = \"{name}\"\napi = \"http://127.0.0.1:4750\"   # unused while agent is set\nagent = \"{agent}\"\npriority = {}\n",
+            spec.priority
+        );
+        if let Some(class) = &spec.class {
+            block.push_str(&format!("class = \"{class}\"\n"));
+        }
+        if let Some(region) = &spec.region {
+            block.push_str(&format!("region = \"{region}\"\n"));
+        }
+        let mut next = text;
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(&block);
+        // Nothing is written that this index would not itself load.
+        let parsed = Self::parse(&next).context("the file with the new worker added does not parse")?;
+        let partial = path.with_extension("toml.partial");
+        std::fs::write(&partial, next.as_bytes()).with_context(|| format!("writing {}", partial.display()))?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&partial, meta.permissions());
+        }
+        std::fs::rename(&partial, path).with_context(|| format!("writing {}", path.display()))?;
+        let hubs = parsed.join.hubs.clone();
+        self.reload(parsed);
+        Ok(Enrolled { name, region: spec.region.clone(), class: spec.class.clone(), priority: spec.priority, hubs })
+    }
+
     /// Keep region requests and granted admins in files beside the hosting
     /// file from now on (made on first write), reading any already there.
     pub fn keep_state_beside(mut self, hosting_file: &std::path::Path) -> Result<Self> {
         self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
         self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
+        self.join_codes = crate::join::JoinStore::load(&hosting_file.with_file_name("join-codes.json"))?;
+        self.hosting_file = Some(hosting_file.to_path_buf());
         Ok(self)
     }
 
@@ -2158,6 +2390,7 @@ mod tests {
             }],
             quota: QuotaSettings::default(),
             admins: Vec::new(),
+            join: JoinSettings::default(),
         }
     }
 
@@ -3574,6 +3807,69 @@ mod tests {
         assert_eq!(denied.state, crate::regions::RequestState::Denied);
         assert_eq!(to.lock().unwrap().hits.len(), hits_before, "a denial touched the server");
     }
+
+    /// A machine joins with a one-time code an admin made: the hosting file
+    /// gains its block (and keeps what the operator wrote), the node is in force
+    /// at once, the code decides where it sits, and a code that could not be
+    /// used is not lost. Only an admin makes codes; none are made with no hub to
+    /// give the worker.
+    #[test]
+    fn a_machine_joins_with_a_code_and_the_hosting_file_gains_it() {
+        let root = AccountId("ad".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosting.toml");
+        let w1 = "3ba38d2b008cd1d999f7a47ce8f8d3e6";
+        std::fs::write(
+            &file,
+            format!(
+                "games = [\"sven-coop\"]\nadmins = [\"{}\"]\n\n[[nodes]]\nname = \"w1\"\napi = \"http://127.0.0.1:1\"\nagent = \"{w1}\"\n# the operator's own note\n",
+                root.0
+            ),
+        )
+        .unwrap();
+        let h = Hosting::new(Hosting::load(&file).unwrap()).keep_state_beside(&file).unwrap();
+        let eu = crate::join::JoinSpec { name: None, region: Some("eu".into()), class: None, priority: 2 };
+
+        assert!(h.create_join_code(&root, eu.clone(), 60, now).unwrap_err().to_string().contains("[join] hubs"), "no hub to give a worker");
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("\n[join]\nhubs = [\"hub.example:4790\"]\n");
+        std::fs::write(&file, &text).unwrap();
+        h.reload_from(&file).unwrap();
+
+        assert!(h.create_join_code(&stranger, eu.clone(), 60, now).unwrap_err().to_string().starts_with("only an admin"));
+        let bad = crate::join::JoinSpec { region: Some("EU west".into()), ..eu.clone() };
+        assert!(h.create_join_code(&root, bad, 60, now).is_err(), "a region is a label");
+        let (_, token) = h.create_join_code(&root, eu.clone(), 60, now).unwrap();
+
+        let w2 = "86de9a454374c84613d5924d8510dde3";
+        assert!(h.enroll(&token, "NOT-A-HASH", None, now).is_err());
+        assert!(h.enroll("wrong", w2, None, now).unwrap_err().to_string().contains("not valid"));
+        assert!(h.enroll(&token, w1, Some("again"), now).unwrap_err().to_string().contains("already a worker"), "a known machine joins once");
+        let enrolled = h.enroll(&token, w2, Some("basement"), now).expect("the code was given back after the refusal");
+        assert_eq!((enrolled.name.as_str(), enrolled.region.as_deref(), enrolled.priority), ("basement", Some("eu"), 2));
+        assert_eq!(enrolled.hubs, ["hub.example:4790"]);
+        assert!(h.enroll(&token, "0095ce31cc9f56cd4c5e93521c2f4138", None, now).is_err(), "a code works once");
+
+        let in_force = h.config();
+        let node = in_force.nodes.iter().find(|n| n.name == "basement").expect("in force at once");
+        assert_eq!((node.agent.as_deref(), node.region.as_deref(), node.priority), (Some(w2), Some("eu"), 2));
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(written.contains("# the operator's own note") && written.contains("[join]"), "the operator's file is kept");
+        assert_eq!(Hosting::load(&file).unwrap().nodes.len(), 2, "what was written loads");
+
+        // A name already taken gets a suffix when the machine chose it, and is
+        // refused when the code fixed it.
+        let (_, open) = h.create_join_code(&root, crate::join::JoinSpec::default(), 60, now).unwrap();
+        let third = h.enroll(&open, "0095ce31cc9f56cd4c5e93521c2f4138", Some("basement"), now).unwrap();
+        assert_eq!(third.name, "basement-2");
+        let fixed = crate::join::JoinSpec { name: Some("w1".into()), ..Default::default() };
+        let (_, token) = h.create_join_code(&root, fixed, 60, now).unwrap();
+        assert!(h.enroll(&token, "4c45ad2a855d1312120128031a4ae602", None, now).unwrap_err().to_string().contains("already exists"));
+        assert_eq!(h.join_codes(&root).unwrap().iter().filter(|c| c.state == "pending").count(), 1, "that code is still good");
+    }
+
 
     /// Becoming an admin of the index: anyone may ask, only an admin decides; an
     /// approval makes them one at once; a file admin is the file's and the last

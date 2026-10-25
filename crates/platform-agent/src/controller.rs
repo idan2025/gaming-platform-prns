@@ -262,6 +262,14 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
             Some(format!("/admin/admins/{identity}"))
         }
         ["admin", "workers"] if *method == Method::GET && no_query() => Some("/admin/workers".into()),
+        // Adding a worker: an admin makes, lists and revokes join codes. The
+        // index checks who is admin. `/join`, which a new machine uses with a
+        // code and no account, is not here: it never goes through a node.
+        ["admin", "join-codes"] if matches!(*method, Method::GET | Method::POST) && no_query() => Some("/admin/join-codes".into()),
+        ["admin", "join-codes", id] if valid_join_id(id) && *method == Method::DELETE && no_query() => {
+            Some(format!("/admin/join-codes/{id}"))
+        }
+        ["admin", "join-info"] if *method == Method::GET && no_query() => Some("/admin/join-info".into()),
         ["instances"] => match *method {
             Method::GET | Method::POST if no_query() => Some("/instances".into()),
             _ => None,
@@ -306,6 +314,10 @@ fn valid_identity(id: &str) -> bool {
 
 /// A region request id the index made: sixteen lower-case hex characters.
 /// Checked before it is put in a path, like a server id.
+fn valid_join_id(id: &str) -> bool {
+    id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn valid_request_id(id: &str) -> bool {
     id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -379,10 +391,16 @@ mod tests {
             (Method::GET, "admin/admins".to_string(), "/admin/admins".to_string()),
             (Method::DELETE, format!("admin/admins/{who}"), format!("/admin/admins/{who}")),
             (Method::GET, "admin/workers".to_string(), "/admin/workers".to_string()),
+            (Method::GET, "admin/join-codes".to_string(), "/admin/join-codes".to_string()),
+            (Method::POST, "admin/join-codes".to_string(), "/admin/join-codes".to_string()),
+            (Method::DELETE, "admin/join-codes/0123456789ab".to_string(), "/admin/join-codes/0123456789ab".to_string()),
+            (Method::GET, "admin/join-info".to_string(), "/admin/join-info".to_string()),
         ] {
             assert_eq!(allowed_path(&method, &rest).as_deref(), Some(want.as_str()), "{method} {rest}");
         }
         assert_eq!(allowed_path(&Method::DELETE, "admin/admins/not-an-identity"), None);
+        assert_eq!(allowed_path(&Method::DELETE, "admin/join-codes/../x"), None);
+        assert_eq!(allowed_path(&Method::POST, "join"), None, "a worker joins directly, never through a node");
         for bad in ["admin/region-requests/../x/approve", "admin/region-requests/ABCDEF0123456789/approve", "admin/users"] {
             assert_eq!(allowed_path(&Method::POST, bad), None, "{bad}");
         }

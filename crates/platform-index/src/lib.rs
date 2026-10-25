@@ -7,6 +7,7 @@ pub mod admins;
 pub mod agent_client;
 pub mod hosting;
 pub mod http;
+pub mod join;
 pub mod node;
 pub mod quota;
 pub mod regions;

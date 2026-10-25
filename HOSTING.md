@@ -603,6 +603,47 @@ and which games, and names no worker.
 Nothing the script prints is secret: the two hashes are public, and the identity
 file never leaves the worker.
 
+### Adding a worker from the page: join codes
+
+On a page with a controller, an admin's **Admin** tab has **Add a worker**. It
+needs one thing in the index's hosting file, once:
+
+```toml
+[join]
+hubs = ["203.0.113.5:4790"]            # a hub a new worker can reach, as it reaches it
+public_url = "http://203.0.113.5:4761"  # this index's HTTP address, for the command
+```
+
+Pick the worker's region, class, priority and (optionally) name, and how long
+the code lasts, and press **Make a join code**. The page shows the same code
+three ways, to run on the new machine:
+
+- **Script**: `curl -fsSL <index>/join.sh | bash -s -- --url <index> --token <code>`.
+  It needs Docker, pulls the platform image, and starts one container that joins
+  and then runs as the worker (`--restart unless-stopped`, so it survives a
+  reboot). `scripts/join-worker.sh` is the same file; read it before running it.
+- **Docker**: the `docker run` the script runs, to paste yourself.
+- **platform-agent**: `platform-agent join --url <index> --token <code> --run`,
+  for a machine that has the binary (`join --help` has the options).
+
+The machine makes its own identity, presents the code and its public control
+address to the index (`POST /join`), and the index adds a `[[nodes]]` block to
+its hosting file, in force at once and kept in the file beside everything you
+wrote. The page watches the code and refreshes the Workers table when the
+machine has joined. A machine that has joined and restarts skips joining and
+just starts.
+
+A code **works once**, expires (1 day at most), and can be revoked; at most 20
+wait at once. The index keeps only its hash, in `join-codes.json` beside the
+hosting file. A wrong, spent, revoked and late code all get the same refusal,
+and a burst of wrong ones locks joining for a minute.
+
+**The code decides where the worker sits** (region, class, priority, name); the
+machine only says who it is. Nor does the index decide what the worker runs: a
+game's image is the machine's operator's choice, so a joined worker takes **no
+game** until you add a `[games.<id>]` section to its `agent.toml` (and the
+game's files), exactly as for a worker made with `setup-worker.sh`.
+
 ## Placing servers through a controller
 
 A worker's page shows one machine. Add a `[controller]` section and the same

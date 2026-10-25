@@ -17,6 +17,7 @@ pub mod docker;
 pub mod install;
 pub mod instance;
 pub mod interfaces;
+pub mod join;
 pub mod mesh;
 pub mod minecraft;
 pub mod official;

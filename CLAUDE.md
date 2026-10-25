@@ -76,6 +76,33 @@ quietly break:
   be neither demoted nor removed. Caught by
   `a_user_runs_servers_only_until_an_admin_makes_them_one` and
   `a_route_nobody_listed_is_an_admins`.
+- **A worker joins with a one-time code, and the code decides where it sits**
+  (2026-10-25, `platform-index/src/join.rs`, `Hosting::enroll`,
+  `platform-agent/src/join.rs`, `scripts/join-worker.sh`). An admin makes a
+  code; `POST /join` spends it and the index appends the worker's block to the
+  hosting file. Rules a later change could quietly break:
+  - **Only the code's hash is kept, a code works once, and every refusal reads
+    the same** (wrong, spent, revoked, late), with a throttle on wrong ones.
+    A claim is marked used before anything else happens, so two machines
+    cannot both win, and given back if the worker could not be added. Caught
+    by `a_code_works_once_and_every_refusal_reads_the_same`.
+  - **The machine says who it is; the code says everything else.** Region,
+    class, priority and name come from the code, never from the request.
+  - **Nothing is written that the index would not load**: the hosting file is
+    read again under a lock, the new text is parsed before the rename, and
+    what the operator wrote (comments included) stays. Caught by
+    `a_machine_joins_with_a_code_and_the_hosting_file_gains_it`.
+  - **The index never tells a worker what to run.** The answer carries the
+    index's identity (the one trusted index) and hubs, no image and no
+    `[games.*]`: a game's image is its machine's operator's choice, the same
+    rule as `GameRuntime.image`. Pinned by
+    `a_joined_config_trusts_the_answering_index_and_names_no_game`.
+  - **`/join` is not on a controller's allowlist.** A node page makes and
+    revokes codes (an admin of the index, checked there); a machine joins
+    directly. Codes need `[join] hubs` or none can be made.
+  - **The workers view never waits for a silent worker**: each is asked at
+    once and held to 8 s, so a worker that has just joined (or is down) is a
+    row that says "no", not an empty table.
 - **An index admin is the hosting file's or granted by an admin**
   (`platform-index/src/admins.rs`, `index-admins.json` beside the hosting
   file). Asking grants nothing; only an identity that is already an admin
