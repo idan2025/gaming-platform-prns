@@ -356,12 +356,92 @@ function toast(msg) {
 
 // ---------- screen switching ----------
 
-function showTokenScreen() {
+// How this node lets a person in (accounts.rs): sign in with an account, make
+// the first account with the API token, or paste the token. A node with no
+// token is loopback-only and open, so it just connects.
+let loginMode = "account";
+let authState = null;
+let autoConnected = false;
+
+async function showTokenScreen() {
   stopPolling();
   $("token-screen").classList.remove("hidden");
   $("main-ui").classList.add("hidden");
-  $("token-input").value = "";
-  $("token-input").focus();
+  for (const id of ["token-input", "login-user", "login-pass", "login-code", "setup-token", "setup-user", "setup-pass", "setup-pass2"]) {
+    const e = $(id);
+    if (e) e.value = "";
+  }
+  $("login-code-wrap").hidden = true;
+  try { authState = await (await fetch("/auth/state")).json(); } catch (_) { authState = null; }
+  if (authState && !authState.token_required && !autoConnected) {
+    autoConnected = true;
+    tryConnect(null);
+    return;
+  }
+  loginMode = !authState || !authState.accounts ? "token" : (authState.has_accounts ? "account" : "setup");
+  renderLoginMode();
+}
+
+function renderLoginMode() {
+  $("login-form").hidden = loginMode !== "account";
+  $("setup-form").hidden = loginMode !== "setup";
+  $("token-form").hidden = loginMode !== "token";
+  $("login-help").textContent = loginMode === "account" ? "Sign in to this node."
+    : loginMode === "setup" ? "Make the account you will sign in with from now on. The API token proves this is your node: it is in the file named by api_token_file in the agent's config. You need it only this once."
+    : "Paste this node's API token, from the file named by api_token_file in the agent's config.";
+  const sw = $("login-switch");
+  const canAccounts = authState && authState.accounts;
+  sw.parentElement.hidden = !canAccounts;
+  sw.textContent = loginMode === "token" ? (authState && authState.has_accounts ? "Sign in with an account instead" : "Make an account instead")
+    : "Use the API token instead";
+  const first = { account: "login-user", setup: "setup-token", token: "token-input" }[loginMode];
+  $(first)?.focus();
+}
+
+async function onLoginSubmit(e) {
+  e.preventDefault();
+  const err = $("token-error");
+  err.textContent = "";
+  const body = { username: $("login-user").value.trim(), password: $("login-pass").value };
+  const code = $("login-code").value.trim();
+  if (code) body.code = code;
+  let resp, out = {};
+  try {
+    resp = await fetch("/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    out = await resp.json().catch(() => ({}));
+  } catch (_) { err.textContent = "Could not reach this node."; return; }
+  if (resp.ok && out.session) {
+    state.signedInAs = out.username;
+    tryConnect(out.session);
+    return;
+  }
+  if (out.needs_code) {
+    $("login-code-wrap").hidden = false;
+    $("login-code").focus();
+  }
+  err.textContent = out.error || "Could not sign in.";
+}
+
+async function onSetupSubmit(e) {
+  e.preventDefault();
+  const err = $("token-error");
+  err.textContent = "";
+  const username = $("setup-user").value.trim();
+  const password = $("setup-pass").value;
+  if (password !== $("setup-pass2").value) { err.textContent = "The two passwords are not the same."; return; }
+  let resp, out = {};
+  try {
+    resp = await fetch("/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: $("setup-token").value.trim(), username, password }) });
+    out = await resp.json().catch(() => ({}));
+  } catch (_) { err.textContent = "Could not reach this node."; return; }
+  if (!resp.ok) { err.textContent = out.error || "The account was not made."; return; }
+  // Made: sign straight in with it.
+  $("login-user").value = username;
+  $("login-pass").value = password;
+  loginMode = "account";
+  renderLoginMode();
+  $("login-form").requestSubmit();
 }
 function showMainUI() {
   $("token-screen").classList.add("hidden");
@@ -651,6 +731,9 @@ async function tryConnect(token) {
     state.games = Array.isArray(games) ? games : [];
     state.capacity = await api("GET", "/capacity");
     await loadControllerStatus();
+    // The Account tab exists where this node has accounts.
+    const acct = $("tab-account");
+    if (acct) acct.hidden = !(authState ? authState.accounts : !!token);
     const insts = await api("GET", "/instances");
     state.instances = Array.isArray(insts) ? insts : [];
     clearError();
@@ -3174,6 +3257,119 @@ function onRelocate(id, name) {
   });
 }
 
+// ---------- account (accounts.rs) ----------
+
+function section(parent, title) {
+  const box = el("div", "req-card");
+  box.appendChild(el("h3", null, title));
+  parent.appendChild(box);
+  return box;
+}
+
+async function loadAccount() {
+  const root = $("account-body");
+  if (!root) return;
+  root.textContent = "";
+  let me = { via: "token" }, users = [];
+  try {
+    me = await api("GET", "/auth/me");
+    users = await api("GET", "/auth/users");
+  } catch (e) {
+    if (!(e && e.__auth)) root.appendChild(el("p", "muted small", (e && e.error) || "Could not read the accounts."));
+    return;
+  }
+  const isAccount = me.via === "account";
+  root.appendChild(el("p", "muted small", isAccount ? "Signed in as " + me.username + "."
+    : "Signed in with the API token. Make an account below and sign in with it to change a password or turn on codes."));
+
+  if (isAccount) {
+    const pw = section(root, "Password");
+    const cur = field(pw, "acct-cur", "Current password", { type: "password", autocomplete: "current-password" });
+    const nw = field(pw, "acct-new", "New password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
+    const nw2 = field(pw, "acct-new2", "The new password again", { type: "password", autocomplete: "new-password" });
+    const save = el("button", "btn btn-primary", "Change password");
+    save.type = "button";
+    save.onclick = async () => {
+      if (nw.value !== nw2.value) { showError("The two new passwords are not the same."); return; }
+      try {
+        await withInFlight(api("POST", "/auth/password", { current: cur.value, new: nw.value }));
+        cur.value = nw.value = nw2.value = "";
+        clearError();
+        toast("Password changed. Other sign-ins of this account were ended.");
+      } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The password was not changed."); }
+    };
+    const r = el("div", "form-actions"); r.style.justifyContent = "flex-start"; r.appendChild(save); pw.appendChild(r);
+
+    const tf = section(root, "Codes from an authenticator app");
+    if (me.totp_enabled) {
+      tf.appendChild(el("p", "muted small", "On. Signing in asks for a code. If the phone is lost, the API token still lets you in."));
+      const code = field(tf, "acct-off-code", "A current code", { type: "text", inputMode: "numeric", maxLength: 8 });
+      const off = el("button", "btn", "Turn codes off");
+      off.type = "button";
+      off.onclick = async () => {
+        try { await withInFlight(api("POST", "/auth/totp/disable", { code: code.value.trim() })); toast("Codes are off."); loadAccount(); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Codes were not turned off."); }
+      };
+      const r2 = el("div", "form-actions"); r2.style.justifyContent = "flex-start"; r2.appendChild(off); tf.appendChild(r2);
+    } else {
+      tf.appendChild(el("p", "muted small", "Off. Turn them on to ask for a code from an app (such as Aegis, Google Authenticator or 1Password) at every sign-in."));
+      const begin = el("button", "btn btn-primary", "Turn codes on");
+      begin.type = "button";
+      begin.onclick = async () => {
+        let t;
+        try { t = await withInFlight(api("POST", "/auth/totp/begin")); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Could not start."); return; }
+        begin.remove();
+        tf.appendChild(el("p", "muted small", "Scan this with your authenticator app, or type the key into it. Then enter the code it shows."));
+        const img = el("img", "totp-qr");
+        img.alt = "QR code for your authenticator app";
+        img.src = "data:image/svg+xml;base64," + btoa(t.qr_svg);
+        tf.appendChild(img);
+        const key = el("p", "mono small", t.secret.replace(/(.{4})/g, "$1 ").trim());
+        tf.appendChild(key);
+        const code = field(tf, "acct-on-code", "The code it shows", { type: "text", inputMode: "numeric", maxLength: 8 });
+        code.classList.add("field");
+        const confirmBtn = el("button", "btn btn-primary", "Confirm");
+        confirmBtn.type = "button";
+        confirmBtn.onclick = async () => {
+          try { await withInFlight(api("POST", "/auth/totp/enable", { code: code.value.trim() })); toast("Codes are on."); loadAccount(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That code was not accepted."); }
+        };
+        const r3 = el("div", "form-actions"); r3.style.justifyContent = "flex-start"; r3.appendChild(confirmBtn); tf.appendChild(r3);
+        code.focus();
+      };
+      const r4 = el("div", "form-actions"); r4.style.justifyContent = "flex-start"; r4.appendChild(begin); tf.appendChild(r4);
+    }
+  }
+
+  const us = section(root, "Accounts on this node");
+  for (const u of users) {
+    const line = el("div", "req-head");
+    line.appendChild(el("span", "req-line", u.username + (u.totp_enabled ? " \u00b7 codes on" : "")));
+    if (users.length > 1 && !(isAccount && u.username === me.username)) {
+      const rm = el("button", "btn", "Remove");
+      rm.type = "button";
+      rm.onclick = async () => {
+        if (!confirm("Remove the account " + u.username + "? It is signed out everywhere.")) return;
+        try { await withInFlight(api("DELETE", "/auth/users/" + encodeURIComponent(u.username))); loadAccount(); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not removed."); }
+      };
+      line.appendChild(rm);
+    }
+    us.appendChild(line);
+  }
+  const nu = field(us, "acct-add-user", "New username", { type: "text", autocapitalize: "none", spellcheck: false });
+  const np = field(us, "acct-add-pass", "Its password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
+  const add = el("button", "btn", "Add account");
+  add.type = "button";
+  add.onclick = async () => {
+    try { await withInFlight(api("POST", "/auth/users", { username: nu.value.trim(), password: np.value })); toast("Account added."); loadAccount(); }
+    catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not added."); }
+  };
+  const r5 = el("div", "form-actions"); r5.style.justifyContent = "flex-start"; r5.appendChild(add); us.appendChild(r5);
+  for (const input of root.querySelectorAll("input")) input.classList.add("field");
+}
+
 // ---------- region requests ----------
 
 function requestLine(r) {
@@ -4435,8 +4631,8 @@ async function onDeleteUnused() {
 
 // ---------- tabs ----------
 
-const TABS = ["servers", "games", "installed", "interfaces", "requests"];
-const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests" };
+const TABS = ["servers", "games", "installed", "interfaces", "requests", "account"];
+const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests", account: "Account" };
 
 function setActiveTab(name) {
   if (!TABS.includes(name)) name = "servers";
@@ -4456,6 +4652,7 @@ function setActiveTab(name) {
   if (name === "servers") pollUsage();
   if (name === "installed") pollInstalled();
   if (name === "requests") loadRequests();
+  if (name === "account") loadAccount();
 }
 
 function renderAll() {
@@ -4469,6 +4666,15 @@ function renderAll() {
 document.addEventListener("DOMContentLoaded", () => {
   $("error-dismiss").addEventListener("click", clearError);
 
+  $("login-form").addEventListener("submit", onLoginSubmit);
+  $("setup-form").addEventListener("submit", onSetupSubmit);
+  $("login-switch").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("token-error").textContent = "";
+    loginMode = loginMode === "token" ? (authState && authState.has_accounts ? "account" : "setup") : "token";
+    renderLoginMode();
+  });
+
   $("token-form").addEventListener("submit", (e) => {
     e.preventDefault();
     const v = $("token-input").value;
@@ -4478,6 +4684,11 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("disconnect-btn").addEventListener("click", () => {
+    // End the session on the node too, so it is not left live; the token has
+    // nothing to end.
+    const t = getToken();
+    if (t && t.startsWith("s.")) fetch("/auth/logout", { method: "POST", headers: { "Authorization": "Bearer " + t } }).catch(() => {});
+    state.signedInAs = null;
     setToken(null);
     state.capacity = null;
     state.instances = [];

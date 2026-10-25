@@ -23,6 +23,16 @@ api_bind = "0.0.0.0:4750"                     # loopback inside a container is t
 api_token_file = "/var/lib/gaming-platform-prns/api.token"
 ```
 
+**Signing in to the page.** The first time you open the page it asks for the API
+token once, with a username and password, and makes your account. From then on
+you sign in with the username and password. Under **Account** you can change the
+password, turn on codes from an authenticator app (scan the QR code, type back
+a code), and add or remove accounts. Accounts are kept in
+`<data_root>/web-accounts.json` (owner-only, passwords as Argon2id hashes). The
+API token keeps working for scripts and a controller, and it is the way back in
+if the phone with the codes is lost: "Use the API token instead" on the sign-in
+page.
+
 The container has to run as you, and in the `docker` group. Put your own ids in
 `docker-compose.yml` (`user:` and `group_add:`), and make the data root yours:
 

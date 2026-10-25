@@ -755,3 +755,56 @@ async fn capacity_reports_free_disk_and_the_reserve_it_is_held_to() {
         "the capacity report and the updates page must name the same reserve"
     );
 }
+
+/// The page signs in with an account instead of the token. The first account
+/// needs the token and only while there is none; a sign-in gives a session that
+/// opens every route and sign-out ends; a wrong name and a wrong password read
+/// alike; and the token keeps working, but changes no account.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_signs_in_with_an_account_made_once_with_the_token() {
+    let token = "t".repeat(32);
+    let Some((addr, dir)) = serve_with_token(&token).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let c = reqwest::Client::new();
+    let url = |p: &str| format!("http://{addr}{p}");
+    let post = |p: &str, body: serde_json::Value| c.post(url(p)).json(&body);
+
+    let state: serde_json::Value = c.get(url("/auth/state")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(state["has_accounts"], false);
+    assert_eq!(state["token_required"], true);
+
+    let wrong = post("/auth/setup", serde_json::json!({"token": "nope", "username": "op", "password": "correct horse battery"}));
+    assert_eq!(wrong.send().await.unwrap().status(), 401);
+    let made = post("/auth/setup", serde_json::json!({"token": token, "username": "op", "password": "correct horse battery"}));
+    assert_eq!(made.send().await.unwrap().status(), 200);
+    let again = post("/auth/setup", serde_json::json!({"token": token, "username": "two", "password": "another long password"}));
+    assert_eq!(again.send().await.unwrap().status(), 409, "the first account is made once");
+
+    let no_name = post("/auth/login", serde_json::json!({"username": "ghost", "password": "correct horse battery"}));
+    let no_name: serde_json::Value = no_name.send().await.unwrap().json().await.unwrap();
+    let bad_pass = post("/auth/login", serde_json::json!({"username": "op", "password": "wrong password!!"}));
+    let bad_pass: serde_json::Value = bad_pass.send().await.unwrap().json().await.unwrap();
+    assert_eq!(no_name["error"], bad_pass["error"], "a missing name must read like a wrong password");
+
+    let login = post("/auth/login", serde_json::json!({"username": "op", "password": "correct horse battery"}));
+    let login: serde_json::Value = login.send().await.unwrap().json().await.unwrap();
+    let session = login["session"].as_str().expect("a session").to_string();
+    let with = |s: &str, p: &str| c.get(url(p)).bearer_auth(s.to_string());
+    assert_eq!(with(&session, "/instances").send().await.unwrap().status(), 200);
+    let me: serde_json::Value = with(&session, "/auth/me").send().await.unwrap().json().await.unwrap();
+    assert_eq!((me["via"].as_str(), me["username"].as_str()), (Some("account"), Some("op")));
+
+    // The token still opens everything, but it is no account to change.
+    assert_eq!(with(&token, "/instances").send().await.unwrap().status(), 200);
+    let by_token = c.post(url("/auth/password")).bearer_auth(&token)
+        .json(&serde_json::json!({"current": "correct horse battery", "new": "a new long password"}));
+    assert_eq!(by_token.send().await.unwrap().status(), 403);
+
+    assert_eq!(c.post(url("/auth/logout")).bearer_auth(&session).send().await.unwrap().status(), 204);
+    assert_eq!(with(&session, "/instances").send().await.unwrap().status(), 401, "sign-out ended it");
+
+    let file = std::fs::read_to_string(dir.path().join("web-accounts.json")).unwrap();
+    assert!(!file.contains("correct horse"), "a password reached the file in clear");
+}

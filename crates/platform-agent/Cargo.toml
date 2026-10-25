@@ -37,6 +37,10 @@ tar = "0.4"
 flate2 = "1"
 lzma-rs = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The node page's accounts: passwords as Argon2id hashes (`src/accounts.rs`).
+argon2 = { version = "0.5", features = ["std"] }
+# The QR code an authenticator app scans to enrol (`src/accounts.rs`).
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [[bin]]
 name = "platform-agent"
