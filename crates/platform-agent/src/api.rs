@@ -233,7 +233,88 @@ pub fn router_full(
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
         .with_state(state)
+}
+
+/// What the page may load: its own three files, game art from the hosts a
+/// pack's `art` may name (`game_bridge::pack::ART_HOSTS`), and the QR code the
+/// node draws for codes. No inline script or style, no plugin, no frame, and
+/// nothing may frame the page, so a page elsewhere cannot overlay it and have
+/// an admin click its buttons.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     img-src 'self' data: https://upload.wikimedia.org https://cdn.cloudflare.steamstatic.com \
+     https://shared.cloudflare.steamstatic.com https://cdn.akamai.steamstatic.com; \
+     connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// Requests only a page of this node's own may make, and the headers every
+/// answer carries.
+///
+/// A browser on the operator's machine can be made to reach a loopback API by
+/// any website it opens: a form or `fetch` with no custom header is sent
+/// without asking (a POST with no body needs no preflight), and DNS rebinding
+/// makes a site's own name answer with `127.0.0.1`. So a request a browser
+/// marks as coming from another site, an `Origin` that is not this host, and,
+/// on a node with no token, a `Host` that is not a loopback name are refused
+/// before any route runs. Programs that are not browsers send none of these
+/// headers and are unaffected.
+async fn browser_guard(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    if let Some(why) = refuse_from_browser(request.headers(), state.token.is_none()) {
+        return (StatusCode::FORBIDDEN, Json(ApiError { error: why.to_string() })).into_response();
+    }
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    h.insert("cross-origin-opener-policy", header::HeaderValue::from_static("same-origin"));
+    h.insert("cross-origin-resource-policy", header::HeaderValue::from_static("same-origin"));
+    response
+}
+
+fn refuse_from_browser(headers: &HeaderMap, loopback_only: bool) -> Option<&'static str> {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // `same-site` is another port or subdomain of the same site: still
+    // another origin, so still refused.
+    let host = text("host");
+    if let Some(site) = text("sec-fetch-site") {
+        if site != "same-origin" && site != "none" {
+            return Some("refused: a request from another site");
+        }
+    } else if let Some(origin) = text("origin") {
+        // An older browser: compare what it says it came from with where it
+        // sent the request. (A browser that sends `Sec-Fetch-Site` has already
+        // made this comparison, and a proxy that rewrites `Host` would make
+        // it fail for a page of this node's own.)
+        let authority = origin.split_once("://").map(|(_, rest)| rest);
+        if authority.is_none() || authority != host {
+            return Some("refused: a request from another site");
+        }
+    }
+    if loopback_only {
+        let host = host?;
+        if !is_loopback_host(host) {
+            return Some("refused: this node answers only to its loopback address");
+        }
+    }
+    None
+}
+
+/// `localhost`, `127.x.x.x` or `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, after)) if after.is_empty() || after.starts_with(':') => inside,
+            _ => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    if name.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 const UI_INDEX: &str = include_str!("../webui/index.html");
@@ -271,9 +352,17 @@ async fn ui_css() -> Response {
 /// operator's own machine is a loopback client, and so is every other program
 /// on it. An exemption there would mean the token protects the network and
 /// nothing else.
+/// Who a request that passed [`require_token`] is: an account by name, or the
+/// API token (no name).
+#[derive(Clone)]
+struct Caller {
+    username: Option<String>,
+    role: crate::accounts::Role,
+}
+
 async fn require_token(
     State(state): State<ApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let Some(expected) = &state.token else {
@@ -284,17 +373,20 @@ async fn require_token(
     let presented = presented_token(request.headers());
     // The API token (an admin), or a live session from signing in with an
     // account, which acts with that account's role.
-    let role = if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        Some(crate::accounts::Role::Admin)
+    let caller = if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        Some(Caller { username: None, role: crate::accounts::Role::Admin })
     } else {
-        state.accounts.as_ref().and_then(|a| a.session(presented).and_then(|user| a.role(&user)))
+        state.accounts.as_ref().and_then(|a| {
+            a.session(presented).and_then(|user| a.role(&user).map(|role| Caller { username: Some(user), role }))
+        })
     };
-    let Some(role) = role else {
+    let Some(caller) = caller else {
         return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
     };
-    if role == crate::accounts::Role::User && !user_may(request.method(), request.uri().path()) {
+    if caller.role == crate::accounts::Role::User && !user_may(request.method(), request.uri().path()) {
         return Err(fail(StatusCode::FORBIDDEN, "only an admin of this node can do that"));
     }
+    request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
 }
 
@@ -567,9 +659,30 @@ async fn auth_user_remove(
     State(state): State<ApiState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    accounts_of(&state)?.remove(&name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    remove_account(&state, &name).await?;
     tracing::info!(user = %name, "a page account was removed");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a page account, and first, for a user on a node with a controller,
+/// everything the index keeps under that account's own identity (its servers
+/// and their backups). If the index cannot do that (one of its workers is not
+/// answering), the account stays, so its servers are never left running with
+/// nobody able to reach them.
+async fn remove_account(state: &ApiState, name: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let accounts = accounts_of(state)?;
+    let role = accounts.role(name).ok_or_else(|| fail(StatusCode::BAD_REQUEST, "no such account"))?;
+    // The account rules (last account, last admin) first, so nothing is erased
+    // for a removal that would be refused anyway.
+    accounts.check_removable(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    if let (Some(controller), crate::accounts::Role::User) = (state.agent.controller(), role) {
+        let caller = Caller { username: Some(name.to_string()), role };
+        let acting = acting_for(state, Some(&caller))?;
+        controller.erase(&acting).await.map_err(|e| {
+            fail(StatusCode::BAD_GATEWAY, format!("the account's servers could not be removed at the controller, so the account stays: {e:#}"))
+        })?;
+    }
+    accounts.remove(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))
 }
 
 /// Compare without leaking where the first difference is.
@@ -1071,17 +1184,35 @@ async fn controller_status(State(state): State<ApiState>) -> Json<serde_json::Va
     })
 }
 
+/// Who a request acts as at the controller: an account with the user role as
+/// its own identity, everyone else (admins, the token, a node with no token)
+/// as the node (`controller::Acting`).
+fn acting_for(state: &ApiState, caller: Option<&Caller>) -> Result<crate::controller::Acting, (StatusCode, Json<ApiError>)> {
+    match caller {
+        Some(Caller { username: Some(username), role: crate::accounts::Role::User }) => {
+            let salt = accounts_of(state)?.key_salt(username).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(crate::controller::Acting::Account { username: username.clone(), salt })
+        }
+        _ => Ok(crate::controller::Acting::Node),
+    }
+}
+
 /// Pass one request through to the controller, if its path is on the allowlist
 /// (`controller::allowed_path`). Anything else is refused here, before a login
 /// is attempted, so a request the list does not name never reaches the index.
 async fn controller_proxy(
     State(state): State<ApiState>,
+    caller: Option<axum::Extension<Caller>>,
     method: axum::http::Method,
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Response {
     let Some(controller) = state.agent.controller() else {
         return fail(StatusCode::NOT_FOUND, "this node has no controller").into_response();
+    };
+    let acting = match acting_for(&state, caller.as_deref()) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
     };
     let rest = uri.path().strip_prefix("/controller/").unwrap_or_default();
     let rest = match uri.query() {
@@ -1096,7 +1227,7 @@ async fn controller_proxy(
         .into_response();
     };
     let body = (!body.is_empty()).then_some(&body[..]);
-    match controller.forward(&method, &path, body).await {
+    match controller.forward_as(&acting, &method, &path, body).await {
         Ok(reply) => {
             let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::builder().status(status);

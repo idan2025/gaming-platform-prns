@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::response::Html;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use game_bridge::browse::{BrowseFilter, BrowseQuery, SortBy};
@@ -55,7 +55,7 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/servers", get(servers))
         .route("/auth/challenge", post(challenge))
         .route("/auth/verify", post(verify))
-        .route("/me", get(me))
+        .route("/me", get(me).delete(erase_me))
         // Hosting. Everything above works with these switched off.
         .route("/hosting", get(hosting_info))
         .route("/instances", get(my_instances).post(deploy))
@@ -81,7 +81,25 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
         .route("/instances/:id/backups/:name/restore", post(backup_restore))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
+}
+
+/// Headers every answer carries. The status page is the only HTML here and has
+/// no script, so the policy allows none; its one inline stylesheet is the only
+/// thing it may load. Nothing may frame any of it.
+async fn security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let h = response.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ),
+    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn health(State(state): State<Arc<IndexState>>) -> Json<serde_json::Value> {
@@ -288,9 +306,10 @@ async fn servers(
 
 async fn challenge(State(state): State<Arc<IndexState>>) -> ApiResult<platform_auth::Challenge> {
     let mut auth = state.auth.lock().await;
-    auth.issue_challenge(std::time::SystemTime::now())
-        .map(Json)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+    auth.issue_challenge(std::time::SystemTime::now()).map(Json).map_err(|e| match e {
+        platform_auth::AuthError::Busy => fail(StatusCode::SERVICE_UNAVAILABLE, e),
+        e => fail(StatusCode::INTERNAL_SERVER_ERROR, e),
+    })
 }
 
 async fn verify(
@@ -302,8 +321,47 @@ async fn verify(
         .map(Json)
         // Every auth failure is a 401 with the same shape, so the response does
         // not tell an attacker which of "unknown nonce", "expired" and "bad
-        // signature" they hit.
-        .map_err(|e| fail(StatusCode::UNAUTHORIZED, e))
+        // signature" they hit. A verifier holding all the sessions it will is
+        // the one answer that is not about the request.
+        .map_err(|e| match e {
+            platform_auth::AuthError::Busy => fail(StatusCode::SERVICE_UNAVAILABLE, e),
+            e => fail(StatusCode::UNAUTHORIZED, e),
+        })
+}
+
+#[derive(Deserialize)]
+struct EraseRequest {
+    /// The caller's own identity hash, typed back, so no stray request removes
+    /// an account's servers.
+    confirm: String,
+}
+
+/// Remove everything this index keeps under the caller's identity: their
+/// servers and backups on every worker, their region requests, and then every
+/// session they hold. Refused unless every worker answered, so it never
+/// reports done with a worker's copy left behind.
+async fn erase_me(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    Json(request): Json<EraseRequest>,
+) -> ApiResult<serde_json::Value> {
+    let account = account_of(&state, &headers).await?;
+    if !request.confirm.trim().eq_ignore_ascii_case(&account.0) {
+        return Err(fail(StatusCode::BAD_REQUEST, "type your identity back to confirm"));
+    }
+    let erased = match &state.hosting {
+        Some(hosting) => hosting.erase_account(&account).await.map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, e))?,
+        None => crate::hosting::Erased::default(),
+    };
+    let identity = hex::decode(&account.0)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+        .map(prns_core::identity::IdentityHash::new);
+    let sessions_ended = match identity {
+        Some(identity) => state.auth.lock().await.revoke_identity(&identity),
+        None => 0,
+    };
+    Ok(Json(json!({ "erased": erased, "sessions_ended": sessions_ended })))
 }
 
 /// Who the caller is, per their bearer token. The smallest possible route that

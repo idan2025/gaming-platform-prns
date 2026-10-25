@@ -5,7 +5,7 @@
 //! are the real ones. Only the routes behind the login are faked. Needs no
 //! Docker.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
@@ -19,8 +19,8 @@ use prns_core::identity::PrivateIdentityMaterial;
 
 struct FakeIndex {
     auth: Mutex<Authenticator>,
-    /// Tokens this index issued and has not revoked.
-    live: Mutex<HashSet<String>>,
+    /// Tokens this index issued and has not revoked, and whose they are.
+    live: Mutex<HashMap<String, String>>,
     /// Every request path that got past the login, so a test can see what the
     /// node actually asked for.
     seen: Mutex<Vec<String>>,
@@ -40,27 +40,42 @@ async fn verify(
         .unwrap()
         .verify(&response, std::time::SystemTime::now())
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    s.live.lock().unwrap().insert(session.token.clone());
+    s.live.lock().unwrap().insert(session.token.clone(), session.identity.clone());
     Ok(Json(session))
 }
 
-fn authorised(s: &FakeIndex, headers: &HeaderMap) -> Result<(), StatusCode> {
+/// The identity the request's token was issued to.
+fn authorised(s: &FakeIndex, headers: &HeaderMap) -> Result<String, StatusCode> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if s.live.lock().unwrap().contains(token) {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
+    s.live.lock().unwrap().get(token).cloned().ok_or(StatusCode::UNAUTHORIZED)
 }
 
 async fn instances(State(s): State<Arc<FakeIndex>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
-    authorised(&s, &headers)?;
+    let owner = authorised(&s, &headers)?;
     s.seen.lock().unwrap().push("/instances".into());
-    Ok(Json(serde_json::json!([{"instance_id": "sven-coop-1"}])))
+    Ok(Json(serde_json::json!([{"instance_id": "sven-coop-1", "owner": owner}])))
+}
+
+async fn me(State(s): State<Arc<FakeIndex>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+    let identity = authorised(&s, &headers)?;
+    Ok(Json(serde_json::json!({ "identity": identity })))
+}
+
+async fn erase_me(
+    State(s): State<Arc<FakeIndex>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let identity = authorised(&s, &headers)?;
+    if body["confirm"] != serde_json::json!(identity) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    s.seen.lock().unwrap().push(format!("erase {identity}"));
+    Ok(Json(serde_json::json!({ "erased": {}, "sessions_ended": 1 })))
 }
 
 async fn logs(
@@ -91,13 +106,14 @@ async fn serve_index(dir: &std::path::Path) -> (String, String, Arc<FakeIndex>) 
     let index_hash = hex::encode(hash.as_bytes());
     let state = Arc::new(FakeIndex {
         auth: Mutex::new(Authenticator::new(hash)),
-        live: Mutex::new(HashSet::new()),
+        live: Mutex::new(HashMap::new()),
         seen: Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/auth/challenge", post(challenge))
         .route("/auth/verify", post(verify))
         .route("/instances", get(instances))
+        .route("/me", get(me).delete(erase_me))
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/stop", post(stop))
         .with_state(state.clone());
@@ -212,4 +228,45 @@ async fn pages_polling_together_cost_the_index_one_listing_and_a_change_is_seen_
     assert_eq!(controller.forward(&Method::POST, "/instances/sven-coop-1/stop", None).await.unwrap().status, 204);
     controller.forward(&Method::GET, "/instances", None).await.unwrap();
     assert_eq!(lists(&index), 2, "the list after a stop came from before it");
+}
+
+/// Each account with the user role is its own identity at the index, derived
+/// from the node's key and the account's salt, so the index keeps their
+/// servers apart; the node's admins are the node. Lists are cached per
+/// identity (one account never sees another's), and erasing an account sends
+/// that account's own identity back as confirmation and is refused for the
+/// node.
+#[tokio::test]
+async fn each_user_account_is_its_own_identity_at_the_controller() {
+    use platform_agent::controller::Acting;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, index_hash, index) = serve_index(dir.path()).await;
+    let controller =
+        Controller::new(&ControllerConfig { url, identity: index_hash }, &node_identity(dir.path()))
+            .unwrap();
+    let account = |name: &str, salt: &str| Acting::Account { username: name.into(), salt: salt.into() };
+    let alice = account("alice", "00112233445566778899aabbccddeeff");
+
+    let node_id = controller.identity_of(&Acting::Node).unwrap();
+    let alice_id = controller.identity_of(&alice).unwrap();
+    assert_ne!(alice_id, node_id);
+    assert_eq!(controller.identity_of(&alice).unwrap(), alice_id, "the same account is the same identity");
+    let others = [account("alice", "ffeeddccbbaa99887766554433221100"), account("bob", "00112233445566778899aabbccddeeff")];
+    for other in &others {
+        let id = controller.identity_of(other).unwrap();
+        assert!(id != alice_id && id != node_id, "{other:?}");
+    }
+
+    let who = |reply: platform_agent::controller::Forwarded| -> serde_json::Value { serde_json::from_slice(&reply.body).unwrap() };
+    assert_eq!(who(controller.forward_as(&alice, &Method::GET, "/me", None).await.unwrap())["identity"], serde_json::json!(alice_id));
+    assert_eq!(who(controller.forward(&Method::GET, "/me", None).await.unwrap())["identity"], serde_json::json!(node_id));
+
+    let alice_list = who(controller.forward_as(&alice, &Method::GET, "/instances", None).await.unwrap());
+    let bob_list = who(controller.forward_as(&others[1], &Method::GET, "/instances", None).await.unwrap());
+    assert_eq!(alice_list[0]["owner"], serde_json::json!(alice_id));
+    assert_ne!(bob_list[0]["owner"], serde_json::json!(alice_id), "one account was handed another's cached list");
+
+    assert!(controller.erase(&Acting::Node).await.is_err());
+    controller.erase(&alice).await.unwrap();
+    assert!(index.seen.lock().unwrap().contains(&format!("erase {alice_id}")));
 }

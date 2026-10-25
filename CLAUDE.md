@@ -76,6 +76,31 @@ quietly break:
   be neither demoted nor removed. Caught by
   `a_user_runs_servers_only_until_an_admin_makes_them_one` and
   `a_route_nobody_listed_is_an_admins`.
+- **Each user account is its own identity at the controller** (2026-10-25,
+  `controller::Acting`, `account_secret`). An account with the user role signs
+  in to the index as an identity derived (HMAC-SHA256) from the node's key, its
+  name and a random per-account `key_salt`; admins and the token act as the
+  node. So the index's owner check keeps accounts' servers apart and its quotas
+  count each one. Before this every account was the node there and any user
+  could stop or remove another's server. A name taken again gets a new salt,
+  never the old account's servers. Removing a user account first has the index
+  erase that identity (`DELETE /me`: its servers and backups, refused while a
+  worker is silent); if the index cannot, the account stays. Lists are cached
+  per identity. Caught by
+  `each_user_account_is_its_own_identity_at_the_controller`.
+- **Sign-in state is bounded** (`platform-auth`: 10,000 challenges, 100,000
+  sessions, 8 per identity, then `Busy`/503), and **the node refuses browser
+  requests from other sites** (`api::browser_guard`: `Sec-Fetch-Site`,
+  `Origin`, and on a tokenless node a non-loopback `Host`, against CSRF and DNS
+  rebinding) and sends a CSP with no inline script or style and
+  `frame-ancestors 'none'`; the index sends the same kind of headers. Inline
+  `style=` in the page is refused by it. The page's prose must not use the
+  class `help` (the `?` tooltip). Caught by
+  `another_site_cannot_drive_a_loopback_node_through_a_browser`.
+- **`cargo audit` runs on both lockfiles** (`.github/workflows/audit.yml`, daily
+  and on lockfile changes). The launcher's zip 4, inside the Tauri updater, is
+  ignored with its reason in the workflow: it extracts only an update whose
+  signature has verified.
 - **An index admin is the hosting file's or granted by an admin**
   (`platform-index/src/admins.rs`, `index-admins.json` beside the hosting
   file). Asking grants nothing; only an identity that is already an admin

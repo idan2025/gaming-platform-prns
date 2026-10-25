@@ -32,7 +32,7 @@ sha2 = "0.10"
 # Mojang publishes SHA-1 only for its server jars (`src/minecraft.rs`).
 sha1 = "0.10"
 # A Minecraft world usually arrives as a zip (`src/world.rs`).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
 lzma-rs = "0.3"

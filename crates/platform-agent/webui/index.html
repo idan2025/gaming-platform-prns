@@ -272,7 +272,7 @@
             <p class="card-text">This node's address: <code id="mesh-destination" class="selectable">—</code></p>
             <div id="interfaces-tbody" class="item-list"></div>
             <p id="interfaces-empty" class="card-text hidden">No uplink connections yet.</p>
-            <form id="iface-form" class="form-grid" autocomplete="off" style="margin-top:14px">
+            <form id="iface-form" class="form-grid mt-14" autocomplete="off">
               <label for="iface-kind">Kind</label>
               <select id="iface-kind" name="kind" class="field">
                 <option value="tcp">TCP (dial a relay, or be one)</option>
@@ -302,7 +302,7 @@
       </section>
       <section id="tab-panel-requests" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-requests">
         <p class="muted small">A move to another region is asked for from a server's menu (Move to another worker…) and decided by an admin of the controller, on the Admin tab. Once approved, the server moves to a worker in that region, which becomes its home; coming back is another request.</p>
-        <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">
+        <div class="form-actions start mb-12">
           <button id="requests-refresh" type="button" class="btn">Refresh</button>
         </div>
         <div id="requests-admin"></div>

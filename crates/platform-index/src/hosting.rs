@@ -418,6 +418,14 @@ pub struct WorkerView {
     pub capacity: Option<platform_agent::uplink_wire::CapacityResp>,
 }
 
+/// What an erase removed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Erased {
+    pub servers_removed: Vec<String>,
+    pub backups_deleted: u32,
+    pub requests_forgotten: usize,
+}
+
 /// Where a move may go. A server stays in its region unless an admin approved
 /// a request for another (`regions.rs`), which is the only way `Region` is used.
 #[derive(Debug, Clone, Copy)]
@@ -1005,6 +1013,43 @@ impl Hosting {
             }
         }
         Ok(held)
+    }
+
+    /// The account's servers on every worker, each worker asked itself. One
+    /// that cannot answer fails the whole call: an erase that skipped a worker
+    /// would read as complete and not be.
+    async fn owned_everywhere(&self, account: &AccountId) -> Result<Vec<HostedInstance>> {
+        let config = self.config();
+        let mut owned = Vec::new();
+        for node in &config.nodes {
+            let rows = self
+                .node_instances(node)
+                .await
+                .map_err(|e| anyhow!("could not ask {} for your servers to remove them; try again later: {e:#}", node.name))?;
+            owned.extend(rows.into_iter().filter(|i| i.owner.as_deref() == Some(account.0.as_str())));
+        }
+        Ok(owned)
+    }
+
+    /// Remove everything this index and its workers hold under one account:
+    /// every backup of every server it owns, then the servers, then its region
+    /// requests. Nothing is touched unless every worker answered, and a failure
+    /// part way stops there; asking again carries on from what is left. A
+    /// server's files stay on its worker until that worker's leftover clean-up,
+    /// as for any removed server.
+    pub async fn erase_account(&self, account: &AccountId) -> Result<Erased> {
+        let owned = self.owned_everywhere(account).await?;
+        let mut erased = Erased::default();
+        for instance in &owned {
+            for backup in self.backups(account, &instance.instance_id).await?.backups {
+                self.backup_delete(account, &instance.instance_id, &backup.name).await?;
+                erased.backups_deleted += 1;
+            }
+            self.destroy(account, &instance.instance_id).await?;
+            erased.servers_removed.push(instance.instance_id.clone());
+        }
+        erased.requests_forgotten = self.requests.forget(&account.0)?;
+        Ok(erased)
     }
 
     pub async fn backup_restore(&self, account: &AccountId, instance_id: &str, name: &str) -> Result<()> {
@@ -3046,6 +3091,99 @@ mod tests {
             }
         });
         (addr, hits)
+    }
+
+    /// A worker whose servers and backups can be removed, recording the order
+    /// it was asked in.
+    async fn erasable_worker(
+        servers: Vec<(&'static str, String, Vec<&'static str>)>,
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<(Vec<(&'static str, String, Vec<&'static str>)>, Vec<String>)>>) {
+        use axum::extract::{Path, State};
+        use axum::routing::{delete, get};
+        use axum::{Json, Router};
+
+        type Held = Arc<std::sync::Mutex<(Vec<(&'static str, String, Vec<&'static str>)>, Vec<String>)>>;
+        async fn list(State(h): State<Held>) -> Json<serde_json::Value> {
+            let held = h.lock().unwrap();
+            Json(serde_json::Value::Array(
+                held.0
+                    .iter()
+                    .map(|(id, owner, _)| {
+                        serde_json::json!({
+                            "instance_id": id, "game_id": "sven-coop", "name": id, "state": "stopped",
+                            "port": null, "ports": [], "owner": owner,
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        async fn backups(State(h): State<Held>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            let held = h.lock().unwrap();
+            let names = held.0.iter().find(|(i, ..)| *i == id).map(|(.., b)| b.clone()).unwrap_or_default();
+            Json(serde_json::Value::Array(
+                names.iter().map(|n| serde_json::json!({"name": n, "bytes": 1, "created_unix": 0})).collect(),
+            ))
+        }
+        async fn remove_backup(State(h): State<Held>, Path((id, name)): Path<(String, String)>) -> &'static str {
+            let mut held = h.lock().unwrap();
+            if let Some(s) = held.0.iter_mut().find(|(i, ..)| *i == id) {
+                s.2.retain(|b| *b != name);
+            }
+            held.1.push(format!("delete {id} {name}"));
+            "ok"
+        }
+        async fn remove(State(h): State<Held>, Path(id): Path<String>) -> &'static str {
+            let mut held = h.lock().unwrap();
+            held.0.retain(|(i, ..)| *i != id);
+            held.1.push(format!("remove {id}"));
+            "ok"
+        }
+        let state: Held = Arc::new(std::sync::Mutex::new((servers, Vec::new())));
+        let app = Router::new()
+            .route("/instances", get(list))
+            .route("/instances/:id", delete(remove))
+            .route("/instances/:id/backups", get(backups))
+            .route("/instances/:id/backups/:name", delete(remove_backup))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, state)
+    }
+
+    /// An account's servers are erased with their backups first, and never a
+    /// stranger's. With a worker that cannot be asked it is refused and nothing
+    /// is touched: an erase that skipped a worker would read as complete and not
+    /// be.
+    #[tokio::test]
+    async fn an_account_erases_its_servers_and_backups_and_nobody_elses() {
+        let me = AccountId("aa".repeat(16));
+        let stranger = "bb".repeat(16);
+        let (addr, held) = erasable_worker(vec![
+            ("mine-1", me.0.clone(), vec!["20261022-000001.tar.gz", "20261022-000002.tar.gz"]),
+            ("mine-2", me.0.clone(), vec![]),
+            ("theirs", stranger.clone(), vec!["20261022-000003.tar.gz"]),
+        ])
+        .await;
+
+        let mut silent = one_node_at(addr);
+        let mut down = silent.nodes[0].clone();
+        down.name = "down".into();
+        down.api = "http://127.0.0.1:9".into();
+        silent.nodes.push(down);
+        assert!(Hosting::new(silent).erase_account(&me).await.is_err());
+        assert!(held.lock().unwrap().1.is_empty(), "something was removed with a worker silent");
+
+        let h = Hosting::new(one_node_at(addr));
+        let erased = h.erase_account(&me).await.unwrap();
+        assert_eq!((erased.backups_deleted, erased.servers_removed.len()), (2, 2));
+        let asked = held.lock().unwrap().1.clone();
+        let removed_at = asked.iter().position(|a| a == "remove mine-1").unwrap();
+        assert!(asked[..removed_at].iter().filter(|a| a.starts_with("delete mine-1")).count() == 2, "{asked:?}");
+        assert!(!asked.iter().any(|a| a.contains("theirs")), "a stranger's server was touched: {asked:?}");
+        assert_eq!(held.lock().unwrap().0.len(), 1);
     }
 
     /// The cap counts an account's backups across **all** its servers on all
