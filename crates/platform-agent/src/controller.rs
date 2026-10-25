@@ -152,7 +152,7 @@ impl Controller {
         }
         // A move carries a server's files between workers and takes as long
         // as that takes; everything else is one quick reply.
-        if path.ends_with("/relocate") {
+        if path.ends_with("/relocate") || path.ends_with("/approve") {
             request = request.timeout(MOVE_TIMEOUT);
         }
         let response = request.send().await.context("asking the controller")?;
@@ -228,6 +228,24 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         // What the index hosts and where (regions), read-only: the create form
         // offers a region from it.
         ["hosting"] if *method == Method::GET && no_query() => Some("/hosting".into()),
+        // Where a server could move, and asking an admin for another region.
+        ["instances", id, "move-targets"] if valid_id(id) && *method == Method::GET && no_query() => {
+            Some(format!("/instances/{id}/move-targets"))
+        }
+        ["instances", id, "region-request"] if valid_id(id) && *method == Method::POST && no_query() => {
+            Some(format!("/instances/{id}/region-request"))
+        }
+        ["region-requests"] if *method == Method::GET && no_query() => Some("/region-requests".into()),
+        ["region-requests", rid] if valid_request_id(rid) && *method == Method::DELETE && no_query() => {
+            Some(format!("/region-requests/{rid}"))
+        }
+        // An admin of the index deciding them. The index checks who is admin.
+        ["admin", "region-requests"] if *method == Method::GET && no_query() => Some("/admin/region-requests".into()),
+        ["admin", "region-requests", rid, action @ ("approve" | "deny")]
+            if valid_request_id(rid) && *method == Method::POST && no_query() =>
+        {
+            Some(format!("/admin/region-requests/{rid}/{action}"))
+        }
         ["instances"] => match *method {
             Method::GET | Method::POST if no_query() => Some("/instances".into()),
             _ => None,
@@ -263,6 +281,12 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// A region request id the index made: sixteen lower-case hex characters.
+/// Checked before it is put in a path, like a server id.
+fn valid_request_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A server id the platform made: lower-case letters, digits and dashes. Checked
@@ -312,6 +336,22 @@ mod tests {
         assert_eq!(allowed_path(&Method::GET, "hosting").as_deref(), Some("/hosting"));
         assert_eq!(allowed_path(&Method::POST, "hosting"), None);
         assert_eq!(allowed_path(&Method::GET, "hosting?x=1"), None);
+        // Region moves: asking, and an admin deciding. The index says who is admin.
+        let rid = "0123456789abcdef";
+        for (method, rest, want) in [
+            (Method::GET, "instances/sven-coop-1/move-targets".to_string(), "/instances/sven-coop-1/move-targets".to_string()),
+            (Method::POST, "instances/sven-coop-1/region-request".to_string(), "/instances/sven-coop-1/region-request".to_string()),
+            (Method::GET, "region-requests".to_string(), "/region-requests".to_string()),
+            (Method::DELETE, format!("region-requests/{rid}"), format!("/region-requests/{rid}")),
+            (Method::GET, "admin/region-requests".to_string(), "/admin/region-requests".to_string()),
+            (Method::POST, format!("admin/region-requests/{rid}/approve"), format!("/admin/region-requests/{rid}/approve")),
+            (Method::POST, format!("admin/region-requests/{rid}/deny"), format!("/admin/region-requests/{rid}/deny")),
+        ] {
+            assert_eq!(allowed_path(&method, &rest).as_deref(), Some(want.as_str()), "{method} {rest}");
+        }
+        for bad in ["admin/region-requests/../x/approve", "admin/region-requests/ABCDEF0123456789/approve", "admin/users"] {
+            assert_eq!(allowed_path(&Method::POST, bad), None, "{bad}");
+        }
     }
 
     /// The point of the list: nothing that types at a server, reads a player's

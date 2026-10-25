@@ -225,6 +225,7 @@ fn hosting_config() -> platform_index::hosting::HostingConfig {
             region: None,
         }],
         quota: Default::default(),
+        admins: Vec::new(),
     }
 }
 
@@ -378,6 +379,7 @@ async fn the_front_page_says_what_this_index_is_and_names_no_worker() {
             region: None,
         }],
         quota: Default::default(),
+        admins: Vec::new(),
     });
     let (addr, _) = serve_with(Some(hosting)).await;
     let page = reqwest::get(format!("http://{addr}/")).await.unwrap().text().await.unwrap();

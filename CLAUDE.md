@@ -133,6 +133,20 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
 **A server moves between workers through the index** (2026-10-23,
 `Hosting::relocate`, ROADMAP §13 item 7; copies while running and keeps its
 address, 2026-10-24). Rules a later change could quietly break:
+- **A move stays in the server's region; only an approved request leaves it**
+  (2026-10-24, `hosting::MoveTarget`, `regions.rs`). A server's region is its
+  worker's, so its creation region is its home. `Auto` and a picked `Worker`
+  are refused outside it, and the automatic choice no longer drifts to another
+  region (it used to prefer its own, then took any). `Region` is reached only
+  from `approve_region_request`, by an identity in the hosting file's
+  `admins`, and the owner can never approve their own unless listed there.
+  An approval that finds no room keeps the request pending with the reason; a
+  move retargets a pending request to the server's new id; the store refuses
+  a second pending request per server and a second decision, and a file that
+  does not parse is an error, never an empty list. Moves pick only workers
+  that answered. Caught by
+  `a_move_goes_to_the_chosen_worker_and_never_leaves_its_region_unasked` and
+  `a_region_move_needs_an_admin_and_its_new_region_becomes_home`.
 - **The old server is removed last, and is not touched at all until the final
   pass.** The new server is made and held stopped, the files are copied while
   the old one still serves (a full copy, then up to three deltas of what
