@@ -30,6 +30,7 @@ const state = {
   token: null,
   controllerOn: false,   // this page places servers through a controller (controller.rs)
   regions: [],           // the controller's regions, offered on the create form
+  hostedGames: [],       // the games the controller hosts: what can be started through it
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
@@ -213,13 +214,16 @@ async function loadControllerStatus() {
       note.textContent = state.controllerOn ? "Servers are placed through the controller at " + s.url + ", across every worker it drives." : "";
     }
     state.regions = [];
+    state.hostedGames = [];
     if (state.controllerOn) {
       const h = await api("GET", "/controller/hosting").catch(() => null);
       if (h && Array.isArray(h.regions)) state.regions = h.regions.filter(r => typeof r === "string");
+      if (h && Array.isArray(h.games)) state.hostedGames = h.games.filter(g => typeof g === "string");
     }
   } catch (_) {
     state.controllerOn = false;
     state.regions = [];
+    state.hostedGames = [];
   }
 }
 
@@ -408,8 +412,9 @@ function renderStorage() {
   const line = $("disk-line");
   if (!line) return;
   const s = state.storage;
-  line.classList.toggle("hidden", !s);
-  if (!s) return;
+  // This node's disk holds no server's files when a controller places them.
+  line.classList.toggle("hidden", !s || state.controllerOn);
+  if (!s || state.controllerOn) return;
   const low = s.free_bytes < LOW_DISK_BYTES;
   line.classList.toggle("low", low);
   $("disk-text").textContent = formatBytes(s.free_bytes) + " free";
@@ -661,8 +666,11 @@ function renderBuildVersion(version) {
 
 function renderStatusPill() {
   const cap = state.capacity || {};
-  const running = cap.running != null ? cap.running : 0;
-  const max = cap.max_instances != null ? cap.max_instances : null;
+  // Through a controller the list is every worker's servers, so count those;
+  // this node's own slots say nothing about the cluster.
+  const running = state.controllerOn ? state.instances.filter(i => i.state === "running").length
+    : (cap.running != null ? cap.running : 0);
+  const max = state.controllerOn ? null : (cap.max_instances != null ? cap.max_instances : null);
   $("status-pill").textContent = running + (max != null ? " of " + max : "") + " running";
   const bar = $("capacity-bar");
   if (bar) bar.style.width = max ? Math.min(100, Math.round(100 * running / max)) + "%" : "0";
@@ -722,6 +730,9 @@ function stateTitle(inst, ending) {
   return parts.join(" ");
 }
 
+// Said on whatever a controller does not carry (controller::allowed_path).
+const NOT_THROUGH_CONTROLLER = "Not through the controller. The worker's own page has it.";
+
 function instById(id) { return state.instances.find(i => i.instance_id === id) || null; }
 
 // What a server can be asked to do right now, and why not when it cannot. One
@@ -735,8 +746,16 @@ function capabilities(inst) {
   return {
     running,
     canStop: !(inst.state === "stopped" || inst.state === "missing"),
-    canMap: running && speaks && !oneWorld,
-    mapWhy: oneWorld ? "A Minecraft server has one world. Upload a different one with Upload a world."
+    // Through a controller there is start but no restart, and no map change
+    // (the controller never types at a server's console).
+    canRestart: state.controllerOn ? inst.state === "stopped" : true,
+    restartLabel: state.controllerOn ? "Start" : "Restart",
+    restartWhy: !state.controllerOn ? "Restart"
+      : inst.state === "stopped" ? "Start this server on its worker."
+      : "Restart is not carried through the controller: stop it, then start it.",
+    canMap: !state.controllerOn && running && speaks && !oneWorld,
+    mapWhy: state.controllerOn ? NOT_THROUGH_CONTROLLER
+      : oneWorld ? "A Minecraft server has one world. Upload a different one with Upload a world."
       : !running ? "The server has to be running to be told anything."
       : (!speaks ? "The " + inst.game_id + " pack declares no console, so the map cannot change without a restart."
         : "Change the map without restarting — players stay connected."),
@@ -807,7 +826,8 @@ function renderInstances() {
     // Cells are updated in place; the row node is never replaced, which is what
     // keeps this list from stealing focus or scroll on a poll.
     row.querySelector(".cell-name").textContent = inst.name || inst.instance_id;
-    row.querySelector(".cell-game").textContent = gameName(inst.game_id);
+    row.querySelector(".cell-game").textContent = gameName(inst.game_id)
+      + (state.controllerOn && inst.node ? " · on " + inst.node : "");
     const pill = row.querySelector(".state-pill");
     const ending = exitWords(inst.last_exit);
     const crashed = inst.state === "stopped" && ending && ending.crash;
@@ -860,6 +880,14 @@ function renderInstances() {
       meshCell.textContent = inst.mesh_destination.slice(0, 10) + "…";
       meshCell.classList.remove("muted-em");
       makeCopyable(meshCell, inst.mesh_destination);
+    } else if (state.controllerOn) {
+      // A worker's server has an address while it runs; this node's [mesh]
+      // has nothing to do with it.
+      meshCell.textContent = inst.state === "running" ? "LAN only" : "—";
+      meshCell.title = inst.state === "running" ? "Its worker announces it on no mesh." : "No address while it is stopped.";
+      meshCell.classList.add("muted-em");
+      meshCell.classList.remove("copyable");
+      meshCell.onclick = null;
     } else {
       meshCell.textContent = "LAN only";
       meshCell.title = "Not announced on the mesh. Add a [mesh] section to this node's config.";
@@ -875,6 +903,10 @@ function renderInstances() {
     mapBtn.disabled = !cap.canMap;
     mapBtn.title = cap.mapWhy;
     row.querySelector(".stop-btn").disabled = !cap.canStop;
+    const restartBtn = row.querySelector(".restart-btn");
+    restartBtn.disabled = !cap.canRestart;
+    restartBtn.title = cap.restartWhy;
+    restartBtn.setAttribute("aria-label", cap.restartLabel);
   }
 
   for (const [id, row] of state.rows) {
@@ -928,7 +960,8 @@ function openInstanceMenu(id, x, y) {
       title: cap.canBots ? "Add or remove bots without restarting." : "The server has to be running.",
       action: () => onBots(id, inst.game_id) });
   }
-  items.push({ label: "Restart", icon: "restart", action: () => onRestart(id) });
+  items.push({ label: cap.restartLabel, icon: "restart", disabled: !cap.canRestart,
+    title: state.controllerOn ? cap.restartWhy : undefined, action: () => onRestart(id) });
   items.push({ label: "Stop", icon: "stop", disabled: !cap.canStop, action: () => onStop(id) });
   items.push("sep");
   items.push({ label: "Announce now", icon: "megaphone", disabled: !cap.canAnnounce,
@@ -940,7 +973,7 @@ function openInstanceMenu(id, x, y) {
     action: () => copyValue(inviteLink(inst)) });
   items.push({ label: "Copy mesh address", icon: "copy", disabled: !inst.mesh_destination, action: () => copyValue(inst.mesh_destination) });
   const hasConsole = state.games.some(g => g.id === inst.game_id && g.console);
-  items.push({ label: hasConsole ? "Log and console" : "Show log", icon: "log", action: () => onShowLog(id) });
+  items.push({ label: hasConsole && !state.controllerOn ? "Log and console" : "Show log", icon: "log", action: () => onShowLog(id) });
   items.push({ label: "Players…", icon: "users", disabled: !cap.running,
     title: cap.running ? "Who is on this server, as the game reports it." : "The server has to be running.",
     action: () => onShowPlayers(id) });
@@ -976,28 +1009,52 @@ function openInstanceMenu(id, x, y) {
   }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
+  // Through a controller, only what it carries is live; the rest says where it is.
+  if (state.controllerOn) {
+    const carried = new Set(["Start", "Stop", "Copy invite link", "Copy mesh address", "Show log", "Log and console",
+      "Backups…", "Move to another worker…", "Remove server…"]);
+    for (const it of items) {
+      if (typeof it === "object" && it.label && !carried.has(it.label)) {
+        it.disabled = true;
+        it.title = NOT_THROUGH_CONTROLLER;
+      }
+    }
+  }
   showMenu(x, y, items);
 }
 
 // ---------- rendering: games ----------
 
+// Whether a game can be started from this page, and why not. Through a
+// controller the index's workers host it, so this node's own setup (its
+// runtimes, its installed files) says nothing: what the controller hosts does.
+function startable(g) {
+  if (state.controllerOn) {
+    return state.hostedGames.includes(g.id)
+      ? { ok: true, reason: "" }
+      : { ok: false, reason: "the controller does not host this game." };
+  }
+  return g.runnable ? { ok: true, reason: "" } : { ok: false, reason: g.reason || "unavailable on this node." };
+}
+
 function renderGames() {
   const grid = $("games-grid");
   const n = $("nav-games-count");
   if (n) n.textContent = state.games.length ? String(state.games.length) : "";
-  const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
+  const sig = (state.controllerOn ? "c:" + state.hostedGames.join(",") + ";" : "") + state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
     + "|" + (g.content ? (g.content.installed ? "i" : "-") + g.content.missing.join(",") : "")).join(";");
   if (grid.dataset.sig !== sig) {
     grid.dataset.sig = sig;
     grid.textContent = "";
-    const sorted = [...state.games].sort((a, b) => (b.runnable - a.runnable) || a.display_name.localeCompare(b.display_name));
+    const sorted = [...state.games].sort((a, b) => (startable(b).ok - startable(a).ok) || a.display_name.localeCompare(b.display_name));
     for (const g of sorted) grid.appendChild(buildGameCard(g));
   }
   for (const g of state.games) refreshCardDynamic(g);
 }
 
 function buildGameCard(g) {
-  const card = el("article", "game-card" + (g.runnable ? "" : " unrunnable"));
+  const can = startable(g);
+  const card = el("article", "game-card" + (can.ok ? "" : " unrunnable"));
   card.dataset.gameId = g.id;
   card.appendChild(art(g.id));
   const body = el("div", "card-body");
@@ -1014,13 +1071,14 @@ function buildGameCard(g) {
     meta.appendChild(t);
   }
   body.appendChild(meta);
-  if (!g.runnable) body.appendChild(el("p", "card-reason", "Cannot start here: " + (g.reason || "unavailable on this node.")));
-  const manualMissing = renderContentHelp(body, g);
+  if (!can.ok) body.appendChild(el("p", "card-reason", "Cannot start here: " + can.reason));
+  // Through a controller the files live on the workers, which fetch them.
+  const manualMissing = state.controllerOn ? false : renderContentHelp(body, g);
   body.appendChild(el("p", "install-status hidden"));
   const actions = el("div", "card-actions");
   const startBtn = el("button", "btn btn-primary start-btn", "Start server");
   startBtn.type = "button";
-  if (!g.runnable) { startBtn.disabled = true; startBtn.title = g.reason || "not runnable"; }
+  if (!can.ok) { startBtn.disabled = true; startBtn.title = can.reason; }
   startBtn.addEventListener("click", () => openStartDialog(g.id));
   const installBtn = el("button", "btn install-btn");
   installBtn.type = "button";
@@ -1043,7 +1101,8 @@ function buildGameCard(g) {
   removeBtn.setAttribute("aria-label", "Remove " + g.display_name);
   removeBtn.appendChild(icon("trash"));
   removeBtn.addEventListener("click", () => onRemovePack(g));
-  actions.append(startBtn, installBtn);
+  actions.append(startBtn);
+  if (!state.controllerOn) actions.append(installBtn);
   body.appendChild(actions);
   card.append(removeBtn, body);
   return card;
@@ -1317,6 +1376,8 @@ function refreshCardDynamic(g) {
   const card = $("games-grid").querySelector('.game-card[data-game-id="' + CSS.escape(g.id) + '"]');
   if (!card) return;
   const installBtn = card.querySelector(".install-btn");
+  // Through a controller a card has no Install: the workers fetch the files.
+  if (!installBtn) return;
   const label = installBtn.querySelector("span");
   const status = card.querySelector(".install-status");
   status.classList.remove("ok", "err");
@@ -1557,10 +1618,12 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
       bots = n;
     }
   }
-  if (!game.runnable) { showError("This game cannot start here: " + (game.reason || "")); return; }
+  const can = startable(game);
+  if (!can.ok) { showError("This game cannot start here: " + can.reason); return; }
 
-  // Starting a game that is not installed yet downloads it first.
-  if (!roomForDownload()) return;
+  // Starting a game that is not installed yet downloads it first, here; through
+  // a controller a worker does that, on its own disk.
+  if (!state.controllerOn && !roomForDownload()) return;
 
   const instance_id = randomInstanceId(gameId);
   if (!/^[a-z0-9._-]{1,64}$/.test(instance_id)) { showError("Could not make a valid id for this server."); return; }
@@ -1999,7 +2062,7 @@ async function onMinecraftSubmit(gameId, f, go, close) {
   if (!name) { showError("A server needs a name."); return; }
   if (!(f.slots >= 1 && f.slots <= 255)) { showError("Player slots must be between 1 and 255."); return; }
   if (f.seed && !/^[A-Za-z0-9-]{1,32}$/.test(f.seed)) { showError("A seed may only hold letters, digits and '-', up to 32."); return; }
-  if (!roomForDownload()) return;
+  if (!state.controllerOn && !roomForDownload()) return;
   const instance_id = randomInstanceId(gameId);
   const settings = Object.assign({}, f.settings);
   if (f.seed) settings.seed = f.seed;
@@ -2289,7 +2352,8 @@ function onShowLog(instanceId) {
     const pre = el("pre", "log-text", "Reading the log…");
     pre.tabIndex = 0;
     const game = inst && state.games.find(g => g.id === inst.game_id);
-    const canType = !!(game && game.console && inst.state === "running");
+    // Never through a controller: it carries no console (controller::allowed_path).
+    const canType = !state.controllerOn && !!(game && game.console && inst.state === "running");
     const footText = canType ? "Updates every 2 s while open. A line you send shows here with the game's answer."
       : "Updates every 2 s while open. Read-only.";
     const foot = el("div", "muted small log-foot", footText);
@@ -2960,6 +3024,13 @@ async function rowAction(instanceId, cls, busyText, request, failText, doneText)
 // Off and on again, keeping its ports and its mesh destination, so a player's
 // saved address still works — which is why this is not remove-and-recreate.
 function onRestart(id) {
+  // Through a controller a stopped server is started (`/start`); restart is not
+  // carried, and the button is off for a running one.
+  if (state.controllerOn) {
+    return rowAction(id, ".restart-btn", "…",
+      () => api("POST", "/instances/" + encodeURIComponent(id) + "/start"),
+      "The server did not start.", "Starting.");
+  }
   return rowAction(id, ".restart-btn", "…",
     () => api("POST", "/instances/" + encodeURIComponent(id) + "/restart"),
     "The server did not restart.", "Restarting.");
