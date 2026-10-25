@@ -3283,232 +3283,620 @@ function applyRole() {
   renderGames();
 }
 
-// Built off the page and swapped in whole, so a refresh never shows half a
-// tab and two overlapping loads never write into the same one.
-let adminLoads = 0;
-async function loadAdmin() {
-  const target = $("admin-body");
-  if (!target) return;
-  const run = ++adminLoads;
-  const root = el("div");
-  let pending = 0;
+// ---------- admin: workers, requests, accounts, adding a worker ----------
+//
+// One sub-view at a time, refreshed on a timer without a flicker: each pass
+// fetches what the current view needs and rebuilds the view only when what it
+// shows has changed, and never while a field in it has focus or a menu is open.
+// Adding a worker is its own page (`#admin/add-worker`) with steps, so the
+// lists are never mixed with a form.
 
-  // This node's accounts and their roles.
-  if (authState && authState.accounts) {
-    const box = section(root, "Accounts on this node");
-    let users = [];
-    try { users = await api("GET", "/auth/users"); } catch (e) { box.appendChild(el("p", "muted small", (e && e.error) || "Could not read the accounts.")); }
-    const me = await api("GET", "/auth/me").catch(() => ({}));
-    for (const u of users) {
-      const line = el("div", "req-head");
-      line.style.marginTop = "8px";
-      const asked = u.admin_requested_unix ? " \u00b7 asked to become an admin" : "";
-      line.appendChild(el("span", "req-line", u.username + " \u00b7 " + u.role + (u.totp_enabled ? " \u00b7 codes on" : "") + asked));
-      const acts = el("span");
-      const btn = (label, fn, primary) => {
-        const b = el("button", "btn" + (primary ? " btn-primary" : ""), label);
-        b.type = "button";
-        b.style.marginLeft = "6px";
-        b.onclick = async () => {
-          try { await withInFlight(fn()); clearError(); loadAdmin(); }
-          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
-        };
-        acts.appendChild(b);
-      };
-      const path = "/auth/users/" + encodeURIComponent(u.username);
-      if (u.admin_requested_unix) {
-        pending++;
-        btn("Approve", () => api("POST", path + "/role", { role: "admin" }), true);
-        btn("Deny", () => api("POST", path + "/deny-admin"));
-      } else if (u.role === "user") {
-        btn("Make admin", () => api("POST", path + "/role", { role: "admin" }));
-      } else if (u.username !== me.username) {
-        btn("Make user", () => api("POST", path + "/role", { role: "user" }));
-      }
-      if (u.username !== me.username) {
-        btn("Remove", () => confirm("Remove the account " + u.username + "? It is signed out everywhere.")
-          ? api("DELETE", path) : Promise.reject({ error: "Not removed." }));
-      }
-      line.appendChild(acts);
-      box.appendChild(line);
-    }
-    const nu = field(box, "adm-add-user", "New username", { type: "text", autocapitalize: "none", spellcheck: false });
-    const np = field(box, "adm-add-pass", "Its password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
-    const nr = selectField(box, "adm-add-role", "Role", [["user", "User: runs servers"], ["admin", "Admin: also manages this node"]], "user");
-    const add = el("button", "btn", "Add account");
-    add.type = "button";
-    add.onclick = async () => {
-      try { await withInFlight(api("POST", "/auth/users", { username: nu.value.trim(), password: np.value, role: nr.value })); toast("Account added."); loadAdmin(); }
-      catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not added."); }
-    };
-    const r = el("div", "form-actions"); r.style.justifyContent = "flex-start"; r.appendChild(add); box.appendChild(r);
+const adm = {
+  route: "workers",
+  data: {},
+  sig: { nav: "", view: "" },
+  timer: null,
+  loading: false,
+  menu: null,
+  loaded: false,
+  code: null, // the join code just made: the secret is held here only, in memory
+  done: null, // a worker that joined through the code
+  method: "script",
+  shell: null,
+};
+
+// ---- small pieces ----
+
+function help(text) {
+  const h = el("span", "help", "?");
+  h.tabIndex = 0;
+  h.dataset.tip = text;
+  h.setAttribute("role", "img");
+  h.setAttribute("aria-label", text);
+  return h;
+}
+
+function titled(text, tip) {
+  const t = el("h3", "panel-title");
+  t.appendChild(document.createTextNode(text));
+  if (tip) t.appendChild(help(tip));
+  return t;
+}
+
+function chip(text, kind) {
+  return el("span", "chip st-" + (kind || "muted"), text);
+}
+
+function labelled(parent, id, text, tip, input) {
+  const wrap = el("div", "fld");
+  const l = el("label", null, text);
+  l.htmlFor = id;
+  if (tip) l.appendChild(help(tip));
+  input.id = id;
+  input.classList.add("field");
+  wrap.append(l, input);
+  parent.appendChild(wrap);
+  return input;
+}
+
+function textInput(attrs) {
+  const i = el("input");
+  i.type = "text";
+  Object.assign(i, attrs || {});
+  return i;
+}
+
+// One floating tip for every `?`, positioned from the icon so a table or a card
+// that scrolls never clips it.
+let tipEl = null;
+function showTip(target) {
+  if (!tipEl) { tipEl = el("div", "tip"); tipEl.setAttribute("role", "tooltip"); document.body.appendChild(tipEl); }
+  tipEl.textContent = target.dataset.tip || "";
+  tipEl.style.display = "block";
+  const r = target.getBoundingClientRect();
+  const w = tipEl.offsetWidth, h = tipEl.offsetHeight;
+  let left = r.left + r.width / 2 - w / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+  let top = r.bottom + 8;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 8);
+  tipEl.style.left = left + "px";
+  tipEl.style.top = top + "px";
+}
+function hideTip() { if (tipEl) tipEl.style.display = "none"; }
+document.addEventListener("mouseover", (e) => { const t = e.target.closest && e.target.closest(".help"); if (t) showTip(t); });
+document.addEventListener("mouseout", (e) => { if (e.target.closest && e.target.closest(".help")) hideTip(); });
+document.addEventListener("focusin", (e) => { const t = e.target.closest && e.target.closest(".help"); if (t) showTip(t); });
+document.addEventListener("focusout", (e) => { if (e.target.closest && e.target.closest(".help")) hideTip(); });
+
+function admCloseMenu() {
+  if (adm.menu) adm.menu.remove();
+  adm.menu = null;
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") admCloseMenu(); });
+
+function admMenu(anchor, items) {
+  admCloseMenu();
+  const m = el("div", "pop-menu");
+  for (const [label, fn, danger] of items) {
+    const b = el("button", "pop-item" + (danger ? " danger" : ""), label);
+    b.type = "button";
+    b.onclick = () => { admCloseMenu(); fn(); };
+    m.appendChild(b);
   }
+  document.body.appendChild(m);
+  const r = anchor.getBoundingClientRect();
+  m.style.top = Math.max(8, Math.min(r.bottom + 4, window.innerHeight - m.offsetHeight - 8)) + "px";
+  m.style.left = Math.max(8, Math.min(r.right - m.offsetWidth, window.innerWidth - m.offsetWidth - 8)) + "px";
+  adm.menu = m;
+  setTimeout(() => document.addEventListener("click", admCloseMenu, { once: true }), 0);
+}
 
-  // The controller: this node's standing there, and an admin's work.
+// A request that changes something: one at a time, then the view catches up.
+async function admDo(call, done) {
+  try {
+    await withInFlight(call());
+    clearError();
+    if (done) toast(done);
+    admRefresh(true);
+  } catch (e) {
+    if (!(e && e.__auth)) showError((e && e.error) || "That did not work.");
+  }
+}
+
+// ---- routes ----
+
+function admRoutes() {
+  const out = [];
+  const me = adm.data.me;
   if (state.controllerOn) {
-    const box = section(root, "The controller");
-    const me = await api("GET", "/controller/me").catch(() => null);
-    if (!me) {
-      box.appendChild(el("p", "muted small", "The controller did not answer."));
-    } else if (!me.admin) {
-      box.appendChild(el("p", "muted small", "This node is not an admin of the controller. An admin there decides region moves and who else is one."));
-      const r = me.admin_request;
-      if (r && r.state === "pending") {
-        box.appendChild(el("p", null, "Asked to become an admin; waiting for one to decide."));
-      } else {
-        if (r && r.state === "denied") box.appendChild(el("p", "muted small", "The last request was turned down" + (r.reason ? ": " + r.reason : ".")));
-        const note = field(box, "adm-ask-note", "A note for the admins (optional)", { type: "text", maxLength: 300 });
-        const ask = el("button", "btn btn-primary", "Ask to become an admin");
-        ask.type = "button";
-        ask.onclick = async () => {
-          try { await withInFlight(api("POST", "/controller/admin-requests", note.value.trim() ? { note: note.value.trim() } : {})); toast("Asked."); loadAdmin(); }
-          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not made."); }
-        };
-        const rr = el("div", "form-actions"); rr.style.justifyContent = "flex-start"; rr.appendChild(ask); box.appendChild(rr);
-      }
-    } else {
-      box.appendChild(el("p", "muted small", "This node is an admin of the controller."));
-      const [moves, asks, admins, workers, joinInfo, joinCodes] = await Promise.all([
-        api("GET", "/controller/admin/region-requests").catch(() => []),
-        api("GET", "/controller/admin/admin-requests").catch(() => []),
-        api("GET", "/controller/admin/admins").catch(() => []),
-        api("GET", "/controller/admin/workers").catch(() => []),
-        api("GET", "/controller/admin/join-info").catch(() => null),
-        api("GET", "/controller/admin/join-codes").catch(() => []),
-      ]);
-      const waitingMoves = moves.filter(r => r.state === "pending");
-      pending += waitingMoves.length;
-      box.appendChild(el("h4", null, "Region moves to decide"));
-      if (!waitingMoves.length) box.appendChild(el("p", "muted small", "Nothing waiting."));
-      for (const r of waitingMoves) box.appendChild(requestCard(r, true));
-
-      const waitingAdmins = asks.filter(r => r.state === "pending");
-      pending += waitingAdmins.length;
-      box.appendChild(el("h4", null, "Asking to become admins"));
-      if (!waitingAdmins.length) box.appendChild(el("p", "muted small", "Nothing waiting."));
-      for (const r of waitingAdmins) {
-        const card = el("div", "req-card");
-        card.appendChild(el("span", "req-line", r.identity.slice(0, 12) + "\u2026 \u00b7 asked " + new Date(r.created_unix * 1000).toLocaleString()));
-        if (r.note) card.appendChild(el("p", "muted small", "\u201c" + r.note + "\u201d"));
-        const row = el("div", "form-actions"); row.style.justifyContent = "flex-start";
-        const ok = el("button", "btn btn-primary", "Make admin");
-        ok.type = "button";
-        ok.onclick = async () => {
-          try { await withInFlight(api("POST", "/controller/admin/admin-requests/" + r.id + "/approve")); toast("Made an admin."); loadAdmin(); }
-          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not approved."); }
-        };
-        const no = el("button", "btn", "Turn down");
-        no.type = "button";
-        no.onclick = async () => {
-          const why = prompt("Why? They see this (optional).", "");
-          if (why === null) return;
-          try { await withInFlight(api("POST", "/controller/admin/admin-requests/" + r.id + "/deny", why ? { note: why } : {})); loadAdmin(); }
-          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not turned down."); }
-        };
-        row.append(ok, no);
-        card.appendChild(row);
-        box.appendChild(card);
-      }
-
-      box.appendChild(el("h4", null, "Admins"));
-      for (const a of admins) {
-        const line = el("div", "req-head");
-        line.appendChild(el("span", "req-line", a.identity.slice(0, 12) + "\u2026" + (a.identity === me.identity ? " (this node)" : "") +
-          (a.source === "file" ? " \u00b7 in the hosting file" : " \u00b7 granted")));
-        if (a.source === "granted") {
-          const rv = el("button", "btn", "Revoke");
-          rv.type = "button";
-          rv.onclick = async () => {
-            if (!confirm("Stop " + a.identity.slice(0, 12) + "\u2026 being an admin of the controller?")) return;
-            try { await withInFlight(api("DELETE", "/controller/admin/admins/" + a.identity)); loadAdmin(); }
-            catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not revoked."); }
-          };
-          line.appendChild(rv);
-        }
-        box.appendChild(line);
-      }
-
-      box.appendChild(el("h4", null, "Workers"));
-      const table = el("table", "admin-workers");
-      const head = el("tr");
-      for (const h of ["Worker", "Region", "Class", "State", "Answers", "Servers", "Running", "Free memory", "Free disk", ""]) head.appendChild(el("th", null, h));
-      table.appendChild(head);
-      let busy = false;
-      for (const w of workers) {
-        const c = w.capacity || {};
-        const tr = el("tr");
-        const state = w.state || "active";
-        if (state === "draining") busy = true;
-        if (w.note && /restarting/.test(w.note)) busy = true;
-        for (const v of [w.name + (w.reserved_for ? " (reserved)" : ""), w.region || "\u2014", w.class || "\u2014"]) tr.appendChild(el("td", null, v));
-        const st = el("td", null, state + (w.note ? " \u00b7 " + w.note : ""));
-        st.style.whiteSpace = "normal";
-        st.style.minWidth = "180px";
-        tr.appendChild(st);
-        for (const v of [w.answered ? "yes" : "no", String(w.servers),
-          c.max_instances != null ? c.running + " of " + c.max_instances : "\u2014",
-          c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : "\u2014",
-          c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : "\u2014"]) tr.appendChild(el("td", null, v));
-        const acts = el("td", "worker-acts");
-        const act = (label, action, ask) => {
-          const b = el("button", "btn", label);
-          b.type = "button";
-          // One request at a time: a second click before the answer is ignored,
-          // not sent again.
-          b.onclick = async () => {
-            if (b.disabled || (ask && !confirm(ask))) return;
-            b.disabled = true;
-            try { await withInFlight(api("POST", "/controller/admin/workers/" + encodeURIComponent(w.name) + "/" + action)); loadAdmin(); }
-            catch (e) { b.disabled = false; if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
-          };
-          acts.appendChild(b);
-        };
-        if (state === "active") {
-          act("Cordon", "cordon", "Stop " + w.name + " taking new servers? Its servers keep running.");
-          act("Drain", "drain", "Drain " + w.name + "? It takes no new servers and its servers are moved to other workers, one at a time.");
-        } else {
-          act("Put back in service", "uncordon");
-          if (state === "cordoned") act("Drain", "drain", "Move " + w.name + "'s servers to other workers, one at a time?");
-        }
-        act("Restart servers", "restart", "Restart every running server on " + w.name + ", one at a time? Players on them are dropped.");
-        tr.appendChild(acts);
-        table.appendChild(tr);
-      }
-      const wrap = el("div", "table-wrap");
-      wrap.appendChild(table);
-      box.appendChild(wrap);
-      box.appendChild(el("p", "muted small", "Cordon keeps a worker from getting new servers. Drain also moves its servers off, within each one's region, class and reservation; a server with nowhere to go stays and is named here. A drained, empty worker can be removed from the hosting file. Restart servers restarts the games, not the agent on the machine."));
-      // Moves take a while: keep the table fresh while one is going, unless a field is being typed in.
-      if (busy) {
-        setTimeout(() => {
-          const body = $("admin-body");
-          if (body && document.body.contains(body) && !body.contains(document.activeElement) && !joinShown) loadAdmin();
-        }, 10000);
-      }
-
-      box.appendChild(el("h4", null, "Add a worker"));
-      box.appendChild(joinWizard(workers, joinInfo, joinCodes));
-    }
+    if (me && me.admin) out.push(["workers", "Workers"], ["requests", "Requests"], ["admins", "Admins"]);
+    else out.push(["admins", "Access"]);
   }
-  for (const input of root.querySelectorAll("input")) input.classList.add("field");
-  if (run !== adminLoads) return;
-  target.replaceChildren(...root.childNodes);
+  if (authState && authState.accounts) out.push(["accounts", "Accounts"]);
+  return out;
+}
+
+function admRouteFromHash() {
+  const m = /^#admin\/([a-z-]+)$/.exec(location.hash);
+  return m ? m[1] : null;
+}
+
+function admGo(route) {
+  if (adm.route === route) return;
+  history.pushState(null, "", "#admin/" + route);
+  adm.route = route;
+  adm.sig.view = "";
+  admRender();
+  admRefresh(true);
+}
+
+window.addEventListener("popstate", () => {
+  if (state.activeTab !== "admin") return;
+  const r = admRouteFromHash();
+  if (r && r !== adm.route) { adm.route = r; adm.sig.view = ""; admRender(); admRefresh(true); }
+});
+
+function admEnter() {
+  const wanted = admRouteFromHash();
+  if (wanted) adm.route = wanted;
+  adm.sig = { nav: "", view: "" };
+  adm.shell = null;
+  adm.loaded = false;
+  adm.data = {};
+  const first = $("admin-body");
+  if (first) first.replaceChildren(el("p", "empty", "Loading\u2026"));
+  admRefresh(true);
+  if (!adm.timer) adm.timer = setInterval(admTick, 4000);
+}
+
+async function admTick() {
+  if (state.activeTab !== "admin") { clearInterval(adm.timer); adm.timer = null; return; }
+  if (document.hidden || adm.menu) return;
+  await admRefresh(false);
+}
+
+// Kept under its old name for the code that asks the Admin tab to catch up.
+function loadAdmin() { return admRefresh(true); }
+
+// ---- data ----
+
+async function admFetch() {
+  const d = { me: null };
+  const r = adm.route;
+  if (state.controllerOn) d.me = await api("GET", "/controller/me").catch(() => null);
+  const admin = !!(d.me && d.me.admin);
+  const jobs = [];
+  const want = (key, path) => jobs.push(api("GET", path).then((v) => { d[key] = v; }).catch(() => { d[key] = adm.data[key] || null; d[key + "_failed"] = true; }));
+  if (admin) {
+    // The counts on the nav need these whichever view is open.
+    want("moves", "/controller/admin/region-requests");
+    want("asks", "/controller/admin/admin-requests");
+    if (r === "workers") want("workers", "/controller/admin/workers");
+    if (r === "admins") want("admins", "/controller/admin/admins");
+    if (r === "add-worker") { want("codes", "/controller/admin/join-codes"); want("info", "/controller/admin/join-info"); want("workers", "/controller/admin/workers"); }
+  }
+  if (authState && authState.accounts) {
+    want("users", "/auth/users");
+    want("self", "/auth/me");
+  }
+  await Promise.all(jobs);
+  return d;
+}
+
+async function admRefresh(force) {
+  if (!$("admin-body") || adm.loading) return;
+  adm.loading = true;
+  try {
+    adm.data = await admFetch();
+    adm.loaded = true;
+    admWatchCode();
+    admRender(force);
+  } finally {
+    adm.loading = false;
+  }
+}
+
+// A join code turning "used" means the machine joined.
+function admWatchCode() {
+  if (!adm.code || !adm.data.codes) return;
+  const mine = adm.data.codes.find((c) => c.id === adm.code.id);
+  if (mine && mine.state === "used") {
+    adm.done = { name: mine.used_name || "A worker", region: mine.spec && mine.spec.region };
+    adm.code = null;
+    adm.sig.view = "";
+    toast(adm.done.name + " joined.");
+  } else if (mine && mine.state !== "pending") {
+    adm.code = null;
+    adm.sig.view = "";
+  } else if (adm.code && Date.now() / 1000 > adm.code.expires) {
+    adm.code = null;
+    adm.sig.view = "";
+  }
+}
+
+// ---- rendering ----
+
+function admPendingCount() {
+  const d = adm.data;
+  let n = 0;
+  if (d.moves) n += d.moves.filter((r) => r.state === "pending").length;
+  if (d.asks) n += d.asks.filter((r) => r.state === "pending").length;
+  if (d.users) n += d.users.filter((u) => u.admin_requested_unix).length;
+  return n;
+}
+
+function admRender(force) {
+  const body = $("admin-body");
+  if (!body || !adm.loaded) return;
+  const routes = admRoutes();
+  if (!routes.length) {
+    body.replaceChildren(el("p", "muted", "Nothing to manage on this node."));
+    adm.shell = null;
+    return;
+  }
+  const known = routes.some(([k]) => k === adm.route) || adm.route === "add-worker" && routes.some(([k]) => k === "workers");
+  if (!known) adm.route = routes[0][0];
+
+  const pending = admPendingCount();
   const n = $("nav-admin-count");
   if (n) n.textContent = pending ? String(pending) : "";
+
+  if (!adm.shell) {
+    adm.shell = { nav: el("div", "adm-nav"), view: el("div", "adm-view") };
+    body.replaceChildren(adm.shell.nav, adm.shell.view);
+    adm.sig = { nav: "", view: "" };
+  }
+
+  // Navigation: only on change.
+  const navSig = JSON.stringify([routes, adm.route, pending]);
+  if (adm.route === "add-worker") {
+    if (adm.sig.nav !== "wizard") { adm.shell.nav.replaceChildren(); adm.sig.nav = "wizard"; }
+  } else if (navSig !== adm.sig.nav) {
+    adm.sig.nav = navSig;
+    const tabs = el("div", "adm-tabs");
+    for (const [key, label] of routes) {
+      const b = el("button", "adm-tab" + (key === adm.route ? " active" : ""), label);
+      b.type = "button";
+      b.onclick = () => admGo(key);
+      if (key === "requests" && pending) b.appendChild(el("span", "adm-badge", String(adm.data.moves ? admPendingBy("moves") + admPendingBy("asks") : pending)));
+      if (key === "accounts" && adm.data.users) {
+        const asked = adm.data.users.filter((u) => u.admin_requested_unix).length;
+        if (asked) b.appendChild(el("span", "adm-badge", String(asked)));
+      }
+      tabs.appendChild(b);
+    }
+    adm.shell.nav.replaceChildren(tabs);
+  }
+
+  // The view: only when what it shows changed, and not under a typing hand.
+  const d = adm.data;
+  const sig = JSON.stringify([adm.route, adm.route === "add-worker" ? [adm.code && adm.code.id, adm.done, adm.method] : null,
+    adm.route === "workers" ? workersSig(d.workers) : null, adm.route === "requests" ? [d.moves, d.asks] : null,
+    adm.route === "admins" ? [d.admins, d.me] : null, adm.route === "accounts" ? [d.users, d.self] : null,
+    adm.route === "add-worker" ? (d.codes || []).map((c) => [c.id, c.state]) : null]);
+  if (!force && sig === adm.sig.view) { admLive(); return; }
+  const focused = document.activeElement;
+  if (!force && focused && adm.shell.view.contains(focused) && /^(INPUT|SELECT|TEXTAREA)$/.test(focused.tagName)) return;
+  if (sig === adm.sig.view && !force) { admLive(); return; }
+  adm.sig.view = sig;
+  const keep = {};
+  for (const id of ["wz-name", "wz-region", "wz-class", "wz-priority", "wz-reserved", "wz-life", "adm-add-user", "adm-add-role"]) {
+    const f = $(id);
+    if (f) keep[id] = f.value;
+  }
+  const addOpen = $("adm-add-box") && !$("adm-add-box").classList.contains("hidden");
+
+  let view;
+  switch (adm.route) {
+    case "workers": view = admWorkersView(); break;
+    case "requests": view = admRequestsView(); break;
+    case "admins": view = admAdminsView(); break;
+    case "accounts": view = admAccountsView(); break;
+    case "add-worker": view = admWizardView(); break;
+    default: view = el("div");
+  }
+  adm.shell.view.replaceChildren(view);
+  for (const [id, v] of Object.entries(keep)) { const f = $(id); if (f) f.value = v; }
+  if (addOpen && $("adm-add-box")) $("adm-add-box").classList.remove("hidden");
+  admLive();
 }
 
-// ---------- adding a worker (join codes, join.rs on the index) ----------
-
-// What a join code just made shows: the code is not kept by the index, so it is
-// held here, in memory, until it is used, dismissed or runs out. A refresh of
-// the tab rebuilds the page around it and does not lose it.
-let joinShown = null;
-let joinTimer = null;
-
-function stopJoinWatch() {
-  if (joinTimer) clearInterval(joinTimer);
-  joinTimer = null;
+// What the workers table shows, as shown: free memory moves every poll, and a
+// rebuild for a change nobody can see would be a flicker.
+function workersSig(ws) {
+  return (ws || []).map((w) => {
+    const c = w.capacity || {};
+    return [w.name, w.region, w.class, w.state, w.note, w.answered, w.servers, w.reserved_for, c.running, c.max_instances,
+      c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : null,
+      c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : null];
+  });
 }
+
+function admPendingBy(key) {
+  const v = adm.data[key];
+  return v ? v.filter((r) => r.state === "pending").length : 0;
+}
+
+// Things that tick without a rebuild: a code's countdown.
+function admLive() {
+  const live = $("wz-live");
+  if (live && adm.code) {
+    const left = Math.max(0, Math.floor(adm.code.expires - Date.now() / 1000));
+    const m = Math.floor(left / 60), s = left % 60;
+    live.textContent = "Waiting for the machine to join · the code ends in " + m + ":" + String(s).padStart(2, "0");
+  }
+}
+
+// -- workers --
+
+function statTile(label, value) {
+  const t = el("div", "stat");
+  t.append(el("div", "stat-value", String(value)), el("div", "stat-label", label));
+  return t;
+}
+
+function admWorkersView() {
+  const ws = adm.data.workers || [];
+  const root = el("div", "adm-stack");
+
+  const stats = el("div", "stats");
+  stats.append(
+    statTile("Workers", ws.length),
+    statTile("Answering", ws.filter((w) => w.answered).length + " of " + ws.length),
+    statTile("Servers", ws.reduce((n, w) => n + (w.servers || 0), 0)),
+    statTile("Regions", new Set(ws.map((w) => w.region).filter(Boolean)).size),
+  );
+  root.appendChild(stats);
+
+  const panel = el("div", "panel");
+  const head = el("div", "panel-head");
+  head.appendChild(titled("Workers", "A worker is a machine that runs game servers for this controller. Cordon stops it taking new servers; Drain also moves its servers to other workers (within each one's region, class and reservation); Restart restarts the games on it, not the agent on the machine."));
+  const add = el("button", "btn btn-primary", "Add worker");
+  add.type = "button";
+  add.onclick = () => { adm.done = null; admGo("add-worker"); };
+  head.appendChild(add);
+  panel.appendChild(head);
+
+  if (!ws.length) {
+    panel.appendChild(el("p", "empty", adm.data.workers_failed ? "The controller did not answer." : "No workers yet. Add one to start placing servers."));
+    root.appendChild(panel);
+    return root;
+  }
+  const showClass = ws.some((w) => w.class);
+  const wrap = el("div", "table-wrap");
+  const table = el("table", "adm-table");
+  const tr0 = el("tr");
+  for (const h of ["Worker", "Region"].concat(showClass ? ["Class"] : [], ["State", "Servers", "Load", "Memory", "Disk", ""])) tr0.appendChild(el("th", null, h));
+  table.appendChild(tr0);
+  for (const w of ws) {
+    const c = w.capacity || {};
+    const tr = el("tr");
+    const who = el("td", "who");
+    const line = el("div", "who-line");
+    const dot = el("span", "dot " + (w.answered ? "up" : "down"));
+    dot.title = w.answered ? "Answering" : "Not answering";
+    line.append(dot, el("span", "who-name", w.name));
+    if (w.reserved_for) { const c2 = chip("reserved", "info"); c2.title = "Reserved for account " + w.reserved_for; line.appendChild(c2); }
+    who.appendChild(line);
+    if (w.note) who.appendChild(el("div", "who-note", w.note));
+    tr.appendChild(who);
+    tr.appendChild(el("td", null, w.region || "—"));
+    if (showClass) tr.appendChild(el("td", null, w.class || "—"));
+    const st = el("td");
+    st.appendChild(chip(w.state || "active", w.state === "draining" ? "busy" : w.state === "cordoned" ? "warn" : "ok"));
+    tr.appendChild(st);
+    tr.appendChild(el("td", null, String(w.servers)));
+    const load = el("td");
+    if (c.max_instances != null) {
+      const bar = el("div", "bar");
+      const fill = el("div", "bar-fill");
+      fill.style.width = Math.min(100, Math.round((c.running / Math.max(1, c.max_instances)) * 100)) + "%";
+      bar.appendChild(fill);
+      load.append(el("span", "load-text", c.running + " / " + c.max_instances), bar);
+    } else load.textContent = "—";
+    tr.appendChild(load);
+    tr.appendChild(el("td", null, c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : "—"));
+    tr.appendChild(el("td", null, c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : "—"));
+    const acts = el("td", "act");
+    const menu = el("button", "btn btn-sm", "Manage");
+    menu.type = "button";
+    menu.setAttribute("aria-haspopup", "menu");
+    menu.onclick = (e) => {
+      e.stopPropagation();
+      const post = (action, done) => () => admDo(() => api("POST", "/controller/admin/workers/" + encodeURIComponent(w.name) + "/" + action), done);
+      const items = [];
+      if (w.state === "active") {
+        items.push(["Cordon", () => { if (confirm("Stop " + w.name + " taking new servers? Its servers keep running.")) post("cordon", w.name + " is cordoned.")(); }]);
+        items.push(["Drain", () => { if (confirm("Drain " + w.name + "? It takes no new servers and its servers are moved to other workers, one at a time.")) post("drain", w.name + " is draining.")(); }]);
+      } else {
+        items.push(["Put back in service", post("uncordon", w.name + " is back in service.")]);
+        if (w.state === "cordoned") items.push(["Drain", () => { if (confirm("Move " + w.name + "'s servers to other workers, one at a time?")) post("drain", w.name + " is draining.")(); }]);
+      }
+      items.push(["Restart servers", () => { if (confirm("Restart every running server on " + w.name + ", one at a time? Players on them are dropped.")) post("restart", "Restarting servers on " + w.name + ".")(); }, true]);
+      admMenu(menu, items);
+    };
+    acts.appendChild(menu);
+    tr.appendChild(acts);
+    table.appendChild(tr);
+  }
+  wrap.appendChild(table);
+  panel.appendChild(wrap);
+  root.appendChild(panel);
+  return root;
+}
+
+// -- requests --
+
+function admRequestsView() {
+  const root = el("div", "adm-stack");
+  const moves = (adm.data.moves || []).filter((r) => r.state === "pending");
+  const asks = (adm.data.asks || []).filter((r) => r.state === "pending");
+
+  const mp = el("div", "panel");
+  const mh = el("div", "panel-head");
+  mh.appendChild(titled("Region moves", "A server stays in its worker's region. Its owner can ask for another; approving moves it to the worker with the most room there, and that becomes its home."));
+  if (moves.length) mh.appendChild(chip(String(moves.length), "warn"));
+  mp.appendChild(mh);
+  if (!moves.length) mp.appendChild(el("p", "empty", "Nothing waiting."));
+  for (const r of moves) mp.appendChild(requestCard(r, true));
+  root.appendChild(mp);
+
+  const ap = el("div", "panel");
+  const ah = el("div", "panel-head");
+  ah.appendChild(titled("Admin requests", "Anyone with an account on this controller can ask to become an admin of it. An admin decides here."));
+  if (asks.length) ah.appendChild(chip(String(asks.length), "warn"));
+  ap.appendChild(ah);
+  if (!asks.length) ap.appendChild(el("p", "empty", "Nothing waiting."));
+  for (const r of asks) {
+    const row = el("div", "row");
+    const text = el("div", "row-main");
+    text.appendChild(el("div", "row-title", r.identity.slice(0, 12) + "…"));
+    text.appendChild(el("div", "row-sub", "asked " + new Date(r.created_unix * 1000).toLocaleString() + (r.note ? " · “" + r.note + "”" : "")));
+    const acts = el("div", "row-acts");
+    const ok = el("button", "btn btn-primary btn-sm", "Make admin");
+    ok.type = "button";
+    ok.onclick = () => admDo(() => api("POST", "/controller/admin/admin-requests/" + r.id + "/approve"), "Made an admin.");
+    const no = el("button", "btn btn-sm", "Turn down");
+    no.type = "button";
+    no.onclick = () => {
+      const why = prompt("Why? They see this (optional).", "");
+      if (why === null) return;
+      admDo(() => api("POST", "/controller/admin/admin-requests/" + r.id + "/deny", why ? { note: why } : {}));
+    };
+    acts.append(ok, no);
+    row.append(text, acts);
+    ap.appendChild(row);
+  }
+  root.appendChild(ap);
+  return root;
+}
+
+// -- admins / access --
+
+function admAdminsView() {
+  const root = el("div", "adm-stack");
+  const me = adm.data.me;
+  const panel = el("div", "panel");
+  if (!me || !me.admin) {
+    panel.appendChild(titled("Access to the controller", "An admin of the controller decides region moves, who else is an admin, and the workers. This node is not one."));
+    if (!me) { panel.appendChild(el("p", "empty", "The controller did not answer.")); root.appendChild(panel); return root; }
+    const r = me.admin_request;
+    if (r && r.state === "pending") {
+      panel.appendChild(el("p", null, "You asked to become an admin. Waiting for one to decide."));
+    } else {
+      if (r && r.state === "denied") panel.appendChild(el("p", "muted", "The last request was turned down" + (r.reason ? ": " + r.reason : ".")));
+      const note = textInput({ maxLength: 300, placeholder: "Who you are, why" });
+      const form = el("div", "form-grid one");
+      labelled(form, "adm-ask-note", "Note for the admins", "Optional. Shown to the admins who decide.", note);
+      panel.appendChild(form);
+      const ask = el("button", "btn btn-primary", "Ask to become an admin");
+      ask.type = "button";
+      ask.onclick = () => admDo(() => api("POST", "/controller/admin-requests", note.value.trim() ? { note: note.value.trim() } : {}), "Asked.");
+      panel.appendChild(ask);
+    }
+    root.appendChild(panel);
+    return root;
+  }
+  const head = el("div", "panel-head");
+  head.appendChild(titled("Admins", "Admins written in the hosting file can only be changed there. Others were granted here and can be revoked."));
+  panel.appendChild(head);
+  for (const a of adm.data.admins || []) {
+    const row = el("div", "row");
+    const text = el("div", "row-main");
+    text.appendChild(el("div", "row-title mono", a.identity.slice(0, 16) + "…" + (a.identity === me.identity ? "  (this node)" : "")));
+    text.appendChild(el("div", "row-sub", a.source === "file" ? "In the hosting file" : "Granted"));
+    row.appendChild(text);
+    if (a.source === "granted") {
+      const rv = el("button", "btn btn-sm", "Revoke");
+      rv.type = "button";
+      rv.onclick = () => { if (confirm("Stop " + a.identity.slice(0, 12) + "… being an admin of the controller?")) admDo(() => api("DELETE", "/controller/admin/admins/" + a.identity), "Revoked."); };
+      row.appendChild(rv);
+    }
+    panel.appendChild(row);
+  }
+  root.appendChild(panel);
+  return root;
+}
+
+// -- accounts --
+
+function admAccountsView() {
+  const root = el("div", "adm-stack");
+  const users = adm.data.users || [];
+  const self = adm.data.self || {};
+  const panel = el("div", "panel");
+  const head = el("div", "panel-head");
+  head.appendChild(titled("Accounts on this node", "An admin has the API token's reach. A user runs servers: create, start, stop, console, backups and the like, and nothing else. A user can ask to become an admin; an admin decides."));
+  const add = el("button", "btn btn-primary", "Add account");
+  add.type = "button";
+  add.onclick = () => {
+    const box = $("adm-add-box");
+    if (box) { box.classList.toggle("hidden"); if (!box.classList.contains("hidden")) $("adm-add-user").focus(); }
+  };
+  head.appendChild(add);
+  panel.appendChild(head);
+
+  const box = el("div", "subpanel hidden");
+  box.id = "adm-add-box";
+  const grid = el("div", "form-grid");
+  const nu = labelled(grid, "adm-add-user", "Username", null, textInput({ autocapitalize: "none", spellcheck: false }));
+  const pw = el("input"); pw.type = "password"; pw.autocomplete = "new-password";
+  const np = labelled(grid, "adm-add-pass", "Password", "At least 10 characters.", pw);
+  const sel = el("select");
+  for (const [v, t] of [["user", "User"], ["admin", "Admin"]]) { const o = el("option", null, t); o.value = v; sel.appendChild(o); }
+  const nr = labelled(grid, "adm-add-role", "Role", "A user runs servers. An admin also manages accounts, games, the mesh and the controller.", sel);
+  box.appendChild(grid);
+  const go = el("button", "btn btn-primary", "Create account");
+  go.type = "button";
+  go.onclick = () => admDo(() => api("POST", "/auth/users", { username: nu.value.trim(), password: np.value, role: nr.value }), "Account added.");
+  box.appendChild(go);
+  panel.appendChild(box);
+
+  const wrap = el("div", "table-wrap");
+  const table = el("table", "adm-table");
+  const tr0 = el("tr");
+  for (const h of ["Account", "Role", "Codes", ""]) tr0.appendChild(el("th", null, h));
+  table.appendChild(tr0);
+  for (const u of users) {
+    const tr = el("tr");
+    const nm = el("td", "who");
+    nm.appendChild(el("div", "who-name", u.username + (u.username === self.username ? "  (you)" : "")));
+    if (u.admin_requested_unix) nm.appendChild(el("div", "who-note", "asked to become an admin"));
+    tr.appendChild(nm);
+    const rc = el("td"); rc.appendChild(chip(u.role, u.role === "admin" ? "info" : "muted")); tr.appendChild(rc);
+    tr.appendChild(el("td", null, u.totp_enabled ? "on" : "off"));
+    const acts = el("td", "act");
+    const path = "/auth/users/" + encodeURIComponent(u.username);
+    const menu = el("button", "btn btn-sm", "Manage");
+    menu.type = "button";
+    menu.onclick = (e) => {
+      e.stopPropagation();
+      const items = [];
+      if (u.admin_requested_unix) {
+        items.push(["Approve as admin", () => admDo(() => api("POST", path + "/role", { role: "admin" }), u.username + " is an admin.")]);
+        items.push(["Turn the request down", () => admDo(() => api("POST", path + "/deny-admin"))]);
+      } else if (u.role === "user") {
+        items.push(["Make admin", () => admDo(() => api("POST", path + "/role", { role: "admin" }), u.username + " is an admin.")]);
+      } else if (u.username !== self.username) {
+        items.push(["Make user", () => admDo(() => api("POST", path + "/role", { role: "user" }), u.username + " is a user.")]);
+      }
+      if (u.username !== self.username) {
+        items.push(["Remove", () => { if (confirm("Remove the account " + u.username + "? It is signed out everywhere.")) admDo(() => api("DELETE", path), "Removed."); }, true]);
+      }
+      if (!items.length) { toast("Nothing to change on your own account here."); return; }
+      admMenu(menu, items);
+    };
+    acts.appendChild(menu);
+    tr.appendChild(acts);
+    table.appendChild(tr);
+  }
+  wrap.appendChild(table);
+  panel.appendChild(wrap);
+  root.appendChild(panel);
+  return root;
+}
+
+// -- adding a worker: its own page --
 
 function joinCommands(url, token) {
   const dir = '"$HOME/lanthorn-worker"';
@@ -3523,155 +3911,195 @@ function joinCommands(url, token) {
   };
 }
 
-function joinWizard(workers, info, codes) {
-  const root = el("div");
+function wizardSteps(active) {
+  const ol = el("ol", "steps");
+  ["Details", "Connect", "Done"].forEach((label, i) => {
+    const li = el("li", i < active ? "done" : i === active ? "active" : "", label);
+    li.prepend(el("span", "step-n", String(i + 1)));
+    ol.appendChild(li);
+  });
+  return ol;
+}
+
+function admWizardView() {
+  const root = el("div", "adm-page");
+  const top = el("div", "page-top");
+  const back = el("button", "link", "← Workers");
+  back.type = "button";
+  back.onclick = () => admGo("workers");
+  top.appendChild(back);
+  root.appendChild(top);
+  root.appendChild(el("h2", "page-h", "Add a worker"));
+
+  const info = adm.data.info;
+  if (adm.done) {
+    root.appendChild(wizardSteps(3));
+    const p = el("div", "panel center");
+    p.appendChild(el("div", "big-ok", "✓"));
+    p.appendChild(el("h3", null, adm.done.name + " joined" + (adm.done.region ? " in " + adm.done.region : "")));
+    p.appendChild(el("p", "muted", "It shows in the Workers table once the controller has asked it for its room. It runs no games until you add them on that machine."));
+    const row = el("div", "btn-row center");
+    const again = el("button", "btn", "Add another");
+    again.type = "button";
+    again.onclick = () => { adm.done = null; adm.sig.view = ""; admRender(true); };
+    const view = el("button", "btn btn-primary", "View workers");
+    view.type = "button";
+    view.onclick = () => { adm.done = null; admGo("workers"); };
+    row.append(again, view);
+    p.appendChild(row);
+    root.appendChild(p);
+    return root;
+  }
+
   if (!info) {
-    root.appendChild(el("p", "muted small", "The controller did not answer."));
+    root.appendChild(el("p", "empty", "Asking the controller…"));
     return root;
   }
   if (!info.hubs || !info.hubs.length) {
-    root.appendChild(el("p", "muted small", "Not set up yet. Add a hub that new workers can reach to the index's hosting file, then reload this tab:"));
-    const pre = el("pre", "mono small", '[join]\nhubs = ["host:4790"]\npublic_url = "http://host:4761"');
-    root.appendChild(pre);
+    const p = el("div", "panel");
+    p.appendChild(titled("One setting first", "New workers dial a hub to reach the mesh. Write one that they can reach into the index's hosting file; it is read within 10 seconds."));
+    p.appendChild(el("pre", "mono code", '[join]\nhubs = ["host:4790"]\npublic_url = "http://host:4761"'));
+    root.appendChild(p);
     return root;
   }
-  root.appendChild(el("p", "muted small", "A join code is good for one machine, once. It fixes where the worker sits; the machine only says who it is. The worker takes no games until you add them on that machine."));
 
-  const form = el("div");
-  const name = field(form, "jw-name", "Name (optional; the machine's host name if empty)", { type: "text", maxLength: 64, placeholder: "basement-pi" });
-  const region = field(form, "jw-region", "Region (optional)", { type: "text", maxLength: 32, placeholder: "eu, il, us-east" });
-  const regions = [...new Set((workers || []).map(w => w.region).filter(Boolean))].sort();
-  const list = el("datalist");
-  list.id = "jw-regions";
-  for (const r of regions) { const o = el("option"); o.value = r; list.appendChild(o); }
-  region.setAttribute("list", "jw-regions");
-  form.appendChild(list);
-  const klass = field(form, "jw-class", "Class (optional)", { type: "text", maxLength: 32 });
-  const prio = field(form, "jw-priority", "Priority (higher fills first)", { type: "number", step: "1", value: "0" });
-  const life = el("select");
-  life.id = "jw-life";
-  life.classList.add("field");
-  for (const [m, label] of [[15, "15 minutes"], [60, "1 hour"], [240, "4 hours"], [1440, "1 day"]]) {
-    const o = el("option", null, label); o.value = String(m); if (m === 60) o.selected = true; life.appendChild(o);
+  if (adm.code) {
+    root.appendChild(wizardSteps(1));
+    const j = adm.code;
+    const p = el("div", "panel");
+    const where = [j.spec.name, j.spec.region && ("region " + j.spec.region), j.spec.class && ("class " + j.spec.class), j.spec.reserved_for && "reserved"].filter(Boolean).join(" · ");
+    p.appendChild(titled("Run this on the new machine", "The code works once and is shown only on this page. The machine makes its own identity and tells the controller who it is; where it sits comes from the code."));
+    if (where) p.appendChild(el("p", "muted", "It will join as " + where + "."));
+    const url = textInput({ value: j.url, placeholder: "http://192.168.1.10:4761" });
+    const grid = el("div", "form-grid one");
+    labelled(grid, "wz-url", "Controller address", "The index's HTTP address as the new machine reaches it. The page cannot know it, so check it.", url);
+    p.appendChild(grid);
+
+    const tabs = el("div", "seg");
+    const pre = el("pre", "mono code");
+    pre.id = "wz-cmd";
+    const tips = {
+      script: "Needs Docker. Pulls the platform image and starts one container that joins and then runs as the worker. Docker restarts it after a reboot.",
+      docker: "The same docker run the script does, to paste by hand.",
+      binary: "For a machine that already has platform-agent. Add --run, as here, to start it after joining.",
+    };
+    const copy = el("button", "btn btn-sm", "Copy");
+    copy.type = "button";
+    const draw = () => {
+      j.url = url.value.trim().replace(/\/+$/, "");
+      const ok = /^https?:\/\/[A-Za-z0-9.:-]+$/.test(j.url);
+      pre.textContent = ok ? joinCommands(j.url, j.token)[adm.method] : "Type the controller's address above.";
+      copy.disabled = !ok;
+      for (const b of tabs.querySelectorAll("button")) b.classList.toggle("on", b.dataset.m === adm.method);
+      tipHolder.dataset.tip = tips[adm.method];
+    };
+    const tipHolder = help(tips[adm.method]);
+    for (const [m, label] of [["script", "Script"], ["docker", "Docker"], ["binary", "platform-agent"]]) {
+      const b = el("button", "seg-b", label);
+      b.type = "button"; b.dataset.m = m;
+      b.onclick = () => { adm.method = m; draw(); };
+      tabs.appendChild(b);
+    }
+    const methodRow = el("div", "method-row");
+    methodRow.append(tabs, tipHolder);
+    p.appendChild(methodRow);
+    p.appendChild(pre);
+    url.oninput = draw;
+    copy.onclick = () => copyValue(pre.textContent);
+    const row = el("div", "btn-row");
+    const revoke = el("button", "btn", "Revoke and start over");
+    revoke.type = "button";
+    revoke.onclick = () => {
+      const id = j.id;
+      adm.code = null;
+      adm.sig.view = "";
+      api("DELETE", "/controller/admin/join-codes/" + id).catch(() => {}).then(() => admRefresh(true));
+    };
+    row.append(copy, revoke);
+    p.appendChild(row);
+    const live = el("div", "live");
+    live.append(el("span", "spinner"), (() => { const s = el("span", null, ""); s.id = "wz-live"; return s; })());
+    p.appendChild(live);
+    root.appendChild(p);
+    draw();
+    return root;
   }
-  const ll = el("label", null, "The code works for"); ll.htmlFor = "jw-life";
-  form.append(ll, life);
-  const make = el("button", "btn btn-primary", "Make a join code");
+
+  root.appendChild(wizardSteps(0));
+  const p = el("div", "panel");
+  p.appendChild(titled("Where it will sit", "A join code is good for one machine, once. It fixes these settings; the machine only says who it is."));
+  const grid = el("div", "form-grid");
+  const regions = [...new Set((adm.data.workers || []).map((w) => w.region).filter(Boolean))].sort();
+  const name = labelled(grid, "wz-name", "Name", "Shown in the Workers table. Leave it empty to use the machine's host name.", textInput({ maxLength: 64, placeholder: "basement-pi" }));
+  const region = labelled(grid, "wz-region", "Region", "Where the machine is. A create can ask for a region, and a move stays inside one. Existing regions are suggested.", textInput({ maxLength: 32, placeholder: "eu, il, us-east" }));
+  const list = el("datalist");
+  list.id = "wz-regions";
+  for (const r of regions) { const o = el("option"); o.value = r; list.appendChild(o); }
+  region.setAttribute("list", "wz-regions");
+  grid.appendChild(list);
+  const klass = labelled(grid, "wz-class", "Class", "A label for a special kind of worker. A worker with a class takes only servers that ask for it; one without takes the rest.", textInput({ maxLength: 32 }));
+  const prio = el("input"); prio.type = "number"; prio.step = "1"; prio.value = "0";
+  labelled(grid, "wz-priority", "Priority", "Higher fills first. Workers with equal priority go by free memory, then free slots.", prio);
+  const reserved = labelled(grid, "wz-reserved", "Reserved for", "Optional. An account's identity hash (32 hex characters). Only that account's servers are placed on this worker, and the shared pool never uses it.", textInput({ maxLength: 32, placeholder: "32 hex characters", spellcheck: false }));
+  const life = el("select");
+  for (const [m, label] of [[15, "15 minutes"], [60, "1 hour"], [240, "4 hours"], [1440, "1 day"]]) { const o = el("option", null, label); o.value = String(m); if (m === 60) o.selected = true; life.appendChild(o); }
+  labelled(grid, "wz-life", "Code valid for", "The code works once, and stops working after this.", life);
+  p.appendChild(grid);
+  const row = el("div", "btn-row");
+  const cancel = el("button", "btn", "Cancel");
+  cancel.type = "button";
+  cancel.onclick = () => admGo("workers");
+  const make = el("button", "btn btn-primary", "Create join code");
   make.type = "button";
   make.onclick = async () => {
+    if (make.disabled) return;
+    make.disabled = true;
     try {
       const made = await withInFlight(api("POST", "/controller/admin/join-codes", {
         name: name.value.trim(), region: region.value.trim(), class: klass.value.trim(),
         priority: parseInt(prio.value, 10) || 0, valid_minutes: parseInt(life.value, 10),
+        reserved_for: reserved.value.trim().toLowerCase(),
       }));
-      joinShown = { id: made.code.id, token: made.token, url: made.public_url || "", spec: made.code.spec, expires: made.code.expires_unix, method: "script" };
-      loadAdmin();
-    } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "No code was made."); }
+      adm.code = { id: made.code.id, token: made.token, url: made.public_url || "", spec: made.code.spec, expires: made.code.expires_unix };
+      adm.sig.view = "";
+      admRender(true);
+    } catch (e) {
+      make.disabled = false;
+      if (!(e && e.__auth)) showError((e && e.error) || "No code was made.");
+    }
   };
-  const row = el("div", "form-actions"); row.style.justifyContent = "flex-start"; row.style.marginTop = "8px";
-  row.appendChild(make);
-  form.appendChild(row);
-  root.appendChild(form);
+  row.append(cancel, make);
+  p.appendChild(row);
+  root.appendChild(p);
 
-  const shown = el("div");
-  shown.id = "join-result";
-  root.appendChild(shown);
-  if (joinShown) renderJoinShown(shown);
-
-  const rest = (codes || []).filter(c => c.state === "pending" && !(joinShown && joinShown.id === c.id));
-  const used = (codes || []).filter(c => c.state === "used").slice(0, 5);
-  if (rest.length || used.length) root.appendChild(el("h4", null, "Join codes"));
-  const when = (u) => new Date(u * 1000).toLocaleString();
-  for (const c of rest) {
-    const line = el("div", "req-head");
-    const where = [c.spec.name, c.spec.region && ("region " + c.spec.region), c.spec.class && ("class " + c.spec.class)].filter(Boolean).join(" \u00b7 ") || "any";
-    line.appendChild(el("span", "req-line", "Waiting \u00b7 " + where + " \u00b7 until " + when(c.expires_unix)));
-    const rv = el("button", "btn", "Revoke");
-    rv.type = "button";
-    rv.onclick = async () => {
-      try { await withInFlight(api("DELETE", "/controller/admin/join-codes/" + c.id)); loadAdmin(); }
-      catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not revoked."); }
-    };
-    line.appendChild(rv);
-    root.appendChild(line);
-  }
-  for (const c of used) {
-    root.appendChild(el("p", "muted small", "Used " + when(c.used_unix) + " \u00b7 joined as " + (c.used_name || "a worker") + (c.spec.region ? " in " + c.spec.region : "")));
+  // Codes made before: waiting ones can be taken back.
+  const codes = (adm.data.codes || []).filter((c) => c.state === "pending");
+  if (codes.length) {
+    const cp = el("div", "panel");
+    cp.appendChild(titled("Codes waiting", "A code that was made but not used yet. Revoke one you no longer want."));
+    for (const c of codes) {
+      const r = el("div", "row");
+      const where = [c.spec.name, c.spec.region && ("region " + c.spec.region), c.spec.class && ("class " + c.spec.class)].filter(Boolean).join(" · ") || "any worker";
+      const text = el("div", "row-main");
+      text.append(el("div", "row-title", where), el("div", "row-sub", "until " + new Date(c.expires_unix * 1000).toLocaleString()));
+      const rv = el("button", "btn btn-sm", "Revoke");
+      rv.type = "button";
+      rv.onclick = () => admDo(() => api("DELETE", "/controller/admin/join-codes/" + c.id), "Revoked.");
+      r.append(text, rv);
+      cp.appendChild(r);
+    }
+    root.appendChild(cp);
   }
   return root;
 }
 
-// The three ways to run it, with the address the new machine reaches the index
-// at (editable: the page cannot know it), and a watch for the machine joining.
-function renderJoinShown(box) {
-  box.textContent = "";
-  const j = joinShown;
-  const card = el("div", "req-card");
-  const where = [j.spec.name, j.spec.region && ("region " + j.spec.region), j.spec.class && ("class " + j.spec.class)].filter(Boolean).join(" \u00b7 ");
-  card.appendChild(el("h3", null, "Run one of these on the new machine"));
-  card.appendChild(el("p", "muted small", (where ? "It will join as " + where + ". " : "") + "The code works once and is shown only here; it ends " + new Date(j.expires * 1000).toLocaleString() + "."));
-  const url = field(card, "jw-url", "The index's address, as the new machine reaches it", { type: "text", value: j.url, placeholder: "http://192.168.1.10:4761" });
-  const tabs = el("div", "form-actions"); tabs.style.justifyContent = "flex-start"; tabs.style.margin = "8px 0";
-  const pre = el("pre", "mono small");
-  pre.style.whiteSpace = "pre-wrap";
-  const draw = () => {
-    j.url = url.value.trim().replace(/\/+$/, "");
-    const ok = /^https?:\/\/[A-Za-z0-9.:-]+$/.test(j.url);
-    const cmd = ok ? joinCommands(j.url, j.token)[j.method] : "Type the index's address above.";
-    pre.textContent = cmd;
-    copy.disabled = !ok;
-    for (const b of tabs.querySelectorAll("button[data-m]")) b.classList.toggle("btn-primary", b.dataset.m === j.method);
-  };
-  for (const [m, label] of [["script", "Script (wget/curl)"], ["docker", "Docker"], ["binary", "platform-agent"]]) {
-    const b = el("button", "btn", label);
-    b.type = "button"; b.dataset.m = m;
-    b.onclick = () => { j.method = m; draw(); };
-    tabs.appendChild(b);
-  }
-  const copy = el("button", "btn", "Copy");
-  copy.type = "button";
-  copy.onclick = () => copyValue(pre.textContent);
-  url.oninput = draw;
-  card.append(tabs, pre);
-  const acts = el("div", "form-actions"); acts.style.justifyContent = "flex-start"; acts.style.marginTop = "8px";
-  const done = el("button", "btn", "Dismiss");
-  done.type = "button";
-  done.onclick = () => { stopJoinWatch(); joinShown = null; loadAdmin(); };
-  acts.append(copy, done);
-  card.appendChild(acts);
-  const status = el("p", "muted small", "Waiting for the machine to join\u2026");
-  card.appendChild(status);
-  box.appendChild(card);
-  draw();
-
-  // Watch the code: when it is used the machine is a worker, and the table
-  // below shows it once the index has asked it for its room.
-  stopJoinWatch();
-  joinTimer = setInterval(async () => {
-    if (!document.body.contains(box)) { stopJoinWatch(); return; }
-    if (Date.now() / 1000 > j.expires) { status.textContent = "This code has run out. Make a new one."; stopJoinWatch(); return; }
-    let codes;
-    try { codes = await api("GET", "/controller/admin/join-codes"); } catch (_) { return; }
-    const mine = codes.find(c => c.id === j.id);
-    if (mine && mine.state === "used") {
-      stopJoinWatch();
-      joinShown = null;
-      toast((mine.used_name || "A worker") + " joined.");
-      loadAdmin();
-      // A new worker needs a few seconds to dial its hub before it answers.
-      for (const ms of [8000, 20000]) setTimeout(() => { if ($("admin-body") && !joinShown) loadAdmin(); }, ms);
-    } else if (mine && mine.state !== "pending") {
-      status.textContent = "This code was " + mine.state + ".";
-      stopJoinWatch();
-    }
-  }, 3000);
-}
-
 // ---------- account (accounts.rs) ----------
 
-function section(parent, title) {
-  const box = el("div", "req-card");
-  box.appendChild(el("h3", null, title));
+function section(parent, title, tip) {
+  const box = el("div", "panel");
+  const head = el("div", "panel-head");
+  head.appendChild(titled(title, tip));
+  box.appendChild(head);
   parent.appendChild(box);
   return box;
 }
@@ -3688,11 +4116,14 @@ async function loadAccount() {
     return;
   }
   const isAccount = me.via === "account";
-  root.appendChild(el("p", "muted small", isAccount ? "Signed in as " + me.username + "."
-    : "Signed in with the API token. Make an account below and sign in with it to change a password or turn on codes."));
+  const who = el("div", "acct-who");
+  who.appendChild(el("span", "who-name", isAccount ? me.username : "API token"));
+  who.appendChild(chip(isAccount ? me.role : "token", isAccount && me.role === "user" ? "muted" : "info"));
+  if (!isAccount) who.appendChild(help("You signed in with the API token. Make an account on the Admin tab and sign in with it to change a password or turn on codes."));
+  root.appendChild(who);
 
   if (isAccount) {
-    const pw = section(root, "Password");
+    const pw = section(root, "Password", "Changing it signs this account out everywhere else. At least 10 characters.");
     const cur = field(pw, "acct-cur", "Current password", { type: "password", autocomplete: "current-password" });
     const nw = field(pw, "acct-new", "New password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
     const nw2 = field(pw, "acct-new2", "The new password again", { type: "password", autocomplete: "new-password" });
@@ -3709,9 +4140,9 @@ async function loadAccount() {
     };
     const r = el("div", "form-actions"); r.style.justifyContent = "flex-start"; r.appendChild(save); pw.appendChild(r);
 
-    const tf = section(root, "Codes from an authenticator app");
+    const tf = section(root, "Sign-in codes", "Ask for a code from an authenticator app (Aegis, Google Authenticator, 1Password) at every sign-in. If the phone is lost, the API token still lets you in.");
+    tf.querySelector(".panel-head").appendChild(chip(me.totp_enabled ? "on" : "off", me.totp_enabled ? "ok" : "muted"));
     if (me.totp_enabled) {
-      tf.appendChild(el("p", "muted small", "On. Signing in asks for a code. If the phone is lost, the API token still lets you in."));
       const code = field(tf, "acct-off-code", "A current code", { type: "text", inputMode: "numeric", maxLength: 8 });
       const off = el("button", "btn", "Turn codes off");
       off.type = "button";
@@ -3721,7 +4152,6 @@ async function loadAccount() {
       };
       const r2 = el("div", "form-actions"); r2.style.justifyContent = "flex-start"; r2.appendChild(off); tf.appendChild(r2);
     } else {
-      tf.appendChild(el("p", "muted small", "Off. Turn them on to ask for a code from an app (such as Aegis, Google Authenticator or 1Password) at every sign-in."));
       const begin = el("button", "btn btn-primary", "Turn codes on");
       begin.type = "button";
       begin.onclick = async () => {
@@ -3729,7 +4159,7 @@ async function loadAccount() {
         try { t = await withInFlight(api("POST", "/auth/totp/begin")); }
         catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Could not start."); return; }
         begin.remove();
-        tf.appendChild(el("p", "muted small", "Scan this with your authenticator app, or type the key into it. Then enter the code it shows."));
+        tf.appendChild(el("p", "muted", "Scan this with your authenticator app, or type the key into it, then enter the code it shows."));
         const img = el("img", "totp-qr");
         img.alt = "QR code for your authenticator app";
         img.src = "data:image/svg+xml;base64," + btoa(t.qr_svg);
@@ -3752,11 +4182,10 @@ async function loadAccount() {
   }
 
   if (isAccount && me.role === "user") {
-    const ad = section(root, "Becoming an admin");
+    const ad = section(root, "Admin access", "You run servers here. An admin also manages accounts, game files and the mesh. Ask, and an admin decides.");
     if (me.admin_requested_unix) {
-      ad.appendChild(el("p", "muted small", "You asked to become an admin of this node; an admin will decide."));
+      ad.appendChild(el("p", "muted", "You asked to become an admin of this node; an admin will decide."));
     } else {
-      ad.appendChild(el("p", "muted small", "You run servers here. An admin also manages accounts, game files and the mesh. Ask, and an admin decides."));
       const ask = el("button", "btn", "Ask to become an admin");
       ask.type = "button";
       ask.onclick = async () => {
@@ -3765,8 +4194,6 @@ async function loadAccount() {
       };
       const r6 = el("div", "form-actions"); r6.style.justifyContent = "flex-start"; r6.appendChild(ask); ad.appendChild(r6);
     }
-  } else if (me.role !== "user") {
-    root.appendChild(el("p", "muted small", "Accounts on this node, and who is an admin, are on the Admin tab."));
   }
   for (const input of root.querySelectorAll("input")) input.classList.add("field");
 }
@@ -5055,7 +5482,7 @@ function setActiveTab(name) {
   if (name === "installed") pollInstalled();
   if (name === "requests") loadRequests();
   if (name === "account") loadAccount();
-  if (name === "admin") loadAdmin();
+  if (name === "admin") admEnter();
 }
 
 function renderAll() {
