@@ -68,6 +68,16 @@ const ANNOUNCE_INTERVAL_SECS: u64 = 30;
 pub const AGENT_APP_NAME: &str = "platform-agent";
 pub const AGENT_ASPECT: &str = "control";
 
+/// What the control destination announces. **Never empty and never printable:**
+/// a launcher cannot tell an announce's aspect, and an empty or text payload
+/// decodes as a legacy server, so this node's control address showed up in
+/// every browser as an unnamed "older server". `0xFE` is neither the server
+/// record's version nor valid UTF-8, so every build's `announce::decode`
+/// refuses it and no browser lists it (the same rule as a repository seed's
+/// announce, `game_bridge::repo_mesh`). The announce is not part of the
+/// destination hash, so the address does not change.
+pub const AGENT_ANNOUNCE: [u8; 4] = [0xFE, b'L', b'A', b'C'];
+
 /// The single request endpoint every op rides on. One endpoint, op byte inside.
 pub const CONTROL_ENDPOINT_ID: &str = "/platform-agent/control/1";
 
@@ -547,7 +557,7 @@ pub fn addresses_of(secret: &[u8; 64]) -> Result<(IdentityHash, DestinationHash)
         app_name: AGENT_APP_NAME,
         aspects: &[AGENT_ASPECT],
         identity: Zeroizing::new(*secret),
-        announce_app_data: b"",
+        announce_app_data: &AGENT_ANNOUNCE,
         proof: ProofStrategy::ProveAll,
         link_requests: LinkRequestPolicy::AcceptAll,
         ratchet: RatchetPolicy::NoRatchets,
@@ -614,7 +624,7 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
                     app_name: AGENT_APP_NAME,
                     aspects: &[AGENT_ASPECT],
                     identity: secret.clone(),
-                    announce_app_data: b"",
+                    announce_app_data: &AGENT_ANNOUNCE,
                     proof: ProofStrategy::ProveAll,
                     link_requests: LinkRequestPolicy::AcceptAll,
                     ratchet: RatchetPolicy::NoRatchets,
@@ -703,6 +713,14 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
 
 #[cfg(test)]
 mod tests {
+    /// The control destination's announce must never decode as a server.
+    #[test]
+    fn the_control_announce_is_never_a_server_row() {
+        assert!(game_bridge::announce::decode(&AGENT_ANNOUNCE).is_err(), "a browser would list it as a server");
+        let bytes: &[u8] = std::hint::black_box(&AGENT_ANNOUNCE);
+        assert!(std::str::from_utf8(bytes).is_err());
+    }
+
     use super::*;
     use platform_auth::answer_challenge;
     use prns_core::identity::PrivateIdentityMaterial;
