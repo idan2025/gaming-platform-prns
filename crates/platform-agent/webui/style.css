@@ -519,3 +519,9 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .mt-14 { margin-top: 14px; }
 .mb-12 { margin-bottom: 12px; }
 .form-actions.start { justify-content: flex-start; }
+
+/* Touch targets: 44 px where a finger is the pointer (WCAG 2.5.5). Desktop keeps its size. */
+@media (pointer: coarse) {
+  .nav-item, .btn, .btn-sm, .login-card input, .modal input, .modal select, .field, select, textarea { min-height: 44px; }
+  .login-note a { display: inline-flex; align-items: center; min-height: 44px; }
+}

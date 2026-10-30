@@ -4829,6 +4829,8 @@ function setActiveTab(name) {
     const on = t === name;
     btn.classList.toggle("active", on);
     btn.setAttribute("aria-selected", String(on));
+    // Roving tab stop: Tab reaches the open tab only; the arrow keys move between them.
+    btn.tabIndex = on ? 0 : -1;
     $("tab-panel-" + t).classList.toggle("hidden", !on);
   }
   $("page-title").textContent = TITLES[name];
@@ -4911,6 +4913,20 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   for (const t of TABS) $("tab-" + t).addEventListener("click", () => setActiveTab(t));
+  // The tab pattern: arrows, Home and End move between the visible tabs.
+  $("tab-servers").parentElement.addEventListener("keydown", (e) => {
+    const shown = TABS.filter((t) => !$("tab-" + t).hidden);
+    const at = shown.indexOf(state.activeTab);
+    let to = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") to = shown[(at + 1) % shown.length];
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") to = shown[(at - 1 + shown.length) % shown.length];
+    else if (e.key === "Home") to = shown[0];
+    else if (e.key === "End") to = shown[shown.length - 1];
+    if (!to) return;
+    e.preventDefault();
+    setActiveTab(to);
+    $("tab-" + to).focus();
+  });
   $("requests-refresh")?.addEventListener("click", loadRequests);
   $("admin-refresh")?.addEventListener("click", loadAdmin);
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
