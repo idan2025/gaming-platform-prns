@@ -14,7 +14,7 @@
   --line-strong: rgba(255, 255, 255, 0.12);
   --text: #e7eaee;
   --text-2: #a3abb6;
-  --text-3: #6d7682;
+  --text-3: #8b939e;
   --accent: #22d37a;
   --accent-hover: #43e392;
   --accent-soft: rgba(34, 211, 122, 0.13);
@@ -45,14 +45,15 @@
     --line-strong: rgba(15, 23, 42, 0.14);
     --text: #161a21;
     --text-2: #4e5764;
-    --text-3: #8a93a0;
-    --accent: #0f9d58;
-    --accent-hover: #0b8148;
-    --accent-soft: rgba(15, 157, 88, 0.1);
-    --ok: #13915a;
-    --ok-soft: rgba(19, 145, 90, 0.1);
-    --warn: #b7791f;
-    --warn-soft: rgba(183, 121, 31, 0.1);
+    --text-3: #4f5866;
+    --accent: #086a3b;
+    --accent-hover: #065530;
+    --accent-text: #ffffff;
+    --accent-soft: rgba(8, 106, 59, 0.1);
+    --ok: #0b6b44;
+    --ok-soft: rgba(11, 107, 68, 0.1);
+    --warn: #8a5712;
+    --warn-soft: rgba(138, 87, 18, 0.1);
     --bad: #d64545;
     --bad-soft: rgba(214, 69, 69, 0.09);
     --shadow: 0 12px 32px rgba(15, 23, 42, 0.14), 0 2px 6px rgba(15, 23, 42, 0.08);
@@ -409,7 +410,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .brand-sub, .sidebar-foot .capacity { display: none; }
   /* The tabs get a row of their own and share it; scrolling is only the
      fallback for a screen narrower than any phone. */
-  .nav { flex-direction: row; order: 3; width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .nav { flex-direction: row; order: 3; width: 100%; overflow-x: auto; }
   .nav-item { flex: 1 0 auto; justify-content: center; }
   .nav-item span:first-of-type { flex: none; }
   .sidebar-foot { margin: 0 0 0 auto; }
@@ -519,3 +520,9 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .mt-14 { margin-top: 14px; }
 .mb-12 { margin-bottom: 12px; }
 .form-actions.start { justify-content: flex-start; }
+
+/* Touch targets: 44 px where a finger is the pointer (WCAG 2.5.5). Desktop keeps its size. */
+@media (pointer: coarse) {
+  .nav-item, .btn, .btn-sm, .login-card input, .modal input, .modal select, .field, select, textarea { min-height: 44px; }
+  .login-note a { display: inline-flex; align-items: center; min-height: 44px; }
+}
