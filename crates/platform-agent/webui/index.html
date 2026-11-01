@@ -62,10 +62,6 @@
   </div>
 </main>
 
-<!-- Which build is serving this page, so "did my redeploy land" is a glance.
-     Filled in from /health after the token is accepted. -->
-<footer id="build-version" class="build-version" title="The agent build serving this page"></footer>
-
 <section id="main-ui" class="screen shell hidden">
   <aside class="sidebar">
     <div class="brand">
@@ -122,6 +118,10 @@
         <div id="disk-line" class="disk-line hidden"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span id="disk-text"></span></div>
         <button id="disconnect-btn" type="button" class="btn btn-block">Sign out</button>
       </div>
+      <!-- Which build is serving this page, so "did my redeploy land" is a glance.
+           Filled in from /health after the token is accepted. In the sidebar,
+           so it never sits over the page. -->
+      <footer id="build-version" class="build-version" title="The agent build serving this page"></footer>
     </div>
   </aside>
 
@@ -179,6 +179,7 @@
       </section>
 
       <section id="tab-panel-installed" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-installed">
+        <p class="muted-em controller-host-note" hidden>This page shows this machine only. The workers that run servers have their own files and connections.</p>
         <p class="page-lead">Game files on this node's disk, and downloads in progress. Deleting files keeps the game on the Games page; it can be downloaded again.</p>
         <div id="updates-bar" class="updates-bar hidden">
           <label class="updates-field"><span>Check for new builds</span>
@@ -217,6 +218,7 @@
 
       <section id="tab-panel-interfaces" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-interfaces">
         <div class="page">
+          <p class="muted-em controller-host-note" hidden>This page shows this machine only. The workers that run servers have their own files and connections.</p>
           <div id="mesh-games" class="card">
             <div class="card-head"><h2>Announced on the mesh</h2></div>
             <p id="mesh-games-note" class="card-text">—</p>
