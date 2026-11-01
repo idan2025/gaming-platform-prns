@@ -233,8 +233,16 @@ async function loadControllerStatus() {
     state.hostedGames = [];
     state.isAdmin = false;
   }
+  showRequestsTab();
+}
+
+// Region requests exist only through a controller, and a user has nothing to
+// ask for while the controller has one region (a move stays in its region).
+function showRequestsTab() {
   const reqTab = $("tab-requests");
-  if (reqTab) reqTab.hidden = !state.controllerOn;
+  if (!reqTab) return;
+  reqTab.hidden = !state.controllerOn || (state.role === "user" && state.regions.length < 2);
+  if (reqTab.hidden && state.activeTab === "requests") setActiveTab("servers");
 }
 
 async function api(method, path, body) {
@@ -1137,16 +1145,21 @@ function startable(g) {
 function renderGames() {
   const grid = $("games-grid");
   const n = $("nav-games-count");
-  if (n) n.textContent = state.games.length ? String(state.games.length) : "";
-  const sig = (state.controllerOn ? "c:" + state.hostedGames.join(",") + ";" : "") + state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
+  // A user through a controller sees what it can start: the rest is the
+  // node's packs, not something they can use here.
+  const onlyStartable = state.controllerOn && state.role === "user";
+  const shown = onlyStartable ? state.games.filter(g => startable(g).ok) : state.games;
+  if (n) n.textContent = shown.length ? String(shown.length) : "";
+  const sig = state.role + ";" + (state.controllerOn ? "c:" + state.hostedGames.join(",") + ";" : "") + state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
     + "|" + (g.content ? (g.content.installed ? "i" : "-") + g.content.missing.join(",") : "")).join(";");
   if (grid.dataset.sig !== sig) {
     grid.dataset.sig = sig;
     grid.textContent = "";
-    const sorted = [...state.games].sort((a, b) => (startable(b).ok - startable(a).ok) || a.display_name.localeCompare(b.display_name));
+    const sorted = [...shown].sort((a, b) => (startable(b).ok - startable(a).ok) || a.display_name.localeCompare(b.display_name));
     for (const g of sorted) grid.appendChild(buildGameCard(g));
+    if (onlyStartable && !shown.length) grid.appendChild(el("p", "muted", "No games can be started here right now."));
   }
-  for (const g of state.games) refreshCardDynamic(g);
+  for (const g of shown) refreshCardDynamic(g);
 }
 
 function buildGameCard(g) {
@@ -1157,12 +1170,14 @@ function buildGameCard(g) {
   const body = el("div", "card-body");
   body.appendChild(el("h3", "card-title", g.display_name));
   const meta = el("div", "card-meta");
-  meta.appendChild(el("span", "chip", (g.transport || "—").toUpperCase() + " " + g.default_port));
-  if (g.extra_ports) meta.appendChild(el("span", "chip", "+" + g.extra_ports + (g.extra_ports === 1 ? " port" : " ports")));
+  // Ports and whose word a pack is are the node's business, not a user's.
+  const plumbing = state.role !== "user";
+  if (plumbing) meta.appendChild(el("span", "chip", (g.transport || "—").toUpperCase() + " " + g.default_port));
+  if (plumbing && g.extra_ports) meta.appendChild(el("span", "chip", "+" + g.extra_ports + (g.extra_ports === 1 ? " port" : " ports")));
   if (g.console) meta.appendChild(el("span", "chip", "Live map change"));
   if (g.bots) meta.appendChild(el("span", "chip", "Bots"));
   // Whose word the pack is, under this node's [pack_trust] (§11.4's words).
-  if (g.trust && g.trust !== "built in") {
+  if (plumbing && g.trust && g.trust !== "built in") {
     const t = el("span", "chip" + (g.signer ? "" : " chip-muted"), g.trust);
     t.title = g.signer ? "Signed by " + g.signer : "Nobody signed this pack; it is trusted only as far as whoever wrote it.";
     meta.appendChild(t);
@@ -1579,7 +1594,7 @@ function openStartDialog(gameId) {
     const mp = field(form, "sf-mp", "Max players", { type: "number", min: "1", max: "64", step: "1", value: "16", required: true });
     const map = field(form, "sf-map", "Starting map", { type: "text", placeholder: "the game's default" });
     map.setAttribute("list", "sf-maplist");
-    const hint = el("p", "muted small", "The map name as the game knows it — svencoop1, de_dust2, cp_dustbowl.");
+    const hint = el("p", "muted small", "The map name as the game knows it. Left blank, the game starts on its usual first map.");
     form.append(mapDatalist("sf-maplist", gameId), hint);
     ensureMaps(gameId, (maps) => {
       const dl = $("sf-maplist");
@@ -1624,7 +1639,7 @@ function openStartDialog(gameId) {
     // Through a controller with workers in named regions: where to put it.
     // A wish the controller keeps when a worker there has room.
     let region = null;
-    if (state.controllerOn && state.regions.length) {
+    if (state.controllerOn && state.regions.length > 1) {
       region = selectField(form, "sf-region", "Region",
         [["", "Any: the worker with the most room"]].concat(state.regions.map(r => [r, r])), "");
     }
@@ -3279,6 +3294,13 @@ function applyRole() {
     else t.hidden = !admin;
   }
   if (!admin && ["admin", "installed", "interfaces"].includes(state.activeTab)) setActiveTab("servers");
+  // The node's packs, its official-pack switch and the announce of this
+  // node's own servers are an admin's (api::user_may).
+  document.body.classList.toggle("role-user", !admin);
+  const lead = document.querySelector("#tab-panel-games .page-lead");
+  if (lead) lead.textContent = admin ? "Games this node has a pack for. A game this node cannot run says why."
+    : "Pick a game and start your server. It runs here, not on your computer.";
+  showRequestsTab();
   $("games-grid").dataset.sig = "";
   renderGames();
 }

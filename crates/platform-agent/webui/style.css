@@ -526,3 +526,8 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .nav-item, .btn, .btn-sm, .login-card input, .modal input, .modal select, .field, select, textarea { min-height: 44px; }
   .login-note a { display: inline-flex; align-items: center; min-height: 44px; }
 }
+.login-note a { color: var(--accent); font-weight: 550; text-decoration: none; }
+.login-note a:hover, .login-note a:focus-visible { text-decoration: underline; }
+/* A user runs servers: the node's packs, its official-pack switch and the
+   announce of this node's own servers are an admin's (api::user_may). */
+body.role-user #add-game-btn, body.role-user #official-row, body.role-user #announce-btn { display: none !important; }
