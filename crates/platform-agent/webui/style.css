@@ -318,7 +318,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 @media (prefers-color-scheme: light) { .error-banner { background: #fff1f1; color: #8a1f1f; } }
 .toast { bottom: 24px; background: var(--surface-3); border: 1px solid var(--line-strong); }
 .error-banner button, .toast button { background: none; border: 0; color: inherit; opacity: 0.7; cursor: pointer; font-size: 18px; line-height: 1; }
-.build-version { position: fixed; right: 14px; bottom: 8px; font-size: 11px; color: var(--text-3); pointer-events: none; z-index: 5; }
+.build-version { text-align: center; padding: 6px 0 0; font-size: 11px; color: var(--text-3); }
 
 /* Disk space where game files live, in the sidebar card. */
 .disk-line { display: flex; align-items: center; gap: 7px; margin: -4px 0 12px; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
@@ -403,7 +403,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .shell { flex-direction: column; }
   .sidebar { width: auto; height: auto; position: static; flex-direction: row; align-items: center; gap: 8px; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   .brand { padding: 0 8px 0 0; }
-  .brand-sub, .sidebar-foot .capacity { display: none; }
+  .brand-sub, .sidebar-foot .capacity, .build-version { display: none; }
   /* The tabs get a row of their own and share it; scrolling is only the
      fallback for a screen narrower than any phone. */
   .nav { flex-direction: row; order: 3; width: 100%; overflow-x: auto; }
@@ -527,3 +527,8 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 /* A user runs servers: the node's packs, its official-pack switch and the
    announce of this node's own servers are an admin's (api::user_may). */
 body.role-user #add-game-btn, body.role-user #official-row, body.role-user #announce-btn { display: none !important; }
+
+/* Games the controller does not host, folded under the ones that start. */
+.games-folded { grid-column: 1 / -1; margin-top: 6px; }
+.games-folded > summary { cursor: pointer; color: var(--text-2); font-weight: 600; padding: 8px 0; }
+.games-folded > .games-grid { margin-top: 10px; }

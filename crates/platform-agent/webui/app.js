@@ -220,8 +220,13 @@ async function loadControllerStatus() {
     const note = $("controller-note");
     if (note) {
       note.hidden = !state.controllerOn;
-      note.textContent = state.controllerOn ? "Servers are placed through the controller at " + s.url + ", across every worker it drives." : "";
+      // A loopback address tells nobody anything; a remote one is worth naming.
+      const local = /^https?:\/\/(127\.|localhost|\[::1\])/.test(String(s.url || ""));
+      note.textContent = state.controllerOn ? "Servers are placed through the controller" + (local ? "" : " at " + s.url) + ", across every worker it drives." : "";
     }
+    // On a controller, Installed and Mesh describe its own machine, not the
+    // workers that run the servers: the page says so there.
+    for (const n of document.querySelectorAll(".controller-host-note")) n.hidden = !state.controllerOn;
     state.regions = [];
     state.hostedGames = [];
     state.isAdmin = false;
@@ -1160,7 +1165,20 @@ function renderGames() {
     grid.dataset.sig = sig;
     grid.textContent = "";
     const sorted = [...shown].sort((a, b) => (startable(b).ok - startable(a).ok) || a.display_name.localeCompare(b.display_name));
-    for (const g of sorted) grid.appendChild(buildGameCard(g));
+    // Through a controller, the games it does not host fold away under the
+    // ones that can start, so the page leads with what can be used.
+    const folded = state.controllerOn ? sorted.filter(g => !startable(g).ok) : [];
+    for (const g of sorted) if (!folded.includes(g)) grid.appendChild(buildGameCard(g));
+    if (folded.length) {
+      const more = el("details", "games-folded");
+      more.open = !!state.foldedOpen;
+      more.addEventListener("toggle", () => { state.foldedOpen = more.open; });
+      more.appendChild(el("summary", null, folded.length + (folded.length === 1 ? " game" : " games") + " the controller does not host"));
+      const inner = el("div", "games-grid");
+      for (const g of folded) inner.appendChild(buildGameCard(g));
+      more.appendChild(inner);
+      grid.appendChild(more);
+    }
     if (onlyStartable && !shown.length) grid.appendChild(el("p", "muted", "No games can be started here right now."));
   }
   for (const g of shown) refreshCardDynamic(g);
