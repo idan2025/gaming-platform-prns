@@ -2194,12 +2194,15 @@ mod tests {
     #[tokio::test]
     async fn a_bedrock_ping_is_answered_from_the_live_row_and_not_without_one() {
         use game_bridge::bedrock_ping::{pong_for, Motd, MAGIC};
+        // The client binds first: bound after the probe was dropped, it could
+        // be handed the probe's port and leave the responder nothing to bind
+        // (CI, macOS: "answered: Elapsed").
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = {
             let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             probe.local_addr().unwrap().port()
         };
         let answer = super::PingAnswer::start(port);
-        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut ping = vec![0x01];
         ping.extend_from_slice(&5i64.to_be_bytes());
         ping.extend_from_slice(&MAGIC);
@@ -2214,11 +2217,17 @@ mod tests {
         );
 
         *answer.motd.lock().unwrap() = Some(Motd { name: "Bedrock test".into(), online: Some(1), max: 10, port });
-        client.send_to(&ping, ("127.0.0.1", port)).await.unwrap();
-        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_from(&mut buf))
-            .await
-            .expect("answered")
-            .unwrap();
+        // Asked again until answered: a datagram is never retried, and one
+        // lost on a busy runner is not the responder's fault.
+        let mut answered = None;
+        for _ in 0..10 {
+            client.send_to(&ping, ("127.0.0.1", port)).await.unwrap();
+            if let Ok(got) = tokio::time::timeout(std::time::Duration::from_millis(500), client.recv_from(&mut buf)).await {
+                answered = Some(got.unwrap());
+                break;
+            }
+        }
+        let (n, _) = answered.expect("answered");
         assert_eq!(buf[0], 0x1c, "an unconnected pong");
         let text = &buf[35..n];
         assert!(std::str::from_utf8(text).unwrap().starts_with("MCPE;Bedrock test;2193;1.26.52.3;1;10;"));
