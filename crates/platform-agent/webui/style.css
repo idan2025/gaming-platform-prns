@@ -416,7 +416,12 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .list-head { display: none; }
   .inst { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
   .inst .art-thumb { width: 64px; height: 30px; }
-  .inst > :nth-child(n+3):not(.actions):not(.usage) { display: none; }
+  .inst > :nth-child(n+3):not(.actions):not(.usage):not(.cell-map):not(.cell-players) { display: none; }
+  /* The map and the players are what a phone looks for, so they get a line
+     each under the name instead of a column that does not fit. */
+  .inst > .cell-map, .inst > .cell-players { grid-column: 1 / -1; font-size: 13px; order: 2; }
+  .inst > .usage { order: 3; }
+  .inst > .cell-players::before { content: "Players: "; color: var(--text-3); }
   .inst > .usage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }
 }
