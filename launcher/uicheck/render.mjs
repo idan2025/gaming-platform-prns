@@ -2267,7 +2267,7 @@ await run('on Android a joined server can be left from the detail pane', {
     '/games': [{ id: 'sven-coop', display_name: 'Sven Co-op', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0, console: true }],
     '/controller/status': { enabled: true, url: 'https://index.test' },
     '/controller/hosting': { games: ['sven-coop'], regions: [] },
-    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [] }],
+    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [], players_now: 2, map_now: 'svencoop1' }],
     '/controller/games/sven-coop/maps': { game_id: 'sven-coop', maps: ['hl_c01_a1', 'svencoop1'] },
     '/controller/instances/s1/logs': { text: 'first line\nsecond line\n', truncated: true },
   };
@@ -2310,6 +2310,8 @@ await run('on Android a joined server can be left from the detail pane', {
   await settle();
   const btn = d.querySelector('.inst[data-id="s1"] .map-btn');
   check('a running server\'s map can be changed through the controller', btn && !btn.disabled, btn && btn.title);
+  const shown = d.querySelector('.inst[data-id="s1"] .cell-map');
+  check('the row shows which map the server is on, through the controller', shown && shown.textContent === 'svencoop1', shown && shown.textContent);
   posts.length = 0;
   w.__map('s1', 'sven-coop');
   await settle();

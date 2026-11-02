@@ -315,6 +315,10 @@ pub struct HostedInstance {
     /// than letting an idle one run.
     #[serde(default)]
     pub players_now: Option<u32>,
+    /// The map it is on right now, as the node read it from the game. `None`
+    /// is "this game answers no query, or did not answer", never "no map".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_now: Option<String>,
     /// The server's mesh address as its node reports it: what an invite names
     /// and a launcher joins. Passed through, never invented; absent while the
     /// node has none (stopped, or no `[mesh]`).
@@ -607,6 +611,7 @@ impl Hosting {
                     stopped_secs: r.stopped_secs,
                     delete_in_secs: None,
                     players_now: r.players_now,
+                    map_now: r.map_now,
                     mesh_destination: r.mesh_destination,
                     region: node.region.clone(),
                 })
@@ -638,6 +643,7 @@ impl Hosting {
                 stopped_secs: r["stopped_secs"].as_u64(),
                 delete_in_secs: None,
                 players_now: r["players_now"].as_u64().map(|p| p as u32),
+                map_now: r["map_now"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
                 mesh_destination: r["mesh_destination"].as_str().map(str::to_string),
                 region: node.region.clone(),
             })
@@ -757,6 +763,7 @@ impl Hosting {
                 stopped_secs: None,
                 delete_in_secs: None,
                 players_now: Some(0),
+                map_now: None,
                 mesh_destination: None,
                 region: None,
             });
@@ -807,6 +814,7 @@ impl Hosting {
             stopped_secs: None,
             delete_in_secs: None,
             players_now: Some(0),
+            map_now: None,
             mesh_destination: None,
             region: None,
         })
@@ -1322,6 +1330,7 @@ impl Hosting {
             stopped_secs: None,
             delete_in_secs: None,
             players_now: None,
+            map_now: None,
             mesh_destination: None,
             region: None,
         })
@@ -2453,6 +2462,7 @@ mod tests {
             owner: None,
             uptime_secs: None,
             players_now: None,
+            map_now: None,
             mesh_destination: None,
             region: None,
         }];
@@ -2475,6 +2485,7 @@ mod tests {
             owner: Some("acct".into()),
             uptime_secs: uptime,
             players_now: players,
+            map_now: None,
             mesh_destination: None,
             region: None,
         }
@@ -2708,6 +2719,7 @@ mod tests {
             owner: Some(owner.into()),
             uptime_secs: None,
             players_now: None,
+            map_now: None,
             mesh_destination: None,
             region: None,
         }
@@ -3042,7 +3054,7 @@ mod tests {
             Json(serde_json::json!([{
                 "instance_id": "srv", "game_id": "sven-coop", "name": "srv", "state": "running",
                 "port": null, "ports": [], "owner": "aa".repeat(16), "uptime_secs": 5,
-                "players_now": 0, "stopped_secs": null,
+                "players_now": 0, "map_now": "c1a0", "stopped_secs": null,
             }]))
         }
         async fn logs(State(h): State<Hits>, Path(id): Path<String>, Query(_q): Query<serde_json::Value>) -> String {
@@ -3107,6 +3119,9 @@ mod tests {
         assert!(h.game_maps("not-hosted").await.is_err());
         assert!(hits.lock().unwrap().is_empty(), "the node was asked: {:?}", hits.lock().unwrap());
 
+        // The map a server is on comes through as the node read it from the game.
+        let mine = h.instances_for(&owner).await.unwrap();
+        assert_eq!(mine[0].map_now.as_deref(), Some("c1a0"));
         h.change_map(&owner, "srv", "c1a1").await.unwrap();
         assert_eq!(h.game_maps("sven-coop").await.unwrap(), vec!["c1a0", "c1a1"]);
         assert_eq!(*hits.lock().unwrap(), vec!["map srv c1a1", "maps sven-coop"]);
