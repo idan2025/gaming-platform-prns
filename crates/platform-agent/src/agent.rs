@@ -139,6 +139,9 @@ pub struct Agent {
     /// authority on what is *running*; this only remembers the display name and
     /// requested size, which Docker has no place to keep.
     specs: Mutex<BTreeMap<String, InstanceSpec>>,
+    /// Instances whose spec could not be read back off their container
+    /// (`recall_specs`), so the list does not inspect them on every call.
+    unrecalled: Mutex<HashSet<String>>,
     /// One mesh bridge per running instance. Empty and inert on a node with no
     /// `[mesh]` section, which is the LAN-only behaviour that came before.
     mesh: Arc<crate::mesh::MeshBridges>,
@@ -560,6 +563,7 @@ impl Agent {
             ports: Mutex::new(ports),
             packs,
             specs: Mutex::new(BTreeMap::new()),
+            unrecalled: Mutex::new(HashSet::new()),
             mesh,
             crashes: Mutex::new(CrashWatch::default()),
             console_counts: Mutex::new(HashMap::new()),
@@ -1806,6 +1810,7 @@ impl Agent {
         self.docker.remove(instance_id).await?;
         self.ports.lock().await.release_all(&held);
         self.specs.lock().await.remove(instance_id);
+        self.unrecalled.lock().await.remove(instance_id);
         // The folder stays (a world or a backup may be wanted; only the
         // operator deletes it), but the identity is the server's address and
         // nothing can use it once the server is gone. A move leaves it on the
@@ -1855,8 +1860,37 @@ impl Agent {
         }
     }
 
+    /// Fill in the spec of every container this run did not create, read back
+    /// off the container (`DockerRuntime::spec_of`). Without it a restarted
+    /// agent showed, and announced, every server by its instance id instead of
+    /// the name its owner gave it. Once per container per run: a container
+    /// that cannot be read keeps the id and is not inspected again.
+    async fn recall_specs(&self, containers: &[crate::docker::ManagedContainer]) {
+        let missing: Vec<String> = {
+            let specs = self.specs.lock().await;
+            let unrecalled = self.unrecalled.lock().await;
+            containers
+                .iter()
+                .map(|c| &c.instance_id)
+                .filter(|id| !specs.contains_key(*id) && !unrecalled.contains(*id))
+                .cloned()
+                .collect()
+        };
+        for id in missing {
+            match self.docker.spec_of(&id).await {
+                Ok(spec) => {
+                    self.specs.lock().await.entry(id).or_insert(spec);
+                }
+                Err(_) => {
+                    self.unrecalled.lock().await.insert(id);
+                }
+            }
+        }
+    }
+
     pub async fn list(&self) -> Result<Vec<InstanceStatus>> {
         let containers = self.docker.list_managed().await?;
+        self.recall_specs(&containers).await;
         let specs = self.specs.lock().await;
         Ok(containers
             .into_iter()
