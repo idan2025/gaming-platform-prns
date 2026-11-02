@@ -40,7 +40,7 @@ jobs:
       - name: Launcher
         working-directory: launcher/src-tauri
         # zip 4.x, pulled in by tauri-plugin-updater: RUSTSEC-2026-0367,
-        # -0368 and -0369 are in `ZipArchive::extract` and
+        # -0368, -0369 and -0429 are in `ZipArchive::extract` and
         # `ZipStreamReader::extract`, which the updater runs only on an update
         # whose minisign signature has already verified against the key in
         # `tauri.conf.json`. Drop these once the updater moves to zip 9.
@@ -49,3 +49,4 @@ jobs:
           --ignore RUSTSEC-2026-0367
           --ignore RUSTSEC-2026-0368
           --ignore RUSTSEC-2026-0369
+          --ignore RUSTSEC-2026-0429
