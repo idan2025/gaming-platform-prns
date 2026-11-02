@@ -323,6 +323,12 @@ async fn a_game_without_a_signal_handler_stops_on_the_signal_not_the_timeout() {
 
     let outcome = async {
         rt.create_and_start(&spec(&id), &test_runtime(), &[], &one_port(27208)).await?;
+        // A stop sent the instant the container starts can reach init before
+        // it has set up its signal forwarding, and PID 1 drops a signal it has
+        // no handler for: the stop then ends in SIGKILL (137) and fails a test
+        // about the game, not init (CI, x86). A game is never stopped that
+        // soon, so give init its moment.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let started = std::time::Instant::now();
         rt.stop(&id).await?;
         Ok::<_, anyhow::Error>(started.elapsed())
