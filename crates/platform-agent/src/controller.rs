@@ -11,9 +11,10 @@
 //! identity hash, so a server that is not that index cannot replay it.
 //!
 //! **The allowlist is the rule.** [`allowed_path`] is the whole of what a node's
-//! page may do through a controller. Console, map change, bots, chat, players,
-//! world upload and backup download are not on it, and they stay on the node:
-//! the controller never gains a console route (`CLAUDE.md`).
+//! page may do through a controller. Console, bots, chat, players, world upload
+//! and backup download are not on it, and they stay on the node: the controller
+//! never gains a console route (`CLAUDE.md`). A map change is on it: a map name
+//! validated as data, never a line (decided by the owner, 2026-11-02).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -391,6 +392,14 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         ["instances", id, action @ ("stop" | "start" | "relocate")] if valid_id(id) && *method == Method::POST && no_query() => {
             Some(format!("/instances/{id}/{action}"))
         }
+        // A map change carries a name, never a line: the index and the node
+        // both validate it and the node picks the words (`console.rs`).
+        ["instances", id, "map"] if valid_id(id) && *method == Method::POST && no_query() => {
+            Some(format!("/instances/{id}/map"))
+        }
+        ["games", game, "maps"] if valid_game(game) && *method == Method::GET && no_query() => {
+            Some(format!("/games/{game}/maps"))
+        }
         ["instances", id, "logs"] if valid_id(id) && *method == Method::GET => {
             let lines = match query {
                 None => None,
@@ -434,6 +443,12 @@ fn valid_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// A game id as a pack may name one (`pack::id_is_file_safe`): no slash, and
+/// never starting with a dot, so never `..`.
+fn valid_game(id: &str) -> bool {
+    id.len() <= 64 && game_bridge::pack::id_is_file_safe(id)
+}
+
 fn is_small_number(n: &str) -> bool {
     (1..=4).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())
 }
@@ -454,6 +469,8 @@ mod tests {
             (Method::POST, format!("instances/{id}/start"), "/instances/sven-coop-1a2b3c/start"),
             (Method::POST, format!("instances/{id}/relocate"), "/instances/sven-coop-1a2b3c/relocate"),
             (Method::GET, format!("instances/{id}/logs?lines=50"), "/instances/sven-coop-1a2b3c/logs?lines=50"),
+            (Method::POST, format!("instances/{id}/map"), "/instances/sven-coop-1a2b3c/map"),
+            (Method::GET, "games/sven-coop/maps".to_string(), "/games/sven-coop/maps"),
             (Method::GET, format!("instances/{id}/backups"), "/instances/sven-coop-1a2b3c/backups"),
             (Method::POST, format!("instances/{id}/backups"), "/instances/sven-coop-1a2b3c/backups"),
             (
@@ -514,7 +531,9 @@ mod tests {
         let id = "sven-coop-1a2b3c";
         for (method, rest) in [
             (Method::POST, format!("instances/{id}/console")),
-            (Method::POST, format!("instances/{id}/map")),
+            (Method::GET, format!("instances/{id}/map")),
+            (Method::POST, format!("instances/{id}/map?map=x")),
+            (Method::POST, "games/../maps".to_string()),
             (Method::POST, format!("instances/{id}/bots")),
             (Method::POST, format!("instances/{id}/chat")),
             (Method::GET, format!("instances/{id}/players")),

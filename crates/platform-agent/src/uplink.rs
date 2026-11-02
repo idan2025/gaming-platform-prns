@@ -299,6 +299,36 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_MAPS => {
+            let req: MapsReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_MAPS, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_MAPS, &msg);
+            }
+            match state.agent.available_maps(&req.game_id).await {
+                Ok(maps) => encode_maps_resp(&maps, req.offset),
+                Err(e) => encode_err(OP_MAPS, &format!("{e:#}")),
+            }
+        }
+
+        OP_MAP => {
+            let req: MapReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_MAP, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_MAP, &msg);
+            }
+            // `change_map` validates the name and picks the words; nothing
+            // from the request becomes a console line unchecked.
+            match state.agent.change_map(&req.instance_id, &req.map).await {
+                Ok(_) => encode_ok(OP_MAP, &[]),
+                Err(e) => encode_err(OP_MAP, &format!("{e:#}")),
+            }
+        }
+
         OP_BACKUPS => {
             let req: InstanceReq = match parse_payload(body) {
                 Ok(r) => r,

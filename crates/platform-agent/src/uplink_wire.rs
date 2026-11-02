@@ -81,9 +81,14 @@ pub const OP_IDENTITY_SET: u8 = 20;
 /// that neither end holds more than this of a file in memory.
 pub const TRANSFER_CHUNK: usize = 256 * 1024;
 
-// Deliberately absent: a map change. It types a line at the server's console,
-// and the uplink never gains a console route (CLAUDE.md). Decided by the owner
-// before any code, per ROADMAP §13.
+/// The maps a node has installed for one game (`Agent::available_maps`), a page
+/// at a time from `offset`, so a long list never needs more than a packet.
+pub const OP_MAPS: u8 = 21;
+/// Change a running server's map in place (`Agent::change_map`). A map name and
+/// nothing else: the words are `console.rs`'s and the name is validated as data
+/// before it is a line. Not a console route: free text never crosses the uplink
+/// (`CLAUDE.md`). Decided by the owner on 2026-11-02.
+pub const OP_MAP: u8 = 22;
 
 // Status byte in a response.
 const STATUS_OK: u8 = 0;
@@ -154,6 +159,22 @@ pub struct LogsReq {
     pub token: String,
     pub instance_id: String,
     pub lines: u32,
+}
+
+/// `OP_MAPS`: one game's installed maps, from `offset` in the node's sorted list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapsReq {
+    pub token: String,
+    pub game_id: String,
+    pub offset: u32,
+}
+
+/// `OP_MAP`: the map one server should change to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapReq {
+    pub token: String,
+    pub instance_id: String,
+    pub map: String,
 }
 
 /// `OP_BACKUP_RESTORE` / `OP_BACKUP_DELETE`: one backup of one server, by name.
@@ -229,6 +250,31 @@ pub struct LogsResp {
 pub struct BackupsResp {
     pub backups: Vec<crate::backups::Backup>,
     pub truncated: bool,
+}
+
+/// `OP_MAPS`: the maps from the asked offset that fit, and where the next page
+/// starts when they did not all fit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapsResp {
+    pub maps: Vec<String>,
+    pub next: Option<u32>,
+}
+
+/// As many maps from `offset` as fit one reply. A page always carries at least
+/// one map while any remain, so a caller following `next` always ends.
+pub fn encode_maps_resp(maps: &[String], offset: u32) -> Vec<u8> {
+    let rest = maps.get(offset as usize..).unwrap_or_default();
+    let mut n = rest.len();
+    loop {
+        let next = (n < rest.len()).then(|| offset + n as u32);
+        let body = payload_bytes(&MapsResp { maps: rest[..n].to_vec(), next }).unwrap_or_default();
+        if body.len() <= MAX_BODY_LEN || n <= 1 {
+            return encode_ok(OP_MAPS, &body);
+        }
+        // Halving finds a page that fits in a few steps; the last step back
+        // up is not worth the code for a list nobody scrolls by the byte.
+        n = (n / 2).max(1);
+    }
 }
 
 /// The newest log text that fits one reply, cut from the front on a character
@@ -478,6 +524,31 @@ pub fn encode_list_resp(instances: &[InstanceStatus], total: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A long map list crosses in pages that each fit a packet, and following
+    /// `next` gives back every map once, in order.
+    #[test]
+    fn a_long_map_list_crosses_in_pages_that_each_fit() {
+        let maps: Vec<String> = (0..400).map(|i| format!("a_rather_long_map_name_{i:03}")).collect();
+        let mut got = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let reply = encode_maps_resp(&maps, offset);
+            let (op, ok, body) = decode_response(&reply).unwrap();
+            assert!(ok && op == OP_MAPS);
+            assert!(body.len() <= MAX_BODY_LEN, "a page of {} bytes", body.len());
+            let page: MapsResp = parse_payload(body).unwrap();
+            got.extend(page.maps);
+            match page.next {
+                Some(n) => { assert!(n > offset); offset = n; }
+                None => break,
+            }
+        }
+        assert_eq!(got, maps);
+        let empty: MapsResp = parse_payload(decode_response(&encode_maps_resp(&[], 0)).unwrap().2).unwrap();
+        assert_eq!(empty, MapsResp { maps: vec![], next: None });
+    }
+
     use super::*;
     use crate::instance::{InstanceSpec, InstanceState};
 

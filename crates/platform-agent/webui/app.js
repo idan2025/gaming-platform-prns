@@ -190,6 +190,8 @@ const CONTROLLER_ROUTES = [
   [/^\/instances\/[a-z0-9-]{1,64}$/, ["GET", "DELETE"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/(stop|start|relocate)$/, ["POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/logs(\?lines=\d{1,4})?$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/map$/, ["POST"]],
+  [/^\/games\/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}\/maps$/, ["GET"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups$/, ["GET", "POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+$/, ["DELETE"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+\/restore$/, ["POST"]],
@@ -200,7 +202,10 @@ const CONTROLLER_ROUTES = [
 // The URL a request really goes to: through the controller when this page has
 // one and the controller carries the request; the node's own path otherwise.
 function routeFor(method, path) {
-  if (!state.controllerOn || !path.startsWith("/instances")) return path;
+  // A game's maps come from a worker that hosts it: the controller's own
+  // machine has no game files.
+  const games = /^\/games\/[^/]+\/maps$/.test(path);
+  if (!state.controllerOn || !(path.startsWith("/instances") || games)) return path;
   const allowed = CONTROLLER_ROUTES.some(([re, methods]) => re.test(path) && methods.includes(method));
   if (!allowed) {
     throw { error: "Not available through the controller yet. This server's own page keeps it.", status: 404 };
@@ -856,16 +861,15 @@ function capabilities(inst) {
   return {
     running,
     canStop: !(inst.state === "stopped" || inst.state === "missing"),
-    // Through a controller there is start but no restart, and no map change
-    // (the controller never types at a server's console).
+    // Through a controller there is start but no restart. A map change goes
+    // through it: a validated name, never a console line.
     canRestart: state.controllerOn ? inst.state === "stopped" : true,
     restartLabel: state.controllerOn ? "Start" : "Restart",
     restartWhy: !state.controllerOn ? "Restart"
       : inst.state === "stopped" ? "Start this server on its worker."
       : "Restart is not carried through the controller: stop it, then start it.",
-    canMap: !state.controllerOn && running && speaks && !oneWorld,
-    mapWhy: state.controllerOn ? NOT_THROUGH_CONTROLLER
-      : oneWorld ? "A Minecraft server has one world. Upload a different one with Upload a world."
+    canMap: running && speaks && !oneWorld,
+    mapWhy: oneWorld ? "A Minecraft server has one world. Upload a different one with Upload a world."
       : !running ? "The server has to be running to be told anything."
       : (!speaks ? "The " + inst.game_id + " pack declares no console, so the map cannot change without a restart."
         : "Change the map without restarting — players stay connected."),
@@ -1551,17 +1555,52 @@ async function ensureMaps(gameId, onLoaded) {
   if (onLoaded) onLoaded(state.maps.get(gameId));
 }
 
-// A <datalist> rather than a <select>: the node lists what it has, and an
-// operator can still type a map it does not know about.
-function mapDatalist(id, gameId) {
-  const dl = el("datalist");
-  dl.id = id;
-  (state.maps.get(gameId) || []).forEach(m => {
-    const o = el("option");
-    o.value = m;
-    dl.appendChild(o);
-  });
-  return dl;
+// A map picked from a menu of what is installed, with "Another map…" for a
+// name the list does not have. Before the list arrives, and when there is
+// none, the box takes a typed name. `blank` is the menu's first entry and
+// means "no map" (the game's default); without it a map must be chosen.
+function mapPicker(parent, id, label, gameId, blank) {
+  const OTHER = "\u0000other";
+  const l = el("label", null, label);
+  l.htmlFor = id;
+  const sel = el("select", "field");
+  sel.id = id;
+  const typed = el("input", "field");
+  typed.type = "text";
+  typed.id = id + "-name";
+  typed.placeholder = "map name";
+  typed.setAttribute("aria-label", label);
+  typed.spellcheck = false;
+  const hint = el("p", "muted small", "Reading the maps installed…");
+  parent.append(l, sel, typed, hint);
+  const show = () => { typed.hidden = sel.value !== OTHER; l.htmlFor = sel.hidden ? typed.id : id; };
+  const fill = (maps) => {
+    sel.textContent = "";
+    const opt = (v, t) => { const o = el("option", null, t); o.value = v; sel.appendChild(o); };
+    if (blank) opt("", blank);
+    else opt("", "Choose a map");
+    (maps || []).forEach(m => opt(m, m));
+    opt(OTHER, "Another map…");
+    if (maps && maps.length) {
+      sel.hidden = false;
+      hint.textContent = maps.length + " maps installed. Pick one, or Another map… to type a name.";
+    } else {
+      // Nothing to pick from: the box is the whole control.
+      sel.hidden = true;
+      sel.value = OTHER;
+      hint.textContent = blank ? "No map list for this game here. Type a name, or leave it blank for the game's default."
+        : "No map list for this game here. Type the map's name.";
+    }
+    show();
+  };
+  sel.addEventListener("change", () => { show(); if (!typed.hidden) typed.focus(); });
+  sel.hidden = true;
+  typed.hidden = false;
+  ensureMaps(gameId, fill);
+  return {
+    value: () => (sel.hidden || sel.value === OTHER ? typed.value : sel.value).trim(),
+    focus: () => (sel.hidden ? typed : sel).focus(),
+  };
 }
 
 // ---------- dialogs ----------
@@ -1610,15 +1649,7 @@ function openStartDialog(gameId) {
     form.autocomplete = "off";
     const name = field(form, "sf-name", "Server name", { type: "text", required: true, placeholder: "My Server" });
     const mp = field(form, "sf-mp", "Max players", { type: "number", min: "1", max: "64", step: "1", value: "16", required: true });
-    const map = field(form, "sf-map", "Starting map", { type: "text", placeholder: "the game's default" });
-    map.setAttribute("list", "sf-maplist");
-    const hint = el("p", "muted small", "The map name as the game knows it. Left blank, the game starts on its usual first map.");
-    form.append(mapDatalist("sf-maplist", gameId), hint);
-    ensureMaps(gameId, (maps) => {
-      const dl = $("sf-maplist");
-      if (dl) dl.replaceWith(mapDatalist("sf-maplist", gameId));
-      if (maps && maps.length) hint.textContent = maps.length + " maps installed here — click the field to pick one, or type any name.";
-    });
+    const map = mapPicker(form, "sf-map", "Starting map", gameId, "The game's default");
     // Bots, and only for a game that has them: a disabled field would be
     // furniture, since nothing an operator does here could make it work.
     let bots = null;
@@ -1704,7 +1735,7 @@ function openStartDialog(gameId) {
       e.preventDefault();
       if (go.disabled) return;
       onStartSubmit(gameId, {
-        name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value,
+        name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value(),
         bots: bots ? bots.value : "", fixedPort: port.value, restartOnCrash: crash.checked,
         eula: !!(eulaBox && eulaBox.checked), world: world ? world() : null,
         region: region ? region.value : "",
@@ -2532,7 +2563,17 @@ function onShowLog(instanceId) {
       if (state.logTimer) { clearTimeout(state.logTimer); state.logTimer = null; }
       if (!$("log-dialog")) return;
       try {
-        const text = await apiText("/instances/" + encodeURIComponent(instanceId) + "/logs?lines=" + lines);
+        let text = await apiText("/instances/" + encodeURIComponent(instanceId) + "/logs?lines=" + lines);
+        // Through a controller the index answers `{text, truncated}` (one
+        // uplink packet's worth, newest kept); the node's own route is plain text.
+        if (state.controllerOn) {
+          try {
+            const j = JSON.parse(text);
+            if (j && typeof j.text === "string") {
+              text = (j.truncated ? "(older lines left out: the newest that fit one reply)\n" : "") + j.text;
+            }
+          } catch (_) { /* a plain-text answer stays as it is */ }
+        }
         if (!$("log-dialog")) return;
         // Follow the end only for a reader who is already there; someone
         // scrolled up to read is left where they are.
@@ -3746,34 +3787,8 @@ function onChangeMap(instanceId, gameId) {
   if (!gameId) return;
   openModal("map-dialog", gameId, (body, close) => {
     body.appendChild(el("h3", null, "Change map"));
-    const note = el("p", "muted small", "Reading the maps installed on this node…");
-    body.appendChild(note);
-    const input = field(body, "map-dialog-input", "Map", { type: "text", placeholder: "map name" });
-    input.setAttribute("list", "map-dialog-list");
-    const holder = el("div");
-    body.appendChild(holder);
-    const fill = (maps) => {
-      holder.textContent = "";
-      holder.appendChild(mapDatalist("map-dialog-list", gameId));
-      note.textContent = maps && maps.length
-        ? maps.length + " maps installed. Players stay connected while the level changes."
-        : "This node lists no maps for this game. Type a name; players stay connected.";
-      if (maps && maps.length) {
-        const list = el("div", "map-list");
-        maps.forEach(m => {
-          const b = el("button", "map-choice", m);
-          b.type = "button";
-          b.addEventListener("click", () => {
-            input.value = m;
-            list.querySelectorAll(".map-choice").forEach(x => x.classList.remove("chosen"));
-            b.classList.add("chosen");
-          });
-          list.appendChild(b);
-        });
-        holder.appendChild(list);
-      }
-    };
-    ensureMaps(gameId, fill);
+    const input = mapPicker(body, "map-dialog-input", "Map", gameId, null);
+    body.appendChild(el("p", "muted small", "Players stay connected while the level changes."));
     const actions = el("div", "form-actions");
     const cancel = el("button", "btn", "Cancel");
     cancel.type = "button";
@@ -3781,7 +3796,7 @@ function onChangeMap(instanceId, gameId) {
     const go = el("button", "btn btn-primary", "Change map");
     go.type = "button";
     go.addEventListener("click", async () => {
-      const trimmed = (input.value || "").trim();
+      const trimmed = input.value();
       if (trimmed === "") { input.focus(); return; }
       if (!MAP_NAME_RE.test(trimmed)) {
         showError("A map name may only contain letters, digits, '_', '-', '.' and '/'.");

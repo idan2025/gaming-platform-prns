@@ -78,6 +78,8 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/admin/admins/:identity", axum::routing::delete(revoke_admin))
         .route("/admin/workers", get(workers))
         .route("/instances/:id/logs", get(logs))
+        .route("/instances/:id/map", post(change_map))
+        .route("/games/:game/maps", get(game_maps))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
         .route("/instances/:id/backups/:name/restore", post(backup_restore))
@@ -801,6 +803,43 @@ async fn start(
         .await
         .map(|()| Json(json!({ "started": id })))
         .map_err(owner_op_failure)
+}
+
+#[derive(Deserialize)]
+struct ChangeMapReq {
+    map: String,
+}
+
+/// Change one of the caller's own running servers to another map, in place:
+/// players stay connected. A map name only; the node picks the words.
+async fn change_map(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<ChangeMapReq>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .change_map(&account, &id, &req.map)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "map": req.map })))
+        .map_err(owner_op_failure)
+}
+
+/// The maps a hosted game has, for a create form: signed in, like every
+/// hosting route.
+async fn game_maps(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(game): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    account_of(&state, &headers).await?;
+    match hosting.game_maps(&game).await {
+        Ok(maps) => Ok(Json(json!({ "game_id": game, "maps": maps }))),
+        Err(e) => Err(fail(StatusCode::NOT_FOUND, e)),
+    }
 }
 
 /// "no such instance" covers both missing and not-yours and is a 404, so

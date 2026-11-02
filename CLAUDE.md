@@ -814,6 +814,12 @@ pack declares a console, every line is logged, and **only the loopback API
 has the route**: the uplink must never gain one, or an index could type at a
 node's servers. Caught by
 `an_operators_line_reaches_the_console_and_a_second_line_never_does`.
+**A map change does cross the uplink and the controller** (2026-11-02, the
+owner's call, `OP_MAP`, `OP_MAPS`): it carries a map name, never a line,
+validated by `validate_map_name` at the index and again in
+`Agent::change_map`, and the words are `console.rs`'s. Do not widen it into
+a free-text route. `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
+still pins console, bots and chat off the controller.
 
 **A server can restart daily in a window** (2026-10-14, `schedule.rs`,
 `Agent::scheduled_restarts`, "Daily restart…" in a server's menu). Once a
