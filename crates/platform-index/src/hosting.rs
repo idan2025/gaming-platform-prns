@@ -949,6 +949,83 @@ impl Hosting {
         Ok(LogsResp { text, truncated: false })
     }
 
+    /// Change one of the caller's own running servers to another map, in place.
+    /// The node validates the name and picks the console words
+    /// (`Agent::change_map`); this only checks whose server it is.
+    pub async fn change_map(&self, account: &AccountId, instance_id: &str, map: &str) -> Result<()> {
+        // Judged here as well as on the node, so a name that is not one never
+        // leaves the index.
+        game_bridge::console::validate_map_name(map).map_err(|e| anyhow!("{e}"))?;
+        let (found, node) = self.owned(account, instance_id).await?;
+        if found.state != "running" {
+            return Err(anyhow!("the server has to be running to change its map"));
+        }
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client = self.agent_client().await.ok_or_else(|| {
+                anyhow!("node {} is remote but this index has no uplink", node.name)
+            })?;
+            return match client.change_map(dest, instance_id, map).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => {
+                    Err(anyhow!("node {} runs an agent too old to change maps; update it", node.name))
+                }
+                other => other.with_context(|| format!("asking agent {} to change the map", node.name)),
+            };
+        }
+        let url = format!("{}/instances/{}/map", node.api.trim_end_matches('/'), instance_id);
+        let response = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "map": map }))
+            .send()
+            .await
+            .context("asking the node")?;
+        if !response.status().is_success() {
+            let why = response.json::<serde_json::Value>().await.ok();
+            let why = why.as_ref().and_then(|v| v["error"].as_str()).unwrap_or("the node refused to change the map");
+            return Err(anyhow!("{why}"));
+        }
+        Ok(())
+    }
+
+    /// The maps a hosted game has, from the first node that answers with any:
+    /// what a create form offers before the server has a node. A game this
+    /// index does not host is "no such game", not an empty list.
+    pub async fn game_maps(&self, game_id: &str) -> Result<Vec<String>> {
+        let config = self.config();
+        if !config.hosts_game(game_id) {
+            return Err(anyhow!("no such game"));
+        }
+        for node in &config.nodes {
+            match self.maps_on(node, game_id).await {
+                Ok(maps) if !maps.is_empty() => return Ok(maps),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(node = %node.name, "maps for {game_id}: {e:#}"),
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    async fn maps_on(&self, node: &NodeConfig, game_id: &str) -> Result<Vec<String>> {
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client = self.agent_client().await.ok_or_else(|| {
+                anyhow!("node {} is remote but this index has no uplink", node.name)
+            })?;
+            return client.maps(dest, game_id).await.with_context(|| format!("asking agent {} for maps", node.name));
+        }
+        let url = format!("{}/games/{}/maps", node.api.trim_end_matches('/'), game_id);
+        let response = self.http.get(&url).send().await.context("asking the node")?;
+        if !response.status().is_success() {
+            return Err(anyhow!("the node refused to list maps"));
+        }
+        let body: serde_json::Value = response.json().await.context("reading the node's maps")?;
+        Ok(body["maps"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect())
+            .unwrap_or_default())
+    }
+
     /// The caller's own server's backups, and the calls that make, restore and
     /// remove one. Restore and remove take a name the agent made; a name that is
     /// not one of its shapes is refused here before it reaches a URL or a node.
@@ -2989,10 +3066,21 @@ mod tests {
             "ok"
         }
 
+        async fn change_map(State(h): State<Hits>, Path(id): Path<String>, Json(b): Json<serde_json::Value>) -> &'static str {
+            h.lock().unwrap().push(format!("map {id} {}", b["map"].as_str().unwrap_or("")));
+            "ok"
+        }
+        async fn maps(State(h): State<Hits>, Path(game): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("maps {game}"));
+            Json(serde_json::json!({"game_id": game, "maps": ["c1a0", "c1a1"]}))
+        }
+
         let hits: Hits = Default::default();
         let app = Router::new()
             .route("/instances", get(list))
             .route("/instances/:id/logs", get(logs))
+            .route("/instances/:id/map", post(change_map))
+            .route("/games/:game/maps", get(maps))
             .route("/instances/:id/backups", get(backups_list).post(backups_make))
             .route("/instances/:id/backups/:name/restore", post(restore))
             .route("/instances/:id/backups/:name", delete(remove))
@@ -3003,6 +3091,25 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (addr, hits)
+    }
+
+    /// An owner changes their running server's map through the index, by name
+    /// only; a stranger's ask, a name that is not one and a game the index does
+    /// not host never reach the node.
+    #[tokio::test]
+    async fn an_owner_changes_the_map_through_the_index_and_nobody_else_does() {
+        let (addr, hits) = recording_node().await;
+        let h = Hosting::new(one_node_at(addr));
+        let owner = AccountId("aa".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+        assert_eq!(h.change_map(&stranger, "srv", "c1a1").await.unwrap_err().to_string(), "no such instance");
+        assert!(h.change_map(&owner, "srv", "c1a1\nquit").await.is_err());
+        assert!(h.game_maps("not-hosted").await.is_err());
+        assert!(hits.lock().unwrap().is_empty(), "the node was asked: {:?}", hits.lock().unwrap());
+
+        h.change_map(&owner, "srv", "c1a1").await.unwrap();
+        assert_eq!(h.game_maps("sven-coop").await.unwrap(), vec!["c1a0", "c1a1"]);
+        assert_eq!(*hits.lock().unwrap(), vec!["map srv c1a1", "maps sven-coop"]);
     }
 
     fn one_node_at(addr: std::net::SocketAddr) -> HostingConfig {

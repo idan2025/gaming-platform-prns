@@ -816,18 +816,20 @@ the owner stamped from the user's identity.
    through the index, and sends stop, start, remove, logs and backups to the
    node that holds the server. The node logs in with its uplink identity,
    pinned to the index's identity, and forwards only what
-   `controller::allowed_path` names. Not carried yet: console, map change,
-   bots, chat, players, restart, world upload and backup download, which stay
-   on the node's own page. Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
+   `controller::allowed_path` names, map change included (2026-11-02). Not
+   carried yet: console, bots, chat, players, restart, world upload and backup
+   download, which stay on the node's own page. Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
    and `a_login_is_refused_by_an_index_the_node_is_not_pinned_to`.
    **Backup cap per account** (built 2026-10-24, `max_backups_per_account`):
    counted across the account's workers when a backup is asked for.
 6. **The missing uplink operations** (built: logs, backups list, create,
    restore and delete, `OP_LOGS` to `OP_BACKUP_DELETE`). Replies are capped to
    one packet: logs keep their newest text, and backup lists keep the newest
-   backups; both say when they were cut. **Map change is not built**: it types
-   a line at the console, which the uplink never gains (`CLAUDE.md`), and
-   ROADMAP §13's console decision is still the owner's to make.
+   backups; both say when they were cut. **Map change** (built 2026-11-02, the
+   owner's call): `OP_MAP` carries a map name, validated at the index and
+   again on the node, where `console.rs` picks the words; `OP_MAPS` lists a
+   game's installed maps in pages that fit a packet. The console itself
+   (free text) still never crosses the uplink (`CLAUDE.md`).
 7. **Moving a server between workers** (built, `Hosting::relocate`,
    `POST /instances/:id/relocate`, `HOSTING.md` "Moving a server to another
    worker"). Create the same server on the new worker held stopped, copy its

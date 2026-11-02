@@ -42,10 +42,11 @@ use platform_agent::backups::UploadProgress;
 use platform_agent::uplink_wire::{
     decode_chunk, decode_response, encode_request, encode_write_body, parse_payload, payload_bytes,
     BackupReadReq, BackupReq, BackupWriteReq, BackupsResp, CapacityResp, CreateReq, DeltaReq,
-    IdentityResp, IdentitySetReq, InstanceReq, ListResp, LogsReq, LogsResp, TokenReq, OP_BACKUPS,
-    OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_READ, OP_BACKUP_RESTORE, OP_BACKUP_WRITE,
-    OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_DELTA_CREATE, OP_DELTA_MERGE, OP_IDENTITY_READ,
-    OP_IDENTITY_SET, OP_LIST, OP_LOGS, OP_REMOVE, OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
+    IdentityResp, IdentitySetReq, InstanceReq, ListResp, LogsReq, LogsResp, MapReq, MapsReq,
+    MapsResp, TokenReq, OP_BACKUPS, OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_READ,
+    OP_BACKUP_RESTORE, OP_BACKUP_WRITE, OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_DELTA_CREATE,
+    OP_DELTA_MERGE, OP_IDENTITY_READ, OP_IDENTITY_SET, OP_LIST, OP_LOGS, OP_MAP, OP_MAPS, OP_REMOVE,
+    OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
 };
 use prns_core::engine::RequestResponseTimeout;
 use prns_core::units::DurationMillis;
@@ -129,6 +130,29 @@ impl AgentClient {
         let req = LogsReq { token: String::new(), instance_id: instance_id.to_string(), lines };
         let body = self.signed_op(agent, OP_LOGS, &payload_bytes(&req)?).await?;
         parse_ok(&body, OP_LOGS)
+    }
+
+    /// Every map the node has installed for one game, page by page.
+    pub async fn maps(&self, agent: DestinationHash, game_id: &str) -> Result<Vec<String>> {
+        let mut maps = Vec::new();
+        let mut offset = 0;
+        loop {
+            let req = MapsReq { token: String::new(), game_id: game_id.to_string(), offset };
+            let body = self.signed_op(agent, OP_MAPS, &payload_bytes(&req)?).await?;
+            let page: MapsResp = parse_ok(&body, OP_MAPS)?;
+            maps.extend(page.maps);
+            match page.next {
+                // A page that does not move forward would loop for ever.
+                Some(next) if next > offset => offset = next,
+                _ => return Ok(maps),
+            }
+        }
+    }
+
+    pub async fn change_map(&self, agent: DestinationHash, instance_id: &str, map: &str) -> Result<()> {
+        let req = MapReq { token: String::new(), instance_id: instance_id.to_string(), map: map.to_string() };
+        let body = self.signed_op(agent, OP_MAP, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_MAP)
     }
 
     pub async fn backups(&self, agent: DestinationHash, instance_id: &str) -> Result<BackupsResp> {
@@ -418,6 +442,16 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
         }
         OP_LOGS => {
             let mut r: LogsReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_MAPS => {
+            let mut r: MapsReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_MAP => {
+            let mut r: MapReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
