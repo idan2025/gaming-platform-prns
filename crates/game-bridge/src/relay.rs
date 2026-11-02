@@ -92,6 +92,9 @@ const UDP_READ_BUF: usize = 8192;
 /// this recently", which `ServerDetails::stats_age_secs` reports rather than
 /// hides.
 const LIVE_STATS_INTERVAL: Duration = Duration::from_secs(10);
+/// How long [`BridgeSession::join_shared_instance`] waits for a shared instance
+/// that was just started to listen.
+pub const JOIN_PATIENCE: Duration = Duration::from_secs(3);
 
 /// Live figures read out of the game server, and when.
 struct LiveStats {
@@ -429,15 +432,27 @@ impl BridgeSession {
     /// A session that joins one needs no interfaces of its own, which is the
     /// entire point: it can still register a destination and announce it, but
     /// it binds nothing and so cannot collide with its siblings.
+    ///
+    /// **A refused connection is retried for up to [`JOIN_PATIENCE`].**
+    /// `serve_shared_instance` only hands the server to the node's supervisor,
+    /// so the port may not be listening yet when it returns, and a join right
+    /// after it found nothing there (the official seed on a fresh node, CI
+    /// ARM). The engine reports "unavailable" only for a failed TCP connect, so
+    /// a retry can never turn a real refusal into a join.
     pub async fn join_shared_instance(&self, port: u16) -> Result<()> {
-        let intent = SharedInstanceClientIntent {
-            bus_port: port,
-            transport: SharedInstanceTransport::Tcp,
-            policy: prns_core::interfaces::shared_instance::configured_policy(Default::default()),
-        };
-        connect_existing_shared_instance(&self.handle, intent)
-            .await
-            .map_err(|e| anyhow!("joining the shared instance on port {port}: {e:?}"))?;
+        let started = Instant::now();
+        loop {
+            let intent = SharedInstanceClientIntent {
+                bus_port: port,
+                transport: SharedInstanceTransport::Tcp,
+                policy: prns_core::interfaces::shared_instance::configured_policy(Default::default()),
+            };
+            match connect_existing_shared_instance(&self.handle, intent).await {
+                Ok(_) => break,
+                Err(_) if started.elapsed() < JOIN_PATIENCE => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(e) => return Err(anyhow!("joining the shared instance on port {port}: {e:?}")),
+            }
+        }
         info!(port, "joined this machine's shared instance");
         Ok(())
     }
