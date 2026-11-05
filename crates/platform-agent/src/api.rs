@@ -99,6 +99,23 @@ pub fn router_full(
     pack_dir: Option<std::path::PathBuf>,
     interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
 ) -> Router {
+    router_extended(agent, token, pack_dir, interfaces, Vec::new())
+}
+
+/// [`router_full`], plus routes an operator's own build adds. Each extra router
+/// is merged **inside** the token gate and the browser guard, so its routes
+/// need the same token or account as the built-in ones, and a route
+/// [`user_may`] does not name is an admin's (`user_may` is the place to open
+/// one to users). Its handlers take the same [`ApiState`]; a route added here
+/// must not be served without the gate, so do not build a router around this
+/// one.
+pub fn router_extended(
+    agent: Arc<Agent>,
+    token: Option<String>,
+    pack_dir: Option<std::path::PathBuf>,
+    interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
+    extra: Vec<Router<ApiState>>,
+) -> Router {
     // A file that cannot be read leaves accounts off rather than starting with
     // none (which would let the next holder of the token make one). The token
     // still works, so the operator is never locked out.
@@ -214,6 +231,7 @@ pub fn router_full(
         .route("/auth/users/:name/role", post(auth_user_role))
         .route("/auth/users/:name/deny-admin", post(auth_user_deny_admin))
         .route("/auth/admin-request", post(auth_admin_request))
+        .merge(extra.into_iter().fold(Router::new(), |acc, r| acc.merge(r)))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         // Signing in happens before there is anything to present, so these
         // sit outside the gate: what this node wants (`/auth/state`), a
