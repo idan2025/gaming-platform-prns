@@ -65,7 +65,10 @@ impl RequestEndpoint<Arc<IndexState>> for QueryEndpoint {
         };
 
         let registry = cx.state.registry.lock().await;
-        let matched = registry.query(&browse, Instant::now());
+        let mut matched = registry.query(&browse, Instant::now());
+        if let Some(hosting) = &cx.state.hosting {
+            matched.retain(|s| hosting.listed(s.destination_hash.as_bytes()));
+        }
         let body = encode_result(&matched, matched.len());
         drop(registry);
 

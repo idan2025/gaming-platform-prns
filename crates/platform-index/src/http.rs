@@ -283,6 +283,7 @@ async fn servers(
     let rows: Vec<ServerRow> = registry
         .query(&query, now)
         .into_iter()
+        .filter(|s| state.hosting.as_ref().is_none_or(|h| h.listed(s.destination_hash.as_bytes())))
         .take(limit)
         .map(|s| {
             let record = s.record();
