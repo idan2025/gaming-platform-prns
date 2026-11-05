@@ -6,7 +6,8 @@
 //! other checks still read the owner.
 //!
 //! What this trait covers is what an account may **see in its list** and
-//! **run** (stop, start, read the log, change the map). What it never covers,
+//! **run** (stop, start, read the log, change the map), and which heard
+//! servers the index **lists** to everyone. What it never covers,
 //! whatever a policy says, is destroying a server, moving it, its backups, a
 //! region request, or erasing an account: those stay the owner's, and they go
 //! through `Hosting::owned`, which is owner-only by name. A policy that wants
@@ -25,6 +26,15 @@ pub trait Access: Send + Sync {
     /// Whether this account may stop, start, read the log of or change the map
     /// of this server.
     fn may_operate(&self, account: &AccountId, server: &HostedInstance) -> bool;
+
+    /// Whether this index lists a server it heard, by its destination, to
+    /// anyone who browses it (`/servers` and the Reticulum query alike). Every
+    /// server, unless a policy keeps the directory to some. It changes what
+    /// this cache shows, never what the mesh carries: a launcher still hears
+    /// every announce itself.
+    fn listed(&self, _destination: &[u8; 16]) -> bool {
+        true
+    }
 }
 
 /// The owner, and nobody else. What the index does when nothing else is set.

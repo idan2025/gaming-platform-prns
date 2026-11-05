@@ -489,6 +489,11 @@ impl Hosting {
         self
     }
 
+    /// Whether this index lists a heard server (`access::Access::listed`).
+    pub fn listed(&self, destination: &[u8; 16]) -> bool {
+        self.access.listed(destination)
+    }
+
     /// The configuration in force right now.
     pub fn config(&self) -> Arc<HostingConfig> {
         self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
