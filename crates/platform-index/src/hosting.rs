@@ -395,6 +395,8 @@ pub struct Hosting {
     requests: crate::regions::RegionRequests,
     /// Admins granted here (beyond the hosting file's), and requests to be one.
     admin_store: crate::admins::AdminStore,
+    /// Who may see and run a server beyond its owner (`access.rs`).
+    access: Arc<dyn crate::access::Access>,
 }
 
 /// One admin of the index and where the role comes from.
@@ -476,7 +478,15 @@ impl Hosting {
             moving: Default::default(),
             requests: Default::default(),
             admin_store: Default::default(),
+            access: crate::access::owner_only(),
         }
+    }
+
+    /// Let a policy say who beyond the owner sees and runs a server (`access.rs`).
+    /// Set before the index serves.
+    pub fn with_access(mut self, access: Arc<dyn crate::access::Access>) -> Self {
+        self.access = access;
+        self
     }
 
     /// The configuration in force right now.
@@ -652,11 +662,12 @@ impl Hosting {
 
     /// Instances belonging to one account.
     pub async fn instances_for(&self, account: &AccountId) -> Result<Vec<HostedInstance>> {
+        let access = self.access.clone();
         Ok(self
             .all_instances()
             .await?
             .into_iter()
-            .filter(|i| i.owner.as_deref() == Some(account.0.as_str()))
+            .filter(|i| access.may_see(account, i))
             .collect())
     }
 
@@ -820,11 +831,27 @@ impl Hosting {
         })
     }
 
-    /// One of the caller's own instances, and the node holding it.
+    /// One of the caller's own instances, and the node holding it. Owner only:
+    /// destroying, moving and backups never go through an access policy.
     ///
     /// Ownership is checked against the node's label, not against anything this
     /// index remembers, so a restarted index still enforces it correctly.
     async fn owned(&self, account: &AccountId, instance_id: &str) -> Result<(HostedInstance, NodeConfig)> {
+        self.find_for(account, instance_id, crate::access::is_owner).await
+    }
+
+    /// A server the account may run (stop, start, log, map), by the access policy.
+    async fn operable(&self, account: &AccountId, instance_id: &str) -> Result<(HostedInstance, NodeConfig)> {
+        let access = self.access.clone();
+        self.find_for(account, instance_id, |a, i| access.may_operate(a, i)).await
+    }
+
+    async fn find_for(
+        &self,
+        account: &AccountId,
+        instance_id: &str,
+        allowed: impl Fn(&AccountId, &HostedInstance) -> bool,
+    ) -> Result<(HostedInstance, NodeConfig)> {
         let all = self.all_instances().await?;
         let found = all
             .into_iter()
@@ -832,7 +859,7 @@ impl Hosting {
             // Not found and not yours are the same answer on purpose: a
             // different one would let anyone enumerate other people's
             // instances by watching which ids come back "forbidden".
-            .filter(|i| i.owner.as_deref() == Some(account.0.as_str()))
+            .filter(|i| allowed(account, i))
             .ok_or_else(|| anyhow!("no such instance"))?;
         let node = self
             .config()
@@ -847,7 +874,7 @@ impl Hosting {
     /// Stop one of the caller's own instances. Its files, ports and address
     /// stay; [`start`](Self::start) brings it back.
     pub async fn stop(&self, account: &AccountId, instance_id: &str) -> Result<()> {
-        let (_, node) = self.owned(account, instance_id).await?;
+        let (_, node) = self.operable(account, instance_id).await?;
         self.stop_on(&node, instance_id).await
     }
 
@@ -860,7 +887,7 @@ impl Hosting {
     /// by the node, so "start" can never restart a server out from under its
     /// players.
     pub async fn start(&self, account: &AccountId, instance_id: &str) -> Result<()> {
-        let (found, node) = self.owned(account, instance_id).await?;
+        let (found, node) = self.operable(account, instance_id).await?;
         if found.state == "running" {
             return Err(anyhow!("it is already running"));
         }
@@ -936,7 +963,7 @@ impl Hosting {
     /// The newest lines one of the caller's own servers wrote. A node whose agent
     /// predates the op says so, rather than "unknown op".
     pub async fn logs(&self, account: &AccountId, instance_id: &str, lines: u32) -> Result<LogsResp> {
-        let (_, node) = self.owned(account, instance_id).await?;
+        let (_, node) = self.operable(account, instance_id).await?;
         let too_old = || anyhow!("node {} runs an agent too old to show logs; update it", node.name);
         if let Some(dest) = Self::agent_dest(&node) {
             let dest = dest?;
@@ -964,7 +991,7 @@ impl Hosting {
         // Judged here as well as on the node, so a name that is not one never
         // leaves the index.
         game_bridge::console::validate_map_name(map).map_err(|e| anyhow!("{e}"))?;
-        let (found, node) = self.owned(account, instance_id).await?;
+        let (found, node) = self.operable(account, instance_id).await?;
         if found.state != "running" {
             return Err(anyhow!("the server has to be running to change its map"));
         }
@@ -3125,6 +3152,42 @@ mod tests {
         h.change_map(&owner, "srv", "c1a1").await.unwrap();
         assert_eq!(h.game_maps("sven-coop").await.unwrap(), vec!["c1a0", "c1a1"]);
         assert_eq!(*hits.lock().unwrap(), vec!["map srv c1a1", "maps sven-coop"]);
+    }
+
+    /// A policy that shares a server with a second account lets that account
+    /// see it and change its map, and nothing more: destroying it stays the
+    /// owner's whatever the policy says, and the default still refuses it.
+    #[tokio::test]
+    async fn a_policy_shares_a_server_to_see_and_run_but_never_to_destroy() {
+        struct Share(AccountId);
+        impl crate::access::Access for Share {
+            fn may_see(&self, account: &AccountId, server: &HostedInstance) -> bool {
+                account == &self.0 || crate::access::is_owner(account, server)
+            }
+            fn may_operate(&self, account: &AccountId, server: &HostedInstance) -> bool {
+                account == &self.0 || crate::access::is_owner(account, server)
+            }
+        }
+        let (addr, hits) = recording_node().await;
+        let owner = AccountId("aa".repeat(16));
+        let friend = AccountId("cc".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+
+        let plain = Hosting::new(one_node_at(addr));
+        assert_eq!(plain.change_map(&friend, "srv", "c1a1").await.unwrap_err().to_string(), "no such instance");
+        assert!(plain.instances_for(&friend).await.unwrap().is_empty());
+
+        let shared = Hosting::new(one_node_at(addr)).with_access(std::sync::Arc::new(Share(friend.clone())));
+        assert_eq!(shared.instances_for(&friend).await.unwrap().len(), 1, "the friend does not see the shared server");
+        assert!(shared.instances_for(&stranger).await.unwrap().is_empty());
+        shared.change_map(&friend, "srv", "c1a1").await.unwrap();
+        assert_eq!(
+            shared.destroy(&friend, "srv").await.unwrap_err().to_string(),
+            "no such instance",
+            "a shared server was destroyed by someone who is not its owner"
+        );
+        assert_eq!(shared.instances_for(&owner).await.unwrap().len(), 1, "the owner keeps the server");
+        assert_eq!(*hits.lock().unwrap(), vec!["map srv c1a1"]);
     }
 
     fn one_node_at(addr: std::net::SocketAddr) -> HostingConfig {
