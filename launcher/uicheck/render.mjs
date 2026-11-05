@@ -2287,7 +2287,7 @@ await run('on Android a joined server can be left from the detail pane', {
     return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
       headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
   };
-  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog;');
+  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog; window.__menu = openInstanceMenu;');
   w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
   await settle();
   const d = w.document;
@@ -2312,6 +2312,14 @@ await run('on Android a joined server can be left from the detail pane', {
   check('a running server\'s map can be changed through the controller', btn && !btn.disabled, btn && btn.title);
   const shown = d.querySelector('.inst[data-id="s1"] .cell-map');
   check('the row shows which map the server is on, through the controller', shown && shown.textContent === 'svencoop1', shown && shown.textContent);
+  // The server's menu agrees with the row: Change map is carried by the
+  // controller, so it is not greyed as "the worker's own page has it"; what
+  // the controller does not carry still is.
+  w.__menu('s1', 10, 10);
+  const menuItems = Object.fromEntries([...d.querySelectorAll('#ctx-menu .menu-item')].map(b => [b.textContent.trim(), b.disabled]));
+  check('the menu lets a running server change map through the controller', menuItems['Change map…'] === false, JSON.stringify(menuItems));
+  check('the menu still greys what the controller does not carry', menuItems['Players…'] === true && menuItems['Chat…'] === true, JSON.stringify(menuItems));
+  d.getElementById('ctx-menu').hidden = true;
   posts.length = 0;
   w.__map('s1', 'sven-coop');
   await settle();
