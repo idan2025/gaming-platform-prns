@@ -85,7 +85,7 @@ pub struct ApiState {
     pub accounts: Option<Arc<crate::accounts::Accounts>>,
     /// A build's own answer for requests [`user_may`] does not name
     /// ([`Extension::user_may`]).
-    pub user_may_ext: Option<fn(&axum::http::Method, &str) -> bool>,
+    pub user_may_ext: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
 }
 
 pub fn router(agent: Arc<Agent>) -> Router {
@@ -131,10 +131,12 @@ pub struct Extension {
     /// reaches these, behind the browser guard and the page's policy only.
     /// For what must work before an account exists (signing up, a reset).
     pub open_routes: Router<ApiState>,
-    /// Which requests a user account may make that [`user_may`] does not name.
-    /// Asked only for those: a route public opens or refuses by name keeps its
-    /// answer, so a build can open its own routes and none of the node's.
-    pub user_may: Option<fn(&axum::http::Method, &str) -> bool>,
+    /// The build's word on what a user account may request. `Some(false)`
+    /// refuses, whatever the node says: a build can always close more.
+    /// `Some(true)` opens only a request [`user_may`] does not name, so a build
+    /// can open its own routes and none of the node's. `None` leaves it to
+    /// the node.
+    pub user_may: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
 }
 
 impl Default for Extension {
@@ -439,10 +441,7 @@ async fn require_token(
     let Some(caller) = caller else {
         return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
     };
-    let may = match user_may_named(request.method(), request.uri().path()) {
-        Some(answer) => answer,
-        None => state.user_may_ext.is_some_and(|ext| ext(request.method(), request.uri().path())),
-    };
+    let may = user_may_with(state.user_may_ext, request.method(), request.uri().path());
     if caller.role == crate::accounts::Role::User && !may {
         return Err(fail(StatusCode::FORBIDDEN, "only an admin of this node can do that"));
     }
@@ -455,6 +454,20 @@ async fn require_token(
 /// so a new route cannot be opened to users by forgetting it.
 pub fn user_may(method: &axum::http::Method, path: &str) -> bool {
     user_may_named(method, path).unwrap_or(false)
+}
+
+/// [`user_may`] with a build's word ([`Extension::user_may`]): the build can
+/// refuse anything, and open only what the node does not name.
+pub fn user_may_with(
+    ext: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
+    method: &axum::http::Method,
+    path: &str,
+) -> bool {
+    let build = ext.and_then(|f| f(method, path));
+    if build == Some(false) {
+        return false;
+    }
+    user_may_named(method, path).unwrap_or(build == Some(true))
 }
 
 /// [`user_may`]'s own answer, or `None` for a request it does not name, which

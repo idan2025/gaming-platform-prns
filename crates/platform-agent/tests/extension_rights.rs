@@ -37,16 +37,22 @@ content_version = "test"
 }
 
 /// Opens everything it is asked about: the node's own refusals must still hold.
-fn opens_everything(_: &axum::http::Method, _: &str) -> bool {
-    true
+fn opens_everything(_: &axum::http::Method, _: &str) -> Option<bool> {
+    Some(true)
 }
 
-fn opens_its_own(_: &axum::http::Method, path: &str) -> bool {
-    path.starts_with("/ext/")
+fn opens_its_own(_: &axum::http::Method, path: &str) -> Option<bool> {
+    path.starts_with("/ext/").then_some(true)
+}
+
+/// Closes a GET the node would let a user make, and its own route.
+fn closes_some(method: &axum::http::Method, path: &str) -> Option<bool> {
+    (path == "/usage" || (path == "/ext/act" && method == axum::http::Method::POST))
+        .then_some(false)
 }
 
 async fn serve(
-    user_may: Option<fn(&axum::http::Method, &str) -> bool>,
+    user_may: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
 ) -> Option<(String, String, tempfile::TempDir)> {
     let dir = tempfile::tempdir().ok()?;
     let config = AgentConfig::parse(&config_toml(dir.path())).ok()?;
@@ -132,6 +138,15 @@ async fn a_build_opens_its_own_routes_to_users_and_none_of_the_nodes() {
     let identity =
         client.put(format!("{base}/instances/x/identity")).bearer_auth(&user).send().await.unwrap();
     assert_eq!(identity.status(), 403, "a build opened a server's identity to a user");
+
+    // A build can close what the node would open: a GET a user may make.
+    let (base, user, _dir4) = serve(Some(closes_some)).await.unwrap();
+    let usage = client.get(format!("{base}/usage")).bearer_auth(&user).send().await.unwrap();
+    assert_eq!(usage.status(), 403, "a build could not close a GET to users");
+    let usage = client.get(format!("{base}/usage")).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(usage.status(), 200, "closing it to users closed it to the admin");
+    let health = client.get(format!("{base}/health")).bearer_auth(&user).send().await.unwrap();
+    assert_eq!(health.status(), 200, "a build's refusal reached past what it named");
 }
 
 #[tokio::test(flavor = "multi_thread")]
