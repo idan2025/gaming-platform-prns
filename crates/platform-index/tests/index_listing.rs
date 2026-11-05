@@ -38,19 +38,17 @@ fn row(n: u8) -> DiscoveredServer {
 }
 
 fn hosting_config() -> platform_index::hosting::HostingConfig {
-    platform_index::hosting::HostingConfig {
-        games: vec!["sven-coop".to_string()],
-        nodes: vec![platform_index::hosting::NodeConfig {
-            name: "local".to_string(),
-            api: "http://127.0.0.1:1".to_string(),
-            agent: None,
-            priority: 0,
-            class: None,
-            region: None,
-        }],
-        quota: Default::default(),
-        admins: Vec::new(),
-    }
+    // Read as the hosting file is, so a build's own fields keep their defaults.
+    toml::from_str(
+        r#"
+games = ["sven-coop"]
+
+[[nodes]]
+name = "local"
+api = "http://127.0.0.1:1"
+"#,
+    )
+    .expect("a minimal hosting file")
 }
 
 /// Lists only the server ending in 1; owners keep today's rule.
