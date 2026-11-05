@@ -75,7 +75,11 @@ fn spec(id: &str, restart_on_crash: bool) -> InstanceSpec {
 
 /// `ports` keeps tests that run at once out of each other's way: they share one
 /// Docker daemon, so two agents with one range would hand out the same port.
-async fn agent_or_skip(dir: &std::path::Path, ports: (u16, u16)) -> Option<Arc<Agent>> {
+async fn agent_or_skip(
+    dir: &std::path::Path,
+    ports: (u16, u16),
+    events: Option<Arc<dyn platform_agent::events::NodeEvents>>,
+) -> Option<Arc<Agent>> {
     if !ensure_crasher() {
         return None;
     }
@@ -104,7 +108,21 @@ content_version = "test"
         ports.1
     );
     let config = AgentConfig::parse(&toml).ok()?;
-    Agent::new(config, vec![game_bridge::GamePack::sven_coop()]).await.ok().map(Arc::new)
+    let mut agent = Agent::new(config, vec![game_bridge::GamePack::sven_coop()]).await.ok()?;
+    if let Some(events) = events {
+        agent.set_events(events);
+    }
+    Some(Arc::new(agent))
+}
+
+/// Records each crash the watch reports, by server id.
+#[derive(Default)]
+struct CrashLog(std::sync::Mutex<Vec<String>>);
+
+impl platform_agent::events::NodeEvents for CrashLog {
+    fn server_crashed(&self, server: &platform_agent::events::ServerEvent, exit: &platform_agent::instance::LastExit) {
+        self.0.lock().unwrap().push(format!("{} {}", server.instance_id, exit.code));
+    }
 }
 
 async fn wait_stopped(agent: &Agent, id: &str) -> bool {
@@ -120,7 +138,8 @@ async fn wait_stopped(agent: &Agent, id: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_server_that_asked_is_started_again_and_one_that_did_not_is_left() {
     let dir = tempfile::tempdir().unwrap();
-    let Some(agent) = agent_or_skip(dir.path(), PORTS_A).await else {
+    let log = Arc::new(CrashLog::default());
+    let Some(agent) = agent_or_skip(dir.path(), PORTS_A, Some(log.clone())).await else {
         eprintln!("skipping: no Docker daemon, or no test image");
         return;
     };
@@ -159,6 +178,12 @@ async fn a_crashed_server_that_asked_is_started_again_and_one_that_did_not_is_le
         let again = started_at(&format!("gpp-{on}"));
         agent.check_crashes().await;
         assert_eq!(again, started_at(&format!("gpp-{on}")), "one crash was restarted twice");
+
+        // Each crash is heard once, whether or not it was restarted: the one
+        // that did not ask is still reported to its listener.
+        let mut heard = log.0.lock().unwrap().clone();
+        heard.sort();
+        assert_eq!(heard, vec![format!("{off} 139"), format!("{on} 139")], "a crash was not heard exactly once");
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -173,7 +198,7 @@ async fn a_crashed_server_that_asked_is_started_again_and_one_that_did_not_is_le
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_keeps_crashing_is_left_stopped_after_the_allowance() {
     let dir = tempfile::tempdir().unwrap();
-    let Some(agent) = agent_or_skip(dir.path(), PORTS_B).await else {
+    let Some(agent) = agent_or_skip(dir.path(), PORTS_B, None).await else {
         eprintln!("skipping: no Docker daemon, or no test image");
         return;
     };

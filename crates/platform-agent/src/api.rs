@@ -501,6 +501,7 @@ async fn auth_login(
     match accounts.login(&req.username, &req.password, req.code.as_deref(), std::time::SystemTime::now()) {
         Ok(session) => {
             tracing::info!(user = %req.username.to_ascii_lowercase(), "signed in to the page");
+            state.agent.events().session_started(&req.username.to_ascii_lowercase());
             Ok(Json(serde_json::json!({
                 "session": session,
                 "username": req.username.to_ascii_lowercase(),
@@ -700,7 +701,9 @@ async fn remove_account(state: &ApiState, name: &str) -> Result<(), (StatusCode,
             fail(StatusCode::BAD_GATEWAY, format!("the account's servers could not be removed at the controller, so the account stays: {e:#}"))
         })?;
     }
-    accounts.remove(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))
+    accounts.remove(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    state.agent.events().account_removed(name);
+    Ok(())
 }
 
 /// Compare without leaking where the first difference is.
