@@ -36,6 +36,15 @@ content_version = "test"
     )
 }
 
+/// Marks every response, so a test can see the wrap ran on built-in and open
+/// routes alike.
+fn stamp(router: Router) -> Router {
+    router.layer(axum::middleware::map_response(|mut r: axum::response::Response| async move {
+        r.headers_mut().insert("x-build", axum::http::HeaderValue::from_static("wrapped"));
+        r
+    }))
+}
+
 /// Opens everything it is asked about: the node's own refusals must still hold.
 fn opens_everything(_: &axum::http::Method, _: &str) -> Option<bool> {
     Some(true)
@@ -68,7 +77,7 @@ async fn serve(
         Some(TOKEN.to_string()),
         None,
         None,
-        Extension { routes, open_routes, user_may },
+        Extension { routes, open_routes, user_may, wrap: Some(stamp) },
     );
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -159,6 +168,7 @@ async fn open_routes_need_no_sign_in_and_keep_the_pages_policy() {
     let open = client.get(format!("{base}/ext/open")).send().await.unwrap();
     assert_eq!(open.status(), 200);
     assert!(open.headers().contains_key("content-security-policy"));
+    assert_eq!(open.headers()["x-build"], "wrapped");
     assert_eq!(open.text().await.unwrap(), "open to all");
     let ask = client.post(format!("{base}/ext/open/ask")).send().await.unwrap();
     assert_eq!(ask.status(), 200);
@@ -173,4 +183,5 @@ async fn open_routes_need_no_sign_in_and_keep_the_pages_policy() {
     // The gated routes stay gated.
     let act = client.post(format!("{base}/ext/act")).send().await.unwrap();
     assert_eq!(act.status(), 401);
+    assert_eq!(act.headers()["x-build"], "wrapped", "the wrap did not see a refused request");
 }

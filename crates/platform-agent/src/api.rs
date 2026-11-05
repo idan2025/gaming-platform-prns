@@ -137,11 +137,16 @@ pub struct Extension {
     /// can open its own routes and none of the node's. `None` leaves it to
     /// the node.
     pub user_may: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
+    /// Wraps the whole router, outermost: it sees every request before the
+    /// browser guard and every response after it (to notice that something
+    /// changed, say). It runs the build's own code on every request, so it
+    /// must pass requests on unchanged.
+    pub wrap: Option<fn(Router) -> Router>,
 }
 
 impl Default for Extension {
     fn default() -> Self {
-        Self { routes: Router::new(), open_routes: Router::new(), user_may: None }
+        Self { routes: Router::new(), open_routes: Router::new(), user_may: None, wrap: None }
     }
 }
 
@@ -153,7 +158,7 @@ pub fn router_with(
     interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
     extension: Extension,
 ) -> Router {
-    let Extension { routes: extra, open_routes, user_may: user_may_ext } = extension;
+    let Extension { routes: extra, open_routes, user_may: user_may_ext, wrap } = extension;
     // A file that cannot be read leaves accounts off rather than starting with
     // none (which would let the next holder of the token make one). The token
     // still works, so the operator is never locked out.
@@ -176,7 +181,7 @@ pub fn router_with(
         accounts,
         user_may_ext,
     };
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/capacity", get(capacity))
         .route("/controller/status", get(controller_status))
@@ -292,7 +297,11 @@ pub fn router_with(
         .route("/style.css", get(ui_css))
         .merge(open_routes)
         .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
-        .with_state(state)
+        .with_state(state);
+    match wrap {
+        Some(wrap) => wrap(router),
+        None => router,
+    }
 }
 
 /// What the page may load: its own three files, game art from the hosts a
