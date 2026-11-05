@@ -177,6 +177,8 @@ pub struct Agent {
     restart_waits: std::sync::Mutex<BTreeMap<String, String>>,
     /// Minecraft builds the publishers list, cached (`minecraft.rs`).
     minecraft: crate::minecraft::Catalog,
+    /// Told what happens on this node (`events.rs`); nothing by default.
+    events: Arc<dyn crate::events::NodeEvents>,
 }
 
 /// A server being moved, and both its copies: neither is deleted while the
@@ -579,7 +581,19 @@ impl Agent {
             move_timing: std::sync::Mutex::new(MoveTiming::default()),
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
             minecraft: crate::minecraft::Catalog::default(),
+            events: crate::events::none(),
         })
+    }
+
+    /// Tell `events` about what happens on this node (`events.rs`). Set before
+    /// the agent is shared; the default listens to nothing.
+    pub fn set_events(&mut self, events: Arc<dyn crate::events::NodeEvents>) {
+        self.events = events;
+    }
+
+    /// The listener for this node's events.
+    pub fn events(&self) -> Arc<dyn crate::events::NodeEvents> {
+        self.events.clone()
     }
 
     /// The official pack repository on this node.
@@ -1704,6 +1718,13 @@ impl Agent {
             match self.stop(&instance.instance_id).await {
                 Ok(()) => {
                     tracing::warn!(instance = %instance.instance_id, "{reason}; stopped");
+                    let server = crate::events::ServerEvent {
+                        instance_id: instance.instance_id.clone(),
+                        game_id: Some(instance.game_id.clone()),
+                        name: Some(instance.name.clone()),
+                        owner: instance.owner.clone(),
+                    };
+                    self.events.server_stopped_by_host(&server, &reason);
                     stopped.push(instance.instance_id.clone());
                 }
                 Err(e) => tracing::warn!(instance = %instance.instance_id, error = %format!("{e:#}"), "over its disk limit, and could not be stopped"),
@@ -2849,6 +2870,7 @@ impl Agent {
             Err(_) => return,
         };
         let mut due = Vec::new();
+        let mut crashed = Vec::new();
         {
             let mut watch = self.crashes.lock().await;
             for c in containers.iter().filter(|c| c.state == InstanceState::Stopped) {
@@ -2862,11 +2884,21 @@ impl Agent {
                     continue;
                 }
                 watch.seen.insert(c.instance_id.clone(), key);
-                if !watch.seeded
-                    || watch.stopped_here.contains(&c.instance_id)
-                    || !exit.is_crash()
-                    || !self.restart_on_crash(&c.instance_id)
-                {
+                if !watch.seeded || watch.stopped_here.contains(&c.instance_id) || !exit.is_crash() {
+                    continue;
+                }
+                // Heard whether or not it is restarted: a server left stopped
+                // after a crash is still one its owner should hear about.
+                crashed.push((
+                    crate::events::ServerEvent {
+                        instance_id: c.instance_id.clone(),
+                        game_id: c.game_id.clone(),
+                        name: None,
+                        owner: c.owner.clone(),
+                    },
+                    exit.clone(),
+                ));
+                if !self.restart_on_crash(&c.instance_id) {
                     continue;
                 }
                 if watch.recent(&c.instance_id) >= MAX_CRASH_RESTARTS_PER_HOUR {
@@ -2878,6 +2910,9 @@ impl Agent {
                 due.push((c.instance_id.clone(), exit));
             }
             watch.seeded = true;
+        }
+        for (server, exit) in &crashed {
+            self.events.server_crashed(server, exit);
         }
         for (id, exit) in due {
             tracing::warn!(instance = %id, code = exit.code, oom_killed = exit.oom_killed, "server crashed; starting it again");
