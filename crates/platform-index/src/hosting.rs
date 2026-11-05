@@ -491,7 +491,7 @@ impl Hosting {
 
     /// Whether this index lists a heard server (`access::Access::listed`).
     pub fn listed(&self, destination: &[u8; 16]) -> bool {
-        self.access.listed(destination)
+        self.access.listed(&self.config(), destination)
     }
 
     /// The configuration in force right now.

@@ -32,7 +32,8 @@ pub trait Access: Send + Sync {
     /// server, unless a policy keeps the directory to some. It changes what
     /// this cache shows, never what the mesh carries: a launcher still hears
     /// every announce itself.
-    fn listed(&self, _destination: &[u8; 16]) -> bool {
+    /// `config` is the hosting file in force, so a policy can follow it.
+    fn listed(&self, _config: &crate::hosting::HostingConfig, _destination: &[u8; 16]) -> bool {
         true
     }
 }

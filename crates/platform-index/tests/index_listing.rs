@@ -63,7 +63,11 @@ impl Access for OnlyOne {
     fn may_operate(&self, account: &AccountId, server: &HostedInstance) -> bool {
         OwnerOnly.may_operate(account, server)
     }
-    fn listed(&self, destination: &[u8; 16]) -> bool {
+    fn listed(
+        &self,
+        _config: &platform_index::hosting::HostingConfig,
+        destination: &[u8; 16],
+    ) -> bool {
         destination == &[1u8; 16]
     }
 }
