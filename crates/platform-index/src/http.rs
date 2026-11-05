@@ -49,6 +49,15 @@ fn fail(status: StatusCode, e: impl std::fmt::Display) -> (StatusCode, Json<ApiE
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 pub fn router(state: Arc<IndexState>) -> Router {
+    router_with(state, Router::new())
+}
+
+/// [`router`], plus routes an operator's own build adds. They are merged
+/// before the security headers, so every answer carries them, and take the
+/// same [`IndexState`]. The index checks who is calling inside each handler
+/// (a session's identity, an admin), so a route added here must do the same:
+/// nothing in front of it does.
+pub fn router_with(state: Arc<IndexState>, extra: Router<Arc<IndexState>>) -> Router {
     Router::new()
         .route("/", get(status_page))
         .route("/health", get(health))
@@ -83,6 +92,7 @@ pub fn router(state: Arc<IndexState>) -> Router {
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
         .route("/instances/:id/backups/:name/restore", post(backup_restore))
+        .merge(extra)
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
 }
@@ -283,6 +293,7 @@ async fn servers(
     let rows: Vec<ServerRow> = registry
         .query(&query, now)
         .into_iter()
+        .filter(|s| state.hosting.as_ref().is_none_or(|h| h.listed(s.destination_hash.as_bytes())))
         .take(limit)
         .map(|s| {
             let record = s.record();
