@@ -83,6 +83,9 @@ pub struct ApiState {
     /// Sign-in accounts for the page (`accounts.rs`). Only where a token is
     /// configured: without one the API is loopback-only and unauthenticated.
     pub accounts: Option<Arc<crate::accounts::Accounts>>,
+    /// A build's own answer for requests [`user_may`] does not name
+    /// ([`Extension::user_may`]).
+    pub user_may_ext: Option<fn(&axum::http::Method, &str) -> bool>,
 }
 
 pub fn router(agent: Arc<Agent>) -> Router {
@@ -105,10 +108,10 @@ pub fn router_full(
 /// [`router_full`], plus routes an operator's own build adds. Each extra router
 /// is merged **inside** the token gate and the browser guard, so its routes
 /// need the same token or account as the built-in ones, and a route
-/// [`user_may`] does not name is an admin's (`user_may` is the place to open
-/// one to users). Its handlers take the same [`ApiState`]; a route added here
-/// must not be served without the gate, so do not build a router around this
-/// one.
+/// [`user_may`] does not name is an admin's. Its handlers take the same
+/// [`ApiState`]; a route added here must not be served without the gate, so do
+/// not build a router around this one. [`router_with`] also takes routes
+/// outside the gate and which of a build's routes a user may call.
 pub fn router_extended(
     agent: Arc<Agent>,
     token: Option<String>,
@@ -116,6 +119,39 @@ pub fn router_extended(
     interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
     extra: Vec<Router<ApiState>>,
 ) -> Router {
+    let routes = extra.into_iter().fold(Router::new(), |acc, r| acc.merge(r));
+    router_with(agent, token, pack_dir, interfaces, Extension { routes, ..Extension::default() })
+}
+
+/// What an operator's own build adds to the node's API (`router_with`).
+pub struct Extension {
+    /// Inside the token gate, like `router_extended`'s routes.
+    pub routes: Router<ApiState>,
+    /// **Outside** the token gate, beside sign-in: anyone who reaches the page
+    /// reaches these, behind the browser guard and the page's policy only.
+    /// For what must work before an account exists (signing up, a reset).
+    pub open_routes: Router<ApiState>,
+    /// Which requests a user account may make that [`user_may`] does not name.
+    /// Asked only for those: a route public opens or refuses by name keeps its
+    /// answer, so a build can open its own routes and none of the node's.
+    pub user_may: Option<fn(&axum::http::Method, &str) -> bool>,
+}
+
+impl Default for Extension {
+    fn default() -> Self {
+        Self { routes: Router::new(), open_routes: Router::new(), user_may: None }
+    }
+}
+
+/// [`router_full`] with an [`Extension`].
+pub fn router_with(
+    agent: Arc<Agent>,
+    token: Option<String>,
+    pack_dir: Option<std::path::PathBuf>,
+    interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
+    extension: Extension,
+) -> Router {
+    let Extension { routes: extra, open_routes, user_may: user_may_ext } = extension;
     // A file that cannot be read leaves accounts off rather than starting with
     // none (which would let the next holder of the token make one). The token
     // still works, so the operator is never locked out.
@@ -136,6 +172,7 @@ pub fn router_extended(
         pack_dir: pack_dir.map(Arc::new),
         interfaces,
         accounts,
+        user_may_ext,
     };
     Router::new()
         .route("/health", get(health))
@@ -231,7 +268,7 @@ pub fn router_extended(
         .route("/auth/users/:name/role", post(auth_user_role))
         .route("/auth/users/:name/deny-admin", post(auth_user_deny_admin))
         .route("/auth/admin-request", post(auth_admin_request))
-        .merge(extra.into_iter().fold(Router::new(), |acc, r| acc.merge(r)))
+        .merge(extra)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         // Signing in happens before there is anything to present, so these
         // sit outside the gate: what this node wants (`/auth/state`), a
@@ -251,6 +288,7 @@ pub fn router_extended(
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .merge(open_routes)
         .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
         .with_state(state)
 }
@@ -401,7 +439,11 @@ async fn require_token(
     let Some(caller) = caller else {
         return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
     };
-    if caller.role == crate::accounts::Role::User && !user_may(request.method(), request.uri().path()) {
+    let may = match user_may_named(request.method(), request.uri().path()) {
+        Some(answer) => answer,
+        None => state.user_may_ext.is_some_and(|ext| ext(request.method(), request.uri().path())),
+    };
+    if caller.role == crate::accounts::Role::User && !may {
         return Err(fail(StatusCode::FORBIDDEN, "only an admin of this node can do that"));
     }
     request.extensions_mut().insert(caller);
@@ -412,33 +454,39 @@ async fn require_token(
 /// needs an admin, **including any route added later until it is listed here**,
 /// so a new route cannot be opened to users by forgetting it.
 pub fn user_may(method: &axum::http::Method, path: &str) -> bool {
+    user_may_named(method, path).unwrap_or(false)
+}
+
+/// [`user_may`]'s own answer, or `None` for a request it does not name, which
+/// only a build's [`Extension::user_may`] can then open.
+pub fn user_may_named(method: &axum::http::Method, path: &str) -> Option<bool> {
     use axum::http::Method;
     let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match seg.as_slice() {
         // A server's identity is its address (its secret); spec, delta and merge
         // are a move's plumbing, driven by an index with the token.
-        ["instances", _, "identity" | "spec" | "delta"] | ["instances", _, "backups", _, "merge"] => false,
+        ["instances", _, "identity" | "spec" | "delta"] | ["instances", _, "backups", _, "merge"] => Some(false),
         // Acting as an admin of the index, or asking to become one, through a
         // controller: the node has one identity there, so only its admins.
-        ["controller", "admin", ..] | ["controller", "admin-requests", ..] => false,
+        ["controller", "admin", ..] | ["controller", "admin-requests", ..] => Some(false),
         // Who has an account here, and who asked to be an admin, is an admin's.
-        ["auth", "users", ..] => false,
-        _ if *method == Method::GET => true,
-        ["instances"] => *method == Method::POST,
-        ["instances", _] => *method == Method::DELETE,
-        ["instances", _, action] => matches!(
+        ["auth", "users", ..] => Some(false),
+        _ if *method == Method::GET => Some(true),
+        ["instances"] => Some(*method == Method::POST),
+        ["instances", _] => Some(*method == Method::DELETE),
+        ["instances", _, action] => Some(matches!(
             *action,
             "stop" | "start" | "restart" | "map" | "console" | "chat" | "bots" | "moderation"
                 | "restart-on-crash" | "restart-schedule" | "backups" | "backup-schedule" | "world"
-        ),
-        ["instances", _, "chat", "mute"] | ["instances", _, "backups", "import"] => true,
-        ["instances", _, "backups", _] => *method == Method::DELETE,
-        ["instances", _, "backups", _, "restore"] => true,
-        ["mesh", "announce"] => true,
-        ["auth", "logout" | "password" | "admin-request"] | ["auth", "totp", _] => true,
+        )),
+        ["instances", _, "chat", "mute"] | ["instances", _, "backups", "import"] => Some(true),
+        ["instances", _, "backups", _] => Some(*method == Method::DELETE),
+        ["instances", _, "backups", _, "restore"] => Some(true),
+        ["mesh", "announce"] => Some(true),
+        ["auth", "logout" | "password" | "admin-request"] | ["auth", "totp", _] => Some(true),
         // Servers through a controller; the controller's own allowlist applies.
-        ["controller", ..] => true,
-        _ => false,
+        ["controller", ..] => Some(true),
+        _ => None,
     }
 }
 
