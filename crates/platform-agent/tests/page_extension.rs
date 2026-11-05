@@ -39,9 +39,19 @@ content_version = "test"
 async fn serve(
     ui_extension: Option<&std::path::Path>,
 ) -> Option<(std::net::SocketAddr, tempfile::TempDir)> {
+    serve_with(ui_extension, None).await
+}
+
+async fn serve_with(
+    ui_extension: Option<&std::path::Path>,
+    embedded: Option<(&'static str, &'static str)>,
+) -> Option<(std::net::SocketAddr, tempfile::TempDir)> {
     let dir = tempfile::tempdir().ok()?;
     let config = AgentConfig::parse(&config_toml(dir.path(), ui_extension)).ok()?;
-    let agent = Agent::new(config, vec![game_bridge::GamePack::sven_coop()]).await.ok()?;
+    let mut agent = Agent::new(config, vec![game_bridge::GamePack::sven_coop()]).await.ok()?;
+    if let Some((js, css)) = embedded {
+        agent.set_ui_extension_embedded(js, css);
+    }
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
     let addr = listener.local_addr().ok()?;
     let router =
@@ -107,4 +117,21 @@ async fn without_a_folder_the_page_loads_empty_extension_files() {
     let css = client.get(format!("http://{addr}/ext/ext.css")).send().await.unwrap();
     assert_eq!(css.status(), 200);
     assert!(css.text().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn page_code_a_build_embeds_is_served_before_a_folder() {
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("ext.js"), "from the folder").unwrap();
+    let Some((addr, _dir)) =
+        serve_with(Some(folder.path()), Some(("from the build", "/* build */"))).await
+    else {
+        eprintln!("skipped: no Docker daemon");
+        return;
+    };
+    let js = reqwest::get(format!("http://{addr}/ext/ext.js")).await.unwrap().text().await.unwrap();
+    assert_eq!(js, "from the build");
+    let css =
+        reqwest::get(format!("http://{addr}/ext/ext.css")).await.unwrap().text().await.unwrap();
+    assert_eq!(css, "/* build */");
 }

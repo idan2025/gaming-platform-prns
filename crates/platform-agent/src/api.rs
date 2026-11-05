@@ -368,8 +368,9 @@ async fn ui_css() -> Response {
 
 /// The operator's page code (`config.ui_extension`). Outside the gate for the
 /// same reason as the page's own files: a script tag cannot send a token. Only
-/// these two fixed names are ever read, so no request names a path. Without a
-/// folder, or a file missing from it, the answer is an empty file.
+/// these two fixed names are ever read, so no request names a path. Page code
+/// the build embedded comes first; then the folder; without either, or a file
+/// missing from the folder, the answer is an empty file.
 async fn ui_ext_js(State(state): State<ApiState>) -> Response {
     ui_extension_file(&state, "ext.js", "text/javascript; charset=utf-8").await
 }
@@ -379,9 +380,11 @@ async fn ui_ext_css(State(state): State<ApiState>) -> Response {
 }
 
 async fn ui_extension_file(state: &ApiState, name: &str, content_type: &'static str) -> Response {
-    let body = match state.agent.ui_extension() {
-        Some(dir) => tokio::fs::read(dir.join(name)).await.unwrap_or_default(),
-        None => Vec::new(),
+    let embedded = state.agent.ui_extension_embedded().map(|(js, css)| if name == "ext.js" { js } else { css });
+    let body = match (embedded, state.agent.ui_extension()) {
+        (Some(text), _) => text.as_bytes().to_vec(),
+        (None, Some(dir)) => tokio::fs::read(dir.join(name)).await.unwrap_or_default(),
+        (None, None) => Vec::new(),
     };
     ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-store")], body).into_response()
 }
