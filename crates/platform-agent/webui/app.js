@@ -1125,7 +1125,7 @@ function openInstanceMenu(id, x, y) {
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
   // Through a controller, only what it carries is live; the rest says where it is.
   if (state.controllerOn) {
-    const carried = new Set(["Start", "Stop", "Copy invite link", "Copy mesh address", "Show log", "Log and console",
+    const carried = new Set(["Change map…", "Start", "Stop", "Copy invite link", "Copy mesh address", "Show log", "Log and console",
       "Backups…", "Move to another worker…", "Remove server…"]);
     for (const it of items) {
       if (typeof it === "object" && it.label && !carried.has(it.label)) {
