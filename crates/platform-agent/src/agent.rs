@@ -179,6 +179,8 @@ pub struct Agent {
     minecraft: crate::minecraft::Catalog,
     /// Told what happens on this node (`events.rs`); nothing by default.
     events: Arc<dyn crate::events::NodeEvents>,
+    /// The operator's page code folder (`config.ui_extension`), read per request.
+    ui_extension: Option<std::path::PathBuf>,
 }
 
 /// A server being moved, and both its copies: neither is deleted while the
@@ -549,6 +551,7 @@ impl Agent {
             config.data_root.join("mesh-interfaces.json"),
         );
         let config_data_root = config.data_root.clone();
+        let ui_extension = config.ui_extension.clone();
         let controller = match (&config.controller, &config.uplink) {
             (Some(c), Some(u)) => Some(Arc::new(
                 crate::controller::Controller::new(c, &u.identity_secret_path)
@@ -582,7 +585,13 @@ impl Agent {
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
             minecraft: crate::minecraft::Catalog::default(),
             events: crate::events::none(),
+            ui_extension,
         })
+    }
+
+    /// The folder with the operator's page code, if this node has one.
+    pub fn ui_extension(&self) -> Option<std::path::PathBuf> {
+        self.ui_extension.clone()
     }
 
     /// Tell `events` about what happens on this node (`events.rs`). Set before

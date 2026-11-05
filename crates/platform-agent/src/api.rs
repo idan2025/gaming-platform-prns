@@ -251,6 +251,8 @@ pub fn router_extended(
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .route("/ext/ext.js", get(ui_ext_js))
+        .route("/ext/ext.css", get(ui_ext_css))
         .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
         .with_state(state)
 }
@@ -362,6 +364,26 @@ async fn ui_js() -> Response {
 
 async fn ui_css() -> Response {
     asset("text/css; charset=utf-8", UI_CSS)
+}
+
+/// The operator's page code (`config.ui_extension`). Outside the gate for the
+/// same reason as the page's own files: a script tag cannot send a token. Only
+/// these two fixed names are ever read, so no request names a path. Without a
+/// folder, or a file missing from it, the answer is an empty file.
+async fn ui_ext_js(State(state): State<ApiState>) -> Response {
+    ui_extension_file(&state, "ext.js", "text/javascript; charset=utf-8").await
+}
+
+async fn ui_ext_css(State(state): State<ApiState>) -> Response {
+    ui_extension_file(&state, "ext.css", "text/css; charset=utf-8").await
+}
+
+async fn ui_extension_file(state: &ApiState, name: &str, content_type: &'static str) -> Response {
+    let body = match state.agent.ui_extension() {
+        Some(dir) => tokio::fs::read(dir.join(name)).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-store")], body).into_response()
 }
 
 /// Reject anything without the token, on every route, once a token exists.
