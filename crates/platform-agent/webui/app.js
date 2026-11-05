@@ -1462,6 +1462,14 @@ function openAddGameDialog() {
       } finally { show.disabled = false; }
     });
     body.appendChild(form);
+    // The official repository is where a node takes its packs from by itself
+    // (`official.rs`), so it is where the dialog starts when no other one was
+    // used here before: the field is never left empty for the operator to fill.
+    if (!saved) {
+      api("GET", "/packs/official").then((o) => {
+        if (o && o.url && !repo.value) { repo.value = o.url; form.requestSubmit(); }
+      }).catch(() => {});
+    }
     const one = el("form", "advanced-wrap");
     one.autocomplete = "off";
     const url = field(one, "ag-url", "Or one pack's address", { type: "text", placeholder: "https://…/game.toml" });
