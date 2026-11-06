@@ -388,6 +388,20 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         ["admin", "games", game] if valid_game(game) && no_query() && matches!(*method, Method::GET | Method::DELETE) => {
             Some(format!("/admin/games/{game}"))
         }
+        // Removing one installed copy from one worker (`?node=<name>`) or from all.
+        ["admin", "games", game, "copies", version] if valid_game(game) && valid_game(version) && *method == Method::DELETE => {
+            let ok = match query {
+                None => true,
+                Some(q) => q.strip_prefix("node=").is_some_and(valid_game),
+            };
+            if !ok {
+                return None;
+            }
+            Some(match query {
+                None => format!("/admin/games/{game}/copies/{version}"),
+                Some(q) => format!("/admin/games/{game}/copies/{version}?{q}"),
+            })
+        }
         ["admin", "games", game, "install"] if valid_game(game) && no_query() && *method == Method::POST => {
             Some(format!("/admin/games/{game}/install"))
         }
@@ -607,6 +621,12 @@ mod tests {
         // The routes that were there before keep their own index paths.
         assert_eq!(allowed_path(&Method::POST, &format!("instances/{id}/stop")).as_deref(), Some(format!("/instances/{id}/stop").as_str()));
         assert_eq!(allowed_path(&Method::POST, &format!("instances/{id}/map")).as_deref(), Some(format!("/instances/{id}/map").as_str()));
+        // Removing an installed copy: from one worker, or from all.
+        assert_eq!(allowed_path(&Method::DELETE, "admin/games/sven-coop/copies/5.26?node=lanthorn-eu-1").as_deref(), Some("/admin/games/sven-coop/copies/5.26?node=lanthorn-eu-1"));
+        assert_eq!(allowed_path(&Method::DELETE, "admin/games/sven-coop/copies/5.26").as_deref(), Some("/admin/games/sven-coop/copies/5.26"));
+        for bad in ["admin/games/sven-coop/copies/../x", "admin/games/sven-coop/copies/5.26?node=a/b", "admin/games/sven-coop/copies/5.26?x=1", "admin/games/sven-coop/copies"] {
+            assert_eq!(allowed_path(&Method::DELETE, bad), None, "{bad}");
+        }
     }
 
     /// A path the platform did not make cannot be turned into another index route

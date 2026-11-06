@@ -95,7 +95,10 @@ async fn a_request_about_the_node_runs_only_from_its_list() {
     assert_eq!(node_call(&agent, &ask("GET", "content")).await.unwrap().status, 200);
     let missing = node_call(&agent, &ask("POST", "content/no-such-game")).await.unwrap();
     assert_eq!(missing.status, 404, "the route's own check: {}", missing.body);
-    for (m, p) in [("POST", "packs"), ("PUT", "updates/settings"), ("POST", "orphans/clean"), ("DELETE", "content/sven-coop/test")] {
+    for (m, p) in [("POST", "packs"), ("PUT", "updates/settings"), ("POST", "orphans/clean"), ("DELETE", "content/sven-coop/test/extra")] {
         assert!(node_call(&agent, &ask(m, p)).await.is_err(), "{m} {p} ran");
     }
+    // Removing a copy the node does not have: its own answer, not a tunnel error.
+    let gone = node_call(&agent, &ask("DELETE", "content/sven-coop/no-such-version")).await.unwrap();
+    assert_eq!(gone.status, 404, "{}", gone.body);
 }

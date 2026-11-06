@@ -1301,6 +1301,29 @@ function workersFilesLine(n) {
   }
 }
 
+// Remove one installed copy from one worker, or from every worker that has it.
+// Asked first, because the files are gone from the worker afterwards.
+async function removeCopy(g, version, node) {
+  const where = node ? "from " + node : "from every worker that has it";
+  if (!confirm("Remove " + g.display_name + " (" + version + ") " + where + "?\n\nIts files are deleted from the worker's disk. "
+    + "Servers that use the copy stop the removal there; a server created later will need the files again.")) return;
+  try {
+    const q = node ? "?node=" + encodeURIComponent(node) : "";
+    const r = await withInFlight(api("DELETE", "/controller/admin/games/" + encodeURIComponent(g.id) + "/copies/" + encodeURIComponent(version) + q));
+    const outcomes = (r && r.nodes || []);
+    const removed = outcomes.filter(n => n.outcome === "removed").length;
+    const refused = outcomes.filter(n => n.outcome === "refused");
+    clearError();
+    if (refused.length) showError(refused.map(n => n.node + ": " + (n.error || "refused") + (n.servers && n.servers.length ? " (" + n.servers.join(", ") + ")" : "")).join(" "));
+    toast(removed ? "Removed from " + removed + (removed === 1 ? " worker." : " workers.") : "Nothing removed.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Not removed.");
+  }
+  // The window reads the workers again on its next tick; the Games cards follow.
+  renderGames();
+}
+
 // Where a game's files stand on each worker, refreshed while open.
 function openWorkersFiles(g) {
   let timer = null;
@@ -1335,7 +1358,28 @@ function openWorkersFiles(g) {
         for (const n of st.nodes || []) {
           const row = el("div", "item");
           row.append(el("span", "item-main", n.node), el("span", "item-meta", workersFilesLine(n)));
+          // Each installed copy on this worker can be removed from it; a copy a
+          // server uses is refused there, and the reason says which servers.
+          for (const c of n.copies || []) {
+            const b = el("button", "btn btn-sm", "Remove " + c.version + " from " + n.node);
+            b.type = "button";
+            const inUse = (c.used_by || []).length;
+            b.disabled = inUse > 0;
+            b.title = inUse ? "A server uses this copy: stop or remove it first." : "Delete this copy of the game's files from this worker.";
+            b.onclick = () => removeCopy(g, c.version, n.node);
+            row.appendChild(b);
+          }
           list.appendChild(row);
+        }
+        // Every worker that has any version: removed from all of them at once.
+        const versions = [...new Set((st.nodes || []).flatMap(n => (n.copies || []).map(c => c.version)))];
+        for (const v of versions) {
+          const holders = (st.nodes || []).filter(n => (n.copies || []).some(c => c.version === v));
+          if (holders.length < 2) continue;
+          const all = el("button", "btn", "Remove " + v + " from all " + holders.length + " workers");
+          all.type = "button";
+          all.onclick = () => removeCopy(g, v, null);
+          list.appendChild(all);
         }
         note.textContent = st.offered ? (st.from_file ? "Offered by the index's hosting file." : "Offered: anyone can start one on a worker that has the files.")
           : "Not offered.";

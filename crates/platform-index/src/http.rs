@@ -91,6 +91,7 @@ pub fn router_with(state: Arc<IndexState>, extra: Router<Arc<IndexState>>) -> Ro
         .route("/instances/:id/node/*rest", axum::routing::any(owner_tool))
         .route("/admin/games/:game", get(admin_game_status).delete(admin_withdraw_game))
         .route("/admin/games/:game/install", post(admin_install_game))
+        .route("/admin/games/:game/copies/:version", axum::routing::delete(admin_remove_copy))
         .route("/games/:game/maps", get(game_maps))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
@@ -872,6 +873,22 @@ async fn admin_install_game(
         .admin_install_game(&account, &game, std::time::SystemTime::now())
         .await
         .map(|nodes| Json(json!({ "game_id": game, "offered": true, "nodes": nodes })))
+        .map_err(admin_games_failure)
+}
+
+/// Remove one installed copy from one worker (`?node=`) or from all of them.
+async fn admin_remove_copy(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path((game, version)): axum::extract::Path<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .admin_remove_game_copy(&account, &game, &version, q.get("node").map(String::as_str))
+        .await
+        .map(|nodes| Json(json!({ "game_id": game, "version": version, "nodes": nodes })))
         .map_err(admin_games_failure)
 }
 
