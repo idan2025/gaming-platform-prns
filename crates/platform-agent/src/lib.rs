@@ -23,6 +23,7 @@ pub mod minecraft;
 pub mod official;
 pub mod pack_import;
 pub mod packs;
+pub mod ops_log;
 pub mod ports;
 pub mod resources;
 pub mod schedule;

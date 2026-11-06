@@ -145,6 +145,17 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The admin dashboard's numbers (`ops_log.rs`): one sample a minute.
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                agent.sample_metrics().await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
     // Disk limits (`Agent::check_disk_limits`): only for games whose
     // `[games.<id>]` sets `writable_limit_bytes`.
     {

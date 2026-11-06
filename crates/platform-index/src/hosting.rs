@@ -319,6 +319,10 @@ pub struct HostedInstance {
     /// is "this game answers no query, or did not answer", never "no map".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub map_now: Option<String>,
+    /// Whether its node starts it again after a crash, as the node reports it;
+    /// absent from a node too old to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_on_crash: Option<bool>,
     /// The server's mesh address as its node reports it: what an invite names
     /// and a launcher joins. Passed through, never invented; absent while the
     /// node has none (stopped, or no `[mesh]`).
@@ -395,6 +399,12 @@ pub struct Hosting {
     requests: crate::regions::RegionRequests,
     /// Admins granted here (beyond the hosting file's), and requests to be one.
     admin_store: crate::admins::AdminStore,
+    /// Games an admin offers beyond the hosting file's (`offered.rs`).
+    offered: crate::offered::OfferedGames,
+    /// What the index itself did for an admin, beside the hosting file.
+    ops: Option<Arc<platform_agent::ops_log::OpsLog>>,
+    /// The hosting file's own `games`, before the offered ones are added.
+    file_games: std::sync::RwLock<Vec<String>>,
     /// Who may see and run a server beyond its owner (`access.rs`).
     access: Arc<dyn crate::access::Access>,
 }
@@ -466,6 +476,7 @@ pub struct MoveWorker {
 
 impl Hosting {
     pub fn new(config: HostingConfig) -> Self {
+        let file_games = config.games.clone();
         Self {
             config: std::sync::RwLock::new(Arc::new(config)),
             http: reqwest::Client::builder()
@@ -478,6 +489,9 @@ impl Hosting {
             moving: Default::default(),
             requests: Default::default(),
             admin_store: Default::default(),
+            offered: Default::default(),
+            ops: None,
+            file_games: std::sync::RwLock::new(file_games),
             access: crate::access::owner_only(),
         }
     }
@@ -504,8 +518,21 @@ impl Hosting {
     /// listed; the servers on it keep running, since only its operator
     /// stops them. Ownership needs nothing carried over: it lives on the
     /// nodes' containers.
-    pub fn reload(&self, config: HostingConfig) {
+    pub fn reload(&self, mut config: HostingConfig) {
+        *self.file_games.write().unwrap_or_else(|e| e.into_inner()) = config.games.clone();
+        for g in self.offered.game_ids() {
+            if !config.games.contains(&g) {
+                config.games.push(g);
+            }
+        }
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+    }
+
+    /// The configuration again, with the offered games as they are now.
+    fn reapply_offered(&self) {
+        let mut config = (*self.config()).clone();
+        config.games = self.file_games.read().unwrap_or_else(|e| e.into_inner()).clone();
+        self.reload(config);
     }
 
     /// Read and parse a hosting config file. A file that does not parse is an
@@ -627,6 +654,7 @@ impl Hosting {
                     delete_in_secs: None,
                     players_now: r.players_now,
                     map_now: r.map_now,
+                    restart_on_crash: r.restart_on_crash,
                     mesh_destination: r.mesh_destination,
                     region: node.region.clone(),
                 })
@@ -659,6 +687,7 @@ impl Hosting {
                 delete_in_secs: None,
                 players_now: r["players_now"].as_u64().map(|p| p as u32),
                 map_now: r["map_now"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
+                restart_on_crash: r["restart_on_crash"].as_bool(),
                 mesh_destination: r["mesh_destination"].as_str().map(str::to_string),
                 region: node.region.clone(),
             })
@@ -780,6 +809,7 @@ impl Hosting {
                 delete_in_secs: None,
                 players_now: Some(0),
                 map_now: None,
+                restart_on_crash: None,
                 mesh_destination: None,
                 region: None,
             });
@@ -831,6 +861,7 @@ impl Hosting {
             delete_in_secs: None,
             players_now: Some(0),
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         })
@@ -1025,6 +1056,345 @@ impl Hosting {
             let why = why.as_ref().and_then(|v| v["error"].as_str()).unwrap_or("the node refused to change the map");
             return Err(anyhow!("{why}"));
         }
+        Ok(())
+    }
+
+    /// One of the owner's tools on a server the caller may run
+    /// (`uplink_wire::owner_route`: players, kick and ban, bots, server chat,
+    /// announcing it, restart if it crashes, the schedules), carried to its
+    /// node, which answers with its own route's status and body. Checked
+    /// against the list here and again on the node; never the console.
+    pub async fn owner_call(
+        &self,
+        account: &AccountId,
+        instance_id: &str,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> Result<platform_agent::uplink_wire::OwnerResp> {
+        use platform_agent::uplink_wire::{owner_reply, owner_route, owner_target, OwnerReq};
+        if !owner_route(method, path, query) {
+            return Err(anyhow!("not one of the owner's tools"));
+        }
+        let (_, node) = self.operable(account, instance_id).await?;
+        let req = OwnerReq {
+            token: String::new(),
+            instance_id: instance_id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.map(str::to_string),
+            body,
+        };
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client =
+                self.agent_client().await.ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            return match client.owner_call(dest, req).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => {
+                    Err(anyhow!("node {} runs an agent too old for this; update it", node.name))
+                }
+                other => other.with_context(|| format!("asking agent {}", node.name)),
+            };
+        }
+        let (m, uri, payload) = owner_target(&req);
+        let url = format!("{}{}", node.api.trim_end_matches('/'), uri);
+        let method = reqwest::Method::from_bytes(m.as_bytes()).map_err(|_| anyhow!("not one of the owner's tools"))?;
+        let mut call = self.http.request(method, &url);
+        if let Some(b) = &payload {
+            call = call.json(b);
+        }
+        let response = call.send().await.context("asking the node")?;
+        let status = response.status().as_u16();
+        let text = response.text().await.context("reading the node's answer")?;
+        Ok(owner_reply(&req, status, text))
+    }
+
+    fn games_admin(&self, account: &AccountId) -> Result<()> {
+        if self.is_admin(account) {
+            Ok(())
+        } else {
+            Err(anyhow!("only an admin of this index can install or offer games"))
+        }
+    }
+
+    /// One request about a node itself (`uplink_wire::node_route`).
+    async fn node_call(&self, node: &NodeConfig, method: &str, path: &str) -> Result<platform_agent::uplink_wire::OwnerResp> {
+        use platform_agent::uplink_wire::{node_route, NodeReq, OwnerResp};
+        if !node_route(method, path) {
+            return Err(anyhow!("not carried"));
+        }
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client =
+                self.agent_client().await.ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            let req = NodeReq { token: String::new(), method: method.to_string(), path: path.to_string() };
+            return match client.node_call(dest, req).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => {
+                    Err(anyhow!("node {} runs an agent too old for this; update it", node.name))
+                }
+                other => other.with_context(|| format!("asking agent {}", node.name)),
+            };
+        }
+        let url = format!("{}/{}", node.api.trim_end_matches('/'), path);
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| anyhow!("not carried"))?;
+        let response = self.http.request(method, &url).send().await.context("asking the node")?;
+        let status = response.status().as_u16();
+        let body = response.text().await.context("reading the node's answer")?;
+        Ok(OwnerResp { status, body })
+    }
+
+    /// Whether a node is set up to run a game (`[games.<id>]` in its config),
+    /// by its own `/games`.
+    async fn node_runs(&self, node: &NodeConfig, game_id: &str) -> Result<bool> {
+        let reply = self.node_call(node, "GET", "games").await?;
+        if reply.status != 200 {
+            return Err(anyhow!("node {} did not list its games ({})", node.name, reply.status));
+        }
+        let games: serde_json::Value = serde_json::from_str(&reply.body).context("reading the node's games")?;
+        Ok(games.as_array().is_some_and(|l| l.iter().any(|g| g["id"] == game_id && g["runnable"] == true)))
+    }
+
+    /// An admin installs a game's files on every worker set up to run it, and
+    /// the index offers it from then on (`offered.rs`; the hosting file is
+    /// never written). Each worker downloads its configured version, held to
+    /// its own disk reserve; what each said is returned. Refused when no
+    /// worker that answered can run the game, so nothing is offered that
+    /// no worker could start.
+    pub async fn admin_install_game(&self, admin: &AccountId, game_id: &str, now: SystemTime) -> Result<Vec<serde_json::Value>> {
+        self.games_admin(admin)?;
+        if game_id.len() > 64 || !game_bridge::pack::id_is_file_safe(game_id) {
+            return Err(anyhow!("that is not a game id"));
+        }
+        let mut out = Vec::new();
+        let mut any = false;
+        for node in self.config().nodes.iter() {
+            match self.node_runs(node, game_id).await {
+                Ok(false) => out.push(serde_json::json!({ "node": node.name, "outcome": "not set up to run it" })),
+                Err(e) => out.push(serde_json::json!({ "node": node.name, "outcome": "did not answer", "error": format!("{e:#}") })),
+                Ok(true) => {
+                    any = true;
+                    match self.node_call(node, "POST", &format!("content/{game_id}")).await {
+                        Ok(r) if (200..300).contains(&r.status) => out.push(serde_json::json!({ "node": node.name, "outcome": "installing", "reply": serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_default() })),
+                        Ok(r) => out.push(serde_json::json!({ "node": node.name, "outcome": "refused", "error": serde_json::from_str::<serde_json::Value>(&r.body).ok().and_then(|v| v["error"].as_str().map(str::to_string)).unwrap_or(r.body) })),
+                        Err(e) => out.push(serde_json::json!({ "node": node.name, "outcome": "did not answer", "error": format!("{e:#}") })),
+                    }
+                }
+            }
+        }
+        if !any {
+            return Err(anyhow!("no worker that answered is set up to run {game_id}: its config needs a [games.{game_id}] section"));
+        }
+        self.offered.offer(game_id, &admin.0, unix(now))?;
+        self.reapply_offered();
+        tracing::info!(admin = %admin.0, game = %game_id, "an admin installed and offered a game");
+        self.ops_record(admin, "admin_action", game_id, "installed on the workers and offered");
+        Ok(out)
+    }
+
+    /// Where a game's files stand on each worker: its installed copies and its
+    /// download, for an admin watching an install.
+    pub async fn admin_game_status(&self, admin: &AccountId, game_id: &str) -> Result<serde_json::Value> {
+        self.games_admin(admin)?;
+        if game_id.len() > 64 || !game_bridge::pack::id_is_file_safe(game_id) {
+            return Err(anyhow!("that is not a game id"));
+        }
+        let mut nodes = Vec::new();
+        for node in self.config().nodes.iter() {
+            let install = self.node_call(node, "GET", &format!("content/{game_id}")).await;
+            let content = self.node_call(node, "GET", "content").await;
+            let copies: Vec<serde_json::Value> = content
+                .ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .and_then(|v| v["copies"].as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c["game_id"] == game_id)
+                .collect();
+            nodes.push(match install {
+                Ok(r) => serde_json::json!({
+                    "node": node.name,
+                    "status": serde_json::from_str::<serde_json::Value>(&r.body).ok().map(|v| v["status"].clone()),
+                    "copies": copies,
+                }),
+                Err(e) => serde_json::json!({ "node": node.name, "error": format!("{e:#}") }),
+            });
+        }
+        let config = self.config();
+        Ok(serde_json::json!({
+            "game_id": game_id,
+            "offered": config.hosts_game(game_id),
+            "from_file": self.file_games.read().unwrap_or_else(|e| e.into_inner()).iter().any(|g| g == game_id),
+            "nodes": nodes,
+        }))
+    }
+
+    /// An admin removes one installed copy of a game's files from one worker
+    /// (`node`) or from every worker that has it (`node` absent). A copy a
+    /// server uses is refused by the worker, and that worker says so; the other
+    /// workers still go ahead. Returns what each worker answered.
+    pub async fn admin_remove_game_copy(
+        &self,
+        admin: &AccountId,
+        game_id: &str,
+        version: &str,
+        node: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.games_admin(admin)?;
+        if game_id.len() > 64 || !game_bridge::pack::id_is_file_safe(game_id) {
+            return Err(anyhow!("that is not a game id"));
+        }
+        if version.len() > 64 || !game_bridge::pack::id_is_file_safe(version) {
+            return Err(anyhow!("that is not a copy"));
+        }
+        let config = self.config();
+        let targets: Vec<&NodeConfig> = config.nodes.iter().filter(|n| node.is_none_or(|name| n.name == name)).collect();
+        if targets.is_empty() {
+            return Err(anyhow!("no such worker"));
+        }
+        let mut out = Vec::new();
+        for n in targets {
+            let copies = match self.node_call(n, "GET", "content").await {
+                Ok(r) if r.status == 200 => r.body,
+                Ok(r) => {
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "did not answer", "error": format!("status {}", r.status) }));
+                    continue;
+                }
+                Err(e) => {
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "did not answer", "error": format!("{e:#}") }));
+                    continue;
+                }
+            };
+            let has = serde_json::from_str::<serde_json::Value>(&copies)
+                .ok()
+                .and_then(|v| v["copies"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c["game_id"] == game_id && c["version"] == version);
+            if !has {
+                out.push(serde_json::json!({ "node": n.name, "outcome": "not installed here" }));
+                continue;
+            }
+            match self.node_call(n, "DELETE", &format!("content/{game_id}/{version}")).await {
+                Ok(r) if (200..300).contains(&r.status) => {
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "removed", "reply": serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_default() }))
+                }
+                Ok(r) => {
+                    let v = serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_default();
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "refused", "error": v["error"].clone(), "servers": v["servers"].clone() }))
+                }
+                Err(e) => out.push(serde_json::json!({ "node": n.name, "outcome": "did not answer", "error": format!("{e:#}") })),
+            }
+        }
+        tracing::info!(admin = %admin.0, game = %game_id, version = %version, node = ?node, "an admin removed a game's files from a worker");
+        self.ops_record(admin, "admin_action", game_id, &format!("removed {version} from {}", node.unwrap_or("every worker")));
+        Ok(out)
+    }
+
+    /// Put one admin action in the index's ops log (`ops_log.rs`).
+    pub(crate) fn ops_record(&self, admin: &AccountId, kind: &str, subject: &str, detail: &str) {
+        if let Some(ops) = &self.ops {
+            ops.record(kind, Some(&admin.0), subject, detail, None);
+        }
+    }
+
+    /// The admin dashboard across every worker and the index: each worker's
+    /// numbers, its last day of samples and events, the index's own events,
+    /// totals across them, and the security events of all, newest first. A
+    /// worker that does not answer is listed as unreachable, never as empty.
+    pub async fn ops_dashboard(&self, admin: &AccountId, now: SystemTime) -> Result<serde_json::Value> {
+        self.games_admin(admin)?;
+        let now_unix = unix(now);
+        let since = now_unix.saturating_sub(86_400);
+        let config = self.config();
+        let mut nodes = Vec::new();
+        for node in config.nodes.iter() {
+            let overview = self.node_call(node, "GET", "ops/overview").await;
+            let Ok(overview) = overview.and_then(|r| if r.status == 200 { Ok(r) } else { Err(anyhow!("status {}", r.status)) }) else {
+                let why = self.node_call(node, "GET", "ops/overview").await.map(|r| r.status.to_string()).unwrap_or_else(|e| format!("{e:#}"));
+                nodes.push(serde_json::json!({ "name": node.name, "reachable": false, "error": why }));
+                continue;
+            };
+            let overview: serde_json::Value = serde_json::from_str(&overview.body).unwrap_or_default();
+            let metrics = self.node_call(node, "GET", &format!("ops/metrics?since={since}&limit=1440")).await.ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .unwrap_or(serde_json::json!([]));
+            let events = self.node_call(node, "GET", &format!("ops/events?since={since}&limit=500")).await.ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .unwrap_or(serde_json::json!([]));
+            nodes.push(serde_json::json!({ "name": node.name, "reachable": true, "overview": overview, "metrics": metrics, "events": events }));
+        }
+        let index_events: Vec<serde_json::Value> = self
+            .ops
+            .as_ref()
+            .map(|o| o.events_since(since, 500))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| serde_json::json!({ "unix": e.unix, "kind": e.kind, "actor": e.actor, "subject": e.subject, "detail": e.detail, "node": "index" }))
+            .collect();
+
+        // Totals across every node that answered.
+        let up: Vec<&serde_json::Value> = nodes.iter().filter(|n| n["reachable"] == true).collect();
+        let sum = |f: &dyn Fn(&serde_json::Value) -> u64| up.iter().map(|n| f(&n["overview"])).sum::<u64>();
+        let min = |f: &dyn Fn(&serde_json::Value) -> Option<u64>| up.iter().filter_map(|n| f(&n["overview"])).min();
+        let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
+        for n in &up {
+            for (k, v) in n["overview"]["counts_24h"].as_object().into_iter().flatten() {
+                *counts.entry(k.clone()).or_default() += v.as_u64().unwrap_or(0);
+            }
+        }
+        let totals = serde_json::json!({
+            "nodes": nodes.len(),
+            "nodes_up": up.len(),
+            "running": sum(&|o| o["capacity"]["running"].as_u64().unwrap_or(0)),
+            "max_instances": sum(&|o| o["capacity"]["max_instances"].as_u64().unwrap_or(0)),
+            "players": sum(&|o| o["last_sample"]["players"].as_u64().unwrap_or(0)),
+            "disk_free_min_bytes": min(&|o| o["capacity"]["disk_free_bytes"].as_u64()),
+            "memory_available_min_bytes": min(&|o| o["capacity"]["memory_available_bytes"].as_u64()),
+            "counts_24h": counts,
+        });
+
+        // Security and account events of every node and the index, newest first.
+        let watched = |k: &str| matches!(k, "sign_in_failed" | "sign_in_locked" | "request_refused" | "account_added" | "account_removed" | "account_role");
+        let mut security: Vec<serde_json::Value> = Vec::new();
+        for n in &nodes {
+            for e in n["events"].as_array().into_iter().flatten() {
+                if e["kind"].as_str().is_some_and(watched) {
+                    let mut e = e.clone();
+                    e["node"] = serde_json::json!(n["name"]);
+                    security.push(e);
+                }
+            }
+        }
+        for e in &index_events {
+            if e["kind"].as_str().is_some_and(watched) {
+                security.push(e.clone());
+            }
+        }
+        security.sort_by(|a, b| b["unix"].as_u64().cmp(&a["unix"].as_u64()));
+        security.truncate(300);
+
+        Ok(serde_json::json!({
+            "unix": now_unix,
+            "nodes": nodes,
+            "index": { "events": index_events },
+            "totals": totals,
+            "security": security,
+        }))
+    }
+
+    /// An admin stops offering a game they offered. A game the hosting file
+    /// lists is the file's. Servers that exist keep running, and the files stay.
+    pub fn admin_withdraw_game(&self, admin: &AccountId, game_id: &str) -> Result<()> {
+        self.games_admin(admin)?;
+        if self.file_games.read().unwrap_or_else(|e| e.into_inner()).iter().any(|g| g == game_id) {
+            return Err(anyhow!("{game_id} is in the hosting file's games; change it there"));
+        }
+        if !self.offered.withdraw(game_id)? {
+            return Err(anyhow!("{game_id} is not offered here"));
+        }
+        self.reapply_offered();
+        self.ops_record(admin, "admin_action", game_id, "stopped offering");
         Ok(())
     }
 
@@ -1363,6 +1733,7 @@ impl Hosting {
             delete_in_secs: None,
             players_now: None,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         })
@@ -1637,6 +2008,9 @@ impl Hosting {
     pub fn keep_state_beside(mut self, hosting_file: &std::path::Path) -> Result<Self> {
         self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
         self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
+        self.offered = crate::offered::OfferedGames::load(&hosting_file.with_file_name("index-offered-games.json"))?;
+        self.ops = hosting_file.parent().map(|dir| Arc::new(platform_agent::ops_log::OpsLog::new(dir)));
+        self.reapply_offered();
         Ok(self)
     }
 
@@ -2495,6 +2869,7 @@ mod tests {
             uptime_secs: None,
             players_now: None,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         }];
@@ -2518,6 +2893,7 @@ mod tests {
             uptime_secs: uptime,
             players_now: players,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         }
@@ -2752,6 +3128,7 @@ mod tests {
             uptime_secs: None,
             players_now: None,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         }
@@ -3114,6 +3491,22 @@ mod tests {
             h.lock().unwrap().push(format!("map {id} {}", b["map"].as_str().unwrap_or("")));
             "ok"
         }
+        async fn players(State(h): State<Hits>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("players {id}"));
+            Json(serde_json::json!([{"name": "gordon", "score": 3}]))
+        }
+        async fn chat_read(State(h): State<Hits>, Path(id): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("chat {id} since={}", q.get("since").cloned().unwrap_or_default()));
+            Json(serde_json::json!({"lines": []}))
+        }
+        async fn announce(State(h): State<Hits>, Json(b): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("announce {}", b["instance"].as_str().unwrap_or("")));
+            Json(serde_json::json!({"announced": 1}))
+        }
+        async fn schedules(State(h): State<Hits>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push("schedules".into());
+            Json(serde_json::json!({"srv": {"start_utc": 4}, "theirs": {"start_utc": 5}}))
+        }
         async fn maps(State(h): State<Hits>, Path(game): Path<String>) -> Json<serde_json::Value> {
             h.lock().unwrap().push(format!("maps {game}"));
             Json(serde_json::json!({"game_id": game, "maps": ["c1a0", "c1a1"]}))
@@ -3125,6 +3518,10 @@ mod tests {
             .route("/instances/:id/logs", get(logs))
             .route("/instances/:id/map", post(change_map))
             .route("/games/:game/maps", get(maps))
+            .route("/instances/:id/players", get(players))
+            .route("/instances/:id/chat", get(chat_read))
+            .route("/mesh/announce", post(announce))
+            .route("/restart-schedules", get(schedules))
             .route("/instances/:id/backups", get(backups_list).post(backups_make))
             .route("/instances/:id/backups/:name/restore", post(restore))
             .route("/instances/:id/backups/:name", delete(remove))
@@ -3157,6 +3554,235 @@ mod tests {
         h.change_map(&owner, "srv", "c1a1").await.unwrap();
         assert_eq!(h.game_maps("sven-coop").await.unwrap(), vec!["c1a0", "c1a1"]);
         assert_eq!(*hits.lock().unwrap(), vec!["map srv c1a1", "maps sven-coop"]);
+    }
+
+    /// The owner's tools on a server reach its node through the index, for the
+    /// owner only and only from the closed list: the console, or a stranger
+    /// asking, never reaches the node. A schedule read leaves only this
+    /// server's entry, and announce goes to the node's announce for it.
+    #[tokio::test]
+    async fn an_owners_tools_reach_the_node_and_nothing_else_does() {
+        let (addr, hits) = recording_node().await;
+        let owner = AccountId("aa".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+        let h = Hosting::new(one_node_at(addr));
+
+        assert_eq!(h.owner_call(&stranger, "srv", "GET", "players", None, None).await.unwrap_err().to_string(), "no such instance");
+        assert!(h.owner_call(&owner, "srv", "POST", "console", None, Some(serde_json::json!({"line": "quit"}))).await.is_err());
+        assert!(h.owner_call(&owner, "srv", "GET", "chat", Some("since=1&x=2"), None).await.is_err());
+        assert!(hits.lock().unwrap().is_empty(), "something reached the node: {:?}", hits.lock().unwrap());
+
+        let players = h.owner_call(&owner, "srv", "GET", "players", None, None).await.unwrap();
+        assert_eq!(players.status, 200);
+        assert!(players.body.contains("gordon"));
+        h.owner_call(&owner, "srv", "GET", "chat", Some("since=7"), None).await.unwrap();
+        h.owner_call(&owner, "srv", "POST", "announce", None, None).await.unwrap();
+        let mine = h.owner_call(&owner, "srv", "GET", "restart-schedule", None, None).await.unwrap();
+        assert_eq!(mine.body, r#"{"srv":{"start_utc":4}}"#, "another server's schedule left the node");
+        assert_eq!(*hits.lock().unwrap(), vec!["players srv", "chat srv since=7", "announce srv", "schedules"]);
+    }
+
+    /// An admin installs a game on the workers set up to run it and the index
+    /// offers it, kept beside the hosting file and kept over a reload of it.
+    /// Nobody else can; a game no worker can run is refused and not offered;
+    /// a game the file lists is the file's to withdraw.
+    #[tokio::test]
+    async fn an_admin_installs_a_game_on_the_workers_and_the_index_offers_it() {
+        use axum::extract::{Path, State};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        type Hits = Arc<std::sync::Mutex<Vec<String>>>;
+        async fn games() -> Json<serde_json::Value> {
+            Json(serde_json::json!([
+                {"id": "team-fortress-2", "runnable": true},
+                {"id": "nfs-underground-2", "runnable": false, "reason": "no [games.nfs-underground-2] section"},
+            ]))
+        }
+        async fn install(State(h): State<Hits>, Path(g): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("install {g}"));
+            Json(serde_json::json!({"game": g, "started": true}))
+        }
+        async fn status(Path(g): Path<String>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({"game": g, "status": {"state": "running", "since_secs": 5, "bytes": 1000}}))
+        }
+        async fn content() -> Json<serde_json::Value> {
+            Json(serde_json::json!({"copies": [{"game_id": "sven-coop", "version": "5.26"}], "downloads": []}))
+        }
+        let hits: Hits = Default::default();
+        let app = Router::new()
+            .route("/games", get(games))
+            .route("/content", get(content))
+            .route("/content/:game", post(install).get(status))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosting.toml");
+        let admin = AccountId("ad".repeat(16));
+        let user = AccountId("bb".repeat(16));
+        let mut c = one_node_at(addr);
+        c.admins = vec![admin.0.clone()];
+        let h = Hosting::new(c.clone()).keep_state_beside(&file).unwrap();
+        let now = std::time::SystemTime::now();
+
+        assert!(h.admin_install_game(&user, "team-fortress-2", now).await.unwrap_err().to_string().starts_with("only an admin"));
+        assert!(h.admin_install_game(&admin, "../x", now).await.is_err());
+        let none = h.admin_install_game(&admin, "nfs-underground-2", now).await.unwrap_err().to_string();
+        assert!(none.contains("no worker that answered is set up to run"), "{none}");
+        assert!(!h.config().hosts_game("nfs-underground-2"), "a game no worker can run is not offered");
+        assert!(hits.lock().unwrap().is_empty());
+
+        let nodes = h.admin_install_game(&admin, "team-fortress-2", now).await.unwrap();
+        assert_eq!(nodes[0]["outcome"], "installing");
+        assert_eq!(*hits.lock().unwrap(), vec!["install team-fortress-2"]);
+        assert!(h.config().hosts_game("team-fortress-2"), "offered at once");
+        let st = h.admin_game_status(&admin, "team-fortress-2").await.unwrap();
+        assert_eq!((st["offered"].as_bool(), st["from_file"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(st["nodes"][0]["status"]["state"], "running");
+        assert!(h.admin_game_status(&user, "team-fortress-2").await.is_err());
+
+        // A reload of the file keeps the offer, and a restart reads it back.
+        h.reload(c.clone());
+        assert!(h.config().hosts_game("team-fortress-2") && h.config().hosts_game("sven-coop"));
+        let again = Hosting::new(c.clone()).keep_state_beside(&file).unwrap();
+        assert!(again.config().hosts_game("team-fortress-2"));
+
+        assert!(h.admin_withdraw_game(&admin, "sven-coop").unwrap_err().to_string().contains("hosting file"));
+        assert!(h.admin_withdraw_game(&user, "team-fortress-2").is_err());
+        h.admin_withdraw_game(&admin, "team-fortress-2").unwrap();
+        assert!(!h.config().hosts_game("team-fortress-2") && h.config().hosts_game("sven-coop"));
+    }
+
+    /// An admin removes one installed copy from one worker or from all of them.
+    /// A worker that uses the copy refuses and says so, the others go ahead,
+    /// and a worker without it is told it does not have it. Nobody else can.
+    #[tokio::test]
+    async fn an_admin_removes_a_game_copy_from_one_worker_or_all_and_a_worker_in_use_refuses() {
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::{delete, get};
+        use axum::{Json, Router};
+        type Hits = Arc<std::sync::Mutex<Vec<String>>>;
+        async fn content(Path(name): Path<String>) -> Json<serde_json::Value> {
+            let copies = match name.as_str() {
+                "a" => serde_json::json!([{"game_id": "team-fortress-2", "version": "app232250"}]),
+                "b" => serde_json::json!([{"game_id": "team-fortress-2", "version": "app232250"}]),
+                _ => serde_json::json!([{"game_id": "sven-coop", "version": "5.26"}]),
+            };
+            Json(serde_json::json!({"copies": copies, "downloads": []}))
+        }
+        async fn remove(State(h): State<Hits>, Path((name, game, version)): Path<(String, String, String)>) -> (StatusCode, Json<serde_json::Value>) {
+            h.lock().unwrap().push(format!("delete {name} {game} {version}"));
+            if name == "b" {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "a server uses it", "servers": ["tf-1"]})));
+            }
+            (StatusCode::OK, Json(serde_json::json!({"game": game, "version": version, "bytes": 1})))
+        }
+        let hits: Hits = Default::default();
+        let app = Router::new()
+            .route("/:name/content", get(content))
+            .route("/:name/content/:game/:version", delete(remove))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let admin = AccountId("ad".repeat(16));
+        let user = AccountId("bb".repeat(16));
+        let mut c = config();
+        c.admins = vec![admin.0.clone()];
+        let base = format!("http://{addr}");
+        let node = |name: &str| {
+            let mut n = c.nodes[0].clone();
+            n.name = name.to_string();
+            n.api = format!("{base}/{name}");
+            n
+        };
+        c.nodes = vec![node("a"), node("b"), node("c")];
+        let h = Hosting::new(c);
+
+        assert!(h.admin_remove_game_copy(&user, "team-fortress-2", "app232250", None).await.unwrap_err().to_string().starts_with("only an admin"));
+        assert!(h.admin_remove_game_copy(&admin, "team-fortress-2", "../x", None).await.is_err());
+        assert_eq!(h.admin_remove_game_copy(&admin, "team-fortress-2", "app232250", Some("zz")).await.unwrap_err().to_string(), "no such worker");
+        assert!(hits.lock().unwrap().is_empty(), "something was removed by a refused request");
+
+        let one = h.admin_remove_game_copy(&admin, "team-fortress-2", "app232250", Some("a")).await.unwrap();
+        assert_eq!(one[0]["outcome"], "removed");
+        assert_eq!(*hits.lock().unwrap(), vec!["delete a team-fortress-2 app232250"]);
+
+        let all = h.admin_remove_game_copy(&admin, "team-fortress-2", "app232250", None).await.unwrap();
+        let outcome = |name: &str| all.iter().find(|r| r["node"] == name).map(|r| r["outcome"].as_str().unwrap_or("").to_string());
+        assert_eq!(outcome("a").as_deref(), Some("removed"));
+        assert_eq!(outcome("b").as_deref(), Some("refused"), "a worker with a server on the copy is refused");
+        assert_eq!(all.iter().find(|r| r["node"] == "b").unwrap()["servers"], serde_json::json!(["tf-1"]));
+        assert_eq!(outcome("c").as_deref(), Some("not installed here"));
+        assert!(hits.lock().unwrap().contains(&"delete b team-fortress-2 app232250".to_string()), "the in-use copy was asked for; the worker refused it");
+    }
+
+    /// The admin dashboard merges every worker's numbers and security events
+    /// and the index's own actions. A worker that does not answer is listed as
+    /// unreachable and counted in neither total; a non-admin reads nothing.
+    #[tokio::test]
+    async fn the_dashboard_merges_every_worker_and_the_index_and_says_when_one_is_silent() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        async fn overview() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "unix": 1, "capacity": {"running": 2, "max_instances": 6, "disk_free_bytes": 900, "memory_available_bytes": 500},
+                "last_sample": {"unix": 1, "players": 4}, "counts_24h": {"sign_in_failed": 3, "sign_in": 5},
+            }))
+        }
+        async fn metrics(Query(_q): Query<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+            Json(serde_json::json!([{"unix": 1, "running": 2, "stopped": 0, "players": 4, "max_instances": 6}]))
+        }
+        async fn events(Query(_q): Query<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+            Json(serde_json::json!([
+                {"unix": 10, "kind": "sign_in_failed", "subject": "ana", "detail": "wrong"},
+                {"unix": 20, "kind": "sign_in", "actor": "ana"},
+            ]))
+        }
+        let app = Router::new()
+            .route("/ops/overview", get(overview))
+            .route("/ops/metrics", get(metrics))
+            .route("/ops/events", get(events));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let admin = AccountId("ad".repeat(16));
+        let user = AccountId("bb".repeat(16));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosting.toml");
+        let mut c = config();
+        c.admins = vec![admin.0.clone()];
+        let mut up = c.nodes[0].clone();
+        up.name = "eu-1".into();
+        up.api = format!("http://{addr}");
+        let mut down = c.nodes[0].clone();
+        down.name = "eu-2".into();
+        down.api = "http://127.0.0.1:9".into();
+        c.nodes = vec![up, down];
+        let h = Hosting::new(c).keep_state_beside(&file).unwrap();
+
+        assert!(h.ops_dashboard(&user, std::time::SystemTime::now()).await.is_err(), "a non-admin read the dashboard");
+        h.ops_record(&admin, "admin_action", "team-fortress-2", "installed");
+        let d = h.ops_dashboard(&admin, std::time::SystemTime::now()).await.unwrap();
+        let nodes = d["nodes"].as_array().unwrap();
+        assert_eq!((nodes[0]["name"].as_str(), nodes[0]["reachable"].as_bool()), (Some("eu-1"), Some(true)));
+        assert_eq!((nodes[1]["name"].as_str(), nodes[1]["reachable"].as_bool()), (Some("eu-2"), Some(false)), "silent is not zero");
+        assert_eq!((d["totals"]["nodes"].as_u64(), d["totals"]["nodes_up"].as_u64()), (Some(2), Some(1)));
+        assert_eq!((d["totals"]["running"].as_u64(), d["totals"]["players"].as_u64()), (Some(2), Some(4)));
+        assert_eq!(d["totals"]["counts_24h"]["sign_in_failed"], 3);
+        let sec: Vec<&str> = d["security"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(sec, ["sign_in_failed"], "the sign-in that worked is not a security event: {sec:?}");
+        assert_eq!(d["security"][0]["node"], "eu-1");
+        assert_eq!(d["index"]["events"][0]["kind"], "admin_action");
     }
 
     /// A policy that shares a server with a second account lets that account

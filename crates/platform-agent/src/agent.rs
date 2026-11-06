@@ -179,6 +179,8 @@ pub struct Agent {
     minecraft: crate::minecraft::Catalog,
     /// Told what happens on this node (`events.rs`); nothing by default.
     events: Arc<dyn crate::events::NodeEvents>,
+    /// What happens on this node, for the admin dashboard (`ops_log.rs`).
+    ops: Arc<crate::ops_log::OpsLog>,
 }
 
 /// A server being moved, and both its copies: neither is deleted while the
@@ -582,7 +584,31 @@ impl Agent {
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
             minecraft: crate::minecraft::Catalog::default(),
             events: crate::events::none(),
+            ops: Arc::new(crate::ops_log::OpsLog::new(&config_data_root)),
         })
+    }
+
+    /// This node's ops log: what happened here, for the dashboard.
+    pub fn ops(&self) -> Arc<crate::ops_log::OpsLog> {
+        self.ops.clone()
+    }
+
+    /// Take one sample of this node's capacity and servers into the ops log.
+    /// Run on a timer (`main.rs`); a node that cannot be asked records nothing
+    /// rather than a zero.
+    pub async fn sample_metrics(&self) {
+        let Ok(list) = self.list().await else { return };
+        let cap = self.capacity().await;
+        let players = list.iter().filter_map(|i| i.players_now).sum::<u32>();
+        self.ops.sample(&crate::ops_log::MetricSample {
+            unix: crate::ops_log::now_unix(),
+            running: list.iter().filter(|i| i.state == InstanceState::Running).count() as u32,
+            stopped: list.iter().filter(|i| i.state != InstanceState::Running).count() as u32,
+            players,
+            max_instances: cap.max_instances as u32,
+            memory_available_bytes: cap.memory_available_bytes,
+            disk_free_bytes: cap.disk_free_bytes,
+        });
     }
 
     /// Tell `events` about what happens on this node (`events.rs`). Set before
@@ -1718,6 +1744,7 @@ impl Agent {
             match self.stop(&instance.instance_id).await {
                 Ok(()) => {
                     tracing::warn!(instance = %instance.instance_id, "{reason}; stopped");
+                    self.ops.record("server_stopped_host", None, &instance.instance_id, &reason, None);
                     let server = crate::events::ServerEvent {
                         instance_id: instance.instance_id.clone(),
                         game_id: Some(instance.game_id.clone()),
@@ -2913,6 +2940,13 @@ impl Agent {
         }
         for (server, exit) in &crashed {
             self.events.server_crashed(server, exit);
+            self.ops.record(
+                "server_crashed",
+                None,
+                &server.instance_id,
+                &format!("exit {}{}", exit.code, if exit.oom_killed { ", out of memory" } else { "" }),
+                None,
+            );
         }
         for (id, exit) in due {
             tracing::warn!(instance = %id, code = exit.code, oom_killed = exit.oom_killed, "server crashed; starting it again");
