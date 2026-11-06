@@ -89,6 +89,8 @@ pub fn router_with(state: Arc<IndexState>, extra: Router<Arc<IndexState>>) -> Ro
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/map", post(change_map))
         .route("/instances/:id/node/*rest", axum::routing::any(owner_tool))
+        .route("/admin/games/:game", get(admin_game_status).delete(admin_withdraw_game))
+        .route("/admin/games/:game/install", post(admin_install_game))
         .route("/games/:game/maps", get(game_maps))
         .route("/instances/:id/backups", get(backups).post(backup_create))
         .route("/instances/:id/backups/:name", axum::routing::delete(backup_delete))
@@ -858,6 +860,51 @@ async fn game_maps(
 /// these routes cannot be used to enumerate other people's instances either;
 /// anything else (already running, a node that refused) is the caller's to
 /// read.
+/// An admin installs a game on every worker set up to run it, and offers it.
+async fn admin_install_game(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(game): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .admin_install_game(&account, &game, std::time::SystemTime::now())
+        .await
+        .map(|nodes| Json(json!({ "game_id": game, "offered": true, "nodes": nodes })))
+        .map_err(admin_games_failure)
+}
+
+/// Where a game's files stand on each worker.
+async fn admin_game_status(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(game): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.admin_game_status(&account, &game).await.map(Json).map_err(admin_games_failure)
+}
+
+/// An admin stops offering a game they offered.
+async fn admin_withdraw_game(
+    State(state): State<Arc<IndexState>>,
+    headers: HeaderMap,
+    axum::extract::Path(game): axum::extract::Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting.admin_withdraw_game(&account, &game).map(|()| Json(json!({ "game_id": game, "offered": false }))).map_err(admin_games_failure)
+}
+
+fn admin_games_failure(e: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    if format!("{e:#}").starts_with("only an admin") {
+        fail(StatusCode::FORBIDDEN, e)
+    } else {
+        fail(StatusCode::BAD_REQUEST, e)
+    }
+}
+
 /// One of the owner's tools on a server the caller may run, carried to its
 /// node (`Hosting::owner_call`). The node's own status and body come back as
 /// they are, so the page reads the same answer as on the node itself.

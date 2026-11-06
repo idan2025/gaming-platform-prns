@@ -71,3 +71,31 @@ async fn an_owners_tool_runs_the_nodes_own_route_and_the_console_never_runs() {
     let schedule = owner_call(&agent, &req("GET", "restart-schedule", None, None)).await.unwrap();
     assert_eq!((schedule.status, schedule.body.as_str()), (200, "{}"), "no schedule, and nobody else's");
 }
+
+/// A request about the node (`OP_NODE`) runs only from its closed list: the
+/// games it can run, its copies and one game's install; never its packs, its
+/// settings or an update.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_about_the_node_runs_only_from_its_list() {
+    use platform_agent::uplink::node_call;
+    use platform_agent::uplink_wire::NodeReq;
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig::parse(&config_toml(dir.path())).unwrap();
+    let agent = match Agent::new(config, vec![game_bridge::GamePack::sven_coop()]).await {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            eprintln!("skipping: {e:#}");
+            return;
+        }
+    };
+    let ask = |method: &str, path: &str| NodeReq { token: String::new(), method: method.into(), path: path.into() };
+    let games = node_call(&agent, &ask("GET", "games")).await.unwrap();
+    assert_eq!(games.status, 200);
+    assert!(games.body.contains("sven-coop"));
+    assert_eq!(node_call(&agent, &ask("GET", "content")).await.unwrap().status, 200);
+    let missing = node_call(&agent, &ask("POST", "content/no-such-game")).await.unwrap();
+    assert_eq!(missing.status, 404, "the route's own check: {}", missing.body);
+    for (m, p) in [("POST", "packs"), ("PUT", "updates/settings"), ("POST", "orphans/clean"), ("DELETE", "content/sven-coop/test")] {
+        assert!(node_call(&agent, &ask(m, p)).await.is_err(), "{m} {p} ran");
+    }
+}

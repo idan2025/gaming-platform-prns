@@ -98,6 +98,11 @@ pub const OP_MAP: u8 = 22;
 /// that moves a server's files or its identity is on the list. Decided by the
 /// owner on 2026-11-06.
 pub const OP_OWNER: u8 = 23;
+/// One request about the node itself from an admin of the index: which games
+/// it can run, and installing a game's files (`node_route` is the whole list:
+/// start one install of the configured version, read it, cancel it). Nothing
+/// else about the node's content, its config or its packs crosses.
+pub const OP_NODE: u8 = 24;
 
 // Status byte in a response.
 const STATUS_OK: u8 = 0;
@@ -265,6 +270,29 @@ pub struct OwnerReq {
 pub struct OwnerResp {
     pub status: u16,
     pub body: String,
+}
+
+/// `OP_NODE`: one request about the node, relative to its API root
+/// (`games`, `content/<game>`), and only what [`node_route`] allows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeReq {
+    pub token: String,
+    pub method: String,
+    pub path: String,
+}
+
+/// Whether a request about the node may cross: the games it can run, the
+/// copies it has installed, and one game's install (read, start the
+/// configured version, cancel). A start
+/// carries no body, so never an update, a file check or another version.
+pub fn node_route(method: &str, path: &str) -> bool {
+    match (method, path.split('/').collect::<Vec<_>>().as_slice()) {
+        ("GET", ["games"] | ["content"]) => true,
+        ("GET" | "POST" | "DELETE", ["content", game]) => {
+            game.len() <= 64 && game_bridge::pack::id_is_file_safe(game)
+        }
+        _ => false,
+    }
 }
 
 /// The most an `OP_OWNER` reply carries. Generous for a player list or a chat
@@ -633,6 +661,18 @@ mod tests {
         assert!(valid_instance_id("sven-coop-1a2b3c"));
         for bad in ["", "a/b", "../x", "A", "a?b", "a.b"] {
             assert!(!valid_instance_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_games_install_and_the_game_list_cross_about_a_node() {
+        for (m, p) in [("GET", "games"), ("GET", "content"), ("GET", "content/team-fortress-2"), ("POST", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2")] {
+            assert!(node_route(m, p), "{m} {p}");
+        }
+        for (m, p) in [("DELETE", "content"), ("DELETE", "content/tf/app1"), ("POST", "content/tf/app1/use"), ("POST", "content/../x"),
+            ("POST", "content/.hidden"), ("POST", "packs"), ("DELETE", "packs/tf"), ("PUT", "updates/settings"), ("POST", "orphans/clean"),
+            ("GET", "interfaces"), ("PUT", "games"), ("POST", "content/a/b")] {
+            assert!(!node_route(m, p), "{m} {p} must never cross");
         }
     }
 

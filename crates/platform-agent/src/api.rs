@@ -863,6 +863,8 @@ struct GameOption {
     /// The game takes Minecraft's world settings (game mode, difficulty,
     /// allowlist): Java or Bedrock. The create form offers them.
     world_settings: bool,
+    /// The pack has a `[lan]` block: the game can be played in a LAN room.
+    lan: bool,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -1216,6 +1218,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 content: contents.remove(&pack.id).flatten(),
                 eula: pack.eula.clone(),
                 minecraft: matches!(pack.content, game_bridge::content::PackContent::Minecraft {}),
+                lan: pack.lan.is_some(),
                 world_settings: matches!(
                     pack.console,
                     Some(game_bridge::pack::PackConsole::Minecraft | game_bridge::pack::PackConsole::Bedrock)
