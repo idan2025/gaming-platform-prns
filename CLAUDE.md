@@ -824,8 +824,19 @@ node's servers. Caught by
 owner's call, `OP_MAP`, `OP_MAPS`): it carries a map name, never a line,
 validated by `validate_map_name` at the index and again in
 `Agent::change_map`, and the words are `console.rs`'s. Do not widen it into
-a free-text route. `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
-still pins console, bots and chat off the controller.
+a free-text route.
+**The owner's tools cross too** (2026-11-06, the owner's call, `OP_OWNER`,
+`uplink_wire::owner_route`): who is on a server, kick, ban and operators,
+bots, server chat, announcing it, restart if it crashes, and the restart and
+backup schedules, for a server the caller may run (`Hosting::owner_call`
+checks `operable`). The list is closed and asked three times, by the
+node page's controller passthrough, the index and the node, and the node runs
+the request against its **own** routes (`uplink::owner_call`), so every
+check there applies. The console, a world upload, backup files, a server's
+identity, spec and deltas never cross: free text never reaches a console line.
+Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`,
+`the_owners_tools_are_a_closed_list_and_the_console_is_not_on_it` and
+`an_owners_tools_reach_the_node_and_nothing_else_does`.
 
 **A server can restart daily in a window** (2026-10-14, `schedule.rs`,
 `Agent::scheduled_restarts`, "Daily restart…" in a server's menu). Once a
