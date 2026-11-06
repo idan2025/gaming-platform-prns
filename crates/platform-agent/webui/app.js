@@ -197,6 +197,11 @@ const CONTROLLER_ROUTES = [
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+\/restore$/, ["POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/move-targets$/, ["GET"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/region-request$/, ["POST"]],
+  // The owner's tools, carried to the server's node (uplink_wire::owner_route).
+  [/^\/instances\/[a-z0-9-]{1,64}\/(players|moderation|backup-schedule|restart-schedule)$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/chat(\?since=\d{1,20})?$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(moderation|bots|chat|chat\/mute|restart-on-crash|announce)$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(chat|restart-schedule|backup-schedule)$/, ["PUT"]],
 ];
 
 // The URL a request really goes to: through the controller when this page has
@@ -1123,12 +1128,13 @@ function openInstanceMenu(id, x, y) {
   }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
-  // Through a controller, only what it carries is live; the rest says where it is.
+  // Through a controller, only what it carries is live; the rest says where it
+  // is. The owner's tools cross to the server's node (uplink_wire::owner_route);
+  // a world upload is a file, and files do not.
   if (state.controllerOn) {
-    const carried = new Set(["Start", "Stop", "Copy invite link", "Copy mesh address", "Show log", "Log and console",
-      "Backups…", "Move to another worker…", "Remove server…"]);
+    const notCarried = new Set(["Upload a world…"]);
     for (const it of items) {
-      if (typeof it === "object" && it.label && !carried.has(it.label)) {
+      if (typeof it === "object" && it.label && notCarried.has(it.label)) {
         it.disabled = true;
         it.title = NOT_THROUGH_CONTROLLER;
       }
@@ -2909,7 +2915,9 @@ async function onRestartSchedule(instanceId) {
   const name = (inst && inst.name) || instanceId;
   let current = null;
   try {
-    const all = await api("GET", "/restart-schedules");
+    // Through a controller the node answers for this server only.
+    const all = await api("GET", state.controllerOn
+      ? "/instances/" + encodeURIComponent(instanceId) + "/restart-schedule" : "/restart-schedules");
     current = all && all[instanceId] ? all[instanceId] : null;
   } catch (e) {
     if (e && e.__auth) return;
@@ -3732,7 +3740,10 @@ async function loadRequests() {
 // its own floor, so this cannot become a storm on someone's slow link.
 async function onAnnounce(id) {
   try {
-    const r = await withInFlight(api("POST", "/mesh/announce", id ? { instance: id } : {}));
+    // Through a controller a server is announced by its own node.
+    const r = await withInFlight(state.controllerOn && id
+      ? api("POST", "/instances/" + encodeURIComponent(id) + "/announce", {})
+      : api("POST", "/mesh/announce", id ? { instance: id } : {}));
     clearError();
     const n = r && r.announced != null ? r.announced : 0;
     toast(id ? "Announced." : (n ? "Announced " + n + (n === 1 ? " server." : " servers.") : "No server is running on the mesh."));

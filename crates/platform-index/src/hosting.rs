@@ -319,6 +319,10 @@ pub struct HostedInstance {
     /// is "this game answers no query, or did not answer", never "no map".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub map_now: Option<String>,
+    /// Whether its node starts it again after a crash, as the node reports it;
+    /// absent from a node too old to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_on_crash: Option<bool>,
     /// The server's mesh address as its node reports it: what an invite names
     /// and a launcher joins. Passed through, never invented; absent while the
     /// node has none (stopped, or no `[mesh]`).
@@ -627,6 +631,7 @@ impl Hosting {
                     delete_in_secs: None,
                     players_now: r.players_now,
                     map_now: r.map_now,
+                    restart_on_crash: r.restart_on_crash,
                     mesh_destination: r.mesh_destination,
                     region: node.region.clone(),
                 })
@@ -659,6 +664,7 @@ impl Hosting {
                 delete_in_secs: None,
                 players_now: r["players_now"].as_u64().map(|p| p as u32),
                 map_now: r["map_now"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
+                restart_on_crash: r["restart_on_crash"].as_bool(),
                 mesh_destination: r["mesh_destination"].as_str().map(str::to_string),
                 region: node.region.clone(),
             })
@@ -780,6 +786,7 @@ impl Hosting {
                 delete_in_secs: None,
                 players_now: Some(0),
                 map_now: None,
+                restart_on_crash: None,
                 mesh_destination: None,
                 region: None,
             });
@@ -831,6 +838,7 @@ impl Hosting {
             delete_in_secs: None,
             players_now: Some(0),
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         })
@@ -1026,6 +1034,57 @@ impl Hosting {
             return Err(anyhow!("{why}"));
         }
         Ok(())
+    }
+
+    /// One of the owner's tools on a server the caller may run
+    /// (`uplink_wire::owner_route`: players, kick and ban, bots, server chat,
+    /// announcing it, restart if it crashes, the schedules), carried to its
+    /// node, which answers with its own route's status and body. Checked
+    /// against the list here and again on the node; never the console.
+    pub async fn owner_call(
+        &self,
+        account: &AccountId,
+        instance_id: &str,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> Result<platform_agent::uplink_wire::OwnerResp> {
+        use platform_agent::uplink_wire::{owner_reply, owner_route, owner_target, OwnerReq};
+        if !owner_route(method, path, query) {
+            return Err(anyhow!("not one of the owner's tools"));
+        }
+        let (_, node) = self.operable(account, instance_id).await?;
+        let req = OwnerReq {
+            token: String::new(),
+            instance_id: instance_id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.map(str::to_string),
+            body,
+        };
+        if let Some(dest) = Self::agent_dest(&node) {
+            let dest = dest?;
+            let client =
+                self.agent_client().await.ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            return match client.owner_call(dest, req).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => {
+                    Err(anyhow!("node {} runs an agent too old for this; update it", node.name))
+                }
+                other => other.with_context(|| format!("asking agent {}", node.name)),
+            };
+        }
+        let (m, uri, payload) = owner_target(&req);
+        let url = format!("{}{}", node.api.trim_end_matches('/'), uri);
+        let method = reqwest::Method::from_bytes(m.as_bytes()).map_err(|_| anyhow!("not one of the owner's tools"))?;
+        let mut call = self.http.request(method, &url);
+        if let Some(b) = &payload {
+            call = call.json(b);
+        }
+        let response = call.send().await.context("asking the node")?;
+        let status = response.status().as_u16();
+        let text = response.text().await.context("reading the node's answer")?;
+        Ok(owner_reply(&req, status, text))
     }
 
     /// The maps a hosted game has, from the first node that answers with any:
@@ -1363,6 +1422,7 @@ impl Hosting {
             delete_in_secs: None,
             players_now: None,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         })
@@ -2495,6 +2555,7 @@ mod tests {
             uptime_secs: None,
             players_now: None,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         }];
@@ -2518,6 +2579,7 @@ mod tests {
             uptime_secs: uptime,
             players_now: players,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         }
@@ -2752,6 +2814,7 @@ mod tests {
             uptime_secs: None,
             players_now: None,
             map_now: None,
+            restart_on_crash: None,
             mesh_destination: None,
             region: None,
         }
@@ -3114,6 +3177,22 @@ mod tests {
             h.lock().unwrap().push(format!("map {id} {}", b["map"].as_str().unwrap_or("")));
             "ok"
         }
+        async fn players(State(h): State<Hits>, Path(id): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("players {id}"));
+            Json(serde_json::json!([{"name": "gordon", "score": 3}]))
+        }
+        async fn chat_read(State(h): State<Hits>, Path(id): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("chat {id} since={}", q.get("since").cloned().unwrap_or_default()));
+            Json(serde_json::json!({"lines": []}))
+        }
+        async fn announce(State(h): State<Hits>, Json(b): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("announce {}", b["instance"].as_str().unwrap_or("")));
+            Json(serde_json::json!({"announced": 1}))
+        }
+        async fn schedules(State(h): State<Hits>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push("schedules".into());
+            Json(serde_json::json!({"srv": {"start_utc": 4}, "theirs": {"start_utc": 5}}))
+        }
         async fn maps(State(h): State<Hits>, Path(game): Path<String>) -> Json<serde_json::Value> {
             h.lock().unwrap().push(format!("maps {game}"));
             Json(serde_json::json!({"game_id": game, "maps": ["c1a0", "c1a1"]}))
@@ -3125,6 +3204,10 @@ mod tests {
             .route("/instances/:id/logs", get(logs))
             .route("/instances/:id/map", post(change_map))
             .route("/games/:game/maps", get(maps))
+            .route("/instances/:id/players", get(players))
+            .route("/instances/:id/chat", get(chat_read))
+            .route("/mesh/announce", post(announce))
+            .route("/restart-schedules", get(schedules))
             .route("/instances/:id/backups", get(backups_list).post(backups_make))
             .route("/instances/:id/backups/:name/restore", post(restore))
             .route("/instances/:id/backups/:name", delete(remove))
@@ -3157,6 +3240,32 @@ mod tests {
         h.change_map(&owner, "srv", "c1a1").await.unwrap();
         assert_eq!(h.game_maps("sven-coop").await.unwrap(), vec!["c1a0", "c1a1"]);
         assert_eq!(*hits.lock().unwrap(), vec!["map srv c1a1", "maps sven-coop"]);
+    }
+
+    /// The owner's tools on a server reach its node through the index, for the
+    /// owner only and only from the closed list: the console, or a stranger
+    /// asking, never reaches the node. A schedule read leaves only this
+    /// server's entry, and announce goes to the node's announce for it.
+    #[tokio::test]
+    async fn an_owners_tools_reach_the_node_and_nothing_else_does() {
+        let (addr, hits) = recording_node().await;
+        let owner = AccountId("aa".repeat(16));
+        let stranger = AccountId("bb".repeat(16));
+        let h = Hosting::new(one_node_at(addr));
+
+        assert_eq!(h.owner_call(&stranger, "srv", "GET", "players", None, None).await.unwrap_err().to_string(), "no such instance");
+        assert!(h.owner_call(&owner, "srv", "POST", "console", None, Some(serde_json::json!({"line": "quit"}))).await.is_err());
+        assert!(h.owner_call(&owner, "srv", "GET", "chat", Some("since=1&x=2"), None).await.is_err());
+        assert!(hits.lock().unwrap().is_empty(), "something reached the node: {:?}", hits.lock().unwrap());
+
+        let players = h.owner_call(&owner, "srv", "GET", "players", None, None).await.unwrap();
+        assert_eq!(players.status, 200);
+        assert!(players.body.contains("gordon"));
+        h.owner_call(&owner, "srv", "GET", "chat", Some("since=7"), None).await.unwrap();
+        h.owner_call(&owner, "srv", "POST", "announce", None, None).await.unwrap();
+        let mine = h.owner_call(&owner, "srv", "GET", "restart-schedule", None, None).await.unwrap();
+        assert_eq!(mine.body, r#"{"srv":{"start_utc":4}}"#, "another server's schedule left the node");
+        assert_eq!(*hits.lock().unwrap(), vec!["players srv", "chat srv since=7", "announce srv", "schedules"]);
     }
 
     /// A policy that shares a server with a second account lets that account

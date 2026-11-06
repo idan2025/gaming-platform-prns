@@ -11,10 +11,12 @@
 //! identity hash, so a server that is not that index cannot replay it.
 //!
 //! **The allowlist is the rule.** [`allowed_path`] is the whole of what a node's
-//! page may do through a controller. Console, bots, chat, players, world upload
-//! and backup download are not on it, and they stay on the node: the controller
-//! never gains a console route (`CLAUDE.md`). A map change is on it: a map name
-//! validated as data, never a line (decided by the owner, 2026-11-02).
+//! page may do through a controller. The console, a world upload and backup
+//! files are not on it, and they stay on the node: the controller never gains a
+//! console route (`CLAUDE.md`). A map change is on it: a map name validated as
+//! data, never a line (decided by the owner, 2026-11-02). So are the owner's
+//! tools on a server, the closed list `uplink_wire::owner_route` (players, kick
+//! and ban, bots, chat, announce, crash restart, schedules; the owner, 2026-11-06).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -422,6 +424,17 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         {
             Some(format!("/instances/{id}/backups/{name}/restore"))
         }
+        // The owner's tools on one server, carried to its node
+        // (`uplink_wire::owner_route` is the list, asked by the index and the
+        // node too). Never the console, a world upload or a backup file.
+        ["instances", id, tool @ ..]
+            if valid_id(id)
+                && !tool.is_empty()
+                && crate::uplink_wire::owner_route(method.as_str(), &tool.join("/"), query) =>
+        {
+            let q = query.map(|q| format!("?{q}")).unwrap_or_default();
+            Some(format!("/instances/{id}/node/{}{q}", tool.join("/")))
+        }
         _ => None,
     }
 }
@@ -523,29 +536,69 @@ mod tests {
         }
     }
 
-    /// The point of the list: nothing that types at a server, reads a player's
-    /// data or moves a file in or out is reachable. Each of these would be a
-    /// console route or a file route through the controller.
+    /// The point of the list: nothing that types free text at a server or
+    /// moves a file or an identity in or out is reachable. Each of these would
+    /// be a console route or a file route through the controller.
     #[test]
     fn nothing_that_types_at_a_server_or_moves_its_files_is_reachable() {
         let id = "sven-coop-1a2b3c";
         for (method, rest) in [
             (Method::POST, format!("instances/{id}/console")),
+            (Method::POST, format!("instances/{id}/node/console")),
             (Method::GET, format!("instances/{id}/map")),
             (Method::POST, format!("instances/{id}/map?map=x")),
             (Method::POST, "games/../maps".to_string()),
-            (Method::POST, format!("instances/{id}/bots")),
-            (Method::POST, format!("instances/{id}/chat")),
-            (Method::GET, format!("instances/{id}/players")),
             (Method::GET, format!("instances/{id}/backups/20261022-101112.tar.gz/file")),
             (Method::POST, format!("instances/{id}/backups/import")),
-            (Method::PUT, format!("instances/{id}/backup-schedule")),
             (Method::POST, format!("instances/{id}/restart")),
             (Method::POST, format!("instances/{id}/world")),
-            (Method::POST, format!("instances/{id}/restart-on-crash")),
+            (Method::GET, format!("instances/{id}/identity")),
+            (Method::GET, format!("instances/{id}/spec")),
+            (Method::POST, format!("instances/{id}/delta")),
+            (Method::POST, format!("instances/{id}/backups/x/merge")),
+            // The owner's tools take no query but a chat read's `since`.
+            (Method::GET, format!("instances/{id}/players?x=1")),
+            (Method::GET, format!("instances/{id}/chat?since=1&x=2")),
+            (Method::POST, format!("instances/{id}/chat?since=1")),
+            // And only the methods the node's routes have.
+            (Method::DELETE, format!("instances/{id}/chat")),
+            (Method::PUT, format!("instances/{id}/players")),
         ] {
             assert_eq!(allowed_path(&method, &rest), None, "{method} {rest} must not reach the controller");
         }
+    }
+
+    /// The owner's tools reach the server's node through the index, decided by
+    /// the owner on 2026-11-06: who is on it, kick and ban, bots, server chat,
+    /// announcing it, restart if it crashes and the schedules.
+    #[test]
+    fn an_owners_tools_on_a_server_go_to_its_node_through_the_index() {
+        let id = "sven-coop-1a2b3c";
+        for (method, rest, want) in [
+            (Method::GET, "players", "players"),
+            (Method::GET, "moderation", "moderation"),
+            (Method::POST, "moderation", "moderation"),
+            (Method::POST, "bots", "bots"),
+            (Method::GET, "chat?since=42", "chat?since=42"),
+            (Method::POST, "chat", "chat"),
+            (Method::PUT, "chat", "chat"),
+            (Method::POST, "chat/mute", "chat/mute"),
+            (Method::POST, "announce", "announce"),
+            (Method::POST, "restart-on-crash", "restart-on-crash"),
+            (Method::GET, "restart-schedule", "restart-schedule"),
+            (Method::PUT, "restart-schedule", "restart-schedule"),
+            (Method::GET, "backup-schedule", "backup-schedule"),
+            (Method::PUT, "backup-schedule", "backup-schedule"),
+        ] {
+            assert_eq!(
+                allowed_path(&method, &format!("instances/{id}/{rest}")).as_deref(),
+                Some(format!("/instances/{id}/node/{want}").as_str()),
+                "{method} {rest}"
+            );
+        }
+        // The routes that were there before keep their own index paths.
+        assert_eq!(allowed_path(&Method::POST, &format!("instances/{id}/stop")).as_deref(), Some(format!("/instances/{id}/stop").as_str()));
+        assert_eq!(allowed_path(&Method::POST, &format!("instances/{id}/map")).as_deref(), Some(format!("/instances/{id}/map").as_str()));
     }
 
     /// A path the platform did not make cannot be turned into another index route
