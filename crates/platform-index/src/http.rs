@@ -89,6 +89,7 @@ pub fn router_with(state: Arc<IndexState>, extra: Router<Arc<IndexState>>) -> Ro
         .route("/instances/:id/logs", get(logs))
         .route("/instances/:id/map", post(change_map))
         .route("/instances/:id/node/*rest", axum::routing::any(owner_tool))
+        .route("/admin/ops", get(admin_ops))
         .route("/admin/games/:game", get(admin_game_status).delete(admin_withdraw_game))
         .route("/admin/games/:game/install", post(admin_install_game))
         .route("/admin/games/:game/copies/:version", axum::routing::delete(admin_remove_copy))
@@ -873,6 +874,17 @@ async fn admin_install_game(
         .admin_install_game(&account, &game, std::time::SystemTime::now())
         .await
         .map(|nodes| Json(json!({ "game_id": game, "offered": true, "nodes": nodes })))
+        .map_err(admin_games_failure)
+}
+
+/// The admin dashboard across every worker and the index (`Hosting::ops_dashboard`).
+async fn admin_ops(State(state): State<Arc<IndexState>>, headers: HeaderMap) -> ApiResult<serde_json::Value> {
+    let hosting = hosting_of(&state)?;
+    let account = account_of(&state, &headers).await?;
+    hosting
+        .ops_dashboard(&account, std::time::SystemTime::now())
+        .await
+        .map(Json)
         .map_err(admin_games_failure)
 }
 

@@ -287,6 +287,24 @@ pub struct NodeReq {
 /// content/<game>/<version>`, refused by the node while a server uses it). A start
 /// carries no body, so never an update, a file check or another version.
 pub fn node_route(method: &str, path: &str) -> bool {
+    // The node's ops log and numbers (`ops/overview`, `ops/events`,
+    // `ops/metrics`): read-only, with a query of plain keys and numbers only.
+    if let Some((base, query)) = path.split_once('?') {
+        return method == "GET"
+            && matches!(base, "ops/overview" | "ops/events" | "ops/metrics")
+            && query.len() <= 120
+            && query.split('&').all(|kv| {
+                kv.split_once('=').is_some_and(|(k, v)| {
+                    matches!(k, "since" | "limit" | "kind")
+                        && !v.is_empty()
+                        && v.len() <= 40
+                        && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                })
+            });
+    }
+    if path == "ops/overview" {
+        return method == "GET";
+    }
     match (method, path.split('/').collect::<Vec<_>>().as_slice()) {
         ("GET", ["games"] | ["content"]) => true,
         ("GET" | "POST" | "DELETE", ["content", game]) => {
@@ -673,10 +691,10 @@ mod tests {
 
     #[test]
     fn only_a_games_install_and_the_game_list_cross_about_a_node() {
-        for (m, p) in [("GET", "games"), ("GET", "content"), ("GET", "content/team-fortress-2"), ("POST", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2/app440")] {
+        for (m, p) in [("GET", "ops/events?since=1&limit=5&kind=sign_in_failed"), ("GET", "ops/metrics?since=0"), ("GET", "ops/overview"), ("GET", "games"), ("GET", "content"), ("GET", "content/team-fortress-2"), ("POST", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2/app440")] {
             assert!(node_route(m, p), "{m} {p}");
         }
-        for (m, p) in [("DELETE", "content"), ("DELETE", "content/tf/app1/extra"), ("POST", "content/tf/app1"), ("POST", "content/tf/app1/use"), ("POST", "content/../x"),
+        for (m, p) in [("POST", "ops/events"), ("GET", "ops/events?x=1"), ("GET", "ops/events?kind=a;b"), ("GET", "ops/events?since=1&limit=2&kind=x&kind=y&z=1"), ("DELETE", "ops/overview"), ("GET", "ops/nope"), ("DELETE", "content"), ("DELETE", "content/tf/app1/extra"), ("POST", "content/tf/app1"), ("POST", "content/tf/app1/use"), ("POST", "content/../x"),
             ("POST", "content/.hidden"), ("POST", "packs"), ("DELETE", "packs/tf"), ("PUT", "updates/settings"), ("POST", "orphans/clean"),
             ("GET", "interfaces"), ("PUT", "games"), ("POST", "content/a/b")] {
             assert!(!node_route(m, p), "{m} {p} must never cross");
