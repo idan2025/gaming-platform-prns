@@ -401,6 +401,8 @@ pub struct Hosting {
     admin_store: crate::admins::AdminStore,
     /// Games an admin offers beyond the hosting file's (`offered.rs`).
     offered: crate::offered::OfferedGames,
+    /// What the index itself did for an admin, beside the hosting file.
+    ops: Option<Arc<platform_agent::ops_log::OpsLog>>,
     /// The hosting file's own `games`, before the offered ones are added.
     file_games: std::sync::RwLock<Vec<String>>,
     /// Who may see and run a server beyond its owner (`access.rs`).
@@ -488,6 +490,7 @@ impl Hosting {
             requests: Default::default(),
             admin_store: Default::default(),
             offered: Default::default(),
+            ops: None,
             file_games: std::sync::RwLock::new(file_games),
             access: crate::access::owner_only(),
         }
@@ -1185,6 +1188,7 @@ impl Hosting {
         self.offered.offer(game_id, &admin.0, unix(now))?;
         self.reapply_offered();
         tracing::info!(admin = %admin.0, game = %game_id, "an admin installed and offered a game");
+        self.ops_record(admin, "admin_action", game_id, "installed on the workers and offered");
         Ok(out)
     }
 
@@ -1283,7 +1287,100 @@ impl Hosting {
             }
         }
         tracing::info!(admin = %admin.0, game = %game_id, version = %version, node = ?node, "an admin removed a game's files from a worker");
+        self.ops_record(admin, "admin_action", game_id, &format!("removed {version} from {}", node.unwrap_or("every worker")));
         Ok(out)
+    }
+
+    /// Put one admin action in the index's ops log (`ops_log.rs`).
+    pub(crate) fn ops_record(&self, admin: &AccountId, kind: &str, subject: &str, detail: &str) {
+        if let Some(ops) = &self.ops {
+            ops.record(kind, Some(&admin.0), subject, detail, None);
+        }
+    }
+
+    /// The admin dashboard across every worker and the index: each worker's
+    /// numbers, its last day of samples and events, the index's own events,
+    /// totals across them, and the security events of all, newest first. A
+    /// worker that does not answer is listed as unreachable, never as empty.
+    pub async fn ops_dashboard(&self, admin: &AccountId, now: SystemTime) -> Result<serde_json::Value> {
+        self.games_admin(admin)?;
+        let now_unix = unix(now);
+        let since = now_unix.saturating_sub(86_400);
+        let config = self.config();
+        let mut nodes = Vec::new();
+        for node in config.nodes.iter() {
+            let overview = self.node_call(node, "GET", "ops/overview").await;
+            let Ok(overview) = overview.and_then(|r| if r.status == 200 { Ok(r) } else { Err(anyhow!("status {}", r.status)) }) else {
+                let why = self.node_call(node, "GET", "ops/overview").await.map(|r| r.status.to_string()).unwrap_or_else(|e| format!("{e:#}"));
+                nodes.push(serde_json::json!({ "name": node.name, "reachable": false, "error": why }));
+                continue;
+            };
+            let overview: serde_json::Value = serde_json::from_str(&overview.body).unwrap_or_default();
+            let metrics = self.node_call(node, "GET", &format!("ops/metrics?since={since}&limit=1440")).await.ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .unwrap_or(serde_json::json!([]));
+            let events = self.node_call(node, "GET", &format!("ops/events?since={since}&limit=500")).await.ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .unwrap_or(serde_json::json!([]));
+            nodes.push(serde_json::json!({ "name": node.name, "reachable": true, "overview": overview, "metrics": metrics, "events": events }));
+        }
+        let index_events: Vec<serde_json::Value> = self
+            .ops
+            .as_ref()
+            .map(|o| o.events_since(since, 500))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| serde_json::json!({ "unix": e.unix, "kind": e.kind, "actor": e.actor, "subject": e.subject, "detail": e.detail, "node": "index" }))
+            .collect();
+
+        // Totals across every node that answered.
+        let up: Vec<&serde_json::Value> = nodes.iter().filter(|n| n["reachable"] == true).collect();
+        let sum = |f: &dyn Fn(&serde_json::Value) -> u64| up.iter().map(|n| f(&n["overview"])).sum::<u64>();
+        let min = |f: &dyn Fn(&serde_json::Value) -> Option<u64>| up.iter().filter_map(|n| f(&n["overview"])).min();
+        let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
+        for n in &up {
+            for (k, v) in n["overview"]["counts_24h"].as_object().into_iter().flatten() {
+                *counts.entry(k.clone()).or_default() += v.as_u64().unwrap_or(0);
+            }
+        }
+        let totals = serde_json::json!({
+            "nodes": nodes.len(),
+            "nodes_up": up.len(),
+            "running": sum(&|o| o["capacity"]["running"].as_u64().unwrap_or(0)),
+            "max_instances": sum(&|o| o["capacity"]["max_instances"].as_u64().unwrap_or(0)),
+            "players": sum(&|o| o["last_sample"]["players"].as_u64().unwrap_or(0)),
+            "disk_free_min_bytes": min(&|o| o["capacity"]["disk_free_bytes"].as_u64()),
+            "memory_available_min_bytes": min(&|o| o["capacity"]["memory_available_bytes"].as_u64()),
+            "counts_24h": counts,
+        });
+
+        // Security and account events of every node and the index, newest first.
+        let watched = |k: &str| matches!(k, "sign_in_failed" | "sign_in_locked" | "request_refused" | "account_added" | "account_removed" | "account_role");
+        let mut security: Vec<serde_json::Value> = Vec::new();
+        for n in &nodes {
+            for e in n["events"].as_array().into_iter().flatten() {
+                if e["kind"].as_str().is_some_and(watched) {
+                    let mut e = e.clone();
+                    e["node"] = serde_json::json!(n["name"]);
+                    security.push(e);
+                }
+            }
+        }
+        for e in &index_events {
+            if e["kind"].as_str().is_some_and(watched) {
+                security.push(e.clone());
+            }
+        }
+        security.sort_by(|a, b| b["unix"].as_u64().cmp(&a["unix"].as_u64()));
+        security.truncate(300);
+
+        Ok(serde_json::json!({
+            "unix": now_unix,
+            "nodes": nodes,
+            "index": { "events": index_events },
+            "totals": totals,
+            "security": security,
+        }))
     }
 
     /// An admin stops offering a game they offered. A game the hosting file
@@ -1297,6 +1394,7 @@ impl Hosting {
             return Err(anyhow!("{game_id} is not offered here"));
         }
         self.reapply_offered();
+        self.ops_record(admin, "admin_action", game_id, "stopped offering");
         Ok(())
     }
 
@@ -1911,6 +2009,7 @@ impl Hosting {
         self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
         self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
         self.offered = crate::offered::OfferedGames::load(&hosting_file.with_file_name("index-offered-games.json"))?;
+        self.ops = hosting_file.parent().map(|dir| Arc::new(platform_agent::ops_log::OpsLog::new(dir)));
         self.reapply_offered();
         Ok(self)
     }
@@ -3622,6 +3721,68 @@ mod tests {
         assert_eq!(all.iter().find(|r| r["node"] == "b").unwrap()["servers"], serde_json::json!(["tf-1"]));
         assert_eq!(outcome("c").as_deref(), Some("not installed here"));
         assert!(hits.lock().unwrap().contains(&"delete b team-fortress-2 app232250".to_string()), "the in-use copy was asked for; the worker refused it");
+    }
+
+    /// The admin dashboard merges every worker's numbers and security events
+    /// and the index's own actions. A worker that does not answer is listed as
+    /// unreachable and counted in neither total; a non-admin reads nothing.
+    #[tokio::test]
+    async fn the_dashboard_merges_every_worker_and_the_index_and_says_when_one_is_silent() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        async fn overview() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "unix": 1, "capacity": {"running": 2, "max_instances": 6, "disk_free_bytes": 900, "memory_available_bytes": 500},
+                "last_sample": {"unix": 1, "players": 4}, "counts_24h": {"sign_in_failed": 3, "sign_in": 5},
+            }))
+        }
+        async fn metrics(Query(_q): Query<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+            Json(serde_json::json!([{"unix": 1, "running": 2, "stopped": 0, "players": 4, "max_instances": 6}]))
+        }
+        async fn events(Query(_q): Query<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+            Json(serde_json::json!([
+                {"unix": 10, "kind": "sign_in_failed", "subject": "ana", "detail": "wrong"},
+                {"unix": 20, "kind": "sign_in", "actor": "ana"},
+            ]))
+        }
+        let app = Router::new()
+            .route("/ops/overview", get(overview))
+            .route("/ops/metrics", get(metrics))
+            .route("/ops/events", get(events));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let admin = AccountId("ad".repeat(16));
+        let user = AccountId("bb".repeat(16));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosting.toml");
+        let mut c = config();
+        c.admins = vec![admin.0.clone()];
+        let mut up = c.nodes[0].clone();
+        up.name = "eu-1".into();
+        up.api = format!("http://{addr}");
+        let mut down = c.nodes[0].clone();
+        down.name = "eu-2".into();
+        down.api = "http://127.0.0.1:9".into();
+        c.nodes = vec![up, down];
+        let h = Hosting::new(c).keep_state_beside(&file).unwrap();
+
+        assert!(h.ops_dashboard(&user, std::time::SystemTime::now()).await.is_err(), "a non-admin read the dashboard");
+        h.ops_record(&admin, "admin_action", "team-fortress-2", "installed");
+        let d = h.ops_dashboard(&admin, std::time::SystemTime::now()).await.unwrap();
+        let nodes = d["nodes"].as_array().unwrap();
+        assert_eq!((nodes[0]["name"].as_str(), nodes[0]["reachable"].as_bool()), (Some("eu-1"), Some(true)));
+        assert_eq!((nodes[1]["name"].as_str(), nodes[1]["reachable"].as_bool()), (Some("eu-2"), Some(false)), "silent is not zero");
+        assert_eq!((d["totals"]["nodes"].as_u64(), d["totals"]["nodes_up"].as_u64()), (Some(2), Some(1)));
+        assert_eq!((d["totals"]["running"].as_u64(), d["totals"]["players"].as_u64()), (Some(2), Some(4)));
+        assert_eq!(d["totals"]["counts_24h"]["sign_in_failed"], 3);
+        let sec: Vec<&str> = d["security"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(sec, ["sign_in_failed"], "the sign-in that worked is not a security event: {sec:?}");
+        assert_eq!(d["security"][0]["node"], "eu-1");
+        assert_eq!(d["index"]["events"][0]["kind"], "admin_action");
     }
 
     /// A policy that shares a server with a second account lets that account

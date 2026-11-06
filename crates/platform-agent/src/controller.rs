@@ -388,6 +388,8 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
         ["admin", "games", game] if valid_game(game) && no_query() && matches!(*method, Method::GET | Method::DELETE) => {
             Some(format!("/admin/games/{game}"))
         }
+        // The admin dashboard across the workers and the index (the index checks who is admin).
+        ["admin", "ops"] if *method == Method::GET && no_query() => Some("/admin/ops".into()),
         // Removing one installed copy from one worker (`?node=<name>`) or from all.
         ["admin", "games", game, "copies", version] if valid_game(game) && valid_game(version) && *method == Method::DELETE => {
             let ok = match query {
@@ -624,6 +626,8 @@ mod tests {
         // Removing an installed copy: from one worker, or from all.
         assert_eq!(allowed_path(&Method::DELETE, "admin/games/sven-coop/copies/5.26?node=lanthorn-eu-1").as_deref(), Some("/admin/games/sven-coop/copies/5.26?node=lanthorn-eu-1"));
         assert_eq!(allowed_path(&Method::DELETE, "admin/games/sven-coop/copies/5.26").as_deref(), Some("/admin/games/sven-coop/copies/5.26"));
+        assert_eq!(allowed_path(&Method::GET, "admin/ops").as_deref(), Some("/admin/ops"));
+        assert_eq!(allowed_path(&Method::GET, "admin/ops?x=1"), None);
         for bad in ["admin/games/sven-coop/copies/../x", "admin/games/sven-coop/copies/5.26?node=a/b", "admin/games/sven-coop/copies/5.26?x=1", "admin/games/sven-coop/copies"] {
             assert_eq!(allowed_path(&Method::DELETE, bad), None, "{bad}");
         }
