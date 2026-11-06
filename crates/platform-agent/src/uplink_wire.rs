@@ -89,6 +89,20 @@ pub const OP_MAPS: u8 = 21;
 /// before it is a line. Not a console route: free text never crosses the uplink
 /// (`CLAUDE.md`). Decided by the owner on 2026-11-02.
 pub const OP_MAP: u8 = 22;
+/// One of the owner's tools on one server, carried to the node's own API
+/// (`owner_route` is the whole list): who is on it, kick, ban and operators,
+/// bots, server chat, announcing it, restart if it crashes, and the restart and
+/// backup schedules. The index checks that the caller may run the server; the
+/// node runs the request against its own routes, so every check there applies.
+/// The console never crosses: no free text reaches a console line, and nothing
+/// that moves a server's files or its identity is on the list. Decided by the
+/// owner on 2026-11-06.
+pub const OP_OWNER: u8 = 23;
+/// One request about the node itself from an admin of the index: which games
+/// it can run, and installing a game's files (`node_route` is the whole list:
+/// start one install of the configured version, read it, cancel it). Nothing
+/// else about the node's content, its config or its packs crosses.
+pub const OP_NODE: u8 = 24;
 
 // Status byte in a response.
 const STATUS_OK: u8 = 0;
@@ -236,6 +250,115 @@ pub struct TokenReq {
 }
 
 // ---- Response payloads ------------------------------------------------------
+
+/// `OP_OWNER`: one owner request for one server. `path` is relative to the
+/// server (`players`, `chat/mute`, ...) and must pass [`owner_route`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerReq {
+    pub token: String,
+    pub instance_id: String,
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}
+
+/// `OP_OWNER`: what the node's own route answered, as it answered it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerResp {
+    pub status: u16,
+    pub body: String,
+}
+
+/// `OP_NODE`: one request about the node, relative to its API root
+/// (`games`, `content/<game>`), and only what [`node_route`] allows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeReq {
+    pub token: String,
+    pub method: String,
+    pub path: String,
+}
+
+/// Whether a request about the node may cross: the games it can run, the
+/// copies it has installed, one game's install (read, start the configured
+/// version, cancel), and removing one installed copy of a game (`DELETE
+/// content/<game>/<version>`, refused by the node while a server uses it). A start
+/// carries no body, so never an update, a file check or another version.
+pub fn node_route(method: &str, path: &str) -> bool {
+    match (method, path.split('/').collect::<Vec<_>>().as_slice()) {
+        ("GET", ["games"] | ["content"]) => true,
+        ("GET" | "POST" | "DELETE", ["content", game]) => {
+            game.len() <= 64 && game_bridge::pack::id_is_file_safe(game)
+        }
+        ("DELETE", ["content", game, version]) => {
+            game.len() <= 64
+                && game_bridge::pack::id_is_file_safe(game)
+                && version.len() <= 64
+                && game_bridge::pack::id_is_file_safe(version)
+        }
+        _ => false,
+    }
+}
+
+/// The most an `OP_OWNER` reply carries. Generous for a player list or a chat
+/// view, and still a bound: a reply is held whole in memory at both ends.
+pub const OWNER_REPLY_MAX: usize = 64 * 1024;
+
+/// Whether an owner request for one server may cross to its node, by method
+/// and the path below `/instances/<id>/`. The one list the node, the index and
+/// a node's controller passthrough all ask, so they cannot disagree. A query
+/// is allowed only on a chat read, and only `since=<number>`.
+pub fn owner_route(method: &str, path: &str, query: Option<&str>) -> bool {
+    let query_ok = match query {
+        None => true,
+        Some(q) => method == "GET" && path == "chat" && q.strip_prefix("since=").is_some_and(|n| !n.is_empty() && n.len() <= 20 && n.bytes().all(|b| b.is_ascii_digit())),
+    };
+    query_ok
+        && matches!(
+            (method, path),
+            ("GET", "players" | "moderation" | "chat" | "backup-schedule" | "restart-schedule")
+                | ("POST", "moderation" | "bots" | "chat" | "chat/mute" | "restart-on-crash" | "announce")
+                | ("PUT", "chat" | "restart-schedule" | "backup-schedule")
+        )
+}
+
+/// Where an owner request goes on the node's own API: method, path and body.
+/// Two have no route under the server: announcing it is `/mesh/announce` for
+/// this server, and its restart schedule is its entry of `/restart-schedules`
+/// ([`owner_reply`] keeps only that entry).
+pub fn owner_target(req: &OwnerReq) -> (&str, String, Option<serde_json::Value>) {
+    let id = &req.instance_id;
+    match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "announce") => ("POST", "/mesh/announce".to_string(), Some(serde_json::json!({ "instance": id }))),
+        ("GET", "restart-schedule") => ("GET", "/restart-schedules".to_string(), None),
+        (m, p) => {
+            let q = req.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default();
+            (m, format!("/instances/{id}/{p}{q}"), req.body.clone())
+        }
+    }
+}
+
+/// What leaves the node for an owner request: the route's answer, except that
+/// the schedule read, which answers for every server, keeps only this one.
+pub fn owner_reply(req: &OwnerReq, status: u16, text: String) -> OwnerResp {
+    if req.path == "restart-schedule" && status == 200 {
+        let all: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        let mut mine = serde_json::Map::new();
+        if let Some(v) = all.get(&req.instance_id) {
+            mine.insert(req.instance_id.clone(), v.clone());
+        }
+        return OwnerResp { status, body: serde_json::Value::Object(mine).to_string() };
+    }
+    OwnerResp { status, body: text }
+}
+
+/// A server id as the platform makes one: lower-case letters, digits and
+/// dashes, so it cannot carry a slash, a dot or a query into a path.
+pub fn valid_instance_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 /// `OP_LOGS`: the newest text that fit, and whether older lines were left out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,6 +647,54 @@ pub fn encode_list_resp(instances: &[InstanceStatus], total: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_owners_tools_are_a_closed_list_and_the_console_is_not_on_it() {
+        for (m, p) in [("GET", "players"), ("POST", "moderation"), ("POST", "bots"), ("PUT", "chat"), ("POST", "chat/mute"),
+            ("POST", "announce"), ("POST", "restart-on-crash"), ("GET", "restart-schedule"), ("PUT", "backup-schedule")] {
+            assert!(owner_route(m, p, None), "{m} {p}");
+        }
+        for (m, p) in [("POST", "console"), ("GET", "identity"), ("PUT", "identity"), ("GET", "spec"), ("POST", "delta"),
+            ("POST", "world"), ("POST", "restart"), ("POST", "stop"), ("DELETE", "chat"), ("GET", "backups/x/file"),
+            ("POST", "backups/import"), ("POST", "chat/../console"), ("POST", "moderation/../console"), ("GET", "")] {
+            assert!(!owner_route(m, p, None), "{m} {p} must never cross");
+        }
+        assert!(owner_route("GET", "chat", Some("since=12")));
+        for q in ["since=", "since=1x", "since=1&x=2", "x=1", "since=-1"] {
+            assert!(!owner_route("GET", "chat", Some(q)), "{q}");
+        }
+        assert!(!owner_route("POST", "chat", Some("since=1")));
+        assert!(valid_instance_id("sven-coop-1a2b3c"));
+        for bad in ["", "a/b", "../x", "A", "a?b", "a.b"] {
+            assert!(!valid_instance_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_games_install_and_the_game_list_cross_about_a_node() {
+        for (m, p) in [("GET", "games"), ("GET", "content"), ("GET", "content/team-fortress-2"), ("POST", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2/app440")] {
+            assert!(node_route(m, p), "{m} {p}");
+        }
+        for (m, p) in [("DELETE", "content"), ("DELETE", "content/tf/app1/extra"), ("POST", "content/tf/app1"), ("POST", "content/tf/app1/use"), ("POST", "content/../x"),
+            ("POST", "content/.hidden"), ("POST", "packs"), ("DELETE", "packs/tf"), ("PUT", "updates/settings"), ("POST", "orphans/clean"),
+            ("GET", "interfaces"), ("PUT", "games"), ("POST", "content/a/b")] {
+            assert!(!node_route(m, p), "{m} {p} must never cross");
+        }
+    }
+
+    #[test]
+    fn a_schedule_read_leaves_the_node_with_only_its_own_server() {
+        let req = OwnerReq { token: String::new(), instance_id: "a".into(), method: "GET".into(), path: "restart-schedule".into(), query: None, body: None };
+        assert_eq!(owner_target(&req).1, "/restart-schedules");
+        let out = owner_reply(&req, 200, r#"{"a":{"start_utc":4},"b":{"start_utc":5}}"#.into());
+        assert_eq!(out.body, r#"{"a":{"start_utc":4}}"#);
+        let ann = OwnerReq { path: "announce".into(), method: "POST".into(), ..req.clone() };
+        assert_eq!(owner_target(&ann), ("POST", "/mesh/announce".to_string(), Some(serde_json::json!({"instance": "a"}))));
+        let chat = OwnerReq { path: "chat".into(), query: Some("since=3".into()), ..req };
+        assert_eq!(owner_target(&chat).1, "/instances/a/chat?since=3");
+    }
+
 
     /// A long map list crosses in pages that each fit a packet, and following
     /// `next` gives back every map once, in order.
@@ -549,7 +720,6 @@ mod tests {
         assert_eq!(empty, MapsResp { maps: vec![], next: None });
     }
 
-    use super::*;
     use crate::instance::{InstanceSpec, InstanceState};
 
     fn spec(id: &str) -> InstanceSpec {
