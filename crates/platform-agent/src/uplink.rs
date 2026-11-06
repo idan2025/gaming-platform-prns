@@ -329,6 +329,40 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_OWNER => {
+            let req: OwnerReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_OWNER, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_OWNER, &msg);
+            }
+            match owner_call(&state.agent, &req).await {
+                Ok(resp) => match payload_bytes(&resp) {
+                    Ok(body) => encode_ok(OP_OWNER, &body),
+                    Err(e) => encode_err(OP_OWNER, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_OWNER, &format!("{e:#}")),
+            }
+        }
+
+        OP_NODE => {
+            let req: NodeReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_NODE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_NODE, &msg);
+            }
+            match node_call(&state.agent, &req).await {
+                Ok(resp) => match payload_bytes(&resp) {
+                    Ok(body) => encode_ok(OP_NODE, &body),
+                    Err(e) => encode_err(OP_NODE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_NODE, &format!("{e:#}")),
+            }
+        }
+
         OP_BACKUPS => {
             let req: InstanceReq = match parse_payload(body) {
                 Ok(r) => r,
@@ -739,6 +773,51 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
         stop_tx: Some(stop_tx),
         done: Some(done_rx),
     })
+}
+
+/// Run one owner request (`OP_OWNER`) against this node's own routes, as the
+/// loopback API would: the route's own checks apply, and the list of what may
+/// be asked at all is `owner_route`, asked again here whatever the index said.
+pub async fn owner_call(agent: &Arc<Agent>, req: &OwnerReq) -> Result<OwnerResp> {
+    if !valid_instance_id(&req.instance_id) {
+        return Err(anyhow!("no such instance"));
+    }
+    if !owner_route(&req.method, &req.path, req.query.as_deref()) {
+        return Err(anyhow!("{} {} is not one of the owner's tools carried here", req.method, req.path));
+    }
+    let (method, uri, body) = owner_target(req);
+    let (status, text) = run_local(agent, method, &uri, body.as_ref()).await?;
+    Ok(owner_reply(req, status, text))
+}
+
+/// Run one request about this node (`OP_NODE`), only from `node_route`, asked
+/// again here. Starting an install carries no body: the configured version.
+pub async fn node_call(agent: &Arc<Agent>, req: &NodeReq) -> Result<OwnerResp> {
+    if !node_route(&req.method, &req.path) {
+        return Err(anyhow!("{} {} is not carried here", req.method, req.path));
+    }
+    let (status, body) = run_local(agent, &req.method, &format!("/{}", req.path), None).await?;
+    Ok(OwnerResp { status, body })
+}
+
+/// One request against the node's own API, in process, as from loopback.
+async fn run_local(agent: &Arc<Agent>, method: &str, uri: &str, body: Option<&serde_json::Value>) -> Result<(u16, String)> {
+    use tower::ServiceExt;
+    let mut builder = axum::http::Request::builder().method(method).uri(uri).header(axum::http::header::HOST, "127.0.0.1");
+    let payload = match body {
+        Some(b) => {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+            serde_json::to_vec(b)?
+        }
+        None => Vec::new(),
+    };
+    let request = builder.body(axum::body::Body::from(payload)).map_err(|e| anyhow!("building the request: {e}"))?;
+    let response = crate::api::router(agent.clone()).oneshot(request).await.map_err(|e| anyhow!("{e}"))?;
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), OWNER_REPLY_MAX)
+        .await
+        .map_err(|_| anyhow!("the answer is larger than one reply carries"))?;
+    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 #[cfg(test)]

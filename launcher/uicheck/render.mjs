@@ -2252,6 +2252,67 @@ await run('on Android a joined server can be left from the detail pane', {
   w.close();
 }
 
+// Through a controller, an admin of the index installs a game the controller
+// does not offer yet on the workers, and watches the download; a LAN game with
+// no server says it is played in a room, and offers no install.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' }, '/capacity': { max_instances: 4, running: 0 },
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 }, '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 }, '/content': { copies: [], downloads: [] },
+    '/games': [
+      { id: 'sven-coop', display_name: 'Sven Co-op', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0 },
+      { id: 'team-fortress-2', display_name: 'Team Fortress 2', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 1 },
+      { id: 'nfs-underground-2', display_name: 'Need for Speed: Underground 2', runnable: false, lan: true, transport: 'udp', default_port: 9900, extra_ports: 0, reason: 'no [games.nfs-underground-2] section' },
+    ],
+    '/controller/status': { enabled: true, url: 'https://index.test' },
+    '/controller/hosting': { games: ['sven-coop'], regions: [] },
+    '/controller/admin/region-requests': [],
+    '/controller/instances': [],
+    '/controller/admin/games/team-fortress-2': { game_id: 'team-fortress-2', offered: true, from_file: false,
+      nodes: [{ node: 'eu-1', status: { state: 'running', since_secs: 9, bytes: 3e9 }, copies: [] }] },
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+  w.confirm = () => true;
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ method: opts.method, path: route });
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' },
+        json: async () => ({ game_id: 'team-fortress-2', offered: true, nodes: [{ node: 'eu-1', outcome: 'installing' }] }), text: async () => '{}' };
+    }
+    const body = routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
+      headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs);
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  const d = w.document;
+  const card = (id) => d.querySelector('.game-card[data-game-id="' + id + '"]');
+  const tf = card('team-fortress-2'), nfs = card('nfs-underground-2');
+  const btnIn = (c, t) => c && [...c.querySelectorAll('button')].find(b => b.textContent.includes(t));
+  check('an admin of the index can install a game the controller does not offer', !!btnIn(tf, 'Install on the workers'));
+  check('a LAN game with no server says it is played in a room', nfs && /played in a LAN room/.test(nfs.textContent) && !btnIn(nfs, 'Install on the workers'), nfs && nfs.textContent);
+  btnIn(tf, 'Install on the workers').click();
+  await settle();
+  await settle();
+  check('Install on the workers asks the controller', posts.some(p => p.method === 'POST' && p.path === '/controller/admin/games/team-fortress-2/install'), JSON.stringify(posts));
+  const dlg = d.getElementById('workers-files-dialog');
+  check('the download shows per worker', dlg && /eu-1/.test(dlg.textContent) && /downloading, 2\.8 GB so far|downloading, 3\.0 GB so far|downloading/.test(dlg.textContent), dlg && dlg.textContent);
+  check('an offered game an admin offered can be withdrawn', dlg && [...dlg.querySelectorAll('button')].some(b => b.textContent === 'Stop offering' && !b.hidden));
+  w.close();
+}
+
 // Lanthorn Host through a controller: maps are picked from a menu of what a
 // worker has, a running server's map changes through the controller, and the
 // log reads as text, not as the index's JSON.
@@ -2267,9 +2328,11 @@ await run('on Android a joined server can be left from the detail pane', {
     '/games': [{ id: 'sven-coop', display_name: 'Sven Co-op', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0, console: true }],
     '/controller/status': { enabled: true, url: 'https://index.test' },
     '/controller/hosting': { games: ['sven-coop'], regions: [] },
-    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [], players_now: 2, map_now: 'svencoop1' }],
+    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [], players_now: 2, map_now: 'svencoop1', mesh_destination: 'ab'.repeat(16) }],
     '/controller/games/sven-coop/maps': { game_id: 'sven-coop', maps: ['hl_c01_a1', 'svencoop1'] },
     '/controller/instances/s1/logs': { text: 'first line\nsecond line\n', truncated: true },
+    '/controller/instances/s1/players': [{ name: 'gordon', score: 3, duration_secs: 60 }],
+    '/controller/instances/s1/restart-schedule': {},
   };
   const vc = new VirtualConsole();
   vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
@@ -2287,7 +2350,7 @@ await run('on Android a joined server can be left from the detail pane', {
     return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
       headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
   };
-  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog;');
+  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog; window.__menu = openInstanceMenu; window.__players = onShowPlayers; window.__announce = onAnnounce;');
   w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
   await settle();
   const d = w.document;
@@ -2312,6 +2375,22 @@ await run('on Android a joined server can be left from the detail pane', {
   check('a running server\'s map can be changed through the controller', btn && !btn.disabled, btn && btn.title);
   const shown = d.querySelector('.inst[data-id="s1"] .cell-map');
   check('the row shows which map the server is on, through the controller', shown && shown.textContent === 'svencoop1', shown && shown.textContent);
+  // The owner's tools work through the controller (uplink_wire::owner_route):
+  // the menu offers them on a running server, and they go to the controller.
+  w.__menu('s1', 10, 10);
+  const menuItems = Object.fromEntries([...d.querySelectorAll('#ctx-menu .menu-item')].map(b => [b.textContent.trim(), b.disabled]));
+  for (const label of ['Players…', 'Chat…', 'Announce now', 'Daily restart…', 'Kick, ban and operators…']) {
+    check('through the controller the menu offers ' + label, menuItems[label] === false, JSON.stringify(menuItems));
+  }
+  d.getElementById('ctx-menu').hidden = true;
+  w.__players('s1');
+  await settle();
+  check('Players… reads the list through the controller', /gordon/.test(d.body.textContent));
+  for (const id of ['players-dialog']) d.getElementById(id)?.remove();
+  posts.length = 0;
+  await w.__announce('s1');
+  await settle();
+  check('Announce now goes through the controller to the server\'s node', posts.some(p => p.path === '/controller/instances/s1/announce'), JSON.stringify(posts));
   posts.length = 0;
   w.__map('s1', 'sven-coop');
   await settle();

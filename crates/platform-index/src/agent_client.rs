@@ -43,10 +43,10 @@ use platform_agent::uplink_wire::{
     decode_chunk, decode_response, encode_request, encode_write_body, parse_payload, payload_bytes,
     BackupReadReq, BackupReq, BackupWriteReq, BackupsResp, CapacityResp, CreateReq, DeltaReq,
     IdentityResp, IdentitySetReq, InstanceReq, ListResp, LogsReq, LogsResp, MapReq, MapsReq,
-    MapsResp, TokenReq, OP_BACKUPS, OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_READ,
+    MapsResp, NodeReq, OwnerReq, OwnerResp, TokenReq, OP_BACKUPS, OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_READ,
     OP_BACKUP_RESTORE, OP_BACKUP_WRITE, OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_DELTA_CREATE,
-    OP_DELTA_MERGE, OP_IDENTITY_READ, OP_IDENTITY_SET, OP_LIST, OP_LOGS, OP_MAP, OP_MAPS, OP_REMOVE,
-    OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
+    OP_DELTA_MERGE, OP_IDENTITY_READ, OP_IDENTITY_SET, OP_LIST, OP_LOGS, OP_MAP, OP_MAPS, OP_NODE, OP_OWNER,
+    OP_REMOVE, OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
 };
 use prns_core::engine::RequestResponseTimeout;
 use prns_core::units::DurationMillis;
@@ -153,6 +153,19 @@ impl AgentClient {
         let req = MapReq { token: String::new(), instance_id: instance_id.to_string(), map: map.to_string() };
         let body = self.signed_op(agent, OP_MAP, &payload_bytes(&req)?).await?;
         expect_empty(&body, OP_MAP)
+    }
+
+    /// One of the owner's tools on one server (`OP_OWNER`): the node answers
+    /// with its own route's status and body.
+    pub async fn owner_call(&self, agent: DestinationHash, req: OwnerReq) -> Result<OwnerResp> {
+        let body = self.signed_op(agent, OP_OWNER, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_OWNER)
+    }
+
+    /// One request about the node itself (`OP_NODE`): its games, a game's install.
+    pub async fn node_call(&self, agent: DestinationHash, req: NodeReq) -> Result<OwnerResp> {
+        let body = self.signed_op(agent, OP_NODE, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_NODE)
     }
 
     pub async fn backups(&self, agent: DestinationHash, instance_id: &str) -> Result<BackupsResp> {
@@ -452,6 +465,16 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
         }
         OP_MAP => {
             let mut r: MapReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_NODE => {
+            let mut r: NodeReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_OWNER => {
+            let mut r: OwnerReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
