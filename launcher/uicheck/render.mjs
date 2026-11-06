@@ -2267,9 +2267,11 @@ await run('on Android a joined server can be left from the detail pane', {
     '/games': [{ id: 'sven-coop', display_name: 'Sven Co-op', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0, console: true }],
     '/controller/status': { enabled: true, url: 'https://index.test' },
     '/controller/hosting': { games: ['sven-coop'], regions: [] },
-    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [], players_now: 2, map_now: 'svencoop1' }],
+    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [], players_now: 2, map_now: 'svencoop1', mesh_destination: 'ab'.repeat(16) }],
     '/controller/games/sven-coop/maps': { game_id: 'sven-coop', maps: ['hl_c01_a1', 'svencoop1'] },
     '/controller/instances/s1/logs': { text: 'first line\nsecond line\n', truncated: true },
+    '/controller/instances/s1/players': [{ name: 'gordon', score: 3, duration_secs: 60 }],
+    '/controller/instances/s1/restart-schedule': {},
   };
   const vc = new VirtualConsole();
   vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
@@ -2287,7 +2289,7 @@ await run('on Android a joined server can be left from the detail pane', {
     return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
       headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
   };
-  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog;');
+  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog; window.__menu = openInstanceMenu; window.__players = onShowPlayers; window.__announce = onAnnounce;');
   w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
   await settle();
   const d = w.document;
@@ -2312,6 +2314,22 @@ await run('on Android a joined server can be left from the detail pane', {
   check('a running server\'s map can be changed through the controller', btn && !btn.disabled, btn && btn.title);
   const shown = d.querySelector('.inst[data-id="s1"] .cell-map');
   check('the row shows which map the server is on, through the controller', shown && shown.textContent === 'svencoop1', shown && shown.textContent);
+  // The owner's tools work through the controller (uplink_wire::owner_route):
+  // the menu offers them on a running server, and they go to the controller.
+  w.__menu('s1', 10, 10);
+  const menuItems = Object.fromEntries([...d.querySelectorAll('#ctx-menu .menu-item')].map(b => [b.textContent.trim(), b.disabled]));
+  for (const label of ['Players…', 'Chat…', 'Announce now', 'Daily restart…', 'Kick, ban and operators…']) {
+    check('through the controller the menu offers ' + label, menuItems[label] === false, JSON.stringify(menuItems));
+  }
+  d.getElementById('ctx-menu').hidden = true;
+  w.__players('s1');
+  await settle();
+  check('Players… reads the list through the controller', /gordon/.test(d.body.textContent));
+  for (const id of ['players-dialog']) d.getElementById(id)?.remove();
+  posts.length = 0;
+  await w.__announce('s1');
+  await settle();
+  check('Announce now goes through the controller to the server\'s node', posts.some(p => p.path === '/controller/instances/s1/announce'), JSON.stringify(posts));
   posts.length = 0;
   w.__map('s1', 'sven-coop');
   await settle();
