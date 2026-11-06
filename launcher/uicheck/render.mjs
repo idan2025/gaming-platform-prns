@@ -2323,7 +2323,10 @@ await run('on Android a joined server can be left from the detail pane', {
     '/controller/admin/region-requests': [],
     '/controller/instances': [],
     '/controller/admin/games/team-fortress-2': { game_id: 'team-fortress-2', offered: true, from_file: false,
-      nodes: [{ node: 'eu-1', status: { state: 'running', since_secs: 9, bytes: 3e9 }, copies: [] }] },
+      nodes: [
+        { node: 'eu-1', status: { state: 'idle' }, copies: [{ game_id: 'team-fortress-2', version: 'app232250', used_by: [] }] },
+        { node: 'eu-2', status: { state: 'idle' }, copies: [{ game_id: 'team-fortress-2', version: 'app232250', used_by: ['tf-1'] }] },
+      ] },
   };
   const vc = new VirtualConsole();
   vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
@@ -2357,8 +2360,19 @@ await run('on Android a joined server can be left from the detail pane', {
   await settle();
   check('Install on the workers asks the controller', posts.some(p => p.method === 'POST' && p.path === '/controller/admin/games/team-fortress-2/install'), JSON.stringify(posts));
   const dlg = d.getElementById('workers-files-dialog');
-  check('the download shows per worker', dlg && /eu-1/.test(dlg.textContent) && /downloading, 2\.8 GB so far|downloading, 3\.0 GB so far|downloading/.test(dlg.textContent), dlg && dlg.textContent);
+  check('each worker shows what it has', dlg && /eu-1/.test(dlg.textContent) && /installed \(app232250\)/.test(dlg.textContent), dlg && dlg.textContent);
   check('an offered game an admin offered can be withdrawn', dlg && [...dlg.querySelectorAll('button')].some(b => b.textContent === 'Stop offering' && !b.hidden));
+  // Removing a copy: from one worker that does not use it, or from all of them.
+  // A copy a server uses cannot be removed from its worker from here.
+  const remove = (t) => dlg && [...dlg.querySelectorAll('button')].find(b => b.textContent === t);
+  check('a copy on a worker can be removed from that worker', !!remove('Remove app232250 from eu-1') && !remove('Remove app232250 from eu-1').disabled);
+  check('a copy a server uses is not removable from its worker', remove('Remove app232250 from eu-2') && remove('Remove app232250 from eu-2').disabled);
+  check('the same copy on every worker can be removed at once', !!remove('Remove app232250 from all 2 workers'));
+  posts.length = 0;
+  remove('Remove app232250 from eu-1').click();
+  await settle();
+  await settle();
+  check('removing from one worker sends a delete for that worker', posts.some(p => p.method === 'DELETE' && p.path === '/controller/admin/games/team-fortress-2/copies/app232250'), JSON.stringify(posts));
   w.close();
 }
 

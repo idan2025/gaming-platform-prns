@@ -1225,6 +1225,67 @@ impl Hosting {
         }))
     }
 
+    /// An admin removes one installed copy of a game's files from one worker
+    /// (`node`) or from every worker that has it (`node` absent). A copy a
+    /// server uses is refused by the worker, and that worker says so; the other
+    /// workers still go ahead. Returns what each worker answered.
+    pub async fn admin_remove_game_copy(
+        &self,
+        admin: &AccountId,
+        game_id: &str,
+        version: &str,
+        node: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.games_admin(admin)?;
+        if game_id.len() > 64 || !game_bridge::pack::id_is_file_safe(game_id) {
+            return Err(anyhow!("that is not a game id"));
+        }
+        if version.len() > 64 || !game_bridge::pack::id_is_file_safe(version) {
+            return Err(anyhow!("that is not a copy"));
+        }
+        let config = self.config();
+        let targets: Vec<&NodeConfig> = config.nodes.iter().filter(|n| node.is_none_or(|name| n.name == name)).collect();
+        if targets.is_empty() {
+            return Err(anyhow!("no such worker"));
+        }
+        let mut out = Vec::new();
+        for n in targets {
+            let copies = match self.node_call(n, "GET", "content").await {
+                Ok(r) if r.status == 200 => r.body,
+                Ok(r) => {
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "did not answer", "error": format!("status {}", r.status) }));
+                    continue;
+                }
+                Err(e) => {
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "did not answer", "error": format!("{e:#}") }));
+                    continue;
+                }
+            };
+            let has = serde_json::from_str::<serde_json::Value>(&copies)
+                .ok()
+                .and_then(|v| v["copies"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c["game_id"] == game_id && c["version"] == version);
+            if !has {
+                out.push(serde_json::json!({ "node": n.name, "outcome": "not installed here" }));
+                continue;
+            }
+            match self.node_call(n, "DELETE", &format!("content/{game_id}/{version}")).await {
+                Ok(r) if (200..300).contains(&r.status) => {
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "removed", "reply": serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_default() }))
+                }
+                Ok(r) => {
+                    let v = serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_default();
+                    out.push(serde_json::json!({ "node": n.name, "outcome": "refused", "error": v["error"].clone(), "servers": v["servers"].clone() }))
+                }
+                Err(e) => out.push(serde_json::json!({ "node": n.name, "outcome": "did not answer", "error": format!("{e:#}") })),
+            }
+        }
+        tracing::info!(admin = %admin.0, game = %game_id, version = %version, node = ?node, "an admin removed a game's files from a worker");
+        Ok(out)
+    }
+
     /// An admin stops offering a game they offered. A game the hosting file
     /// lists is the file's. Servers that exist keep running, and the files stay.
     pub fn admin_withdraw_game(&self, admin: &AccountId, game_id: &str) -> Result<()> {
@@ -3494,6 +3555,73 @@ mod tests {
         assert!(h.admin_withdraw_game(&user, "team-fortress-2").is_err());
         h.admin_withdraw_game(&admin, "team-fortress-2").unwrap();
         assert!(!h.config().hosts_game("team-fortress-2") && h.config().hosts_game("sven-coop"));
+    }
+
+    /// An admin removes one installed copy from one worker or from all of them.
+    /// A worker that uses the copy refuses and says so, the others go ahead,
+    /// and a worker without it is told it does not have it. Nobody else can.
+    #[tokio::test]
+    async fn an_admin_removes_a_game_copy_from_one_worker_or_all_and_a_worker_in_use_refuses() {
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::{delete, get};
+        use axum::{Json, Router};
+        type Hits = Arc<std::sync::Mutex<Vec<String>>>;
+        async fn content(Path(name): Path<String>) -> Json<serde_json::Value> {
+            let copies = match name.as_str() {
+                "a" => serde_json::json!([{"game_id": "team-fortress-2", "version": "app232250"}]),
+                "b" => serde_json::json!([{"game_id": "team-fortress-2", "version": "app232250"}]),
+                _ => serde_json::json!([{"game_id": "sven-coop", "version": "5.26"}]),
+            };
+            Json(serde_json::json!({"copies": copies, "downloads": []}))
+        }
+        async fn remove(State(h): State<Hits>, Path((name, game, version)): Path<(String, String, String)>) -> (StatusCode, Json<serde_json::Value>) {
+            h.lock().unwrap().push(format!("delete {name} {game} {version}"));
+            if name == "b" {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "a server uses it", "servers": ["tf-1"]})));
+            }
+            (StatusCode::OK, Json(serde_json::json!({"game": game, "version": version, "bytes": 1})))
+        }
+        let hits: Hits = Default::default();
+        let app = Router::new()
+            .route("/:name/content", get(content))
+            .route("/:name/content/:game/:version", delete(remove))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let admin = AccountId("ad".repeat(16));
+        let user = AccountId("bb".repeat(16));
+        let mut c = config();
+        c.admins = vec![admin.0.clone()];
+        let base = format!("http://{addr}");
+        let node = |name: &str| {
+            let mut n = c.nodes[0].clone();
+            n.name = name.to_string();
+            n.api = format!("{base}/{name}");
+            n
+        };
+        c.nodes = vec![node("a"), node("b"), node("c")];
+        let h = Hosting::new(c);
+
+        assert!(h.admin_remove_game_copy(&user, "team-fortress-2", "app232250", None).await.unwrap_err().to_string().starts_with("only an admin"));
+        assert!(h.admin_remove_game_copy(&admin, "team-fortress-2", "../x", None).await.is_err());
+        assert_eq!(h.admin_remove_game_copy(&admin, "team-fortress-2", "app232250", Some("zz")).await.unwrap_err().to_string(), "no such worker");
+        assert!(hits.lock().unwrap().is_empty(), "something was removed by a refused request");
+
+        let one = h.admin_remove_game_copy(&admin, "team-fortress-2", "app232250", Some("a")).await.unwrap();
+        assert_eq!(one[0]["outcome"], "removed");
+        assert_eq!(*hits.lock().unwrap(), vec!["delete a team-fortress-2 app232250"]);
+
+        let all = h.admin_remove_game_copy(&admin, "team-fortress-2", "app232250", None).await.unwrap();
+        let outcome = |name: &str| all.iter().find(|r| r["node"] == name).map(|r| r["outcome"].as_str().unwrap_or("").to_string());
+        assert_eq!(outcome("a").as_deref(), Some("removed"));
+        assert_eq!(outcome("b").as_deref(), Some("refused"), "a worker with a server on the copy is refused");
+        assert_eq!(all.iter().find(|r| r["node"] == "b").unwrap()["servers"], serde_json::json!(["tf-1"]));
+        assert_eq!(outcome("c").as_deref(), Some("not installed here"));
+        assert!(hits.lock().unwrap().contains(&"delete b team-fortress-2 app232250".to_string()), "the in-use copy was asked for; the worker refused it");
     }
 
     /// A policy that shares a server with a second account lets that account

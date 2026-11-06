@@ -282,14 +282,21 @@ pub struct NodeReq {
 }
 
 /// Whether a request about the node may cross: the games it can run, the
-/// copies it has installed, and one game's install (read, start the
-/// configured version, cancel). A start
+/// copies it has installed, one game's install (read, start the configured
+/// version, cancel), and removing one installed copy of a game (`DELETE
+/// content/<game>/<version>`, refused by the node while a server uses it). A start
 /// carries no body, so never an update, a file check or another version.
 pub fn node_route(method: &str, path: &str) -> bool {
     match (method, path.split('/').collect::<Vec<_>>().as_slice()) {
         ("GET", ["games"] | ["content"]) => true,
         ("GET" | "POST" | "DELETE", ["content", game]) => {
             game.len() <= 64 && game_bridge::pack::id_is_file_safe(game)
+        }
+        ("DELETE", ["content", game, version]) => {
+            game.len() <= 64
+                && game_bridge::pack::id_is_file_safe(game)
+                && version.len() <= 64
+                && game_bridge::pack::id_is_file_safe(version)
         }
         _ => false,
     }
@@ -666,10 +673,10 @@ mod tests {
 
     #[test]
     fn only_a_games_install_and_the_game_list_cross_about_a_node() {
-        for (m, p) in [("GET", "games"), ("GET", "content"), ("GET", "content/team-fortress-2"), ("POST", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2")] {
+        for (m, p) in [("GET", "games"), ("GET", "content"), ("GET", "content/team-fortress-2"), ("POST", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2"), ("DELETE", "content/team-fortress-2/app440")] {
             assert!(node_route(m, p), "{m} {p}");
         }
-        for (m, p) in [("DELETE", "content"), ("DELETE", "content/tf/app1"), ("POST", "content/tf/app1/use"), ("POST", "content/../x"),
+        for (m, p) in [("DELETE", "content"), ("DELETE", "content/tf/app1/extra"), ("POST", "content/tf/app1"), ("POST", "content/tf/app1/use"), ("POST", "content/../x"),
             ("POST", "content/.hidden"), ("POST", "packs"), ("DELETE", "packs/tf"), ("PUT", "updates/settings"), ("POST", "orphans/clean"),
             ("GET", "interfaces"), ("PUT", "games"), ("POST", "content/a/b")] {
             assert!(!node_route(m, p), "{m} {p} must never cross");
