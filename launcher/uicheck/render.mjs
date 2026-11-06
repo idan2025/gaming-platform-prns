@@ -2252,6 +2252,67 @@ await run('on Android a joined server can be left from the detail pane', {
   w.close();
 }
 
+// Through a controller, an admin of the index installs a game the controller
+// does not offer yet on the workers, and watches the download; a LAN game with
+// no server says it is played in a room, and offers no install.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' }, '/capacity': { max_instances: 4, running: 0 },
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 }, '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 }, '/content': { copies: [], downloads: [] },
+    '/games': [
+      { id: 'sven-coop', display_name: 'Sven Co-op', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0 },
+      { id: 'team-fortress-2', display_name: 'Team Fortress 2', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 1 },
+      { id: 'nfs-underground-2', display_name: 'Need for Speed: Underground 2', runnable: false, lan: true, transport: 'udp', default_port: 9900, extra_ports: 0, reason: 'no [games.nfs-underground-2] section' },
+    ],
+    '/controller/status': { enabled: true, url: 'https://index.test' },
+    '/controller/hosting': { games: ['sven-coop'], regions: [] },
+    '/controller/admin/region-requests': [],
+    '/controller/instances': [],
+    '/controller/admin/games/team-fortress-2': { game_id: 'team-fortress-2', offered: true, from_file: false,
+      nodes: [{ node: 'eu-1', status: { state: 'running', since_secs: 9, bytes: 3e9 }, copies: [] }] },
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+  w.confirm = () => true;
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ method: opts.method, path: route });
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' },
+        json: async () => ({ game_id: 'team-fortress-2', offered: true, nodes: [{ node: 'eu-1', outcome: 'installing' }] }), text: async () => '{}' };
+    }
+    const body = routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
+      headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs);
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  const d = w.document;
+  const card = (id) => d.querySelector('.game-card[data-game-id="' + id + '"]');
+  const tf = card('team-fortress-2'), nfs = card('nfs-underground-2');
+  const btnIn = (c, t) => c && [...c.querySelectorAll('button')].find(b => b.textContent.includes(t));
+  check('an admin of the index can install a game the controller does not offer', !!btnIn(tf, 'Install on the workers'));
+  check('a LAN game with no server says it is played in a room', nfs && /played in a LAN room/.test(nfs.textContent) && !btnIn(nfs, 'Install on the workers'), nfs && nfs.textContent);
+  btnIn(tf, 'Install on the workers').click();
+  await settle();
+  await settle();
+  check('Install on the workers asks the controller', posts.some(p => p.method === 'POST' && p.path === '/controller/admin/games/team-fortress-2/install'), JSON.stringify(posts));
+  const dlg = d.getElementById('workers-files-dialog');
+  check('the download shows per worker', dlg && /eu-1/.test(dlg.textContent) && /downloading, 2\.8 GB so far|downloading, 3\.0 GB so far|downloading/.test(dlg.textContent), dlg && dlg.textContent);
+  check('an offered game an admin offered can be withdrawn', dlg && [...dlg.querySelectorAll('button')].some(b => b.textContent === 'Stop offering' && !b.hidden));
+  w.close();
+}
+
 // Lanthorn Host through a controller: maps are picked from a menu of what a
 // worker has, a running server's map changes through the controller, and the
 // log reads as text, not as the index's JSON.

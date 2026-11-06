@@ -383,6 +383,14 @@ pub fn allowed_path(method: &Method, rest: &str) -> Option<String> {
             Some(format!("/admin/admins/{identity}"))
         }
         ["admin", "workers"] if *method == Method::GET && no_query() => Some("/admin/workers".into()),
+        // An admin installing a game on the workers and offering it, and
+        // watching the download. The index checks who is admin.
+        ["admin", "games", game] if valid_game(game) && no_query() && matches!(*method, Method::GET | Method::DELETE) => {
+            Some(format!("/admin/games/{game}"))
+        }
+        ["admin", "games", game, "install"] if valid_game(game) && no_query() && *method == Method::POST => {
+            Some(format!("/admin/games/{game}/install"))
+        }
         ["instances"] => match *method {
             Method::GET | Method::POST if no_query() => Some("/instances".into()),
             _ => None,

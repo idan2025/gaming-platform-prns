@@ -399,6 +399,10 @@ pub struct Hosting {
     requests: crate::regions::RegionRequests,
     /// Admins granted here (beyond the hosting file's), and requests to be one.
     admin_store: crate::admins::AdminStore,
+    /// Games an admin offers beyond the hosting file's (`offered.rs`).
+    offered: crate::offered::OfferedGames,
+    /// The hosting file's own `games`, before the offered ones are added.
+    file_games: std::sync::RwLock<Vec<String>>,
     /// Who may see and run a server beyond its owner (`access.rs`).
     access: Arc<dyn crate::access::Access>,
 }
@@ -470,6 +474,7 @@ pub struct MoveWorker {
 
 impl Hosting {
     pub fn new(config: HostingConfig) -> Self {
+        let file_games = config.games.clone();
         Self {
             config: std::sync::RwLock::new(Arc::new(config)),
             http: reqwest::Client::builder()
@@ -482,6 +487,8 @@ impl Hosting {
             moving: Default::default(),
             requests: Default::default(),
             admin_store: Default::default(),
+            offered: Default::default(),
+            file_games: std::sync::RwLock::new(file_games),
             access: crate::access::owner_only(),
         }
     }
@@ -508,8 +515,21 @@ impl Hosting {
     /// listed; the servers on it keep running, since only its operator
     /// stops them. Ownership needs nothing carried over: it lives on the
     /// nodes' containers.
-    pub fn reload(&self, config: HostingConfig) {
+    pub fn reload(&self, mut config: HostingConfig) {
+        *self.file_games.write().unwrap_or_else(|e| e.into_inner()) = config.games.clone();
+        for g in self.offered.game_ids() {
+            if !config.games.contains(&g) {
+                config.games.push(g);
+            }
+        }
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+    }
+
+    /// The configuration again, with the offered games as they are now.
+    fn reapply_offered(&self) {
+        let mut config = (*self.config()).clone();
+        config.games = self.file_games.read().unwrap_or_else(|e| e.into_inner()).clone();
+        self.reload(config);
     }
 
     /// Read and parse a hosting config file. A file that does not parse is an
@@ -1085,6 +1105,138 @@ impl Hosting {
         let status = response.status().as_u16();
         let text = response.text().await.context("reading the node's answer")?;
         Ok(owner_reply(&req, status, text))
+    }
+
+    fn games_admin(&self, account: &AccountId) -> Result<()> {
+        if self.is_admin(account) {
+            Ok(())
+        } else {
+            Err(anyhow!("only an admin of this index can install or offer games"))
+        }
+    }
+
+    /// One request about a node itself (`uplink_wire::node_route`).
+    async fn node_call(&self, node: &NodeConfig, method: &str, path: &str) -> Result<platform_agent::uplink_wire::OwnerResp> {
+        use platform_agent::uplink_wire::{node_route, NodeReq, OwnerResp};
+        if !node_route(method, path) {
+            return Err(anyhow!("not carried"));
+        }
+        if let Some(dest) = Self::agent_dest(node) {
+            let dest = dest?;
+            let client =
+                self.agent_client().await.ok_or_else(|| anyhow!("node {} is remote but this index has no uplink", node.name))?;
+            let req = NodeReq { token: String::new(), method: method.to_string(), path: path.to_string() };
+            return match client.node_call(dest, req).await {
+                Err(e) if format!("{e:#}").contains("unknown op") => {
+                    Err(anyhow!("node {} runs an agent too old for this; update it", node.name))
+                }
+                other => other.with_context(|| format!("asking agent {}", node.name)),
+            };
+        }
+        let url = format!("{}/{}", node.api.trim_end_matches('/'), path);
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| anyhow!("not carried"))?;
+        let response = self.http.request(method, &url).send().await.context("asking the node")?;
+        let status = response.status().as_u16();
+        let body = response.text().await.context("reading the node's answer")?;
+        Ok(OwnerResp { status, body })
+    }
+
+    /// Whether a node is set up to run a game (`[games.<id>]` in its config),
+    /// by its own `/games`.
+    async fn node_runs(&self, node: &NodeConfig, game_id: &str) -> Result<bool> {
+        let reply = self.node_call(node, "GET", "games").await?;
+        if reply.status != 200 {
+            return Err(anyhow!("node {} did not list its games ({})", node.name, reply.status));
+        }
+        let games: serde_json::Value = serde_json::from_str(&reply.body).context("reading the node's games")?;
+        Ok(games.as_array().is_some_and(|l| l.iter().any(|g| g["id"] == game_id && g["runnable"] == true)))
+    }
+
+    /// An admin installs a game's files on every worker set up to run it, and
+    /// the index offers it from then on (`offered.rs`; the hosting file is
+    /// never written). Each worker downloads its configured version, held to
+    /// its own disk reserve; what each said is returned. Refused when no
+    /// worker that answered can run the game, so nothing is offered that
+    /// no worker could start.
+    pub async fn admin_install_game(&self, admin: &AccountId, game_id: &str, now: SystemTime) -> Result<Vec<serde_json::Value>> {
+        self.games_admin(admin)?;
+        if game_id.len() > 64 || !game_bridge::pack::id_is_file_safe(game_id) {
+            return Err(anyhow!("that is not a game id"));
+        }
+        let mut out = Vec::new();
+        let mut any = false;
+        for node in self.config().nodes.iter() {
+            match self.node_runs(node, game_id).await {
+                Ok(false) => out.push(serde_json::json!({ "node": node.name, "outcome": "not set up to run it" })),
+                Err(e) => out.push(serde_json::json!({ "node": node.name, "outcome": "did not answer", "error": format!("{e:#}") })),
+                Ok(true) => {
+                    any = true;
+                    match self.node_call(node, "POST", &format!("content/{game_id}")).await {
+                        Ok(r) if (200..300).contains(&r.status) => out.push(serde_json::json!({ "node": node.name, "outcome": "installing", "reply": serde_json::from_str::<serde_json::Value>(&r.body).unwrap_or_default() })),
+                        Ok(r) => out.push(serde_json::json!({ "node": node.name, "outcome": "refused", "error": serde_json::from_str::<serde_json::Value>(&r.body).ok().and_then(|v| v["error"].as_str().map(str::to_string)).unwrap_or(r.body) })),
+                        Err(e) => out.push(serde_json::json!({ "node": node.name, "outcome": "did not answer", "error": format!("{e:#}") })),
+                    }
+                }
+            }
+        }
+        if !any {
+            return Err(anyhow!("no worker that answered is set up to run {game_id}: its config needs a [games.{game_id}] section"));
+        }
+        self.offered.offer(game_id, &admin.0, unix(now))?;
+        self.reapply_offered();
+        tracing::info!(admin = %admin.0, game = %game_id, "an admin installed and offered a game");
+        Ok(out)
+    }
+
+    /// Where a game's files stand on each worker: its installed copies and its
+    /// download, for an admin watching an install.
+    pub async fn admin_game_status(&self, admin: &AccountId, game_id: &str) -> Result<serde_json::Value> {
+        self.games_admin(admin)?;
+        if game_id.len() > 64 || !game_bridge::pack::id_is_file_safe(game_id) {
+            return Err(anyhow!("that is not a game id"));
+        }
+        let mut nodes = Vec::new();
+        for node in self.config().nodes.iter() {
+            let install = self.node_call(node, "GET", &format!("content/{game_id}")).await;
+            let content = self.node_call(node, "GET", "content").await;
+            let copies: Vec<serde_json::Value> = content
+                .ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .and_then(|v| v["copies"].as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c["game_id"] == game_id)
+                .collect();
+            nodes.push(match install {
+                Ok(r) => serde_json::json!({
+                    "node": node.name,
+                    "status": serde_json::from_str::<serde_json::Value>(&r.body).ok().map(|v| v["status"].clone()),
+                    "copies": copies,
+                }),
+                Err(e) => serde_json::json!({ "node": node.name, "error": format!("{e:#}") }),
+            });
+        }
+        let config = self.config();
+        Ok(serde_json::json!({
+            "game_id": game_id,
+            "offered": config.hosts_game(game_id),
+            "from_file": self.file_games.read().unwrap_or_else(|e| e.into_inner()).iter().any(|g| g == game_id),
+            "nodes": nodes,
+        }))
+    }
+
+    /// An admin stops offering a game they offered. A game the hosting file
+    /// lists is the file's. Servers that exist keep running, and the files stay.
+    pub fn admin_withdraw_game(&self, admin: &AccountId, game_id: &str) -> Result<()> {
+        self.games_admin(admin)?;
+        if self.file_games.read().unwrap_or_else(|e| e.into_inner()).iter().any(|g| g == game_id) {
+            return Err(anyhow!("{game_id} is in the hosting file's games; change it there"));
+        }
+        if !self.offered.withdraw(game_id)? {
+            return Err(anyhow!("{game_id} is not offered here"));
+        }
+        self.reapply_offered();
+        Ok(())
     }
 
     /// The maps a hosted game has, from the first node that answers with any:
@@ -1697,6 +1849,8 @@ impl Hosting {
     pub fn keep_state_beside(mut self, hosting_file: &std::path::Path) -> Result<Self> {
         self.requests = crate::regions::RegionRequests::load(&hosting_file.with_file_name("region-requests.json"))?;
         self.admin_store = crate::admins::AdminStore::load(&hosting_file.with_file_name("index-admins.json"))?;
+        self.offered = crate::offered::OfferedGames::load(&hosting_file.with_file_name("index-offered-games.json"))?;
+        self.reapply_offered();
         Ok(self)
     }
 
@@ -3266,6 +3420,80 @@ mod tests {
         let mine = h.owner_call(&owner, "srv", "GET", "restart-schedule", None, None).await.unwrap();
         assert_eq!(mine.body, r#"{"srv":{"start_utc":4}}"#, "another server's schedule left the node");
         assert_eq!(*hits.lock().unwrap(), vec!["players srv", "chat srv since=7", "announce srv", "schedules"]);
+    }
+
+    /// An admin installs a game on the workers set up to run it and the index
+    /// offers it, kept beside the hosting file and kept over a reload of it.
+    /// Nobody else can; a game no worker can run is refused and not offered;
+    /// a game the file lists is the file's to withdraw.
+    #[tokio::test]
+    async fn an_admin_installs_a_game_on_the_workers_and_the_index_offers_it() {
+        use axum::extract::{Path, State};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        type Hits = Arc<std::sync::Mutex<Vec<String>>>;
+        async fn games() -> Json<serde_json::Value> {
+            Json(serde_json::json!([
+                {"id": "team-fortress-2", "runnable": true},
+                {"id": "nfs-underground-2", "runnable": false, "reason": "no [games.nfs-underground-2] section"},
+            ]))
+        }
+        async fn install(State(h): State<Hits>, Path(g): Path<String>) -> Json<serde_json::Value> {
+            h.lock().unwrap().push(format!("install {g}"));
+            Json(serde_json::json!({"game": g, "started": true}))
+        }
+        async fn status(Path(g): Path<String>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({"game": g, "status": {"state": "running", "since_secs": 5, "bytes": 1000}}))
+        }
+        async fn content() -> Json<serde_json::Value> {
+            Json(serde_json::json!({"copies": [{"game_id": "sven-coop", "version": "5.26"}], "downloads": []}))
+        }
+        let hits: Hits = Default::default();
+        let app = Router::new()
+            .route("/games", get(games))
+            .route("/content", get(content))
+            .route("/content/:game", post(install).get(status))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hosting.toml");
+        let admin = AccountId("ad".repeat(16));
+        let user = AccountId("bb".repeat(16));
+        let mut c = one_node_at(addr);
+        c.admins = vec![admin.0.clone()];
+        let h = Hosting::new(c.clone()).keep_state_beside(&file).unwrap();
+        let now = std::time::SystemTime::now();
+
+        assert!(h.admin_install_game(&user, "team-fortress-2", now).await.unwrap_err().to_string().starts_with("only an admin"));
+        assert!(h.admin_install_game(&admin, "../x", now).await.is_err());
+        let none = h.admin_install_game(&admin, "nfs-underground-2", now).await.unwrap_err().to_string();
+        assert!(none.contains("no worker that answered is set up to run"), "{none}");
+        assert!(!h.config().hosts_game("nfs-underground-2"), "a game no worker can run is not offered");
+        assert!(hits.lock().unwrap().is_empty());
+
+        let nodes = h.admin_install_game(&admin, "team-fortress-2", now).await.unwrap();
+        assert_eq!(nodes[0]["outcome"], "installing");
+        assert_eq!(*hits.lock().unwrap(), vec!["install team-fortress-2"]);
+        assert!(h.config().hosts_game("team-fortress-2"), "offered at once");
+        let st = h.admin_game_status(&admin, "team-fortress-2").await.unwrap();
+        assert_eq!((st["offered"].as_bool(), st["from_file"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(st["nodes"][0]["status"]["state"], "running");
+        assert!(h.admin_game_status(&user, "team-fortress-2").await.is_err());
+
+        // A reload of the file keeps the offer, and a restart reads it back.
+        h.reload(c.clone());
+        assert!(h.config().hosts_game("team-fortress-2") && h.config().hosts_game("sven-coop"));
+        let again = Hosting::new(c.clone()).keep_state_beside(&file).unwrap();
+        assert!(again.config().hosts_game("team-fortress-2"));
+
+        assert!(h.admin_withdraw_game(&admin, "sven-coop").unwrap_err().to_string().contains("hosting file"));
+        assert!(h.admin_withdraw_game(&user, "team-fortress-2").is_err());
+        h.admin_withdraw_game(&admin, "team-fortress-2").unwrap();
+        assert!(!h.config().hosts_game("team-fortress-2") && h.config().hosts_game("sven-coop"));
     }
 
     /// A policy that shares a server with a second account lets that account

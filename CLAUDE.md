@@ -831,6 +831,17 @@ identity, spec and deltas never cross: free text never reaches a console line.
 Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`,
 `the_owners_tools_are_a_closed_list_and_the_console_is_not_on_it` and
 `an_owners_tools_reach_the_node_and_nothing_else_does`.
+**An index admin installs a game on the workers from the page** (2026-11-06,
+`OP_NODE`, `uplink_wire::node_route`, `Hosting::admin_install_game`): every
+worker set up to run it (`[games.<id>]`, its own `/games`) downloads its
+configured version, held to its disk reserve, and the index offers the game
+from `index-offered-games.json` beside the hosting file, **never writing the
+hosting file**; a game the file lists is withdrawn only there. A game no
+worker that answered can run is refused and not offered. About a node only
+the game list, the copies list and one game's install (start, read, cancel)
+cross: never its packs, settings, updates or deletes. Caught by
+`only_a_games_install_and_the_game_list_cross_about_a_node` and
+`an_admin_installs_a_game_on_the_workers_and_the_index_offers_it`.
 
 **A server can restart daily in a window** (2026-10-14, `schedule.rs`,
 `Agent::scheduled_restarts`, "Daily restart…" in a server's menu). Once a
