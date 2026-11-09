@@ -11,7 +11,8 @@
 //! - **The launcher never elevates itself.** On Linux the helper holds a file
 //!   capability the player granted once (`grant_lan_helper` asks through
 //!   `pkexec`, which is the opt-in); on Windows the helper asks for
-//!   administrator rights when a room starts. Nothing here runs privileged.
+//!   administrator rights when a room starts, and on macOS the system's
+//!   administrator prompt starts it. Nothing here runs privileged.
 //! - **A game without a `[lan]` block gets no room**, and a room row is never
 //!   offered as an ordinary join: its destination speaks the room protocol,
 //!   not a game's datagrams.
@@ -82,7 +83,7 @@ pub struct LanHelperView {
     /// How the helper gets its privilege when a room starts:
     /// `"granted"` (Linux, permission granted once — no prompt),
     /// `"per-room"` (Linux, a password prompt each room, nothing installed),
-    /// `"prompt"` (Windows' elevation prompt), or `"none"`.
+    /// `"prompt"` (Windows' elevation prompt, macOS's administrator prompt), or `"none"`.
     pub mode: String,
     /// The launcher can grant the permission once, so rooms stop prompting
     /// (Linux, installed — never portable or AppImage).
@@ -431,6 +432,7 @@ fn on_path(program: &str) -> bool {
 pub(crate) struct HelperFacts {
     pub supported: bool,
     pub windows: bool,
+    pub macos: bool,
     pub path: Option<PathBuf>,
     pub exists: bool,
     /// The helper's own `check`: its capability on Linux, Wintun on Windows.
@@ -462,7 +464,8 @@ pub(crate) fn helper_view(f: HelperFacts) -> LanHelperView {
             "none",
             false,
             false,
-            "LAN rooms need a room adapter, which this platform does not have yet (Linux and Windows do)."
+            "LAN rooms need a room adapter, which this platform does not have yet (Linux, macOS and \
+             Windows do)."
                 .to_string(),
         );
     }
@@ -478,6 +481,20 @@ pub(crate) fn helper_view(f: HelperFacts) -> LanHelperView {
         );
     }
     let check_ok = matches!(f.check, Some(Ok(())));
+    // macOS: only root opens a `utun`, and the helper is started as root through
+    // the system's administrator prompt every room. Nothing to grant or revoke;
+    // `check` says only that this process is not root, which is no problem.
+    if f.macos {
+        return view(
+            true,
+            "prompt",
+            false,
+            false,
+            "Ready. macOS asks for your password when a room starts, for the helper only; the room's \
+             network interface goes when the room ends."
+                .to_string(),
+        );
+    }
     if f.windows {
         return if check_ok {
             view(
@@ -579,10 +596,11 @@ impl Launcher {
         tokio::task::spawn_blocking(move || {
             let path = helper_path();
             let exists = path.as_ref().is_some_and(|p| p.is_file());
-            let supported = cfg!(any(target_os = "linux", windows));
+            let supported = cfg!(any(target_os = "linux", target_os = "macos", windows));
             helper_view(HelperFacts {
                 supported,
                 windows: cfg!(windows),
+                macos: cfg!(target_os = "macos"),
                 check: (supported && exists).then(|| run_check(path.as_ref().expect("exists"))),
                 path,
                 exists,
@@ -743,7 +761,7 @@ impl Launcher {
     }
 
     async fn run_helper_elevated(&self, args: Vec<String>, in_place: bool) -> Result<String> {
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             let path = helper_path()
                 .filter(|p| p.is_file())
@@ -754,7 +772,7 @@ impl Launcher {
             .await?
             .map_err(|e| anyhow!("{e}"))
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = (args, in_place);
             Err(anyhow!("LAN rooms are not built for this platform yet"))
@@ -1199,7 +1217,7 @@ enum RoomRequest {
     Join { hash: String, game_id: String },
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn spawn_room(
     session: Arc<LanSession>,
     policy: game_bridge::lan_filter::LanPolicy,
@@ -1221,7 +1239,7 @@ fn spawn_room(
     ))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn spawn_room(
     _session: Arc<LanSession>,
     _policy: game_bridge::lan_filter::LanPolicy,
@@ -1323,6 +1341,7 @@ mod tests {
         HelperFacts {
             supported: true,
             windows: false,
+            macos: false,
             path: Some(PathBuf::from("/usr/bin/lan-helper")),
             exists: true,
             check: Some(Err("no CAP_NET_ADMIN".into())),
@@ -1521,6 +1540,23 @@ mod tests {
         assert!(p.detail.contains("driver is removed"));
         let no_dll = helper_view(HelperFacts { check: Some(Err("no wintun.dll".into())), ..win });
         assert!(!no_dll.ready && no_dll.detail.contains("wintun.dll"));
+    }
+
+    #[test]
+    fn macos_asks_for_the_password_at_room_start_and_has_nothing_to_grant() {
+        // `check` fails for a launcher that is not root, which is how it runs.
+        let mac = HelperFacts {
+            macos: true,
+            check: Some(Err("not root".into())),
+            pkexec: false,
+            setcap: false,
+            ..facts()
+        };
+        let v = helper_view(mac.clone());
+        assert!(v.ready && v.mode == "prompt" && !v.can_grant && !v.can_revoke);
+        assert!(v.detail.contains("password"));
+        // The helper must still be beside the launcher.
+        assert!(!helper_view(HelperFacts { exists: false, ..mac }).ready);
     }
 
     #[test]

@@ -209,6 +209,11 @@ pub fn detect() -> LocalFirewall {
     }
     #[cfg(not(windows))]
     {
+        // macOS has no ufw or firewalld to read, and its application firewall
+        // is per program, not per interface: nothing here opens it.
+        if cfg!(target_os = "macos") {
+            return LocalFirewall::Unknown;
+        }
         let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
         if ufw_refuses_incoming(&read("/etc/ufw/ufw.conf"), &read("/etc/default/ufw")) {
             return LocalFirewall::Ufw;

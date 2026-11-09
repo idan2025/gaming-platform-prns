@@ -699,7 +699,7 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
 }
 
 /// This machine's IPv4 addresses with their networks, every interface's.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn local_networks() -> Vec<LocalNetwork> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -763,7 +763,7 @@ pub fn local_networks() -> Vec<LocalNetwork> {
 }
 
 /// No room adapter on any other system.
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn local_networks() -> Vec<LocalNetwork> {
     Vec::new()
 }

@@ -422,7 +422,7 @@ fn run_lan(role: &str, rest: &[String]) -> Result<()> {
     })
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 async fn run_lan_adapter(
     session: std::sync::Arc<game_bridge::lan_session::LanSession>,
     policy: game_bridge::lan_filter::LanPolicy,
@@ -454,7 +454,7 @@ async fn run_lan_adapter(
 
 /// `--check`: run the room check (`lan_check.rs`) each time the room's members
 /// change while the adapter is up, and print what it found.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 async fn check_room_on_change(
     session: std::sync::Arc<game_bridge::lan_session::LanSession>,
     policy: game_bridge::lan_filter::LanPolicy,
@@ -486,7 +486,7 @@ async fn check_room_on_change(
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 async fn run_lan_adapter(
     _session: std::sync::Arc<game_bridge::lan_session::LanSession>,
     _policy: game_bridge::lan_filter::LanPolicy,

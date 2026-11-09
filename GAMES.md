@@ -475,7 +475,7 @@ server fetches anonymously where the list says steamcmd.
 
 Games that only find each other by LAN broadcast, the Hamachi and Tunngle
 catalogue. **The platform half is shipped (v0.2.20, `PLAN.md` §14)**: rooms in
-the launcher, on Linux and Windows, portable or installed, leaving nothing
+the launcher, on Linux, macOS and Windows, portable or installed, leaving nothing
 behind. Each game now needs only a pack with a `[lan]` block, and what makes
 one hard is knowing its ports and testing it with people.
 

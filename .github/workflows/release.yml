@@ -113,10 +113,8 @@ jobs:
           mkdir -p "dist/$name"
           out="target/${{ matrix.target }}/release"
           cp "$out/game-bridge" "$out/platform-agent" "$out/platform-index" "dist/$name/"
-          # Mode 3's privileged half (PLAN.md §14). Linux only: macOS has no
-          # room adapter yet, and a helper that can only say so is not worth
-          # shipping.
-          if [ "$(uname -s)" = Linux ]; then cp "$out/lan-helper" "dist/$name/"; fi
+          # Mode 3's privileged half (PLAN.md §14), on Linux and macOS.
+          cp "$out/lan-helper" "dist/$name/"
           cp -r packs "dist/$name/packs"
           cp README.md RELEASE.md ENGINE.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
@@ -244,13 +242,13 @@ jobs:
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      # lan-helper as a sidecar on Linux and Windows, and wintun.dll beside it
-      # on Windows (tauri.linux.conf.json, tauri.windows.conf.json). The
-      # universal macOS bundle carries neither: no room adapter there yet.
+      # lan-helper as a sidecar on Linux, Windows and macOS, and wintun.dll
+      # beside it on Windows (tauri.linux.conf.json, tauri.windows.conf.json,
+      # tauri.macos.conf.json). The universal macOS bundle gets a universal
+      # helper (`lipo` of both architectures).
       - name: Stage the LAN helper
-        if: runner.os != 'macOS'
         shell: bash
-        run: scripts/stage-lan-helper.sh --release
+        run: scripts/stage-lan-helper.sh --release ${{ runner.os == 'macOS' && '--target universal-apple-darwin' || '' }}
 
       - name: Stage Wintun
         if: runner.os == 'Windows'

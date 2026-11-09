@@ -1381,9 +1381,10 @@ an unprivileged binary; only a player who turns LAN on installs the helper.
      opt-in moment; otherwise it shows the command. An AppImage cannot hold a
      file capability (its mount is `nosuid`), so there it says to install the
      `.deb` or `.rpm` instead of offering a grant that would change nothing.
-   - **The helper ships in the bundle.** `tauri.linux.conf.json` and
-     `tauri.windows.conf.json` add it as a sidecar, and Windows' adds
-     `wintun.dll` and its license beside it; macOS carries neither.
+   - **The helper ships in the bundle.** `tauri.linux.conf.json`,
+     `tauri.windows.conf.json` and `tauri.macos.conf.json` add it as a sidecar,
+     and Windows' adds `wintun.dll` and its license beside it. The universal
+     macOS bundle carries a universal helper (`lipo` of both architectures).
      `scripts/stage-lan-helper.sh` and `scripts/fetch-wintun.ps1` stage them,
      and CI's launcher job runs them — the shell's build script refuses to
      start without them, so a bundle config naming a missing file fails CI.
@@ -1497,7 +1498,9 @@ games CI cannot run. Open beyond them, none started:
   certificate is a purchase and the owner's call.
 - **Direct member-to-member links**, a latency optimization: every packet
   passes through the room's host today. Measure with a real game first.
-- **macOS rooms** (`utun`), not planned yet.
+- **macOS rooms** (`utun`) are built (`lan_adapter/macos.rs`, §14.5). Not yet
+  played by a person on a real Mac; CI's `lan-macos` job and a macOS 15 VM
+  have run the adapter, the limited broadcast and the helper's teardown.
 - **The real `pkexec` prompt and a Windows portable room through the UI** are
   each covered in parts but have not been seen whole; the NFS session is the
   first time a person will.
@@ -1512,6 +1515,40 @@ prerequisite for anything but LAN rooms. A game that can join by `host:port`
 uses Mode 1 or 2 even if it also has a LAN mode. Mode 4 — traffic addressed to a
 publisher's relay (Steam networking, EOS P2P) — stays impossible, and a game
 that is only reachable that way is listed as such rather than attempted.
+
+### 14.5 macOS rooms (2026-11-09)
+
+The third adapter, so a Mac is a full member of a room: `lan_adapter/macos.rs`,
+the same relay shape as Windows and Linux (the room, the filter and the pump
+are shared; only the adapter is per system). Rules a later change could quietly
+break:
+
+- **A `utun`, opened only by root, through the system's administrator prompt.**
+  The launcher never elevates itself: it asks `osascript … with administrator
+  privileges` to start `lan-helper serve`, which connects *out* with the
+  one-time token (`lan_relay.rs`). Nothing to grant or revoke, so the helper
+  view's mode is `"prompt"`, as on Windows.
+- **The kernel names the interface (`utunN`).** The helper configures only the
+  `utun` it just made, read back from its own descriptor, and never an
+  interface name from its caller: `gbl*` stays the room's name for the launcher
+  and the firewall code. Caught by `the_adapter_gets_the_room_subnet_and_the_limited_broadcast_and_nothing_else`.
+- **Non-persistent by nature.** macOS removes a `utun` with the last descriptor
+  on its control socket, and the helper exits when its relay drops, so a quit, a
+  crash or `kill -9` of the launcher leaves nothing behind. Pinned by
+  `the_helper_and_its_utun_go_when_the_launcher_does` (`tests/lan_macos.rs`).
+- **Every packet carries a 4-byte address-family word**; only `AF_INET` is a
+  room's, anything else (the kernel's IPv6 chatter) is dropped.
+- **The helper runs `/sbin/ifconfig` and `/sbin/route`**, by absolute path,
+  only as root, with arguments built from a validated room address and subnet
+  and the interface it made. No default route, ever: the adapter gets its
+  subnet and the limited-broadcast host route that makes old games find each
+  other, and goes with the device.
+- **The admin prompt's command line is one shell word per argument**, single
+  quoted; a path with a quote, a backslash or a control character is refused,
+  never escaped.
+- **No firewall rule is written.** macOS's application firewall is per
+  program, not per interface; a game that asks to accept incoming connections
+  gets the system's own prompt. Nothing here opens it.
 
 ## 15. Roadmap
 
