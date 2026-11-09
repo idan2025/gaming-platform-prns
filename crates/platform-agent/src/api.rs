@@ -295,6 +295,8 @@ pub fn router_with(
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .route("/ext/ext.js", get(ui_ext_js))
+        .route("/ext/ext.css", get(ui_ext_css))
         .merge(open_routes)
         .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
         .with_state(state);
@@ -411,6 +413,29 @@ async fn ui_js() -> Response {
 
 async fn ui_css() -> Response {
     asset("text/css; charset=utf-8", UI_CSS)
+}
+
+/// The operator's page code (`config.ui_extension`). Outside the gate for the
+/// same reason as the page's own files: a script tag cannot send a token. Only
+/// these two fixed names are ever read, so no request names a path. Page code
+/// the build embedded comes first; then the folder; without either, or a file
+/// missing from the folder, the answer is an empty file.
+async fn ui_ext_js(State(state): State<ApiState>) -> Response {
+    ui_extension_file(&state, "ext.js", "text/javascript; charset=utf-8").await
+}
+
+async fn ui_ext_css(State(state): State<ApiState>) -> Response {
+    ui_extension_file(&state, "ext.css", "text/css; charset=utf-8").await
+}
+
+async fn ui_extension_file(state: &ApiState, name: &str, content_type: &'static str) -> Response {
+    let embedded = state.agent.ui_extension_embedded().map(|(js, css)| if name == "ext.js" { js } else { css });
+    let body = match (embedded, state.agent.ui_extension()) {
+        (Some(text), _) => text.as_bytes().to_vec(),
+        (None, Some(dir)) => tokio::fs::read(dir.join(name)).await.unwrap_or_default(),
+        (None, None) => Vec::new(),
+    };
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-store")], body).into_response()
 }
 
 /// Reject anything without the token, on every route, once a token exists.
@@ -1442,7 +1467,8 @@ async fn create(
                     "started": started,
                     "status": state.installs.state(&spec.game_id).await,
                     "message": "This game's files are not on this node yet, so the download \
-                                started. Your server will start once it finishes.",
+                                started. Send the same request again when it finishes; the server \
+                                is not created for you.",
                 })),
             ))
         }

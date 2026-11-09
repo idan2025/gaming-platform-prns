@@ -302,8 +302,12 @@ fn inside_a_user_namespace() {
     });
 
     let member_log = || std::fs::read_to_string(dir.join("member-bridge.log")).unwrap_or_default();
+    // The report is a heading and then its findings, each its own write:
+    // wait for a finding, or the heading alone can be read (seen on CI).
     wait_for("lan-join --check reports", Duration::from_secs(30), || {
-        member_log().contains("room check from").then_some(())
+        let log = member_log();
+        let (_, after) = log.split_once("room check from")?;
+        after.lines().nth(1).map(|_| ())
     });
     assert!(
         member_log().contains("The room works"),

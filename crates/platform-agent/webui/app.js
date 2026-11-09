@@ -1068,6 +1068,76 @@ function showMenu(x, y, items) {
   m.querySelector(".menu-item:not(:disabled)")?.focus({ preventScroll: true });
 }
 
+// ---------- extension point ----------
+//
+// The operator's own page code (`ext.js` and `ext.css`, beside this page; the
+// node serves them when it was given a folder: `ui_extension` in agent.toml)
+// adds tabs and server menu items through `window.LanthornUI`. It can only add
+// things to the page. Every right and every rule stays the node's (`user_may`
+// and the controller check every request again), and a function that throws is
+// reported and skipped, so a bad extension never takes the page down.
+const EXT_TAB_ID = /^[a-z][a-z0-9-]{0,31}$/;
+
+function extSafely(what, fn, fallback) {
+  try {
+    return fn();
+  } catch (e) {
+    console.error("extension: " + what + " failed", e);
+    return fallback;
+  }
+}
+
+function registerTab(opts) {
+  const id = opts && opts.id;
+  if (typeof id !== "string" || !EXT_TAB_ID.test(id)) throw new Error("a tab id is lowercase letters, digits and dashes");
+  if (TABS.includes(id) || EXT.tabs.some(t => t.id === id)) throw new Error("tab " + id + " already exists");
+  const nav = $("tab-servers").parentElement;
+  const button = el("button", "nav-item", null);
+  button.id = "tab-" + id;
+  button.type = "button";
+  button.setAttribute("role", "tab");
+  button.setAttribute("aria-selected", "false");
+  button.setAttribute("aria-controls", "tab-panel-" + id);
+  button.tabIndex = -1;
+  button.hidden = true;
+  button.append(el("span", null, String(opts.title || id)));
+  button.addEventListener("click", () => setActiveTab(id));
+  nav.append(button);
+  const panel = el("section", "tab-panel hidden", null);
+  panel.id = "tab-panel-" + id;
+  panel.setAttribute("role", "tabpanel");
+  panel.setAttribute("aria-labelledby", "tab-" + id);
+  $("tab-panel-servers").parentElement.append(panel);
+  EXT.tabs.push({ id, title: String(opts.title || id), render: typeof opts.render === "function" ? opts.render : null,
+    adminOnly: !!opts.adminOnly });
+  // The tab's own hidden state follows the role from here on (applyRole).
+  if (state.role) applyRole();
+}
+
+function registerServerAction(opts) {
+  if (!opts || typeof opts.label !== "string" || typeof opts.run !== "function") {
+    throw new Error("a server action needs a label and a run function");
+  }
+  EXT.actions.push({ label: opts.label, title: opts.title ? String(opts.title) : "",
+    enabled: typeof opts.enabled === "function" ? opts.enabled : null, run: opts.run });
+}
+
+function onRole(fn) {
+  if (typeof fn !== "function") throw new Error("onRole takes a function");
+  EXT.roles.push(fn);
+  if (state.role) extSafely("onRole", () => fn(state.role));
+}
+
+// What ext.js may use. Frozen, so an extension cannot swap a function out from
+// under the page or another extension.
+window.LanthornUI = Object.freeze({
+  registerTab,
+  registerServerAction,
+  onRole,
+  api: (method, path, body) => api(method, path, body),
+  currentRole: () => state.role,
+});
+
 function openInstanceMenu(id, x, y) {
   const inst = instById(id);
   if (!inst) return;
@@ -1125,6 +1195,11 @@ function openInstanceMenu(id, x, y) {
     items.push({ label: "Move to another worker…", icon: "restart",
       title: "Copy its files to the worker with the most room while it runs, then switch over. It keeps its mesh address.",
       action: () => onRelocate(id, inst.name) });
+  }
+  for (const a of EXT.actions) {
+    const enabled = extSafely("server action " + a.label, () => (a.enabled ? !!a.enabled(inst) : true), false);
+    items.push({ label: a.label, disabled: !enabled, title: a.title || "",
+      action: () => extSafely("server action " + a.label, () => a.run(inst)) });
   }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
@@ -1468,6 +1543,14 @@ function openAddGameDialog() {
       } finally { show.disabled = false; }
     });
     body.appendChild(form);
+    // The official repository is where a node takes its packs from by itself
+    // (`official.rs`), so it is where the dialog starts when no other one was
+    // used here before: the field is never left empty for the operator to fill.
+    if (!saved) {
+      api("GET", "/packs/official").then((o) => {
+        if (o && o.url && !repo.value) { repo.value = o.url; form.requestSubmit(); }
+      }).catch(() => {});
+    }
     const one = el("form", "advanced-wrap");
     one.autocomplete = "off";
     const url = field(one, "ag-url", "Or one pack's address", { type: "text", placeholder: "https://…/game.toml" });
@@ -3361,6 +3444,11 @@ function applyRole() {
     else t.hidden = !admin;
   }
   if (!admin && ["admin", "installed", "interfaces"].includes(state.activeTab)) setActiveTab("servers");
+  for (const t of EXT.tabs) {
+    const b = $("tab-" + t.id);
+    if (b) b.hidden = t.adminOnly && !admin;
+  }
+  for (const fn of EXT.roles) extSafely("onRole", () => fn(state.role));
   // The node's packs, its official-pack switch and the announce of this
   // node's own servers are an admin's (api::user_may).
   document.body.classList.toggle("role-user", !admin);
@@ -4887,10 +4975,14 @@ async function onDeleteUnused() {
 const TABS = ["servers", "games", "installed", "interfaces", "requests", "admin", "account"];
 const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests", admin: "Admin", account: "Account" };
 
+// Extension point: what ext.js registered (see LanthornUI, below).
+const EXT = { tabs: [], actions: [], roles: [] };
+function allTabs() { return TABS.concat(EXT.tabs.map(t => t.id)); }
+
 function setActiveTab(name) {
-  if (!TABS.includes(name)) name = "servers";
+  if (!allTabs().includes(name)) name = "servers";
   state.activeTab = name;
-  for (const t of TABS) {
+  for (const t of allTabs()) {
     const btn = $("tab-" + t);
     const on = t === name;
     btn.classList.toggle("active", on);
@@ -4899,7 +4991,8 @@ function setActiveTab(name) {
     btn.tabIndex = on ? 0 : -1;
     $("tab-panel-" + t).classList.toggle("hidden", !on);
   }
-  $("page-title").textContent = TITLES[name];
+  const extTab = EXT.tabs.find(t => t.id === name);
+  $("page-title").textContent = extTab ? extTab.title : TITLES[name];
   // Fetched on entry rather than polled: rare to change, never stale when
   // the operator is looking.
   if (name === "interfaces") loadInterfaces();
@@ -4909,6 +5002,7 @@ function setActiveTab(name) {
   if (name === "requests") loadRequests();
   if (name === "account") loadAccount();
   if (name === "admin") loadAdmin();
+  if (extTab && extTab.render) extSafely("tab " + name, () => extTab.render($("tab-panel-" + name)));
 }
 
 function renderAll() {
@@ -4981,7 +5075,7 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const t of TABS) $("tab-" + t).addEventListener("click", () => setActiveTab(t));
   // The tab pattern: arrows, Home and End move between the visible tabs.
   $("tab-servers").parentElement.addEventListener("keydown", (e) => {
-    const shown = TABS.filter((t) => !$("tab-" + t).hidden);
+    const shown = allTabs().filter((t) => !$("tab-" + t).hidden);
     const at = shown.indexOf(state.activeTab);
     let to = null;
     if (e.key === "ArrowRight" || e.key === "ArrowDown") to = shown[(at + 1) % shown.length];
