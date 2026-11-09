@@ -297,6 +297,12 @@ async fn a_download_shows_growing_bytes_and_a_cancel_leaves_nothing() {
     for _ in 0..40 {
         let st = get(addr, "/content/sven-coop").await;
         let status = &st["status"];
+        // A download is queued for a moment before its run takes the slot
+        // (seen on CI's ARM runner).
+        if status["state"] == "queued" {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
         assert_eq!(status["state"], "running", "{st}");
         assert!(status.get("total_bytes").is_none(), "an invented total: {st}");
         readings.push(status["bytes"].as_u64().unwrap());
