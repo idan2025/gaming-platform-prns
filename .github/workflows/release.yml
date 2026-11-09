@@ -47,7 +47,7 @@ jobs:
           # cross-linked binary nobody has run is not evidence of anything.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           # Intel macOS is **cross-built on an Apple Silicon runner**, which is
           # a different claim from the one the ARM Linux entry above refuses to
@@ -55,12 +55,15 @@ jobs:
           # retired label is not failed — it queues, forever. That is what left
           # every release run since v0.1.0 hanging with one job outstanding,
           # and why no release has ever carried an Intel-mac asset.
+          # `macos-14` went the same way in 2026-11, and that one fails at
+          # once ("The configuration 'macos-14-arm64-us-default' is not
+          # supported"); `macos-15` is the oldest macOS runner left.
           #
           # Cross-compiling here is honest because it is the same OS and the
           # same Apple SDK, which ships both architectures; nothing
           # third-party links this. It is still a binary nobody has run, so it
           # is a CLI target and not the launcher's.
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -177,8 +180,8 @@ jobs:
           # published both, and the universal dmg came out at 10.4 MB against
           # the native 5.3 MB. That size is the evidence it is genuinely a fat
           # binary and not a single-arch build wearing the name.
-          - os: macos-14
-            label: macos-14-universal
+          - os: macos-15
+            label: macos-15-universal
             args: "--target universal-apple-darwin"
             rust-targets: "x86_64-apple-darwin,aarch64-apple-darwin"
           - os: windows-latest
