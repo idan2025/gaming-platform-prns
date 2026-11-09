@@ -2252,6 +2252,55 @@ await run('on Android a joined server can be left from the detail pane', {
   w.close();
 }
 
+// Add a game starts on the official repository the node syncs from, so the
+// operator never has to find and paste its address; a repository used here
+// before still wins.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const OFFICIAL = 'https://idan2025.github.io/gaming-platform-prns/packs/index.json';
+  for (const saved of ['', 'https://packs.example/index.json']) {
+    const asked = [];
+    const routes = {
+      '/health': { ok: true, version: 'test' }, '/capacity': { max_instances: 4, running: 0 }, '/instances': [], '/games': [],
+      '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 }, '/usage': [],
+      '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 }, '/content': { copies: [], downloads: [] },
+      '/packs/official': { on: true, url: OFFICIAL },
+      '/packs/repository': { name: 'Lanthorn official packs', packs: [{ id: 'openttd', display_name: 'OpenTTD', signed: true, lan: true, status: 'available' }] },
+    };
+    const vc = new VirtualConsole();
+    vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+    const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+    const w = dom.window;
+    w.localStorage.setItem('agent_token', 'x');
+    if (saved) w.localStorage.setItem('lanthorn-host.repository', saved);
+    w.CSS = { escape: v => String(v) };
+    w.fetch = async (path) => {
+      asked.push(String(path));
+      const body = routes[String(path).split('?')[0]];
+      return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '', headers: { get: () => 'application/json' },
+        json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+    };
+    w.eval(nodeJs + '\n;window.__addGame = openAddGameDialog;');
+    w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+    await settle();
+    w.__addGame();
+    await settle();
+    await settle();
+    const d = w.document;
+    if (!saved) {
+      check('Add a game starts on the official repository', d.getElementById('ag-repo').value === OFFICIAL, d.getElementById('ag-repo').value);
+      check('and lists its games without a click',
+        asked.some(a => a.includes('/packs/repository?url=' + encodeURIComponent(OFFICIAL))) && /OpenTTD/.test(d.body.textContent), asked.join(' '));
+    } else {
+      check('a repository used before is kept over the official one', d.getElementById('ag-repo').value === saved
+        && !asked.some(a => a.includes('/packs/repository')), asked.join(' '));
+    }
+    w.close();
+  }
+}
+
 // Through a controller, an admin of the index installs a game the controller
 // does not offer yet on the workers, and watches the download; a LAN game with
 // no server says it is played in a room, and offers no install.
@@ -2379,7 +2428,7 @@ await run('on Android a joined server can be left from the detail pane', {
   // the menu offers them on a running server, and they go to the controller.
   w.__menu('s1', 10, 10);
   const menuItems = Object.fromEntries([...d.querySelectorAll('#ctx-menu .menu-item')].map(b => [b.textContent.trim(), b.disabled]));
-  for (const label of ['Players…', 'Chat…', 'Announce now', 'Daily restart…', 'Kick, ban and operators…']) {
+  for (const label of ['Change map…', 'Players…', 'Chat…', 'Announce now', 'Daily restart…', 'Kick, ban and operators…']) {
     check('through the controller the menu offers ' + label, menuItems[label] === false, JSON.stringify(menuItems));
   }
   d.getElementById('ctx-menu').hidden = true;
