@@ -5,7 +5,7 @@
 //! [`run_room_on_adapter`] is too: a platform supplies only how to bring an
 //! adapter up and open it, and how to take it away.
 //!
-//! On both, the elevated `lan-helper serve` holds the adapter for the session
+//! On all three, the elevated `lan-helper serve` holds the adapter for the session
 //! and relays its packets to the unprivileged launcher (`lan_relay.rs`), and
 //! the adapter is made so that it dies with the helper — which exits when the
 //! relay drops. **Nothing a room creates can outlive the launcher**, not on a
@@ -17,6 +17,9 @@
 //! - **Windows** (`windows.rs`): a Wintun adapter, which Wintun lets only an
 //!   administrator open. In portable mode the helper also removes the Wintun
 //!   driver again when the room ends.
+//! - **macOS** (`macos.rs`): a `utun` device, which only root can open. The
+//!   helper is started through macOS's own administrator prompt and holds the
+//!   device; the kernel removes it with the helper's last descriptor.
 //!
 //! # Rules a later change could quietly break
 //!
@@ -36,6 +39,11 @@ pub use linux::*;
 mod linux_capture;
 #[cfg(target_os = "linux")]
 pub use linux_capture::{Capture, RULE_PRIO};
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::*;
 
 #[cfg(windows)]
 mod windows;
@@ -163,7 +171,7 @@ pub enum AdapterSetup {
 /// `start` is given the helper's arguments and does the platform's part —
 /// spawn it, or ask for elevation — returning anything that must live until
 /// the helper has connected (a staged copy of it, on Linux).
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) async fn relayed<G, F>(
     config: &AdapterConfig,
     extra: Vec<String>,
@@ -219,7 +227,7 @@ pub enum AdapterPhase {
 /// room seats this member somewhere else later (it lost the link and came back
 /// to find its address taken), the adapter is moved to the new address rather
 /// than left answering for the old one.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub async fn run_room_on_adapter(
     session: std::sync::Arc<crate::lan_session::LanSession>,
     policy: crate::lan_filter::LanPolicy,
@@ -232,7 +240,7 @@ pub async fn run_room_on_adapter(
 }
 
 /// [`run_room_on_adapter`], saying where it is on `phase` as it goes.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub async fn run_room_on_adapter_reporting(
     session: std::sync::Arc<crate::lan_session::LanSession>,
     policy: crate::lan_filter::LanPolicy,

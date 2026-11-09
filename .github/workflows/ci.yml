@@ -102,6 +102,36 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 
+  # Mode 3 on macOS (PLAN.md §14.3): a real utun, made by the real lan-helper,
+  # with a limited broadcast proven to leave through it, and the helper shown
+  # to take its interface with it when the launcher goes. Its own job because
+  # opening a utun needs root, which a hosted runner has through sudo; without
+  # root the test skips, so the test job stays unprivileged.
+  lan-macos:
+    name: LAN room adapter (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-lan-macos
+
+      # Built as the runner, run as root: a root-owned target directory would
+      # break the next cache save. `--no-run` prints the test binary's path.
+      - name: Build the test
+        run: cargo test -p game-bridge --test lan_macos --no-run
+
+      - name: Run it as root
+        run: |
+          set -euo pipefail
+          bin="$(cargo test -p game-bridge --test lan_macos --no-run --message-format=json \
+            | python3 -c 'import json,sys; [print(m["executable"]) for m in map(json.loads, sys.stdin) if m.get("reason")=="compiler-artifact" and m.get("executable") and m.get("target",{}).get("name")=="lan_macos"]' | tail -1)"
+          echo "test binary: $bin"
+          sudo "$bin" --nocapture --test-threads=1
+
   # Mode 3 on Windows (PLAN.md §14.3 step 4): a real Wintun adapter, made by the
   # real lan-helper, with a limited broadcast proven to leave through it. Its
   # own job because it needs what the test job must not assume: an
@@ -216,13 +246,12 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev xvfb
 
-      # The launcher ships lan-helper as a sidecar on Linux and Windows, and
-      # wintun.dll beside it on Windows (tauri.linux.conf.json,
-      # tauri.windows.conf.json). The shell's build script refuses to start
-      # without them, so staging them here is also what proves the bundle
-      # config names files that exist.
+      # The launcher ships lan-helper as a sidecar on Linux, Windows and macOS,
+      # and wintun.dll beside it on Windows (tauri.linux.conf.json,
+      # tauri.windows.conf.json, tauri.macos.conf.json). The shell's build
+      # script refuses to start without them, so staging them here is also
+      # what proves the bundle config names files that exist.
       - name: Stage the LAN helper
-        if: runner.os != 'macOS'
         shell: bash
         run: scripts/stage-lan-helper.sh
 

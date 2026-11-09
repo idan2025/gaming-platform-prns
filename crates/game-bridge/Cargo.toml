@@ -37,8 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [target.'cfg(target_os = "android")'.dependencies]
 webpki-root-certs = "1"
 
-# The Mode 3 adapter (`src/lan_adapter.rs`) is TUN ioctls, Linux only.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The Mode 3 adapter (`src/lan_adapter.rs`) is TUN ioctls on Linux and a `utun`
+# control socket on macOS (`src/lan_adapter/macos.rs`).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
 # The Mode 3 adapter on Windows: Wintun, loaded at runtime, and the IP Helper

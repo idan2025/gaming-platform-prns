@@ -6,7 +6,8 @@
 //! connects *out* to that launcher, proves itself with the token the launcher
 //! made, and relays packets until the launcher goes away (`lan_relay.rs`).
 //! Then it exits, and the adapter goes with it — on Linux a non-persistent
-//! TUN device, on Windows a Wintun adapter.
+//! TUN device, on Windows a Wintun adapter, on macOS a `utun` (the kernel
+//! removes it with the helper's last descriptor).
 //!
 //! ```text
 //! lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> --token <hex>
@@ -34,7 +35,9 @@
 //!
 //! How it gets its privilege is the platform's: on Linux, `cap_net_admin`
 //! granted once (`sudo setcap cap_net_admin+ep lan-helper`) or `pkexec` per
-//! room; on Windows, the elevation prompt. `check` says whether `serve` could
+//! room; on Windows, the elevation prompt; on macOS, the system's
+//! administrator prompt (`osascript`), every room, since only root opens a
+//! `utun`. `check` says whether `serve` could
 //! work right now, without doing anything.
 //!
 //! Every argument is the caller's, so `lan_adapter` refuses any name but
@@ -42,7 +45,7 @@
 //! that is not this machine.
 
 /// `serve`'s arguments after the adapter name and CIDR.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 struct ServeArgs {
     connect: std::net::SocketAddr,
     token: game_bridge::lan_relay::RelayToken,
@@ -52,13 +55,13 @@ struct ServeArgs {
     portable: bool,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const USAGE: &str =
     "usage: lan-helper serve <name> <address>/<prefix-len> --connect 127.0.0.1:<port> \
                      --token <hex> [--portable] [--wintun <dll>] [--remove-driver] | lan-helper check \
                      | lan-helper allow-rooms [<name>] | lan-helper grant | lan-helper unblock <hex>...";
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn parse_serve(rest: &[String]) -> Result<ServeArgs, String> {
     use game_bridge::lan_relay::RelayToken;
     let (mut connect, mut token, mut wintun, mut remove_driver) = (None, None, None, false);
@@ -93,7 +96,7 @@ fn parse_serve(rest: &[String]) -> Result<ServeArgs, String> {
     })
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
@@ -118,18 +121,18 @@ fn main() -> std::process::ExitCode {
 
 /// The adapter the launcher makes; `allow-rooms` opens it when not told
 /// another.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const DEFAULT_ADAPTER: &str = "gbl0";
 
 /// Whether this process may change the firewall: an administrator on Windows
-/// (which `serve` always is), root on Linux — not a capability alone.
-#[cfg(any(target_os = "linux", windows))]
+/// (which `serve` always is), root on Linux and macOS — not a capability alone.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn fully_privileged() -> bool {
     #[cfg(windows)]
     {
         game_bridge::lan_adapter::is_elevated()
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // SAFETY: geteuid has no preconditions and cannot fail.
         unsafe { libc::geteuid() == 0 }
@@ -138,7 +141,7 @@ fn fully_privileged() -> bool {
 
 /// Open the firewall to the room; a failure is said and does not stop the
 /// room — the launcher's watch still names what is dropped.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn open_firewall(
     name: &str,
     lifetime: game_bridge::lan_firewall::Lifetime,
@@ -156,11 +159,11 @@ fn open_firewall(
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn allow_rooms(name: &str) -> Result<(), String> {
     use game_bridge::lan_firewall::{detect, open, Lifetime, Opened, System};
     if !fully_privileged() {
-        return Err("allow-rooms needs an administrator (Windows) or root (Linux)".to_string());
+        return Err("allow-rooms needs an administrator (Windows) or root (Linux, macOS)".to_string());
     }
     let firewall = detect();
     match open(&System, firewall, name, Lifetime::Kept).map_err(|e| e.to_string())? {
@@ -285,7 +288,7 @@ impl Drop for RuleKeeper {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn serve(name: &str, cidr: &str, rest: &[String]) -> Result<(), String> {
     let config = game_bridge::lan_adapter::AdapterConfig::from_cidr(name, cidr)
         .map_err(|e| e.to_string())?;
@@ -320,7 +323,7 @@ fn serve(name: &str, cidr: &str, rest: &[String]) -> Result<(), String> {
     result
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn serve_room(
     config: &game_bridge::lan_adapter::AdapterConfig,
     args: ServeArgs,
@@ -330,6 +333,11 @@ fn serve_room(
         .build()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
+    let run = {
+        let _ = (&args.wintun, args.remove_driver, args.portable);
+        game_bridge::lan_adapter::serve(config, args.connect, &args.token)
+    };
+    #[cfg(target_os = "macos")]
     let run = {
         let _ = (&args.wintun, args.remove_driver, args.portable);
         game_bridge::lan_adapter::serve(config, args.connect, &args.token)
@@ -373,6 +381,19 @@ fn check() -> Result<(), String> {
     }
 }
 
+/// macOS: only root opens a `utun`. `serve` is started as root through the
+/// system's administrator prompt, so this says what is true of the process
+/// that asks, never what a room would do.
+#[cfg(target_os = "macos")]
+fn check() -> Result<(), String> {
+    if fully_privileged() {
+        println!("ok");
+        Ok(())
+    } else {
+        Err("not root: a room asks for the administrator prompt when it starts".to_string())
+    }
+}
+
 /// Windows: `wintun.dll` is where `serve` will load it from. Needs no
 /// elevation — the prompt is `serve`'s, when a room starts.
 #[cfg(windows)]
@@ -386,7 +407,7 @@ fn check() -> Result<(), String> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn main() -> std::process::ExitCode {
     eprintln!("lan-helper: this platform's room adapter is not built yet (PLAN.md §14.3)");
     std::process::ExitCode::FAILURE

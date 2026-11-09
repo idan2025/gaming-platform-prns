@@ -50,7 +50,7 @@ stylesheet, which looked exactly like `cargo build` failing to re-embed
 # Rust side, from the repo root
 cargo test -p launcher-core
 
-# The Tauri shell (its own workspace). On Linux and Windows it bundles
+# The Tauri shell (its own workspace). On Linux, Windows and macOS it bundles
 # lan-helper as a sidecar (PLAN.md §14), and its build script refuses to start
 # until the helper is staged; Windows also wants wintun.dll:
 scripts/stage-lan-helper.sh                                   # from the repo root

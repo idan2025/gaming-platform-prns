@@ -1161,10 +1161,25 @@ Rules a later change could quietly break:
   `resource_dir` never points at the executable's folder on Linux outside a
   cargo `target/`, so `pack_dir` looks there first; drop that and a portable
   launcher silently offers only the built-in game.
-- **`lan-helper` ships as a Tauri sidecar on Linux and Windows**, staged by
-  `scripts/stage-lan-helper.sh` (and `scripts/fetch-wintun.ps1` on Windows).
+- **`lan-helper` ships as a Tauri sidecar on Linux, Windows and macOS**, staged by
+  `scripts/stage-lan-helper.sh` (and `scripts/fetch-wintun.ps1` on Windows; a
+  universal macOS bundle needs `--target universal-apple-darwin`, which
+  `lipo`s both architectures).
   Building `launcher/src-tauri` there fails until they are staged — on
   purpose, so a bundle can never ship without its helper.
+- **macOS rooms are a `feth` pair read through BPF, not a `utun`** (2026-11-09,
+  `lan_adapter/macos.rs`, `PLAN.md` §14.5). The kernel refuses a limited
+  broadcast on a point-to-point interface (`EADDRNOTAVAIL`, measured on macOS 15
+  with every route and bind variant), and old LAN games find each other with
+  exactly that. A `feth` end has the BROADCAST flag; the helper holds the other
+  end through BPF, wraps and unwraps the IPv4 packets and answers ARP for the
+  room (proxy ARP, one fixed MAC). The helper destroys the pair when the relay
+  drops or on `SIGTERM`/`SIGINT`/`SIGHUP`; a `feth` is **not** tied to a
+  descriptor, so a `SIGKILL`ed helper leaves its pair — which the next helper
+  reaps (any `feth` with an address in `198.18.0.0/15`). A `utun` is the
+  fallback where no `feth` can be made, and says what it cannot carry. Pinned
+  by `tests/lan_macos.rs` (root; CI's `lan-macos` job). Registering a BPF
+  descriptor for write readiness fails with `EINVAL` — read events only.
 - **The room check (`lan_check.rs`) sends from an OS socket bound to
   `0.0.0.0`, never into the pump.** Routing is the thing under test; an
   injected probe passes on exactly the machine where the game fails. Every
