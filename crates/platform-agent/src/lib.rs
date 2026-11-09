@@ -14,6 +14,7 @@ pub mod config;
 pub mod controller;
 pub mod content;
 pub mod docker;
+pub mod events;
 pub mod install;
 pub mod instance;
 pub mod interfaces;

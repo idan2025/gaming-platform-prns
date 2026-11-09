@@ -2,6 +2,8 @@
 //! it, the server is stopped and refuses to start until it is back under,
 //! and nothing is deleted. Needs Docker; skips without it.
 
+use std::sync::Arc;
+
 use platform_agent::agent::Agent;
 use platform_agent::config::AgentConfig;
 use platform_agent::instance::InstanceSpec;
@@ -95,6 +97,16 @@ fn spec(id: &str) -> InstanceSpec {
     }
 }
 
+/// Records each server the host stopped, with its id and the agent's reason.
+#[derive(Default)]
+struct StopLog(std::sync::Mutex<Vec<String>>);
+
+impl platform_agent::events::NodeEvents for StopLog {
+    fn server_stopped_by_host(&self, server: &platform_agent::events::ServerEvent, reason: &str) {
+        self.0.lock().unwrap().push(format!("{}: {reason}", server.instance_id));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_over_its_disk_limit_is_stopped_and_stays_stopped_until_it_is_under() {
     if !ensure_image() {
@@ -102,7 +114,9 @@ async fn a_server_over_its_disk_limit_is_stopped_and_stays_stopped_until_it_is_u
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let Some(agent) = agent_in(dir.path(), 27255).await else { return };
+    let Some(mut agent) = agent_in(dir.path(), 27255).await else { return };
+    let heard = Arc::new(StopLog::default());
+    agent.set_events(heard.clone());
     let id = format!("disklimit{}", std::process::id());
     let _cleanup = Container(id.clone());
     agent.create(spec(&id)).await.expect("create");
@@ -115,6 +129,9 @@ async fn a_server_over_its_disk_limit_is_stopped_and_stays_stopped_until_it_is_u
     let slot = std::fs::read_dir(&writable).unwrap().flatten().next().expect("a writable slot").path();
     std::fs::write(slot.join("big.dat"), vec![0u8; 4096]).unwrap();
     assert_eq!(agent.check_disk_limits().await, vec![id.clone()], "a server over its limit was not stopped");
+    let told = heard.0.lock().unwrap().clone();
+    assert_eq!(told.len(), 1, "the listener was not told exactly once: {told:?}");
+    assert!(told[0].starts_with(&format!("{id}: ")) && told[0].contains("writable_limit_bytes"), "{told:?}");
     assert_eq!(state(&agent, &id).await, platform_agent::instance::InstanceState::Stopped);
 
     // It does not come back while it is over, and its files are all there.
