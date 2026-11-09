@@ -197,6 +197,11 @@ const CONTROLLER_ROUTES = [
   [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+\/restore$/, ["POST"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/move-targets$/, ["GET"]],
   [/^\/instances\/[a-z0-9-]{1,64}\/region-request$/, ["POST"]],
+  // The owner's tools, carried to the server's node (uplink_wire::owner_route).
+  [/^\/instances\/[a-z0-9-]{1,64}\/(players|moderation|backup-schedule|restart-schedule)$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/chat(\?since=\d{1,20})?$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(moderation|bots|chat|chat\/mute|restart-on-crash|announce)$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(chat|restart-schedule|backup-schedule)$/, ["PUT"]],
 ];
 
 // The URL a request really goes to: through the controller when this page has
@@ -1198,12 +1203,13 @@ function openInstanceMenu(id, x, y) {
   }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
-  // Through a controller, only what it carries is live; the rest says where it is.
+  // Through a controller, only what it carries is live; the rest says where it
+  // is. The owner's tools cross to the server's node (uplink_wire::owner_route);
+  // a world upload is a file, and files do not.
   if (state.controllerOn) {
-    const carried = new Set(["Change map…", "Start", "Stop", "Copy invite link", "Copy mesh address", "Show log", "Log and console",
-      "Backups…", "Move to another worker…", "Remove server…"]);
+    const notCarried = new Set(["Upload a world…"]);
     for (const it of items) {
-      if (typeof it === "object" && it.label && !carried.has(it.label)) {
+      if (typeof it === "object" && it.label && notCarried.has(it.label)) {
         it.disabled = true;
         it.title = NOT_THROUGH_CONTROLLER;
       }
@@ -1219,9 +1225,12 @@ function openInstanceMenu(id, x, y) {
 // runtimes, its installed files) says nothing: what the controller hosts does.
 function startable(g) {
   if (state.controllerOn) {
-    return state.hostedGames.includes(g.id)
-      ? { ok: true, reason: "" }
-      : { ok: false, reason: "the controller does not host this game." };
+    if (state.hostedGames.includes(g.id)) return { ok: true, reason: "" };
+    // A LAN game with no server runtime is played in a room, never on a server.
+    if (g.lan && !g.runnable) return { ok: false, lanOnly: true, reason: "it has no dedicated server; it is played in a LAN room." };
+    return { ok: false, reason: state.isAdmin
+      ? "the controller does not offer it yet. Install it on the workers to offer it."
+      : "the controller does not host this game." };
   }
   return g.runnable ? { ok: true, reason: "" } : { ok: false, reason: g.reason || "unavailable on this node." };
 }
@@ -1315,10 +1324,148 @@ function buildGameCard(g) {
   // the workers fetch them.
   const manages = state.role === "admin";
   if (!state.controllerOn && manages) actions.append(installBtn);
+  // Through a controller an admin of the index installs a game on the
+  // workers, and the controller offers it (Hosting::admin_install_game).
+  if (state.controllerOn && manages && state.isAdmin && !can.lanOnly) {
+    const hosted = state.hostedGames.includes(g.id);
+    const w = el("button", "btn workers-btn");
+    w.type = "button";
+    w.appendChild(icon("download"));
+    w.appendChild(el("span", null, hosted ? "Workers' files…" : "Install on the workers"));
+    w.title = hosted ? "Where this game's files stand on each worker" : "Download this game's files on every worker set up to run it, and offer it";
+    w.addEventListener("click", () => (hosted ? openWorkersFiles(g) : onInstallOnWorkers(g)));
+    actions.append(w);
+  }
   body.appendChild(actions);
   if (manages) card.appendChild(removeBtn);
   card.appendChild(body);
   return card;
+}
+
+// Installing a game on the workers through the controller: each worker set up
+// to run it downloads its configured version, and the controller offers it at
+// once. A server can start on a worker once its download is done.
+async function onInstallOnWorkers(g) {
+  if (!confirm("Install " + g.display_name + " on every worker set up to run it?\n\nEach worker downloads the game's files, "
+    + "which can be many gigabytes, held to its disk reserve. The controller offers the game at once; a server can start "
+    + "once a worker has the files.")) return;
+  try {
+    const r = await withInFlight(api("POST", "/controller/admin/games/" + encodeURIComponent(g.id) + "/install"));
+    clearError();
+    const started = (r && r.nodes || []).filter(n => n.outcome === "installing").length;
+    toast(started ? "Installing on " + started + (started === 1 ? " worker." : " workers.") : "Offered.");
+    await loadControllerStatus();
+    renderGames();
+    openWorkersFiles(g);
+  } catch (e) {
+    if (!(e && e.__auth)) showError((e && e.error) || "Not installed.");
+  }
+}
+
+function workersFilesLine(n) {
+  if (n.error) return "did not answer: " + n.error;
+  const st = n.status || {};
+  const have = (n.copies || []).map(c => c.version).filter(Boolean);
+  const copies = have.length ? "installed (" + have.join(", ") + ")" : "";
+  switch (st.state) {
+    case "running": return "downloading, " + formatBytes(st.bytes || 0) + " so far" + (copies ? "; " + copies : "");
+    case "queued": return "waiting for another download to finish" + (copies ? "; " + copies : "");
+    case "failed": return "failed: " + (st.error || "unknown") + (copies ? "; " + copies : "");
+    case "done": return copies || "done";
+    default: return copies || "not installed";
+  }
+}
+
+// Remove one installed copy from one worker, or from every worker that has it.
+// Asked first, because the files are gone from the worker afterwards.
+async function removeCopy(g, version, node) {
+  const where = node ? "from " + node : "from every worker that has it";
+  if (!confirm("Remove " + g.display_name + " (" + version + ") " + where + "?\n\nIts files are deleted from the worker's disk. "
+    + "Servers that use the copy stop the removal there; a server created later will need the files again.")) return;
+  try {
+    const q = node ? "?node=" + encodeURIComponent(node) : "";
+    const r = await withInFlight(api("DELETE", "/controller/admin/games/" + encodeURIComponent(g.id) + "/copies/" + encodeURIComponent(version) + q));
+    const outcomes = (r && r.nodes || []);
+    const removed = outcomes.filter(n => n.outcome === "removed").length;
+    const refused = outcomes.filter(n => n.outcome === "refused");
+    clearError();
+    if (refused.length) showError(refused.map(n => n.node + ": " + (n.error || "refused") + (n.servers && n.servers.length ? " (" + n.servers.join(", ") + ")" : "")).join(" "));
+    toast(removed ? "Removed from " + removed + (removed === 1 ? " worker." : " workers.") : "Nothing removed.");
+  } catch (e) {
+    if (e && e.__auth) return;
+    showError((e && e.error) || "Not removed.");
+  }
+  // The window reads the workers again on its next tick; the Games cards follow.
+  renderGames();
+}
+
+// Where a game's files stand on each worker, refreshed while open.
+function openWorkersFiles(g) {
+  let timer = null;
+  openModal("workers-files-dialog", g.id, (body, close) => {
+    body.appendChild(el("h3", null, g.display_name + " on the workers"));
+    const list = el("div", "workers-files");
+    const note = el("p", "muted small", "Reading\u2026");
+    const actions = el("div", "form-actions");
+    const again = el("button", "btn", "Install again");
+    again.type = "button";
+    again.onclick = () => { clearInterval(timer); close(); onInstallOnWorkers(g); };
+    const withdraw = el("button", "btn", "Stop offering");
+    withdraw.type = "button";
+    withdraw.hidden = true;
+    withdraw.onclick = async () => {
+      if (!confirm("Stop offering " + g.display_name + "? Servers that exist keep running and the files stay on the workers.")) return;
+      try {
+        await withInFlight(api("DELETE", "/controller/admin/games/" + encodeURIComponent(g.id)));
+        clearInterval(timer); close(); toast("No longer offered."); await loadControllerStatus(); renderGames();
+      } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not changed."); }
+    };
+    const shut = el("button", "btn btn-primary", "Close");
+    shut.type = "button";
+    shut.onclick = () => { clearInterval(timer); close(); };
+    actions.append(again, withdraw, shut);
+    body.append(list, note, actions);
+    const read = async () => {
+      if (!$("workers-files-dialog")) { clearInterval(timer); return; }
+      try {
+        const st = await api("GET", "/controller/admin/games/" + encodeURIComponent(g.id));
+        list.textContent = "";
+        for (const n of st.nodes || []) {
+          const row = el("div", "item");
+          row.append(el("span", "item-main", n.node), el("span", "item-meta", workersFilesLine(n)));
+          // Each installed copy on this worker can be removed from it; a copy a
+          // server uses is refused there, and the reason says which servers.
+          for (const c of n.copies || []) {
+            const b = el("button", "btn btn-sm", "Remove " + c.version + " from " + n.node);
+            b.type = "button";
+            const inUse = (c.used_by || []).length;
+            b.disabled = inUse > 0;
+            b.title = inUse ? "A server uses this copy: stop or remove it first." : "Delete this copy of the game's files from this worker.";
+            b.onclick = () => removeCopy(g, c.version, n.node);
+            row.appendChild(b);
+          }
+          list.appendChild(row);
+        }
+        // Every worker that has any version: removed from all of them at once.
+        const versions = [...new Set((st.nodes || []).flatMap(n => (n.copies || []).map(c => c.version)))];
+        for (const v of versions) {
+          const holders = (st.nodes || []).filter(n => (n.copies || []).some(c => c.version === v));
+          if (holders.length < 2) continue;
+          const all = el("button", "btn", "Remove " + v + " from all " + holders.length + " workers");
+          all.type = "button";
+          all.onclick = () => removeCopy(g, v, null);
+          list.appendChild(all);
+        }
+        note.textContent = st.offered ? (st.from_file ? "Offered by the index's hosting file." : "Offered: anyone can start one on a worker that has the files.")
+          : "Not offered.";
+        withdraw.hidden = !st.offered || st.from_file;
+      } catch (e) {
+        if (!(e && e.__auth)) note.textContent = (e && e.error) || "Could not read it.";
+      }
+    };
+    read();
+    timer = setInterval(read, 3000);
+  });
 }
 
 // Where a game's files stand (PLAN.md §13.3 step 3, Agent::content_state):
@@ -2992,7 +3139,9 @@ async function onRestartSchedule(instanceId) {
   const name = (inst && inst.name) || instanceId;
   let current = null;
   try {
-    const all = await api("GET", "/restart-schedules");
+    // Through a controller the node answers for this server only.
+    const all = await api("GET", state.controllerOn
+      ? "/instances/" + encodeURIComponent(instanceId) + "/restart-schedule" : "/restart-schedules");
     current = all && all[instanceId] ? all[instanceId] : null;
   } catch (e) {
     if (e && e.__auth) return;
@@ -3820,7 +3969,10 @@ async function loadRequests() {
 // its own floor, so this cannot become a storm on someone's slow link.
 async function onAnnounce(id) {
   try {
-    const r = await withInFlight(api("POST", "/mesh/announce", id ? { instance: id } : {}));
+    // Through a controller a server is announced by its own node.
+    const r = await withInFlight(state.controllerOn && id
+      ? api("POST", "/instances/" + encodeURIComponent(id) + "/announce", {})
+      : api("POST", "/mesh/announce", id ? { instance: id } : {}));
     clearError();
     const n = r && r.announced != null ? r.announced : 0;
     toast(id ? "Announced." : (n ? "Announced " + n + (n === 1 ? " server." : " servers.") : "No server is running on the mesh."));

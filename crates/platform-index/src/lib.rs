@@ -9,6 +9,7 @@ pub mod agent_client;
 pub mod hosting;
 pub mod http;
 pub mod node;
+pub mod offered;
 pub mod quota;
 pub mod regions;
 pub mod registry;

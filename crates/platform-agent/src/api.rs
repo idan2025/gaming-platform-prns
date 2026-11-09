@@ -184,6 +184,9 @@ pub fn router_with(
     let router = Router::new()
         .route("/health", get(health))
         .route("/capacity", get(capacity))
+        .route("/ops/overview", get(ops_overview))
+        .route("/ops/events", get(ops_events))
+        .route("/ops/metrics", get(ops_metrics))
         .route("/controller/status", get(controller_status))
         .route("/controller/*rest", axum::routing::any(controller_proxy))
         .route("/instances", get(list).post(create))
@@ -329,6 +332,7 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; st
 /// headers and are unaffected.
 async fn browser_guard(State(state): State<ApiState>, request: Request, next: Next) -> Response {
     if let Some(why) = refuse_from_browser(request.headers(), state.token.is_none()) {
+        state.agent.ops().record("request_refused", None, request.uri().path(), why, None);
         return (StatusCode::FORBIDDEN, Json(ApiError { error: why.to_string() })).into_response();
     }
     let mut response = next.run(request).await;
@@ -518,6 +522,8 @@ pub fn user_may_named(method: &axum::http::Method, path: &str) -> Option<bool> {
         ["controller", "admin", ..] | ["controller", "admin-requests", ..] => Some(false),
         // Who has an account here, and who asked to be an admin, is an admin's.
         ["auth", "users", ..] => Some(false),
+        // The node's ops log and its numbers: an admin's, whatever the method.
+        ["ops", ..] => Some(false),
         _ if *method == Method::GET => Some(true),
         ["instances"] => Some(*method == Method::POST),
         ["instances", _] => Some(*method == Method::DELETE),
@@ -593,8 +599,11 @@ async fn auth_login(
     let Some(accounts) = state.accounts.as_ref() else {
         return Err(refuse(StatusCode::NOT_FOUND, "this node has no accounts".into(), false));
     };
+    let ops = state.agent.ops();
+    let who = req.username.to_ascii_lowercase();
     match accounts.login(&req.username, &req.password, req.code.as_deref(), std::time::SystemTime::now()) {
         Ok(session) => {
+            ops.record("sign_in", Some(&who), "", "", None);
             tracing::info!(user = %req.username.to_ascii_lowercase(), "signed in to the page");
             state.agent.events().session_started(&req.username.to_ascii_lowercase());
             Ok(Json(serde_json::json!({
@@ -603,11 +612,18 @@ async fn auth_login(
                 "expires_in_secs": crate::accounts::SESSION_LIFETIME.as_secs(),
             })))
         }
-        Err(r @ LoginRefusal::Throttled { .. }) => Err(refuse(StatusCode::TOO_MANY_REQUESTS, r.to_string(), false)),
+        Err(r @ LoginRefusal::Throttled { .. }) => {
+            ops.record("sign_in_locked", None, &who, "too many failures for this name", None);
+            Err(refuse(StatusCode::TOO_MANY_REQUESTS, r.to_string(), false))
+        }
         Err(r @ (LoginRefusal::NeedsCode | LoginRefusal::WrongCode)) => {
+            ops.record("sign_in_failed", None, &who, &r.to_string(), None);
             Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), true))
         }
-        Err(r @ LoginRefusal::Wrong) => Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), false)),
+        Err(r @ LoginRefusal::Wrong) => {
+            ops.record("sign_in_failed", None, &who, &r.to_string(), None);
+            Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), false))
+        }
     }
 }
 
@@ -725,11 +741,52 @@ struct UserReq {
     role: Option<crate::accounts::Role>,
 }
 
+/// This node's numbers and what it counted over the last day (`/ops/overview`).
+async fn ops_overview(State(state): State<ApiState>) -> ApiResult<serde_json::Value> {
+    let since = crate::ops_log::now_unix().saturating_sub(86_400);
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for e in state.agent.ops().events_since(since, usize::MAX) {
+        *counts.entry(e.kind).or_default() += 1;
+    }
+    let capacity = state.agent.capacity().await;
+    let last = state.agent.ops().samples_since(0, 1).pop();
+    Ok(Json(serde_json::json!({
+        "unix": crate::ops_log::now_unix(),
+        "capacity": capacity,
+        "last_sample": last,
+        "counts_24h": counts,
+    })))
+}
+
+/// Recent ops events, oldest first. `since` (unix seconds), `limit` (at most
+/// 1000), `kind` (one kind, e.g. `sign_in_failed`).
+async fn ops_events(State(state): State<ApiState>, Query(q): Query<std::collections::HashMap<String, String>>) -> ApiResult<Vec<crate::ops_log::OpsEvent>> {
+    let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200usize).clamp(1, 1000);
+    let kind = q.get("kind").cloned();
+    let mut events = state.agent.ops().events_since(since, usize::MAX);
+    if let Some(k) = kind {
+        events.retain(|e| e.kind == k);
+    }
+    if events.len() > limit {
+        events.drain(..events.len() - limit);
+    }
+    Ok(Json(events))
+}
+
+/// This node's capacity samples, oldest first (`since`, `limit` at most 2000).
+async fn ops_metrics(State(state): State<ApiState>, Query(q): Query<std::collections::HashMap<String, String>>) -> ApiResult<Vec<crate::ops_log::MetricSample>> {
+    let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(1440usize).clamp(1, 2000);
+    Ok(Json(state.agent.ops().samples_since(since, limit)))
+}
+
 async fn auth_user_add(State(state): State<ApiState>, Json(req): Json<UserReq>) -> ApiResult<crate::accounts::AccountView> {
     let role = req.role.unwrap_or(crate::accounts::Role::User);
     let made = accounts_of(&state)?
         .create_with_role(&req.username, &req.password, role, std::time::SystemTime::now())
         .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    state.agent.ops().record("account_added", None, &made.username, &format!("{:?}", made.role).to_ascii_lowercase(), None);
     tracing::info!(user = %made.username, "a page account was added");
     Ok(Json(made))
 }
@@ -746,6 +803,7 @@ async fn auth_user_role(
     Json(req): Json<RoleReq>,
 ) -> ApiResult<crate::accounts::AccountView> {
     let changed = accounts_of(&state)?.set_role(&name, req.role).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    state.agent.ops().record("account_role", None, &name, &format!("now {:?}", req.role).to_ascii_lowercase(), None);
     tracing::info!(user = %name, role = ?req.role, "a page account's role changed");
     Ok(Json(changed))
 }
@@ -774,6 +832,7 @@ async fn auth_user_remove(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     remove_account(&state, &name).await?;
+    state.agent.ops().record("account_removed", None, &name, "", None);
     tracing::info!(user = %name, "a page account was removed");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -863,6 +922,8 @@ struct GameOption {
     /// The game takes Minecraft's world settings (game mode, difficulty,
     /// allowlist): Java or Bedrock. The create form offers them.
     world_settings: bool,
+    /// The pack has a `[lan]` block: the game can be played in a LAN room.
+    lan: bool,
 }
 
 /// What this node is announcing on the mesh, per running game server.
@@ -1216,6 +1277,7 @@ async fn games(State(state): State<ApiState>) -> Json<Vec<GameOption>> {
                 content: contents.remove(&pack.id).flatten(),
                 eula: pack.eula.clone(),
                 minecraft: matches!(pack.content, game_bridge::content::PackContent::Minecraft {}),
+                lan: pack.lan.is_some(),
                 world_settings: matches!(
                     pack.console,
                     Some(game_bridge::pack::PackConsole::Minecraft | game_bridge::pack::PackConsole::Bedrock)
