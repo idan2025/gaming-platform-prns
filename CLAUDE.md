@@ -606,9 +606,15 @@ starts no game. Rules a later change could quietly break:
 - **The Android update check reads asset names**: an APK must be published
   as `lanthorn-<version>-android-arm64-<versionCode>.apk` on an `android-*`
   tag, or no installed phone sees it (`update::android`). The versionCode in
-  `tauri.conf.json` is the one source; `build.rs` reads it. The page only
-  opens the APK; Android installs it only over a copy signed by the same key
-  (`~/.config/lanthorn-android/`, not in the repo).
+  `tauri.conf.json` is the one source; `build.rs` reads it. The app
+  downloads the APK itself (`download_update`), checks its SHA-256 and size
+  against the release asset's digest, and hands it to the system installer
+  through FileProvider (`install_apk`; the class is loaded through the
+  activity's loader, since `FindClass` on a Rust thread cannot see app
+  classes). Previews are offered only while the player's switch is on.
+  Android installs only over a copy signed by the same key
+  (`~/.config/lanthorn-android/`, not in the repo); the cached APK is
+  removed at the next start.
 
 **Minecraft is hosted, and every console game has kick and ban** (2026-10-18,
 `MINECRAFT.md`, branch `feat/minecraft`). Rules a later change could quietly

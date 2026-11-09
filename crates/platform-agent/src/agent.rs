@@ -179,6 +179,10 @@ pub struct Agent {
     minecraft: crate::minecraft::Catalog,
     /// Told what happens on this node (`events.rs`); nothing by default.
     events: Arc<dyn crate::events::NodeEvents>,
+    /// The operator's page code folder (`config.ui_extension`), read per request.
+    ui_extension: Option<std::path::PathBuf>,
+    /// Page code a build carries inside itself (`set_ui_extension_embedded`).
+    ui_embedded: Option<(&'static str, &'static str)>,
     /// What happens on this node, for the admin dashboard (`ops_log.rs`).
     ops: Arc<crate::ops_log::OpsLog>,
 }
@@ -551,6 +555,7 @@ impl Agent {
             config.data_root.join("mesh-interfaces.json"),
         );
         let config_data_root = config.data_root.clone();
+        let ui_extension = config.ui_extension.clone();
         let controller = match (&config.controller, &config.uplink) {
             (Some(c), Some(u)) => Some(Arc::new(
                 crate::controller::Controller::new(c, &u.identity_secret_path)
@@ -584,8 +589,27 @@ impl Agent {
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
             minecraft: crate::minecraft::Catalog::default(),
             events: crate::events::none(),
+            ui_extension,
+            ui_embedded: None,
             ops: Arc::new(crate::ops_log::OpsLog::new(&config_data_root)),
         })
+    }
+
+    /// The folder with the operator's page code, if this node has one.
+    pub fn ui_extension(&self) -> Option<std::path::PathBuf> {
+        self.ui_extension.clone()
+    }
+
+    /// Page code a build carries in its binary, served as `ext.js` and
+    /// `ext.css` in place of a folder's, so a build whose page needs it can
+    /// never be started without it. Set before the agent is shared.
+    pub fn set_ui_extension_embedded(&mut self, js: &'static str, css: &'static str) {
+        self.ui_embedded = Some((js, css));
+    }
+
+    /// The embedded page code, if a build set it.
+    pub fn ui_extension_embedded(&self) -> Option<(&'static str, &'static str)> {
+        self.ui_embedded
     }
 
     /// This node's ops log: what happened here, for the dashboard.
