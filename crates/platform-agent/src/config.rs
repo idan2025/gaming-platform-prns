@@ -169,6 +169,12 @@ pub struct AgentConfig {
     /// so a containerised agent has a secret without the operator inventing one.
     #[serde(default)]
     pub api_token_file: Option<PathBuf>,
+    /// A folder with the operator's own page code: `ext.js` and `ext.css`,
+    /// served same-origin beside the page (`api::ui_extension_file`). The page
+    /// calls the functions `ext.js` registers (`app.js`, "Extension point").
+    /// Unset, both files are empty and the page is what it always was.
+    #[serde(default)]
+    pub ui_extension: Option<PathBuf>,
 }
 
 /// The operator's pack-signing trust list (`PLAN.md` §11.4).
