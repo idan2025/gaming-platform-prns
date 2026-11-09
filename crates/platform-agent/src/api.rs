@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -80,6 +80,12 @@ pub struct ApiState {
     /// answer "no uplink" rather than 404 — the difference between "this agent
     /// cannot do that" and "this agent has no mesh node to do it to".
     pub interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
+    /// Sign-in accounts for the page (`accounts.rs`). Only where a token is
+    /// configured: without one the API is loopback-only and unauthenticated.
+    pub accounts: Option<Arc<crate::accounts::Accounts>>,
+    /// A build's own answer for requests [`user_may`] does not name
+    /// ([`Extension::user_may`]).
+    pub user_may_ext: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
 }
 
 pub fn router(agent: Arc<Agent>) -> Router {
@@ -96,16 +102,90 @@ pub fn router_full(
     pack_dir: Option<std::path::PathBuf>,
     interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
 ) -> Router {
+    router_extended(agent, token, pack_dir, interfaces, Vec::new())
+}
+
+/// [`router_full`], plus routes an operator's own build adds. Each extra router
+/// is merged **inside** the token gate and the browser guard, so its routes
+/// need the same token or account as the built-in ones, and a route
+/// [`user_may`] does not name is an admin's. Its handlers take the same
+/// [`ApiState`]; a route added here must not be served without the gate, so do
+/// not build a router around this one. [`router_with`] also takes routes
+/// outside the gate and which of a build's routes a user may call.
+pub fn router_extended(
+    agent: Arc<Agent>,
+    token: Option<String>,
+    pack_dir: Option<std::path::PathBuf>,
+    interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
+    extra: Vec<Router<ApiState>>,
+) -> Router {
+    let routes = extra.into_iter().fold(Router::new(), |acc, r| acc.merge(r));
+    router_with(agent, token, pack_dir, interfaces, Extension { routes, ..Extension::default() })
+}
+
+/// What an operator's own build adds to the node's API (`router_with`).
+pub struct Extension {
+    /// Inside the token gate, like `router_extended`'s routes.
+    pub routes: Router<ApiState>,
+    /// **Outside** the token gate, beside sign-in: anyone who reaches the page
+    /// reaches these, behind the browser guard and the page's policy only.
+    /// For what must work before an account exists (signing up, a reset).
+    pub open_routes: Router<ApiState>,
+    /// The build's word on what a user account may request. `Some(false)`
+    /// refuses, whatever the node says: a build can always close more.
+    /// `Some(true)` opens only a request [`user_may`] does not name, so a build
+    /// can open its own routes and none of the node's. `None` leaves it to
+    /// the node.
+    pub user_may: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
+    /// Wraps the whole router, outermost: it sees every request before the
+    /// browser guard and every response after it (to notice that something
+    /// changed, say). It runs the build's own code on every request, so it
+    /// must pass requests on unchanged.
+    pub wrap: Option<fn(Router) -> Router>,
+}
+
+impl Default for Extension {
+    fn default() -> Self {
+        Self { routes: Router::new(), open_routes: Router::new(), user_may: None, wrap: None }
+    }
+}
+
+/// [`router_full`] with an [`Extension`].
+pub fn router_with(
+    agent: Arc<Agent>,
+    token: Option<String>,
+    pack_dir: Option<std::path::PathBuf>,
+    interfaces: Option<Arc<crate::interfaces::InterfaceManager>>,
+    extension: Extension,
+) -> Router {
+    let Extension { routes: extra, open_routes, user_may: user_may_ext, wrap } = extension;
+    // A file that cannot be read leaves accounts off rather than starting with
+    // none (which would let the next holder of the token make one). The token
+    // still works, so the operator is never locked out.
+    let accounts = token.as_ref().and_then(|_| {
+        let path = agent.config().data_root.join("web-accounts.json");
+        match crate::accounts::Accounts::load(&path) {
+            Ok(a) => Some(Arc::new(a)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "page accounts are off until this file is fixed; the API token still works");
+                None
+            }
+        }
+    });
     let state = ApiState {
         agent: agent.clone(),
         installs: agent.installs(),
         token: token.map(Arc::new),
         pack_dir: pack_dir.map(Arc::new),
         interfaces,
+        accounts,
+        user_may_ext,
     };
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/capacity", get(capacity))
+        .route("/controller/status", get(controller_status))
+        .route("/controller/*rest", axum::routing::any(controller_proxy))
         .route("/instances", get(list).post(create))
         .route("/usage", get(usage))
         .route("/storage", get(storage))
@@ -131,6 +211,12 @@ pub fn router_full(
         .route("/instances/:id/backups/:name/restore", post(restore_backup))
         .route("/instances/:id/backup-schedule", get(backup_schedule).put(set_backup_schedule))
         .route("/instances/:id/backups/:name/file", get(download_backup))
+        .route("/instances/:id/spec", get(instance_spec))
+        // A move (ROADMAP §13 item 7): the files changed since a time, laid
+        // over a stopped server, and its mesh identity.
+        .route("/instances/:id/delta", post(create_delta))
+        .route("/instances/:id/backups/:name/merge", post(merge_backup))
+        .route("/instances/:id/identity", get(read_identity).put(set_identity))
         .route(
             "/instances/:id/backups/import",
             post(import_backup).layer(axum::extract::DefaultBodyLimit::disable()),
@@ -178,7 +264,25 @@ pub fn router_full(
         .route("/interfaces", get(interfaces_status).post(interfaces_add))
         .route("/interfaces/:id", delete(interfaces_remove))
         .route("/interfaces/:id/rename", post(interfaces_rename))
+        .route("/auth/logout", post(auth_logout))
+        .route("/auth/me", get(auth_me))
+        .route("/auth/password", post(auth_password))
+        .route("/auth/totp/begin", post(auth_totp_begin))
+        .route("/auth/totp/enable", post(auth_totp_enable))
+        .route("/auth/totp/disable", post(auth_totp_disable))
+        .route("/auth/users", get(auth_users).post(auth_user_add))
+        .route("/auth/users/:name", delete(auth_user_remove))
+        .route("/auth/users/:name/role", post(auth_user_role))
+        .route("/auth/users/:name/deny-admin", post(auth_user_deny_admin))
+        .route("/auth/admin-request", post(auth_admin_request))
+        .merge(extra)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        // Signing in happens before there is anything to present, so these
+        // sit outside the gate: what this node wants (`/auth/state`), a
+        // sign-in, and making the first account, which needs the API token.
+        .route("/auth/state", get(auth_state))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/setup", post(auth_setup))
         // The web UI is served **outside** the auth layer, deliberately. A
         // login page that needed the token to load could never be reached, and
         // these three files are the same for every install — they contain no
@@ -191,7 +295,93 @@ pub fn router_full(
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
-        .with_state(state)
+        .merge(open_routes)
+        .layer(middleware::from_fn_with_state(state.clone(), browser_guard))
+        .with_state(state);
+    match wrap {
+        Some(wrap) => wrap(router),
+        None => router,
+    }
+}
+
+/// What the page may load: its own three files, game art from the hosts a
+/// pack's `art` may name (`game_bridge::pack::ART_HOSTS`), and the QR code the
+/// node draws for codes. No inline script or style, no plugin, no frame, and
+/// nothing may frame the page, so a page elsewhere cannot overlay it and have
+/// an admin click its buttons.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     img-src 'self' data: https://upload.wikimedia.org https://cdn.cloudflare.steamstatic.com \
+     https://shared.cloudflare.steamstatic.com https://cdn.akamai.steamstatic.com; \
+     connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// Requests only a page of this node's own may make, and the headers every
+/// answer carries.
+///
+/// A browser on the operator's machine can be made to reach a loopback API by
+/// any website it opens: a form or `fetch` with no custom header is sent
+/// without asking (a POST with no body needs no preflight), and DNS rebinding
+/// makes a site's own name answer with `127.0.0.1`. So a request a browser
+/// marks as coming from another site, an `Origin` that is not this host, and,
+/// on a node with no token, a `Host` that is not a loopback name are refused
+/// before any route runs. Programs that are not browsers send none of these
+/// headers and are unaffected.
+async fn browser_guard(State(state): State<ApiState>, request: Request, next: Next) -> Response {
+    if let Some(why) = refuse_from_browser(request.headers(), state.token.is_none()) {
+        return (StatusCode::FORBIDDEN, Json(ApiError { error: why.to_string() })).into_response();
+    }
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    h.insert("cross-origin-opener-policy", header::HeaderValue::from_static("same-origin"));
+    h.insert("cross-origin-resource-policy", header::HeaderValue::from_static("same-origin"));
+    response
+}
+
+fn refuse_from_browser(headers: &HeaderMap, loopback_only: bool) -> Option<&'static str> {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // `same-site` is another port or subdomain of the same site: still
+    // another origin, so still refused.
+    let host = text("host");
+    if let Some(site) = text("sec-fetch-site") {
+        if site != "same-origin" && site != "none" {
+            return Some("refused: a request from another site");
+        }
+    } else if let Some(origin) = text("origin") {
+        // An older browser: compare what it says it came from with where it
+        // sent the request. (A browser that sends `Sec-Fetch-Site` has already
+        // made this comparison, and a proxy that rewrites `Host` would make
+        // it fail for a page of this node's own.)
+        let authority = origin.split_once("://").map(|(_, rest)| rest);
+        if authority.is_none() || authority != host {
+            return Some("refused: a request from another site");
+        }
+    }
+    if loopback_only {
+        let host = host?;
+        if !is_loopback_host(host) {
+            return Some("refused: this node answers only to its loopback address");
+        }
+    }
+    None
+}
+
+/// `localhost`, `127.x.x.x` or `[::1]`, with or without a port.
+fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, after)) if after.is_empty() || after.starts_with(':') => inside,
+            _ => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _)| name)
+    };
+    if name.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 const UI_INDEX: &str = include_str!("../webui/index.html");
@@ -229,9 +419,17 @@ async fn ui_css() -> Response {
 /// operator's own machine is a loopback client, and so is every other program
 /// on it. An exemption there would mean the token protects the network and
 /// nothing else.
+/// Who a request that passed [`require_token`] is: an account by name, or the
+/// API token (no name).
+#[derive(Clone)]
+struct Caller {
+    username: Option<String>,
+    role: crate::accounts::Role,
+}
+
 async fn require_token(
     State(state): State<ApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<ApiError>)> {
     let Some(expected) = &state.token else {
@@ -239,16 +437,343 @@ async fn require_token(
         // bind anywhere but loopback, so this is the local-only mode.
         return Ok(next.run(request).await);
     };
-    let presented = request
-        .headers()
+    let presented = presented_token(request.headers());
+    // The API token (an admin), or a live session from signing in with an
+    // account, which acts with that account's role.
+    let caller = if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        Some(Caller { username: None, role: crate::accounts::Role::Admin })
+    } else {
+        state.accounts.as_ref().and_then(|a| {
+            a.session(presented).and_then(|user| a.role(&user).map(|role| Caller { username: Some(user), role }))
+        })
+    };
+    let Some(caller) = caller else {
+        return Err(fail(StatusCode::UNAUTHORIZED, "sign in, or present a valid API token"));
+    };
+    let may = user_may_with(state.user_may_ext, request.method(), request.uri().path());
+    if caller.role == crate::accounts::Role::User && !may {
+        return Err(fail(StatusCode::FORBIDDEN, "only an admin of this node can do that"));
+    }
+    request.extensions_mut().insert(caller);
+    Ok(next.run(request).await)
+}
+
+/// What an account with the user role may do: run servers. Everything else
+/// needs an admin, **including any route added later until it is listed here**,
+/// so a new route cannot be opened to users by forgetting it.
+pub fn user_may(method: &axum::http::Method, path: &str) -> bool {
+    user_may_named(method, path).unwrap_or(false)
+}
+
+/// [`user_may`] with a build's word ([`Extension::user_may`]): the build can
+/// refuse anything, and open only what the node does not name.
+pub fn user_may_with(
+    ext: Option<fn(&axum::http::Method, &str) -> Option<bool>>,
+    method: &axum::http::Method,
+    path: &str,
+) -> bool {
+    let build = ext.and_then(|f| f(method, path));
+    if build == Some(false) {
+        return false;
+    }
+    user_may_named(method, path).unwrap_or(build == Some(true))
+}
+
+/// [`user_may`]'s own answer, or `None` for a request it does not name, which
+/// only a build's [`Extension::user_may`] can then open.
+pub fn user_may_named(method: &axum::http::Method, path: &str) -> Option<bool> {
+    use axum::http::Method;
+    let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match seg.as_slice() {
+        // A server's identity is its address (its secret); spec, delta and merge
+        // are a move's plumbing, driven by an index with the token.
+        ["instances", _, "identity" | "spec" | "delta"] | ["instances", _, "backups", _, "merge"] => Some(false),
+        // Acting as an admin of the index, or asking to become one, through a
+        // controller: the node has one identity there, so only its admins.
+        ["controller", "admin", ..] | ["controller", "admin-requests", ..] => Some(false),
+        // Who has an account here, and who asked to be an admin, is an admin's.
+        ["auth", "users", ..] => Some(false),
+        _ if *method == Method::GET => Some(true),
+        ["instances"] => Some(*method == Method::POST),
+        ["instances", _] => Some(*method == Method::DELETE),
+        ["instances", _, action] => Some(matches!(
+            *action,
+            "stop" | "start" | "restart" | "map" | "console" | "chat" | "bots" | "moderation"
+                | "restart-on-crash" | "restart-schedule" | "backups" | "backup-schedule" | "world"
+        )),
+        ["instances", _, "chat", "mute"] | ["instances", _, "backups", "import"] => Some(true),
+        ["instances", _, "backups", _] => Some(*method == Method::DELETE),
+        ["instances", _, "backups", _, "restore"] => Some(true),
+        ["mesh", "announce"] => Some(true),
+        ["auth", "logout" | "password" | "admin-request"] | ["auth", "totp", _] => Some(true),
+        // Servers through a controller; the controller's own allowlist applies.
+        ["controller", ..] => Some(true),
+        _ => None,
+    }
+}
+
+fn presented_token(headers: &HeaderMap) -> &str {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        return Err(fail(StatusCode::UNAUTHORIZED, "a valid API token is required"));
+        .unwrap_or("")
+}
+
+// ---------- page accounts (accounts.rs) ----------
+
+const TOTP_ISSUER: &str = "Lanthorn Host";
+
+fn accounts_of(state: &ApiState) -> Result<&Arc<crate::accounts::Accounts>, (StatusCode, Json<ApiError>)> {
+    state
+        .accounts
+        .as_ref()
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "this node has no accounts: it needs an API token first"))
+}
+
+/// The account behind this request's session, for the routes that change an
+/// account. The API token is no account, so it cannot change a password.
+fn signed_in(state: &ApiState, headers: &HeaderMap) -> Result<String, (StatusCode, Json<ApiError>)> {
+    accounts_of(state)?
+        .session(presented_token(headers))
+        .ok_or_else(|| fail(StatusCode::FORBIDDEN, "sign in with an account to change it"))
+}
+
+/// What the page should offer: a sign-in, the first account, or nothing (no
+/// token, so loopback-only and open).
+async fn auth_state(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "token_required": state.token.is_some(),
+        "accounts": state.accounts.is_some(),
+        "has_accounts": state.accounts.as_ref().is_some_and(|a| a.any()),
+    }))
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    username: String,
+    password: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+async fn auth_login(
+    State(state): State<ApiState>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::accounts::LoginRefusal;
+    let refuse = |status: StatusCode, msg: String, needs_code: bool| {
+        (status, Json(serde_json::json!({ "error": msg, "needs_code": needs_code })))
+    };
+    let Some(accounts) = state.accounts.as_ref() else {
+        return Err(refuse(StatusCode::NOT_FOUND, "this node has no accounts".into(), false));
+    };
+    match accounts.login(&req.username, &req.password, req.code.as_deref(), std::time::SystemTime::now()) {
+        Ok(session) => {
+            tracing::info!(user = %req.username.to_ascii_lowercase(), "signed in to the page");
+            state.agent.events().session_started(&req.username.to_ascii_lowercase());
+            Ok(Json(serde_json::json!({
+                "session": session,
+                "username": req.username.to_ascii_lowercase(),
+                "expires_in_secs": crate::accounts::SESSION_LIFETIME.as_secs(),
+            })))
+        }
+        Err(r @ LoginRefusal::Throttled { .. }) => Err(refuse(StatusCode::TOO_MANY_REQUESTS, r.to_string(), false)),
+        Err(r @ (LoginRefusal::NeedsCode | LoginRefusal::WrongCode)) => {
+            Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), true))
+        }
+        Err(r @ LoginRefusal::Wrong) => Err(refuse(StatusCode::UNAUTHORIZED, r.to_string(), false)),
     }
-    Ok(next.run(request).await)
+}
+
+#[derive(Deserialize)]
+struct SetupReq {
+    token: String,
+    username: String,
+    password: String,
+}
+
+/// The first account, made with the API token: whoever can read that file owns
+/// this node. Refused once any account exists, so it is never a way in.
+async fn auth_setup(State(state): State<ApiState>, Json(req): Json<SetupReq>) -> ApiResult<crate::accounts::AccountView> {
+    let accounts = accounts_of(&state)?;
+    let Some(expected) = &state.token else {
+        return Err(fail(StatusCode::NOT_FOUND, "this node has no API token"));
+    };
+    if accounts.any() {
+        return Err(fail(StatusCode::CONFLICT, "an account already exists here; sign in with it"));
+    }
+    if !constant_time_eq(req.token.trim().as_bytes(), expected.as_bytes()) {
+        return Err(fail(StatusCode::UNAUTHORIZED, "that is not this node's API token"));
+    }
+    let made = accounts
+        .create(&req.username, &req.password, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %made.username, "the first page account was made");
+    Ok(Json(made))
+}
+
+async fn auth_logout(State(state): State<ApiState>, headers: HeaderMap) -> StatusCode {
+    if let Some(a) = state.accounts.as_ref() {
+        a.end_session(presented_token(&headers));
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn auth_me(State(state): State<ApiState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let user = state.accounts.as_ref().and_then(|a| a.session(presented_token(&headers)).and_then(|u| a.get(&u)));
+    Json(match user {
+        Some(u) => serde_json::json!({
+            "via": "account", "username": u.username, "totp_enabled": u.totp_enabled,
+            "role": u.role, "admin_requested_unix": u.admin_requested_unix,
+        }),
+        None => serde_json::json!({ "via": "token", "role": "admin" }),
+    })
+}
+
+#[derive(Deserialize)]
+struct PasswordReq {
+    current: String,
+    new: String,
+}
+
+async fn auth_password(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<PasswordReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let user = signed_in(&state, &headers)?;
+    accounts_of(&state)?
+        .change_password(&user, &req.current, &req.new, Some(presented_token(&headers)))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account changed its password");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_totp_begin(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<serde_json::Value> {
+    let user = signed_in(&state, &headers)?;
+    let (secret, uri, svg) = accounts_of(&state)?.begin_totp(&user, TOTP_ISSUER).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(serde_json::json!({ "secret": secret, "otpauth": uri, "qr_svg": svg })))
+}
+
+#[derive(Deserialize)]
+struct CodeReq {
+    code: String,
+}
+
+async fn auth_totp_enable(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CodeReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let user = signed_in(&state, &headers)?;
+    accounts_of(&state)?
+        .enable_totp(&user, &req.code, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account turned sign-in codes on");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_totp_disable(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<CodeReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let user = signed_in(&state, &headers)?;
+    accounts_of(&state)?
+        .disable_totp(&user, &req.code, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account turned sign-in codes off");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_users(State(state): State<ApiState>) -> ApiResult<Vec<crate::accounts::AccountView>> {
+    Ok(Json(accounts_of(&state)?.list()))
+}
+
+#[derive(Deserialize)]
+struct UserReq {
+    username: String,
+    password: String,
+    /// `user` unless an admin asks for `admin`.
+    #[serde(default)]
+    role: Option<crate::accounts::Role>,
+}
+
+async fn auth_user_add(State(state): State<ApiState>, Json(req): Json<UserReq>) -> ApiResult<crate::accounts::AccountView> {
+    let role = req.role.unwrap_or(crate::accounts::Role::User);
+    let made = accounts_of(&state)?
+        .create_with_role(&req.username, &req.password, role, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %made.username, "a page account was added");
+    Ok(Json(made))
+}
+
+#[derive(Deserialize)]
+struct RoleReq {
+    role: crate::accounts::Role,
+}
+
+/// An admin makes an account an admin or a user (admin only, by `user_may`).
+async fn auth_user_role(
+    State(state): State<ApiState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(req): Json<RoleReq>,
+) -> ApiResult<crate::accounts::AccountView> {
+    let changed = accounts_of(&state)?.set_role(&name, req.role).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %name, role = ?req.role, "a page account's role changed");
+    Ok(Json(changed))
+}
+
+async fn auth_user_deny_admin(
+    State(state): State<ApiState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> ApiResult<crate::accounts::AccountView> {
+    let denied = accounts_of(&state)?.deny_admin(&name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %name, "a page account's request to become an admin was turned down");
+    Ok(Json(denied))
+}
+
+/// A user asks to become an admin of this node; an admin decides.
+async fn auth_admin_request(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<crate::accounts::AccountView> {
+    let user = signed_in(&state, &headers)?;
+    let asked = accounts_of(&state)?
+        .request_admin(&user, std::time::SystemTime::now())
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(user = %user, "a page account asked to become an admin");
+    Ok(Json(asked))
+}
+
+async fn auth_user_remove(
+    State(state): State<ApiState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    remove_account(&state, &name).await?;
+    tracing::info!(user = %name, "a page account was removed");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a page account, and first, for a user on a node with a controller,
+/// everything the index keeps under that account's own identity (its servers
+/// and their backups). If the index cannot do that (one of its workers is not
+/// answering), the account stays, so its servers are never left running with
+/// nobody able to reach them.
+async fn remove_account(state: &ApiState, name: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let accounts = accounts_of(state)?;
+    let role = accounts.role(name).ok_or_else(|| fail(StatusCode::BAD_REQUEST, "no such account"))?;
+    // The account rules (last account, last admin) first, so nothing is erased
+    // for a removal that would be refused anyway.
+    accounts.check_removable(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    if let (Some(controller), crate::accounts::Role::User) = (state.agent.controller(), role) {
+        let caller = Caller { username: Some(name.to_string()), role };
+        let acting = acting_for(state, Some(&caller))?;
+        controller.erase(&acting).await.map_err(|e| {
+            fail(StatusCode::BAD_GATEWAY, format!("the account's servers could not be removed at the controller, so the account stays: {e:#}"))
+        })?;
+    }
+    accounts.remove(name).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    state.agent.events().account_removed(name);
+    Ok(())
 }
 
 /// Compare without leaking where the first difference is.
@@ -741,6 +1266,73 @@ async fn logs(
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
 }
 
+/// Whether this page places servers through a controller, and where. The
+/// address is not a secret; the login is, and it is never sent to the page.
+async fn controller_status(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(match state.agent.controller() {
+        Some(c) => json!({ "enabled": true, "url": c.address() }),
+        None => json!({ "enabled": false }),
+    })
+}
+
+/// Who a request acts as at the controller: an account with the user role as
+/// its own identity, everyone else (admins, the token, a node with no token)
+/// as the node (`controller::Acting`).
+fn acting_for(state: &ApiState, caller: Option<&Caller>) -> Result<crate::controller::Acting, (StatusCode, Json<ApiError>)> {
+    match caller {
+        Some(Caller { username: Some(username), role: crate::accounts::Role::User }) => {
+            let salt = accounts_of(state)?.key_salt(username).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            Ok(crate::controller::Acting::Account { username: username.clone(), salt })
+        }
+        _ => Ok(crate::controller::Acting::Node),
+    }
+}
+
+/// Pass one request through to the controller, if its path is on the allowlist
+/// (`controller::allowed_path`). Anything else is refused here, before a login
+/// is attempted, so a request the list does not name never reaches the index.
+async fn controller_proxy(
+    State(state): State<ApiState>,
+    caller: Option<axum::Extension<Caller>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(controller) = state.agent.controller() else {
+        return fail(StatusCode::NOT_FOUND, "this node has no controller").into_response();
+    };
+    let acting = match acting_for(&state, caller.as_deref()) {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let rest = uri.path().strip_prefix("/controller/").unwrap_or_default();
+    let rest = match uri.query() {
+        Some(q) => format!("{rest}?{q}"),
+        None => rest.to_string(),
+    };
+    let Some(path) = crate::controller::allowed_path(&method, &rest) else {
+        return fail(
+            StatusCode::NOT_FOUND,
+            "the controller does not carry that yet; this server's own page keeps it",
+        )
+        .into_response();
+    };
+    let body = (!body.is_empty()).then_some(&body[..]);
+    match controller.forward_as(&acting, &method, &path, body).await {
+        Ok(reply) => {
+            let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = Response::builder().status(status);
+            if let Some(ct) = reply.content_type {
+                response = response.header(header::CONTENT_TYPE, ct);
+            }
+            response
+                .body(axum::body::Body::from(reply.body))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        Err(e) => fail(StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
 /// Who is on a server, from the game. 404 for an unknown instance; `null` for
 /// a game that could not be asked, which the page must not show as empty.
 async fn players(
@@ -963,6 +1555,64 @@ async fn create_backup(State(state): State<ApiState>, Path(id): Path<String>) ->
     state.agent.create_backup(&id).await.map(Json).map_err(|e| fail(StatusCode::CONFLICT, e))
 }
 
+#[derive(Deserialize)]
+struct DeltaBody {
+    since: i64,
+}
+
+/// The files changed since a time, for `merge_backup` on another node.
+async fn create_delta(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeltaBody>,
+) -> ApiResult<crate::backups::Backup> {
+    state.agent.create_delta(&id, body.since).await.map(Json).map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
+/// Lay a delta over a stopped server's files.
+async fn merge_backup(
+    State(state): State<ApiState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    state
+        .agent
+        .merge_backup(&id, &name)
+        .await
+        .map(|()| Json(json!({ "instance_id": id, "merged": name })))
+        .map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
+/// A server's mesh identity as hex, or `null` for a node with no mesh.
+async fn read_identity(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<crate::uplink_wire::IdentityResp> {
+    state
+        .agent
+        .identity(&id)
+        .await
+        .map(|found| Json(crate::uplink_wire::IdentityResp { identity: found.map(hex::encode) }))
+        .map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct IdentityBody {
+    identity: String,
+}
+
+/// Give a stopped server another's mesh identity.
+async fn set_identity(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<IdentityBody>,
+) -> ApiResult<serde_json::Value> {
+    let bytes = hex::decode(&body.identity)
+        .map_err(|_| fail(StatusCode::BAD_REQUEST, anyhow::anyhow!("that is not a mesh identity")))?;
+    state
+        .agent
+        .set_identity(&id, &bytes)
+        .await
+        .map(|()| Json(json!({ "instance_id": id })))
+        .map_err(|e| fail(StatusCode::CONFLICT, e))
+}
+
 /// Put a backup back over a stopped server's files.
 async fn restore_backup(
     State(state): State<ApiState>,
@@ -988,9 +1638,15 @@ async fn delete_backup(
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))
 }
 
-/// The largest backup the node takes in. A server's own files (saves,
-/// settings, logs) are megabytes; this is a bound on a mistake, not a quota.
-const MAX_BACKUP_UPLOAD: u64 = 4 * 1024 * 1024 * 1024;
+/// The largest backup the node takes in, the same bound the uplink holds an
+/// upload to.
+const MAX_BACKUP_UPLOAD: u64 = crate::backups::MAX_IMPORT_BYTES;
+
+/// What a server would be created from again on another node
+/// (`Agent::spec`): an index moving it reads this first.
+async fn instance_spec(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<crate::instance::InstanceSpec> {
+    state.agent.spec(&id).await.map(Json).map_err(|e| fail(StatusCode::NOT_FOUND, e))
+}
 
 /// A backup's file, for the operator to keep elsewhere. Streamed, never read
 /// whole into memory.

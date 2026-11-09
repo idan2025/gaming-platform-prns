@@ -544,6 +544,15 @@ impl DockerRuntime {
             cap_drop: Some(vec!["ALL".to_string()]),
             security_opt: Some(vec!["no-new-privileges".to_string()]),
             pids_limit: Some(GAME_PIDS_LIMIT),
+            // Docker's init as PID 1, passing signals to the game. A process
+            // that is PID 1 gets no default action for a signal it has no
+            // handler for, and a dedicated server installs none for SIGTERM:
+            // measured on Sven Co-op, every `docker stop` waited out the ten
+            // seconds and ended in SIGKILL (exit 137), and that wait was the
+            // whole of a server move's downtime. Under init the game exits on
+            // the signal (exit 143, 0.25 s). Stdin passes through, so the
+            // console still reaches the game.
+            init: Some(true),
             // No restart policy on purpose: the agent decides what runs, and a
             // container that resurrects itself behind the agent's back is a
             // container the agent's state no longer describes.

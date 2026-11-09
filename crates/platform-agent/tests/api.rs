@@ -100,6 +100,7 @@ async fn without_the_token_every_route_is_refused() {
         "/health", "/capacity", "/instances", "/orphans", "/games", "/usage", "/storage",
         "/orphans/summary", "/instances/x/logs", "/instances/x/players", "/content",
         "/content/sven-coop", "/updates", "/restart-schedules", "/instances/x/backups", "/backups", "/instances/x/backup-schedule", "/instances/x/backups/20261014-051002.tar.gz/file",
+        "/controller/status", "/controller/instances",
     ] {
         let status = client
             .get(format!("http://{addr}{path}"))
@@ -237,6 +238,51 @@ async fn the_web_ui_loads_without_a_token_but_the_api_still_does_not() {
         .unwrap()
         .status();
     assert_eq!(status, 401);
+}
+
+/// A website the operator opens can make their browser send a request to a
+/// loopback node: a POST with no body needs no preflight, and DNS rebinding
+/// gives a site's own name the address `127.0.0.1`. A node with no token has
+/// nothing else in the way, so a request the browser marks as another site's,
+/// an `Origin` that is not the node, and a `Host` that is not a loopback name
+/// are refused before any route runs. A program that sends none of these is
+/// unaffected, and the page itself still works.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_site_cannot_drive_a_loopback_node_through_a_browser() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let clean = format!("http://{addr}/orphans/clean");
+    let port = addr.port();
+
+    let refused = [
+        client.post(&clean).header("sec-fetch-site", "cross-site"),
+        client.post(&clean).header("sec-fetch-site", "same-site"),
+        client.post(&clean).header("origin", "http://evil.example"),
+        client.post(&clean).header("origin", "null"),
+        client.post(&clean).header("host", format!("evil.example:{port}")),
+    ];
+    for request in refused {
+        assert_eq!(request.send().await.unwrap().status(), 403);
+    }
+
+    for request in [
+        client.get(format!("http://{addr}/instances")),
+        client.get(format!("http://{addr}/instances")).header("sec-fetch-site", "same-origin"),
+        client.get(format!("http://{addr}/instances")).header("origin", format!("http://{addr}")),
+        client.get(format!("http://localhost:{port}/instances")),
+    ] {
+        assert_eq!(request.send().await.unwrap().status(), 200);
+    }
+
+    // The page says what it may load and that nothing may frame it.
+    let page = client.get(format!("http://{addr}/")).send().await.unwrap();
+    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(csp.contains("frame-ancestors 'none'") && csp.contains("script-src 'self'"), "{csp}");
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
+    assert_eq!(page.headers()["x-content-type-options"], "nosniff");
 }
 
 /// Importing a pack must take effect on a *running* node — "add a game" that
@@ -730,4 +776,146 @@ async fn a_manual_game_says_where_its_files_go_and_which_folders_they_need() {
         std::fs::create_dir_all(want.join(p)).unwrap();
     }
     assert_eq!(content().await["missing"], serde_json::json!([]));
+}
+
+/// Placement reads the disk out of the capacity report, under the reserve the
+/// node itself keeps, so the two numbers must be the ones `/updates` shows.
+/// Report only one of them and an index would have nothing to compare it to.
+#[tokio::test(flavor = "multi_thread")]
+async fn capacity_reports_free_disk_and_the_reserve_it_is_held_to() {
+    let Some((addr, _dir)) = serve().await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let cap: serde_json::Value =
+        client.get(format!("http://{addr}/capacity")).send().await.unwrap().json().await.unwrap();
+    let updates: serde_json::Value =
+        client.get(format!("http://{addr}/updates")).send().await.unwrap().json().await.unwrap();
+
+    let free = cap["disk_free_bytes"].as_u64().expect("free disk is reported");
+    assert!(free > 0, "{cap}");
+    assert_eq!(
+        cap["disk_reserve_bytes"], updates["reserve_bytes"],
+        "the capacity report and the updates page must name the same reserve"
+    );
+}
+
+/// The page signs in with an account instead of the token. The first account
+/// needs the token and only while there is none; a sign-in gives a session that
+/// opens every route and sign-out ends; a wrong name and a wrong password read
+/// alike; and the token keeps working, but changes no account.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_signs_in_with_an_account_made_once_with_the_token() {
+    let token = "t".repeat(32);
+    let Some((addr, dir)) = serve_with_token(&token).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let c = reqwest::Client::new();
+    let url = |p: &str| format!("http://{addr}{p}");
+    let post = |p: &str, body: serde_json::Value| c.post(url(p)).json(&body);
+
+    let state: serde_json::Value = c.get(url("/auth/state")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(state["has_accounts"], false);
+    assert_eq!(state["token_required"], true);
+
+    let wrong = post("/auth/setup", serde_json::json!({"token": "nope", "username": "op", "password": "correct horse battery"}));
+    assert_eq!(wrong.send().await.unwrap().status(), 401);
+    let made = post("/auth/setup", serde_json::json!({"token": token, "username": "op", "password": "correct horse battery"}));
+    assert_eq!(made.send().await.unwrap().status(), 200);
+    let again = post("/auth/setup", serde_json::json!({"token": token, "username": "two", "password": "another long password"}));
+    assert_eq!(again.send().await.unwrap().status(), 409, "the first account is made once");
+
+    let no_name = post("/auth/login", serde_json::json!({"username": "ghost", "password": "correct horse battery"}));
+    let no_name: serde_json::Value = no_name.send().await.unwrap().json().await.unwrap();
+    let bad_pass = post("/auth/login", serde_json::json!({"username": "op", "password": "wrong password!!"}));
+    let bad_pass: serde_json::Value = bad_pass.send().await.unwrap().json().await.unwrap();
+    assert_eq!(no_name["error"], bad_pass["error"], "a missing name must read like a wrong password");
+
+    let login = post("/auth/login", serde_json::json!({"username": "op", "password": "correct horse battery"}));
+    let login: serde_json::Value = login.send().await.unwrap().json().await.unwrap();
+    let session = login["session"].as_str().expect("a session").to_string();
+    let with = |s: &str, p: &str| c.get(url(p)).bearer_auth(s.to_string());
+    assert_eq!(with(&session, "/instances").send().await.unwrap().status(), 200);
+    let me: serde_json::Value = with(&session, "/auth/me").send().await.unwrap().json().await.unwrap();
+    assert_eq!((me["via"].as_str(), me["username"].as_str()), (Some("account"), Some("op")));
+
+    // The token still opens everything, but it is no account to change.
+    assert_eq!(with(&token, "/instances").send().await.unwrap().status(), 200);
+    let by_token = c.post(url("/auth/password")).bearer_auth(&token)
+        .json(&serde_json::json!({"current": "correct horse battery", "new": "a new long password"}));
+    assert_eq!(by_token.send().await.unwrap().status(), 403);
+
+    assert_eq!(c.post(url("/auth/logout")).bearer_auth(&session).send().await.unwrap().status(), 204);
+    assert_eq!(with(&session, "/instances").send().await.unwrap().status(), 401, "sign-out ended it");
+
+    let file = std::fs::read_to_string(dir.path().join("web-accounts.json")).unwrap();
+    assert!(!file.contains("correct horse"), "a password reached the file in clear");
+}
+
+/// A user runs servers and nothing else; asks to become an admin; an admin
+/// promotes them, and their very next request has the admin's reach, with no
+/// new sign-in. The node enforces it, not the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_runs_servers_only_until_an_admin_makes_them_one() {
+    let token = "t".repeat(32);
+    let Some((addr, _dir)) = serve_with_token(&token).await else {
+        eprintln!("skipping: no Docker daemon");
+        return;
+    };
+    let c = reqwest::Client::new();
+    let url = |p: &str| format!("http://{addr}{p}");
+    let setup = c.post(url("/auth/setup")).json(&serde_json::json!({"token": token, "username": "op", "password": "correct horse battery"}));
+    assert_eq!(setup.send().await.unwrap().status(), 200);
+    let login = |user: &'static str, pass: &'static str| {
+        let c = c.clone();
+        let u = url("/auth/login");
+        async move {
+            let r: serde_json::Value = c.post(u).json(&serde_json::json!({"username": user, "password": pass})).send().await.unwrap().json().await.unwrap();
+            r["session"].as_str().unwrap().to_string()
+        }
+    };
+    let admin = login("op", "correct horse battery").await;
+    let added = c.post(url("/auth/users")).bearer_auth(&admin).json(&serde_json::json!({"username": "guest", "password": "another long password"}));
+    let added: serde_json::Value = added.send().await.unwrap().json().await.unwrap();
+    assert_eq!(added["role"], "user", "a new account is a user unless asked otherwise");
+
+    let guest = login("guest", "another long password").await;
+    let status = |s: &str, m: reqwest::Method, p: &str| c.request(m, url(p)).bearer_auth(s.to_string()).send();
+    assert_eq!(status(&guest, reqwest::Method::GET, "/instances").await.unwrap().status(), 200, "a user sees servers");
+    for (m, p) in [
+        (reqwest::Method::POST, "/orphans/clean"),
+        (reqwest::Method::GET, "/instances/x/identity"),
+        (reqwest::Method::POST, "/packs"),
+        (reqwest::Method::GET, "/controller/admin/region-requests"),
+        (reqwest::Method::POST, "/auth/users/guest/role"),
+        (reqwest::Method::GET, "/auth/users"),
+    ] {
+        assert_eq!(status(&guest, m.clone(), p).await.unwrap().status(), 403, "{m} {p} is an admin's");
+    }
+
+    let asked = c.post(url("/auth/admin-request")).bearer_auth(&guest).send().await.unwrap();
+    assert_eq!(asked.status(), 200);
+    let users: serde_json::Value = c.get(url("/auth/users")).bearer_auth(&admin).send().await.unwrap().json().await.unwrap();
+    let g = users.as_array().unwrap().iter().find(|u| u["username"] == "guest").unwrap();
+    assert!(g["admin_requested_unix"].is_u64(), "the admin sees the request");
+
+    let promote = c.post(url("/auth/users/guest/role")).bearer_auth(&admin).json(&serde_json::json!({"role": "admin"}));
+    assert_eq!(promote.send().await.unwrap().status(), 200);
+    assert_ne!(status(&guest, reqwest::Method::POST, "/orphans/clean").await.unwrap().status(), 403, "the same session now reaches it");
+    let demote_last = c.post(url("/auth/users/op/role")).bearer_auth(&admin).json(&serde_json::json!({"role": "user"}));
+    assert_eq!(demote_last.send().await.unwrap().status(), 200, "op may step down now that guest is an admin");
+    let me: serde_json::Value = c.get(url("/auth/me")).bearer_auth(&admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(me["role"], "user");
+}
+
+#[test]
+fn a_route_nobody_listed_is_an_admins() {
+    use axum::http::Method;
+    assert!(platform_agent::api::user_may(&Method::POST, "/instances/srv/stop"));
+    assert!(platform_agent::api::user_may(&Method::POST, "/controller/instances/srv/relocate"));
+    assert!(!platform_agent::api::user_may(&Method::POST, "/some/route/added/later"));
+    assert!(!platform_agent::api::user_may(&Method::PUT, "/instances/srv/identity"));
+    assert!(!platform_agent::api::user_may(&Method::POST, "/controller/admin-requests"));
 }

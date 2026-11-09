@@ -763,3 +763,7 @@ html.phone .update-progress.indeterminate .update-progress-bar {
   to { transform: translateX(330%); }
 }
 
+
+/* The invite QR code: always black on white, whatever the theme, so a phone reads it. */
+.invite-qr { padding: 12px; display: flex; justify-content: center; }
+.invite-qr img { width: 240px; height: 240px; max-width: 70vw; max-height: 70vw; background: #fff; border-radius: 6px; }

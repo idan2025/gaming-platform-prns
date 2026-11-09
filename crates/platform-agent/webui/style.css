@@ -14,7 +14,7 @@
   --line-strong: rgba(255, 255, 255, 0.12);
   --text: #e7eaee;
   --text-2: #a3abb6;
-  --text-3: #6d7682;
+  --text-3: #8b939e;
   --accent: #22d37a;
   --accent-hover: #43e392;
   --accent-soft: rgba(34, 211, 122, 0.13);
@@ -45,14 +45,15 @@
     --line-strong: rgba(15, 23, 42, 0.14);
     --text: #161a21;
     --text-2: #4e5764;
-    --text-3: #8a93a0;
-    --accent: #0f9d58;
-    --accent-hover: #0b8148;
-    --accent-soft: rgba(15, 157, 88, 0.1);
-    --ok: #13915a;
-    --ok-soft: rgba(19, 145, 90, 0.1);
-    --warn: #b7791f;
-    --warn-soft: rgba(183, 121, 31, 0.1);
+    --text-3: #4f5866;
+    --accent: #086a3b;
+    --accent-hover: #065530;
+    --accent-text: #ffffff;
+    --accent-soft: rgba(8, 106, 59, 0.1);
+    --ok: #0b6b44;
+    --ok-soft: rgba(11, 107, 68, 0.1);
+    --warn: #8a5712;
+    --warn-soft: rgba(138, 87, 18, 0.1);
     --bad: #d64545;
     --bad-soft: rgba(214, 69, 69, 0.09);
     --shadow: 0 12px 32px rgba(15, 23, 42, 0.14), 0 2px 6px rgba(15, 23, 42, 0.08);
@@ -310,10 +311,6 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .muted { color: var(--text-3); }
 .small { font-size: 12px; }
 .advanced-wrap { display: flex; flex-direction: column; gap: 8px; }
-.map-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 200px; overflow-y: auto; padding: 2px; }
-.map-choice { height: 28px; padding: 0 10px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--line); cursor: pointer; font-family: var(--mono); font-size: 12px; }
-.map-choice:hover { border-color: var(--line-strong); }
-.map-choice.chosen { background: var(--accent); color: var(--accent-text); border-color: transparent; }
 
 /* ---------- toasts ---------- */
 .error-banner, .toast { position: fixed; left: 50%; transform: translateX(-50%); z-index: 90; display: flex; align-items: center; gap: 12px; max-width: min(640px, calc(100vw - 32px)); padding: 10px 12px 10px 16px; border-radius: 10px; box-shadow: var(--shadow); }
@@ -321,7 +318,7 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 @media (prefers-color-scheme: light) { .error-banner { background: #fff1f1; color: #8a1f1f; } }
 .toast { bottom: 24px; background: var(--surface-3); border: 1px solid var(--line-strong); }
 .error-banner button, .toast button { background: none; border: 0; color: inherit; opacity: 0.7; cursor: pointer; font-size: 18px; line-height: 1; }
-.build-version { position: fixed; right: 14px; bottom: 8px; font-size: 11px; color: var(--text-3); pointer-events: none; z-index: 5; }
+.build-version { text-align: center; padding: 6px 0 0; font-size: 11px; color: var(--text-3); }
 
 /* Disk space where game files live, in the sidebar card. */
 .disk-line { display: flex; align-items: center; gap: 7px; margin: -4px 0 12px; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
@@ -406,10 +403,10 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .shell { flex-direction: column; }
   .sidebar { width: auto; height: auto; position: static; flex-direction: row; align-items: center; gap: 8px; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   .brand { padding: 0 8px 0 0; }
-  .brand-sub, .sidebar-foot .capacity { display: none; }
+  .brand-sub, .sidebar-foot .capacity, .build-version { display: none; }
   /* The tabs get a row of their own and share it; scrolling is only the
      fallback for a screen narrower than any phone. */
-  .nav { flex-direction: row; order: 3; width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .nav { flex-direction: row; order: 3; width: 100%; overflow-x: auto; }
   .nav-item { flex: 1 0 auto; justify-content: center; }
   .nav-item span:first-of-type { flex: none; }
   .sidebar-foot { margin: 0 0 0 auto; }
@@ -419,7 +416,12 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
   .list-head { display: none; }
   .inst { grid-template-columns: 64px 1fr auto; row-gap: 6px; }
   .inst .art-thumb { width: 64px; height: 30px; }
-  .inst > :nth-child(n+3):not(.actions):not(.usage) { display: none; }
+  .inst > :nth-child(n+3):not(.actions):not(.usage):not(.cell-map):not(.cell-players) { display: none; }
+  /* The map and the players are what a phone looks for, so they get a line
+     each under the name instead of a column that does not fit. */
+  .inst > .cell-map, .inst > .cell-players { grid-column: 1 / -1; font-size: 13px; order: 2; }
+  .inst > .usage { order: 3; }
+  .inst > .cell-players::before { content: "Players: "; color: var(--text-3); }
   .inst > .usage { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .form-grid { grid-template-columns: 1fr; }
 }
@@ -488,3 +490,50 @@ select.field { appearance: none; -webkit-appearance: none; padding-right: 28px; 
 .mod-form .field:nth-child(3), .mod-form .btn { grid-column: 1 / -1; }
 .modal select.field { height: 36px; }
 
+
+/* Region move requests (Requests tab, through a controller). */
+.req-card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.req-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; justify-content: space-between; }
+.req-line { font-weight: 550; overflow-wrap: anywhere; }
+.chip.req-pending { background: var(--warn-soft); color: var(--warn); }
+.chip.req-approved { background: var(--ok-soft); color: var(--ok); }
+.chip.req-denied { background: var(--bad-soft); color: var(--bad); }
+.req-card .form-actions { margin-top: 8px; }
+#tab-panel-requests h3 { margin: 18px 0 8px; font-size: 14px; }
+
+/* Account tab (accounts.rs): the QR an authenticator app scans, on white so
+   every app reads it in either theme. */
+.totp-qr { display: block; width: 200px; height: 200px; background: #fff; padding: 8px; border-radius: 6px; margin: 8px 0; }
+#tab-panel-account .req-card label { display: block; margin-top: 8px; }
+#tab-panel-account .req-card input { width: 100%; max-width: 360px; }
+#login-code-wrap { margin-top: 4px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.04em; overflow-wrap: anywhere; }
+
+/* Admin tab: the controller's workers. */
+.table-wrap { overflow-x: auto; }
+.admin-workers { width: 100%; border-collapse: collapse; font-size: 13px; }
+.admin-workers th, .admin-workers td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.admin-workers th { color: var(--text-2); font-weight: 550; }
+#tab-panel-admin h4 { margin: 16px 0 6px; }
+
+/* Spacing the markup once set inline; inline styles are refused by the page's
+   content security policy. */
+.mt-14 { margin-top: 14px; }
+.mb-12 { margin-bottom: 12px; }
+.form-actions.start { justify-content: flex-start; }
+
+/* Touch targets: 44 px where a finger is the pointer (WCAG 2.5.5). Desktop keeps its size. */
+@media (pointer: coarse) {
+  .nav-item, .btn, .btn-sm, .login-card input, .modal input, .modal select, .field, select, textarea { min-height: 44px; }
+  .login-note a { display: inline-flex; align-items: center; min-height: 44px; }
+}
+.login-note a { color: var(--accent); font-weight: 550; text-decoration: none; }
+.login-note a:hover, .login-note a:focus-visible { text-decoration: underline; }
+/* A user runs servers: the node's packs, its official-pack switch and the
+   announce of this node's own servers are an admin's (api::user_may). */
+body.role-user #add-game-btn, body.role-user #official-row, body.role-user #announce-btn { display: none !important; }
+
+/* Games the controller does not host, folded under the ones that start. */
+.games-folded { grid-column: 1 / -1; margin-top: 6px; }
+.games-folded > summary { cursor: pointer; color: var(--text-2); font-weight: 600; padding: 8px 0; }
+.games-folded > .games-grid { margin-top: 10px; }

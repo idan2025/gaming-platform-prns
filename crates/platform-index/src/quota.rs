@@ -22,6 +22,7 @@
 //! know how old this is" is **brand new** — never "infinitely idle", which would
 //! reap a running server because someone's clock drifted.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,53 @@ pub struct QuotaPolicy {
     pub min_lifetime: Duration,
     /// Refuse a new instance from an account that created one within this long.
     pub create_cooldown: Option<Duration>,
+    /// Accounts that differ from the rules above. Anyone not listed gets the
+    /// rules as written.
+    #[serde(default)]
+    pub overrides: BTreeMap<AccountId, AccountLimits>,
+    /// Remove a server that has been stopped for this long. `None` keeps
+    /// stopped servers for ever, which is the default.
+    ///
+    /// Removing takes the container only. The server's files stay on the node
+    /// until the operator removes them, the same as any server removed by hand.
+    #[serde(default)]
+    pub stopped_expiry: Option<Duration>,
+    /// Backups one account may hold across all its servers. `None` is no cap.
+    /// A server's backups sit on its node, so the index counts them when a
+    /// backup is asked for; a backup a node's own schedule makes counts too,
+    /// but is not stopped by this (the schedule has its own `keep`).
+    #[serde(default)]
+    pub max_backups_per_account: Option<u32>,
+}
+
+/// What one account is allowed beyond (or below) the shared rules. Every field
+/// left out means "as everyone else".
+///
+/// Nothing here can lift the node-wide cap: `max_total_instances` is checked
+/// for every account, so an override can reserve room for one account but never
+/// make a full node take another server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountLimits {
+    /// Instances this account may hold, in place of `max_instances_per_account`.
+    #[serde(default)]
+    pub max_instances: Option<u32>,
+    /// The outer `Some` is "this account has its own rule"; the inner `None` is
+    /// "no cooldown at all".
+    #[serde(default)]
+    pub create_cooldown: Option<Option<Duration>>,
+    /// Never stop this account's servers for being idle, and never remove them
+    /// for having been stopped too long.
+    #[serde(default)]
+    pub never_reap: bool,
+    /// The node classes this account may ask for. An account that lists none
+    /// may ask for none, so naming a class is never self-service.
+    #[serde(default)]
+    pub classes: Vec<String>,
+    /// Backups this account may hold, in place of `max_backups_per_account`.
+    /// Can be higher than the shared cap, and applies even where there is none.
+    #[serde(default)]
+    pub max_backups: Option<u32>,
 }
 
 impl Default for QuotaPolicy {
@@ -54,6 +102,9 @@ impl Default for QuotaPolicy {
             idle_timeout: Some(Duration::from_secs(30 * 60)),
             min_lifetime: Duration::from_secs(5 * 60),
             create_cooldown: Some(Duration::from_secs(30)),
+            overrides: BTreeMap::new(),
+            stopped_expiry: None,
+            max_backups_per_account: None,
         }
     }
 }
@@ -79,6 +130,7 @@ pub enum DenyReason {
     AccountInstanceLimit { limit: u32, held: u32 },
     NodeInstanceLimit { limit: u32, held: u32 },
     Cooldown { retry_after: Duration },
+    AccountBackupLimit { limit: u32, held: u32 },
 }
 
 impl core::fmt::Display for DenyReason {
@@ -96,6 +148,11 @@ impl core::fmt::Display for DenyReason {
                 f,
                 "too many servers started too quickly; try again in {} seconds",
                 retry_after.as_secs().max(1)
+            ),
+            Self::AccountBackupLimit { limit, held } => write!(
+                f,
+                "you already hold {held} of your {limit} backups; \
+                 delete one before making another"
             ),
         }
     }
@@ -140,6 +197,58 @@ impl Quotas {
         &self.policy
     }
 
+    /// The limit that applies to `account`: its override if it has one.
+    pub fn max_instances_for(&self, account: &AccountId) -> u32 {
+        self.policy
+            .overrides
+            .get(account)
+            .and_then(|o| o.max_instances)
+            .unwrap_or(self.policy.max_instances_per_account)
+    }
+
+    /// The most backups `account` may hold, or `None` for no cap.
+    pub fn max_backups_for(&self, account: &AccountId) -> Option<u32> {
+        self.policy
+            .overrides
+            .get(account)
+            .and_then(|o| o.max_backups)
+            .or(self.policy.max_backups_per_account)
+    }
+
+    /// May `account`, holding `held` backups, make another?
+    pub fn admit_backup(&self, account: &AccountId, held: u32) -> Result<(), DenyReason> {
+        match self.max_backups_for(account) {
+            Some(limit) if held >= limit => Err(DenyReason::AccountBackupLimit { limit, held }),
+            _ => Ok(()),
+        }
+    }
+
+    /// How long a stopped server of `account` is kept before it is removed, or
+    /// `None` when it is kept for ever.
+    pub fn stopped_expiry_for(&self, account: &AccountId) -> Option<Duration> {
+        if self.policy.overrides.get(account).is_some_and(|o| o.never_reap) {
+            return None;
+        }
+        self.policy.stopped_expiry
+    }
+
+    /// May `account` ask for servers on nodes of `class`?
+    pub fn may_use_class(&self, account: &AccountId, class: &str) -> bool {
+        self.policy.overrides.get(account).is_some_and(|o| o.classes.iter().any(|c| c == class))
+    }
+
+    /// Whether a server of `account` stopped for `stopped_for` is due removal.
+    pub fn stopped_expired(&self, account: &AccountId, stopped_for: Duration) -> bool {
+        self.stopped_expiry_for(account).is_some_and(|after| stopped_for >= after)
+    }
+
+    fn cooldown_for(&self, account: &AccountId) -> Option<Duration> {
+        match self.policy.overrides.get(account).and_then(|o| o.create_cooldown) {
+            Some(own) => own,
+            None => self.policy.create_cooldown,
+        }
+    }
+
     pub fn held_by(&self, account: &AccountId, existing: &[InstanceRecord]) -> u32 {
         existing.iter().filter(|i| &i.account == account).count() as u32
     }
@@ -159,11 +268,9 @@ impl Quotas {
         // where "the node is full" reads as somebody else's problem even when
         // the caller is the one filling it.
         let held = self.held_by(account, existing);
-        if held >= self.policy.max_instances_per_account {
-            return Err(DenyReason::AccountInstanceLimit {
-                limit: self.policy.max_instances_per_account,
-                held,
-            });
+        let limit = self.max_instances_for(account);
+        if held >= limit {
+            return Err(DenyReason::AccountInstanceLimit { limit, held });
         }
 
         let total = existing.len() as u32;
@@ -174,7 +281,7 @@ impl Quotas {
             });
         }
 
-        if let Some(cooldown) = self.policy.create_cooldown {
+        if let Some(cooldown) = self.cooldown_for(account) {
             let newest = existing
                 .iter()
                 .filter(|i| &i.account == account)
@@ -207,6 +314,10 @@ impl Quotas {
             .filter_map(|i| {
                 // An operator pinned it.
                 if i.exempt_from_reaping {
+                    return None;
+                }
+                // The account's own rule: its servers are kept.
+                if self.policy.overrides.get(&i.account).is_some_and(|o| o.never_reap) {
                     return None;
                 }
                 // Someone is playing. This ends the question even if
@@ -252,7 +363,83 @@ mod tests {
             idle_timeout: Some(Duration::from_secs(600)),
             min_lifetime: Duration::from_secs(300),
             create_cooldown: Some(Duration::from_secs(30)),
+            overrides: BTreeMap::new(),
+            stopped_expiry: None,
+            max_backups_per_account: None,
         }
+    }
+
+    /// No cap unless the operator wrote one; the shared cap holds backups at the
+    /// limit exactly (the limit-th is allowed, the next is not); and an account's
+    /// own number replaces the shared one in either direction, or sets one where
+    /// there is none.
+    #[test]
+    fn the_backup_cap_is_off_until_written_and_an_accounts_own_number_wins() {
+        let uncapped = Quotas::new(policy());
+        assert_eq!(uncapped.max_backups_for(&account(1)), None);
+        assert!(uncapped.admit_backup(&account(1), 10_000).is_ok());
+
+        let mut p = policy();
+        p.max_backups_per_account = Some(3);
+        p.overrides.insert(account(2), AccountLimits { max_backups: Some(10), ..Default::default() });
+        p.overrides.insert(account(3), AccountLimits { max_backups: Some(1), ..Default::default() });
+        let q = Quotas::new(p);
+        assert!(q.admit_backup(&account(1), 2).is_ok(), "the third is allowed");
+        assert_eq!(
+            q.admit_backup(&account(1), 3).unwrap_err().to_string(),
+            "you already hold 3 of your 3 backups; delete one before making another"
+        );
+        assert!(q.admit_backup(&account(2), 9).is_ok(), "an account may be given more");
+        assert!(q.admit_backup(&account(2), 10).is_err());
+        assert!(q.admit_backup(&account(3), 1).is_err(), "or fewer");
+
+        let mut only_one = policy();
+        only_one.overrides.insert(account(4), AccountLimits { max_backups: Some(2), ..Default::default() });
+        let q = Quotas::new(only_one);
+        assert!(q.admit_backup(&account(4), 2).is_err(), "a cap for one account where there is none");
+        assert!(q.admit_backup(&account(5), 2).is_ok(), "and nobody else is capped");
+    }
+
+    #[test]
+    fn an_account_may_ask_only_for_the_classes_it_was_given() {
+        let q = with_override(
+            AccountLimits { classes: vec!["gold".into()], ..Default::default() },
+            1,
+        );
+        assert!(q.may_use_class(&account(1), "gold"));
+        assert!(!q.may_use_class(&account(1), "silver"), "a class it was not given");
+        assert!(!q.may_use_class(&account(2), "gold"), "an account with no entry has none");
+    }
+
+    #[test]
+    fn a_stopped_server_is_removed_only_after_the_expiry() {
+        let mut p = policy();
+        p.stopped_expiry = Some(Duration::from_secs(86_400));
+        let q = Quotas::new(p);
+        assert!(!q.stopped_expired(&account(1), Duration::from_secs(86_399)));
+        assert!(q.stopped_expired(&account(1), Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn with_no_expiry_set_a_stopped_server_is_kept_for_ever() {
+        let q = Quotas::new(policy());
+        assert!(!q.stopped_expired(&account(1), Duration::from_secs(10 * 365 * 86_400)));
+    }
+
+    #[test]
+    fn a_never_reap_account_keeps_its_stopped_servers_too() {
+        let mut p = policy();
+        p.stopped_expiry = Some(Duration::from_secs(60));
+        p.overrides.insert(account(1), AccountLimits { never_reap: true, ..Default::default() });
+        let q = Quotas::new(p);
+        assert!(!q.stopped_expired(&account(1), Duration::from_secs(1_000_000)));
+        assert!(q.stopped_expired(&account(2), Duration::from_secs(1_000_000)));
+    }
+
+    fn with_override(limits: AccountLimits, who: u8) -> Quotas {
+        let mut p = policy();
+        p.overrides.insert(account(who), limits);
+        Quotas::new(p)
     }
 
     fn account(n: u8) -> AccountId {
@@ -427,5 +614,70 @@ mod tests {
         assert!(d.max_total_instances > 0);
         assert!(d.idle_timeout.is_some(), "reaping off by default is free compute");
         assert!(d.min_lifetime > Duration::ZERO);
+    }
+
+    #[test]
+    fn an_account_with_its_own_limit_gets_it_and_others_keep_the_shared_one() {
+        let q = with_override(AccountLimits { max_instances: Some(3), ..Default::default() }, 1);
+        let mine = vec![rec("a", 1, 1000), rec("b", 1, 1000)];
+        assert_eq!(q.admit(&account(1), &mine, t0()), Ok(()), "two of its three");
+        let theirs = vec![rec("a", 2, 1000), rec("b", 2, 1000)];
+        assert_eq!(
+            q.admit(&account(2), &theirs, t0()),
+            Err(DenyReason::AccountInstanceLimit { limit: 2, held: 2 }),
+            "another account is not widened"
+        );
+    }
+
+    #[test]
+    fn an_override_can_lower_a_limit_too() {
+        let q = with_override(AccountLimits { max_instances: Some(1), ..Default::default() }, 1);
+        assert_eq!(
+            q.admit(&account(1), &[rec("a", 1, 1000)], t0()),
+            Err(DenyReason::AccountInstanceLimit { limit: 1, held: 1 })
+        );
+    }
+
+    /// An override reserves room for one account; it never makes a full node
+    /// take another server.
+    #[test]
+    fn an_override_cannot_lift_the_node_wide_cap() {
+        let q = with_override(AccountLimits { max_instances: Some(50), ..Default::default() }, 1);
+        let others = vec![rec("a", 2, 1000), rec("b", 3, 1000), rec("c", 4, 1000)];
+        assert_eq!(
+            q.admit(&account(1), &others, t0()),
+            Err(DenyReason::NodeInstanceLimit { limit: 3, held: 3 })
+        );
+    }
+
+    #[test]
+    fn an_account_can_have_its_own_cooldown_or_none() {
+        let just_made = vec![rec("a", 1, 10)];
+        let none = with_override(AccountLimits { create_cooldown: Some(None), ..Default::default() }, 1);
+        assert_eq!(none.admit(&account(1), &just_made, t0()), Ok(()));
+        let long = with_override(
+            AccountLimits { create_cooldown: Some(Some(Duration::from_secs(100))), ..Default::default() },
+            1,
+        );
+        assert_eq!(
+            long.admit(&account(1), &just_made, t0()),
+            Err(DenyReason::Cooldown { retry_after: Duration::from_secs(90) })
+        );
+        // Someone else still has the shared 30 s.
+        let theirs = vec![rec("a", 2, 10)];
+        assert_eq!(
+            none.admit(&account(2), &theirs, t0()),
+            Err(DenyReason::Cooldown { retry_after: Duration::from_secs(20) })
+        );
+    }
+
+    #[test]
+    fn a_never_reap_account_is_kept_and_its_neighbour_is_not() {
+        let q = with_override(AccountLimits { never_reap: true, ..Default::default() }, 1);
+        let kept = rec("kept", 1, 100_000);
+        let gone = rec("gone", 2, 100_000);
+        let reaped = q.to_reap(&[kept, gone], t0());
+        let ids: Vec<&str> = reaped.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["gone"]);
     }
 }

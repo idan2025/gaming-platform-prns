@@ -121,6 +121,23 @@ pub fn web_link(destination_hash: &str, game_id: Option<&str>, name: Option<&str
     format!("{WEB_PAGE}#{}", app.strip_prefix(&format!("{SCHEME}://join/")).unwrap_or(&app))
 }
 
+/// An invite as a QR code, an SVG the page draws as it is. Only a string
+/// [`parse`] accepts is drawn, so the command cannot be asked to make a code
+/// for anything else (a code can be scanned by a phone that will open it).
+/// Drawn here and sent nowhere.
+pub fn qr_svg(invite: &str) -> Result<String, String> {
+    parse(invite)?;
+    let code = qrcode::QrCode::with_error_correction_level(invite.as_bytes(), qrcode::EcLevel::M)
+        .map_err(|e| format!("could not make a QR code: {e}"))?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .quiet_zone(true)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build())
+}
+
 fn is_hash(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -166,6 +183,16 @@ mod tests {
     use super::*;
 
     const H: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn a_qr_code_is_made_for_an_invite_and_for_nothing_else() {
+        let svg = qr_svg(&web_link(H, Some("minecraft-bedrock"), Some("Friday"), false)).unwrap();
+        assert!(svg.starts_with("<?xml") && svg.contains("<svg"), "{svg}");
+        assert!(qr_svg(&link(H, None, None, true)).is_ok(), "the app link too");
+        for stranger in ["https://example.com/", "", "tel:+15551234567", "lanthorn://join/nothex"] {
+            assert!(qr_svg(stranger).is_err(), "{stranger} must not get a code");
+        }
+    }
 
     #[test]
     fn a_link_round_trips() {

@@ -12,7 +12,7 @@ MAXPLAYERS="${GPP_MAX_PLAYERS:-16}"
 MAP="${GPP_MAP:-svencoop1}"
 NAME="${GPP_SERVER_NAME:-Sven Co-op}"
 
-if [ ! -x "$CONTENT/svends_run" ]; then
+if [ ! -x "$CONTENT/svends_i686" ]; then
     echo "No Sven Co-op install at $CONTENT." >&2
     echo "The node mounts its content there; install it first (the agent's" >&2
     echo "steamcmd driver fetches app 276060)." >&2
@@ -39,10 +39,19 @@ echo "Starting Sven Co-op: port=$PORT maxplayers=$MAXPLAYERS map=$MAP name=$NAME
 # svencoop-prns's controller — `/proc/net/udp` shows 0.0.0.0 regardless). The
 # node decides what is reachable from outside by which port it publishes.
 #
-# `exec` so the DS is PID 1 and receives `docker stop`'s SIGTERM directly.
-# Without it the shell is PID 1, the signal never reaches the game, and every
-# stop takes the full ten-second timeout before a SIGKILL.
-exec ./svends_run \
+# `svends_i686`, not the `svends_run` wrapper, as the GoldSrc image runs
+# `hlds_linux` and not `hlds_run`. The wrapper is a restart loop that runs the
+# DS as its child, and even with `-norestart` it runs it without `exec` (its
+# own comment says otherwise), so the wrapper stays PID 1 and `docker stop`'s
+# SIGTERM never reaches the game. Measured: every stop took 10.3 s and ended in
+# SIGKILL (exit 137), and so did every server move; with the DS as PID 1 it
+# exits on the signal. The loop also restarted a crashed DS inside the
+# container, where the agent's crash watch cannot see it. The wrapper's other
+# work is the library path, set here, and a `steam_appid.txt` the install
+# already ships.
+LD_LIBRARY_PATH="$CONTENT:$CONTENT/redist:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH
+exec ./svends_i686 \
     -port "$PORT" \
     +maxplayers "$MAXPLAYERS" \
     +map "$MAP" \

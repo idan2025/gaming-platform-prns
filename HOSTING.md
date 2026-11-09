@@ -23,6 +23,16 @@ api_bind = "0.0.0.0:4750"                     # loopback inside a container is t
 api_token_file = "/var/lib/gaming-platform-prns/api.token"
 ```
 
+**Signing in to the page.** The first time you open the page it asks for the API
+token once, with a username and password, and makes your account. From then on
+you sign in with the username and password. Under **Account** you can change the
+password, turn on codes from an authenticator app (scan the QR code, type back
+a code), and add or remove accounts. Accounts are kept in
+`<data_root>/web-accounts.json` (owner-only, passwords as Argon2id hashes). The
+API token keeps working for scripts and a controller, and it is the way back in
+if the phone with the codes is lost: "Use the API token instead" on the sign-in
+page.
+
 The container has to run as you, and in the `docker` group. Put your own ids in
 `docker-compose.yml` (`user:` and `group_add:`), and make the data root yours:
 
@@ -548,6 +558,198 @@ entries YaPB logs `Unable to open Pathmatrix file for writing` on every map and
 recomputes it each time; with them each instance gets its own cache. Remember
 that a writable path mounts an **empty** directory over the content, so name
 only directories that are empty in the install.
+
+## Adding a worker to an index
+
+A worker is an ordinary agent on another machine that an index places servers
+on. It needs no inbound port: it dials out to a hub, and the index reaches it
+over the mesh.
+
+On the worker, with Docker running and a built `platform-agent`:
+
+```
+scripts/setup-worker.sh --index <index identity hash> --hub <hub host:port> \
+    --name <node name> [--class <label>] [--region <label>] [--priority <n>] [--service]
+```
+
+**More than one hub.** Give `--hub` more than once and the worker dials each;
+give the index `--tcp` more than once and it does the same. Reticulum carries
+the traffic through whichever hub is up, so one hub going down does not take
+the cluster with it. Measured on two LXC workers with one hub on the index's
+machine and one on a worker: with the first hub stopped, logs, stop, start and
+a new create all went through the second without one failed request, and
+every client was back on the first hub within 4 s of it returning. A worker's
+hubs live in `data/agent-interfaces.json`, the same file its page edits.
+
+It writes `~/lanthorn-worker/agent.toml` that trusts the index, makes the
+worker's identity (`agent.identity`, owner-only), points the worker at the hub,
+and prints a `[[nodes]]` block. Paste that block into the index's hosting file;
+the index picks it up within 10 s. It starts nothing unless you pass `--service`,
+which writes a systemd user unit and leaves enabling it to you.
+
+Add a `[games.<id>]` section to `agent.toml` for each game the worker runs. A
+game with no entry cannot be placed there.
+
+`--region` (`region = "eu"` in the node's block) says where the worker is. A
+create may ask for a region (`"region": "eu"`, or the Region field on a node
+page with a controller), and a worker there that answered is picked before any
+other; with none there that has room, the server goes wherever it would have
+gone. A move prefers the region it is leaving. The index lists its regions on
+`/hosting` and its page, never which worker is in which.
+
+The index's identity hash is in its log at start (`index identity ... identity=`),
+and on the page its HTTP address serves (`/`), which also says whether it hosts
+and which games, and names no worker.
+Nothing the script prints is secret: the two hashes are public, and the identity
+file never leaves the worker.
+
+## Placing servers through a controller
+
+A worker's page shows one machine. Add a `[controller]` section and the same
+page places servers through an index instead, across every worker it drives:
+
+```toml
+[uplink]
+identity_secret_path = "/var/lib/gaming-platform-prns/agent.identity"
+trusted_indexes = ["<index identity hash>"]
+
+[controller]
+url = "https://index.example.org"        # or http://127.0.0.1:4760 on this machine
+identity = "<index identity hash>"       # the same hash, pinned
+```
+
+The node logs in to the index with its uplink identity, so **the servers the
+page places belong to this node's identity**, and the quotas that index keeps
+apply to it. The login's signature is bound to the pinned identity: an index
+the node is not pinned to cannot use it. A plain `http://` address off this
+machine is refused at start, because it would send the session in the clear.
+
+The page lists every server on every worker the index drives. Create, stop,
+start, remove, logs and backups go through the index, which sends each to the
+node that holds the server. **What the controller does not carry**, and what
+stays on the node's own page: console, map change, changing bots on a running
+server, chat, players, restart, world upload and backup download. The node
+refuses those on this route, so nothing that types at a server or moves its
+files is reachable from the controller. With a controller the Games page offers the games the index hosts (this node's
+own setup does not count; the workers fetch the files), a server's row names its
+worker and shows its address, a stopped one has **Start** where a node has
+Restart, and what the controller does not carry is greyed out with the reason.
+What the create form asks for travels
+with the create: bots to start with, restart on crash, and a game's own
+choices (a Minecraft build, its heap, the EULA, world settings).
+
+Each action on the controller list is one request to the index. The page polls
+the list every 5 s; the node shares one list from the index among every page
+open on it for 4 s, and drops it whenever a change goes through, so several
+open pages cost the index what one does.
+
+## Moving a server to another worker
+
+"Move to another worker…" in a server's menu (on a page with a controller), or
+`POST /instances/<id>/relocate` on the index (`{"node": "<worker>"}` to pick
+one), moves one of your servers to the worker you pick, or the one with the most
+room, **among the workers of its own region** and class
+(`GET /instances/<id>/move-targets` lists them). **The server keeps running
+while its files are copied**, and comes up on the new worker at the **same mesh
+address**.
+
+**Another region is asked for, not taken.** A server's region is the region of
+the worker it runs on, so the one it was created in is its home. To move it to
+another, its owner asks (`POST /instances/<id>/region-request`, or "Ask an
+admin" in the move dialog), and an admin of the index decides on the page's
+**Requests** tab (`/admin/region-requests/<id>/approve` or `/deny`). On
+approval the index moves it to the worker with the most room in that region,
+which becomes its home; going back is another request. An approval that finds
+no room leaves the request waiting and says why. Admins are identity hashes in
+the hosting file:
+
+```toml
+admins = ["<identity hash>"]   # who may decide region requests; nobody by default
+```
+
+Requests are kept in `region-requests.json` beside the hosting file. One
+request may wait per server, and its owner can take it back.
+
+**More admins are asked for, too.** An account of the index (for a node, the
+identity it signs in to its controller with) asks with `POST /admin-requests`
+(`{"note": "…"}`, optional), or "Ask to become an admin" on the node page's
+**Admin** tab; an admin decides at `/admin/admin-requests/<id>/approve` or
+`/deny`. A grant is kept in `index-admins.json` beside the hosting file and
+can be revoked (`DELETE /admin/admins/<identity>`); an admin written in the
+hosting file is changed only there. `GET /admin/admins` lists both kinds and
+`GET /admin/workers` shows each worker's region, class, whether it answered,
+its servers and its room. `GET /me` says whether the caller is an admin and
+how their last request went.
+
+## Accounts and roles on the node page
+
+The node page signs in with accounts once the agent has an API token (the
+first account is made with the token, at the page's first visit). Each account
+is an **admin** or a **user**:
+
+- an **admin** has the token's reach: every route, accounts, packs, content,
+  the mesh interfaces;
+- a **user** runs servers: create, start, stop, restart, remove, maps, the
+  console, bots, chat, moderation, backups, schedules and the server's world,
+  and through a controller whatever the controller allows. Reading is open,
+  except the account list. Everything else (installing games, packs, cleaning
+  leftovers, the mesh, a server's identity, acting as the node at its
+  controller) answers 403.
+
+Accounts from before roles existed are admins. A user can ask to become an
+admin (Account tab); an admin approves or turns it down on the Admin tab, and
+can change a role at any time. The last admin cannot be made a user or
+removed. The rule is one function, `api::user_may`, and a route it does not
+name is an admin's.
+
+The move itself:
+
+1. reads how the server was made and creates the same server on the new worker
+   (the new worker picks the ports), held stopped;
+2. while the old server still runs, copies all its files across (in 256 KiB
+   pieces over the uplink, through a temporary file on the index's machine),
+   then copies only what changed since, up to three times, until a copy is
+   under 1 MiB;
+3. stops the old server, copies the last changes, and gives the new server the
+   old one's identity;
+4. starts the new server, then removes the old one, last.
+
+Players are down from step 3 to the game's own boot, not for the copy: the time
+is the last small delta plus the boot (the index logs it as `downtime_ms`, which
+is the part it can see; the game's boot comes after). A server that is not
+running moves in one full copy.
+
+Measured between two LXC workers on one Proxmox host, over the LAN through a
+real index and hub, with 300 MiB of server files and a log being written to: the
+whole move took 18 s and `downtime_ms` was 478. The first run logged 10275: the
+game was PID 1 and ignored SIGTERM, so Docker waited out its 10 s stop timeout.
+Every game container now runs under Docker's init, which hands the signal on,
+so a game with no handler of its own stops in a quarter of a second. With the
+real Sven Co-op server (same 300 MiB, same workers) the move took 22 s and the
+server stopped answering A2S queries from the LAN for **1.4 s**, its own boot
+included; the index logged 303. Two machines in different
+buildings will add each piece's round trip to the copy, not to the downtime.
+
+Until step 3 the old server is not touched. If any step before the last fails,
+what was made on the new worker is removed and the old server is started again
+if it had been stopped. A worker whose agent predates moves is named as too old.
+The server gets a new instance id, but players' invite links name its address,
+which does not change.
+
+The index reads and writes a server's files on its workers to do this, and
+**carries the server's identity**, the secret that is its address, in memory
+(never written on the index). A worker that trusts an index already lets it
+create, stop and remove servers there; this also lets it stand in for that one
+server's address. If the old worker cannot remove the old server after a
+successful move, it stays there stopped and is logged: start it and two servers
+would answer to one address.
+
+Carrying a copy over the uplink ran at about 47 MiB/s read and 108 MiB/s write
+on a local hub in a release build (`a_backup_carry_is_timed`, 32 MiB, Ryzen 9
+8945HS VM). A debug build ran the same code at 2.5 MiB/s: always time a release
+build. A real link adds its own round trip to each 256 KiB piece, and the
+pieces go one at a time, so a distant worker will be slower than the hub. The
+copy is time the server is up, not down.
 
 ## Reaching the mesh: how anyone finds your server
 

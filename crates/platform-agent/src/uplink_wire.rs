@@ -47,6 +47,48 @@ pub const OP_CAPACITY: u8 = 7;
 /// Start a stopped instance. An agent older than this op answers "unknown
 /// op", which the index turns into "update that node".
 pub const OP_START: u8 = 8;
+/// The last lines a server wrote (`Agent::logs`). Read-only. The reply is the
+/// newest text that fits one packet, flagged when older lines were left out.
+pub const OP_LOGS: u8 = 9;
+/// A server's backups: list, make, restore and delete (`Agent::backups`,
+/// `create_backup`, `restore_backup`, `delete_backup`). Restore and delete name
+/// one backup by the agent's own name for it.
+pub const OP_BACKUPS: u8 = 10;
+pub const OP_BACKUP_CREATE: u8 = 11;
+pub const OP_BACKUP_RESTORE: u8 = 12;
+pub const OP_BACKUP_DELETE: u8 = 13;
+/// What a server would be created from on another node (`Agent::spec`), so an
+/// index can move it (ROADMAP §13 item 7).
+pub const OP_SPEC: u8 = 14;
+/// A backup's file, one piece at a time: read from one node, written to
+/// another. The only ops whose replies or requests are bigger than a packet;
+/// they ride a Reticulum resource, and a piece is at most `TRANSFER_CHUNK`.
+pub const OP_BACKUP_READ: u8 = 15;
+pub const OP_BACKUP_WRITE: u8 = 16;
+/// What changed in a server's files since a time, made as a backup-shaped file
+/// that is read and written like one (`Agent::create_delta`), and laid over a
+/// stopped server's files (`Agent::merge_backup`): the second half of a move
+/// that copied while the server ran.
+pub const OP_DELTA_CREATE: u8 = 17;
+pub const OP_DELTA_MERGE: u8 = 18;
+/// A server's mesh identity, which is its address: read, and set on a stopped
+/// server so a moved one keeps it (`Agent::identity`, `set_identity`).
+pub const OP_IDENTITY_READ: u8 = 19;
+pub const OP_IDENTITY_SET: u8 = 20;
+
+/// The most file one `OP_BACKUP_READ` reply or `OP_BACKUP_WRITE` request
+/// carries. Big enough that the link set-up per piece is noise, small enough
+/// that neither end holds more than this of a file in memory.
+pub const TRANSFER_CHUNK: usize = 256 * 1024;
+
+/// The maps a node has installed for one game (`Agent::available_maps`), a page
+/// at a time from `offset`, so a long list never needs more than a packet.
+pub const OP_MAPS: u8 = 21;
+/// Change a running server's map in place (`Agent::change_map`). A map name and
+/// nothing else: the words are `console.rs`'s and the name is validated as data
+/// before it is a line. Not a console route: free text never crosses the uplink
+/// (`CLAUDE.md`). Decided by the owner on 2026-11-02.
+pub const OP_MAP: u8 = 22;
 
 // Status byte in a response.
 const STATUS_OK: u8 = 0;
@@ -110,6 +152,83 @@ pub struct InstanceReq {
     pub instance_id: String,
 }
 
+/// `OP_LOGS`: how many lines to ask for. The node caps it, and the reply is
+/// capped by what fits one packet regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsReq {
+    pub token: String,
+    pub instance_id: String,
+    pub lines: u32,
+}
+
+/// `OP_MAPS`: one game's installed maps, from `offset` in the node's sorted list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapsReq {
+    pub token: String,
+    pub game_id: String,
+    pub offset: u32,
+}
+
+/// `OP_MAP`: the map one server should change to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapReq {
+    pub token: String,
+    pub instance_id: String,
+    pub map: String,
+}
+
+/// `OP_BACKUP_RESTORE` / `OP_BACKUP_DELETE`: one backup of one server, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupReq {
+    pub token: String,
+    pub instance_id: String,
+    pub name: String,
+}
+
+/// `OP_DELTA_CREATE`: the files of one server changed at or after `since`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaReq {
+    pub token: String,
+    pub instance_id: String,
+    pub since: i64,
+}
+
+/// `OP_IDENTITY_SET`: a server's identity as hex (64 bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentitySetReq {
+    pub token: String,
+    pub instance_id: String,
+    pub identity: String,
+}
+
+/// `OP_IDENTITY_READ`'s reply: the identity as hex, or none for a node with
+/// no mesh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityResp {
+    pub identity: Option<String>,
+}
+
+/// `OP_BACKUP_READ`: a piece of a named backup, from `offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupReadReq {
+    pub token: String,
+    pub instance_id: String,
+    pub name: String,
+    pub offset: u64,
+}
+
+/// `OP_BACKUP_WRITE`'s header: which upload, where this piece starts, and the
+/// whole file's length. The first piece has no `upload`; the node names it.
+/// The piece's bytes follow the header on the wire (`encode_write_body`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupWriteReq {
+    pub token: String,
+    pub instance_id: String,
+    pub upload: Option<String>,
+    pub offset: u64,
+    pub total: u64,
+}
+
 /// `OP_LIST` / `OP_CAPACITY`: read the node, with a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenReq {
@@ -117,6 +236,85 @@ pub struct TokenReq {
 }
 
 // ---- Response payloads ------------------------------------------------------
+
+/// `OP_LOGS`: the newest text that fit, and whether older lines were left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResp {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// `OP_BACKUPS`: the newest backups that fit, and whether older ones were left
+/// out. Backups are named by time, so newest is the end of the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupsResp {
+    pub backups: Vec<crate::backups::Backup>,
+    pub truncated: bool,
+}
+
+/// `OP_MAPS`: the maps from the asked offset that fit, and where the next page
+/// starts when they did not all fit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapsResp {
+    pub maps: Vec<String>,
+    pub next: Option<u32>,
+}
+
+/// As many maps from `offset` as fit one reply. A page always carries at least
+/// one map while any remain, so a caller following `next` always ends.
+pub fn encode_maps_resp(maps: &[String], offset: u32) -> Vec<u8> {
+    let rest = maps.get(offset as usize..).unwrap_or_default();
+    let mut n = rest.len();
+    loop {
+        let next = (n < rest.len()).then(|| offset + n as u32);
+        let body = payload_bytes(&MapsResp { maps: rest[..n].to_vec(), next }).unwrap_or_default();
+        if body.len() <= MAX_BODY_LEN || n <= 1 {
+            return encode_ok(OP_MAPS, &body);
+        }
+        // Halving finds a page that fits in a few steps; the last step back
+        // up is not worth the code for a list nobody scrolls by the byte.
+        n = (n / 2).max(1);
+    }
+}
+
+/// The newest log text that fits one reply, cut from the front on a character
+/// boundary: the end of a log is what someone asking for it needs.
+pub fn encode_logs_resp(text: &str) -> Vec<u8> {
+    let mut start = 0;
+    loop {
+        let kept = &text[start..];
+        let body = payload_bytes(&LogsResp { text: kept.to_string(), truncated: start > 0 })
+            .unwrap_or_default();
+        if body.len() <= MAX_BODY_LEN || kept.is_empty() {
+            return encode_ok(OP_LOGS, &body);
+        }
+        // Eighths keep this quick on a long log; the last few lines are found
+        // by the loop's final steps.
+        start += (kept.len() / 8).max(1);
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        if start >= text.len() {
+            start = text.len();
+        }
+    }
+}
+
+/// The newest backups that fit one reply. Names are the agent's own timestamps,
+/// so ascending by name is oldest first, and the oldest are the ones dropped.
+pub fn encode_backups_resp(backups: &[crate::backups::Backup]) -> Vec<u8> {
+    let mut sorted = backups.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut start = 0;
+    loop {
+        let kept = sorted[start..].to_vec();
+        let body = payload_bytes(&BackupsResp { backups: kept, truncated: start > 0 }).unwrap_or_default();
+        if body.len() <= MAX_BODY_LEN || start + 1 >= sorted.len() {
+            return encode_ok(OP_BACKUPS, &body);
+        }
+        start += 1;
+    }
+}
 
 /// `OP_LIST` result. Truncation is on the wire for the same reason as
 /// `wire.rs::QueryResult`: a caller that cannot tell "this is the whole node"
@@ -148,6 +346,53 @@ pub struct CapacityResp {
     /// CPUs this agent may use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u32>,
+    /// Free space on the disk holding game files, and the reserve this node
+    /// keeps free (`updates::Settings::reserve`). Both or neither: absent from
+    /// an older agent and where free space cannot be read, which an index
+    /// reads as "not reported", never as room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_reserve_bytes: Option<u64>,
+}
+
+// ---- File pieces -------------------------------------------------------------
+
+/// An `OP_BACKUP_READ` reply body: the file's whole length, then the piece.
+pub fn encode_chunk(total: u64, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + data.len());
+    body.extend_from_slice(&total.to_be_bytes());
+    body.extend_from_slice(data);
+    body
+}
+
+pub fn decode_chunk(body: &[u8]) -> Result<(u64, &[u8]), WireError> {
+    let (len, data) = body.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((u64::from_be_bytes(*len), data))
+}
+
+/// An `OP_BACKUP_WRITE` request body: the JSON header's length, the header,
+/// then the piece. The header carries the token like every other op's.
+pub fn encode_write_body(header: &BackupWriteReq, data: &[u8]) -> Result<Vec<u8>, WireError> {
+    let json = payload_bytes(header)?;
+    let mut body = Vec::with_capacity(4 + json.len() + data.len());
+    body.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    body.extend_from_slice(&json);
+    body.extend_from_slice(data);
+    Ok(body)
+}
+
+pub fn decode_write_body(body: &[u8]) -> Result<(BackupWriteReq, &[u8]), WireError> {
+    let (len, rest) = body.split_first_chunk::<4>().ok_or(WireError::Truncated)?;
+    let len = u32::from_be_bytes(*len) as usize;
+    if rest.len() < len || len > MAX_BODY_LEN {
+        return Err(WireError::Truncated);
+    }
+    let (json, data) = rest.split_at(len);
+    if data.len() > TRANSFER_CHUNK {
+        return Err(WireError::TooLarge(data.len()));
+    }
+    Ok((parse_payload(json)?, data))
 }
 
 // ---- Envelope encode/decode -------------------------------------------------
@@ -279,6 +524,31 @@ pub fn encode_list_resp(instances: &[InstanceStatus], total: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A long map list crosses in pages that each fit a packet, and following
+    /// `next` gives back every map once, in order.
+    #[test]
+    fn a_long_map_list_crosses_in_pages_that_each_fit() {
+        let maps: Vec<String> = (0..400).map(|i| format!("a_rather_long_map_name_{i:03}")).collect();
+        let mut got = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let reply = encode_maps_resp(&maps, offset);
+            let (op, ok, body) = decode_response(&reply).unwrap();
+            assert!(ok && op == OP_MAPS);
+            assert!(body.len() <= MAX_BODY_LEN, "a page of {} bytes", body.len());
+            let page: MapsResp = parse_payload(body).unwrap();
+            got.extend(page.maps);
+            match page.next {
+                Some(n) => { assert!(n > offset); offset = n; }
+                None => break,
+            }
+        }
+        assert_eq!(got, maps);
+        let empty: MapsResp = parse_payload(decode_response(&encode_maps_resp(&[], 0)).unwrap().2).unwrap();
+        assert_eq!(empty, MapsResp { maps: vec![], next: None });
+    }
+
     use super::*;
     use crate::instance::{InstanceSpec, InstanceState};
 
@@ -314,6 +584,7 @@ mod tests {
             players_now: None,
             max_players_now: None,
             last_exit: None,
+            stopped_secs: None,
             restart_on_crash: None,
             crash_restarts: None,
             map_now: None,
@@ -420,5 +691,79 @@ mod tests {
     fn fits_rejects_an_oversized_body() {
         assert!(fits(MAX_BODY_LEN).is_ok());
         assert_eq!(fits(MAX_BODY_LEN + 1), Err(WireError::TooLarge(MAX_BODY_LEN + 1)));
+    }
+
+    fn body_of(reply: &[u8]) -> Vec<u8> {
+        let (_, ok, body) = decode_response(reply).unwrap();
+        assert!(ok, "a reply that should be ok was an error");
+        body.to_vec()
+    }
+
+    /// A long log comes back as its newest lines that fit one packet, flagged,
+    /// and never with a character cut in half.
+    #[test]
+    fn a_long_log_keeps_its_newest_text_and_says_it_was_cut() {
+        let text: String = (0..4000).map(|i| format!("line {i} é\n")).collect();
+        let reply = encode_logs_resp(&text);
+        let resp: LogsResp = serde_json::from_slice(&body_of(&reply)).unwrap();
+        assert!(resp.truncated, "older lines were left out, and the reply must say so");
+        assert!(text.ends_with(&resp.text), "what is kept is the end of the log");
+        assert!(resp.text.contains("line 3999"), "the newest line is kept");
+        assert!(fits(body_of(&reply).len()).is_ok(), "the reply fits one packet");
+    }
+
+    #[test]
+    fn a_short_log_comes_back_whole_and_unflagged() {
+        let reply = encode_logs_resp("one\ntwo\n");
+        let resp: LogsResp = serde_json::from_slice(&body_of(&reply)).unwrap();
+        assert_eq!(resp, LogsResp { text: "one\ntwo\n".into(), truncated: false });
+    }
+
+    /// Backups are named by time, so the oldest are the ones left out, and the
+    /// reply says so rather than looking like the whole set.
+    #[test]
+    fn many_backups_keep_the_newest_and_say_so() {
+        let made: Vec<crate::backups::Backup> = (0..200)
+            .map(|i| crate::backups::Backup {
+                name: format!("20261022-{:06}.tar.gz", i),
+                bytes: 1024,
+                created_unix: Some(i),
+                started_unix: None,
+            })
+            .collect();
+        let reply = encode_backups_resp(&made);
+        let resp: BackupsResp = serde_json::from_slice(&body_of(&reply)).unwrap();
+        assert!(resp.truncated);
+        assert_eq!(resp.backups.last().unwrap().name, "20261022-000199.tar.gz", "newest kept");
+        assert!(resp.backups.len() < made.len());
+        assert!(fits(body_of(&reply).len()).is_ok());
+    }
+
+    /// A file piece and its header survive the wire, and a piece bigger than
+    /// `TRANSFER_CHUNK` or a header that claims more than the body holds is
+    /// refused at decode, before anything reads it as a request.
+    #[test]
+    fn a_file_piece_round_trips_and_an_oversized_or_short_one_is_refused() {
+        let chunk = encode_chunk(70_000, b"abc");
+        let (total, data) = decode_chunk(&chunk).unwrap();
+        assert_eq!((total, data), (70_000, &b"abc"[..]));
+        assert_eq!(decode_chunk(&[0; 7]), Err(WireError::Truncated));
+
+        let header = BackupWriteReq {
+            token: "t".into(),
+            instance_id: "srv".into(),
+            upload: Some("0123456789abcdef".into()),
+            offset: 10,
+            total: 20,
+        };
+        let body = encode_write_body(&header, b"0123456789").unwrap();
+        let (back, data) = decode_write_body(&body).unwrap();
+        assert_eq!((back, data), (header.clone(), &b"0123456789"[..]));
+
+        let big = encode_write_body(&header, &vec![0; TRANSFER_CHUNK + 1]).unwrap();
+        assert_eq!(decode_write_body(&big), Err(WireError::TooLarge(TRANSFER_CHUNK + 1)));
+        let mut short = body.clone();
+        short[3] = 0xff;
+        assert_eq!(decode_write_body(&short), Err(WireError::Truncated));
     }
 }

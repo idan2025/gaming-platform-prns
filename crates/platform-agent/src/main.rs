@@ -35,6 +35,22 @@ so an index can drive this node with no inbound port.
 
 RUST_LOG sets log filtering (default: platform_agent=info).";
 
+/// The two public addresses an index needs to reach this node: the identity
+/// hash, and the control destination the index's hosting file names as
+/// `agent = "..."`. Prints hashes only; the identity secret is never shown.
+fn print_control_address(config_path: &std::path::Path) -> Result<()> {
+    let config = AgentConfig::load(config_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let uplink = config
+        .uplink
+        .ok_or_else(|| anyhow::anyhow!("{} has no [uplink] section: an index reaches a node through one", config_path.display()))?;
+    let (identity, control) = uplink::control_address_of(&uplink)?;
+    println!("identity {}", hex::encode(identity.as_bytes()));
+    println!("control {}", hex::encode(control.as_bytes()));
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_init();
@@ -50,6 +66,10 @@ async fn main() -> Result<()> {
     if matches!(config_path.as_str(), "-V" | "--version") {
         println!("platform-agent {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if config_path == "--control-address" {
+        let path = args.next().ok_or_else(|| anyhow::anyhow!("--control-address needs a config file"))?;
+        return print_control_address(std::path::Path::new(&path));
     }
     let pack_dir = args.next().unwrap_or_else(|| "packs".to_string());
 

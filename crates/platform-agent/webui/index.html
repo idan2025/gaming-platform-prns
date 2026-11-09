@@ -15,7 +15,7 @@
 <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
 <!-- Token screen -->
-<section id="token-screen" class="screen login hidden" aria-labelledby="token-heading">
+<main id="token-screen" class="screen login hidden" aria-labelledby="token-heading">
   <div class="login-card">
     <svg class="brand-mark" viewBox="0 0 1024 1024" width="40" height="40" aria-hidden="true">
         <rect width="1024" height="1024" rx="228" fill="#0a1a12"/>
@@ -29,20 +29,38 @@
         <rect x="344" y="696" width="336" height="58" rx="20" fill="#e3eae7"/>
       </svg>
     <h1 id="token-heading">Lanthorn Host</h1>
-    <p class="help">This node is protected by a token. You will find it in the file named by
-      <code>api_token_file</code> in the agent's config.</p>
-    <form id="token-form" autocomplete="off">
+    <p id="login-help" class="help"></p>
+    <form id="login-form" hidden>
+      <label for="login-user">Username</label>
+      <input id="login-user" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="login-pass">Password</label>
+      <input id="login-pass" type="password" name="password" autocomplete="current-password" required>
+      <div id="login-code-wrap" hidden>
+        <label for="login-code">Code from your authenticator app</label>
+        <input id="login-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8">
+      </div>
+      <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+    </form>
+    <form id="setup-form" hidden>
+      <label for="setup-token">This node's API token</label>
+      <input id="setup-token" type="password" autocomplete="off" required>
+      <label for="setup-user">Username</label>
+      <input id="setup-user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="setup-pass">Password (at least 10 characters)</label>
+      <input id="setup-pass" type="password" autocomplete="new-password" required>
+      <label for="setup-pass2">The password again</label>
+      <input id="setup-pass2" type="password" autocomplete="new-password" required>
+      <button type="submit" class="btn btn-primary btn-block">Create the account</button>
+    </form>
+    <form id="token-form" autocomplete="off" hidden>
       <label for="token-input">Access token</label>
       <input id="token-input" type="password" name="token" required>
       <button type="submit" class="btn btn-primary btn-block">Sign in</button>
     </form>
     <p id="token-error" class="inline-error" aria-live="polite"></p>
+    <p class="help"><a href="#" id="login-switch"></a></p>
   </div>
-</section>
-
-<!-- Which build is serving this page, so "did my redeploy land" is a glance.
-     Filled in from /health after the token is accepted. -->
-<div id="build-version" class="build-version" title="The agent build serving this page"></div>
+</main>
 
 <section id="main-ui" class="screen shell hidden">
   <aside class="sidebar">
@@ -80,6 +98,18 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>
         <span>Mesh</span>
       </button>
+      <button id="tab-admin" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-admin" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg>
+        <span>Admin</span><span class="nav-count" id="nav-admin-count"></span>
+      </button>
+      <button id="tab-account" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-account" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+        <span>Account</span>
+      </button>
+      <button id="tab-requests" type="button" class="nav-item" role="tab" aria-selected="false" aria-controls="tab-panel-requests" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 100 18 9 9 0 000-18z"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3z"/></svg>
+        <span>Requests</span><span class="nav-count" id="nav-requests-count"></span>
+      </button>
     </nav>
     <div class="sidebar-foot">
       <div class="node-card">
@@ -88,6 +118,10 @@
         <div id="disk-line" class="disk-line hidden"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span id="disk-text"></span></div>
         <button id="disconnect-btn" type="button" class="btn btn-block">Sign out</button>
       </div>
+      <!-- Which build is serving this page, so "did my redeploy land" is a glance.
+           Filled in from /health after the token is accepted. In the sidebar,
+           so it never sits over the page. -->
+      <footer id="build-version" class="build-version" title="The agent build serving this page"></footer>
     </div>
   </aside>
 
@@ -122,6 +156,7 @@
           <span id="removed-backups-text"></span>
           <button id="removed-backups-show" type="button" class="btn btn-small">Show…</button>
         </div>
+        <p id="controller-note" class="muted-em" hidden></p>
         <div class="list-head">
           <div></div><div>Server</div><div>Status</div><div>Map</div><div>Players</div><div>Port</div><div>Mesh address</div><div>Uptime</div><div></div>
         </div>
@@ -144,6 +179,7 @@
       </section>
 
       <section id="tab-panel-installed" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-installed">
+        <p class="muted-em controller-host-note" hidden>This page shows this machine only. The workers that run servers have their own files and connections.</p>
         <p class="page-lead">Game files on this node's disk, and downloads in progress. Deleting files keeps the game on the Games page; it can be downloaded again.</p>
         <div id="updates-bar" class="updates-bar hidden">
           <label class="updates-field"><span>Check for new builds</span>
@@ -182,6 +218,7 @@
 
       <section id="tab-panel-interfaces" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-interfaces">
         <div class="page">
+          <p class="muted-em controller-host-note" hidden>This page shows this machine only. The workers that run servers have their own files and connections.</p>
           <div id="mesh-games" class="card">
             <div class="card-head"><h2>Announced on the mesh</h2></div>
             <p id="mesh-games-note" class="card-text">—</p>
@@ -237,7 +274,7 @@
             <p class="card-text">This node's address: <code id="mesh-destination" class="selectable">—</code></p>
             <div id="interfaces-tbody" class="item-list"></div>
             <p id="interfaces-empty" class="card-text hidden">No uplink connections yet.</p>
-            <form id="iface-form" class="form-grid" autocomplete="off" style="margin-top:14px">
+            <form id="iface-form" class="form-grid mt-14" autocomplete="off">
               <label for="iface-kind">Kind</label>
               <select id="iface-kind" name="kind" class="field">
                 <option value="tcp">TCP (dial a relay, or be one)</option>
@@ -264,6 +301,23 @@
             </form>
           </div>
         </div>
+      </section>
+      <section id="tab-panel-requests" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-requests">
+        <p class="muted small">A move to another region is asked for from a server's menu (Move to another worker…) and decided by an admin of the controller, on the Admin tab. Once approved, the server moves to a worker in that region, which becomes its home; coming back is another request.</p>
+        <div class="form-actions start mb-12">
+          <button id="requests-refresh" type="button" class="btn">Refresh</button>
+        </div>
+        <div id="requests-admin"></div>
+        <div id="requests-mine"></div>
+      </section>
+      <section id="tab-panel-account" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-account">
+        <div id="account-body"></div>
+      </section>
+      <section id="tab-panel-admin" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-admin">
+        <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">
+          <button id="admin-refresh" type="button" class="btn">Refresh</button>
+        </div>
+        <div id="admin-body"></div>
       </section>
     </main>
   </div>

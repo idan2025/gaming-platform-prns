@@ -3,11 +3,14 @@
 //! `DESIGN.md` §2.4. Not the authority — see `registry` for why that is a fact
 //! about the code and not just an intention.
 
+pub mod access;
+pub mod admins;
 pub mod agent_client;
 pub mod hosting;
 pub mod http;
 pub mod node;
 pub mod quota;
+pub mod regions;
 pub mod registry;
 
 // The codec and the query call live in `index-client`, so a launcher can ask an

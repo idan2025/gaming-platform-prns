@@ -221,8 +221,11 @@ fn hosting_config() -> platform_index::hosting::HostingConfig {
             api: "http://127.0.0.1:1".to_string(),
             agent: None,
             priority: 0,
+            class: None,
+            region: None,
         }],
         quota: Default::default(),
+        admins: Vec::new(),
     }
 }
 
@@ -349,4 +352,103 @@ async fn stopping_or_starting_someone_elses_instance_is_indistinguishable_from_a
             .unwrap();
         assert_eq!(unauthenticated.status(), 401, "{op} without a session");
     }
+}
+
+/// Someone opening the index's address in a browser gets a page saying what it
+/// is and the identity a worker or a node pins. It names no worker, and
+/// operator text on it is text, never markup.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_front_page_says_what_this_index_is_and_names_no_worker() {
+    let (addr, index_key) = serve().await;
+    let page = reqwest::get(format!("http://{addr}/")).await.unwrap();
+    assert!(page.status().is_success());
+    assert!(page.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    let page = page.text().await.unwrap();
+    assert!(page.contains(&hex::encode(index_key.identity_hash().as_bytes())), "the identity is missing");
+    assert!(page.contains("a directory only"), "an index without hosting should say so");
+
+    use platform_index::hosting::{Hosting, HostingConfig, NodeConfig};
+    let hosting = Hosting::new(HostingConfig {
+        games: vec!["sven-coop".into(), "<script>alert(1)</script>".into()],
+        nodes: vec![NodeConfig {
+            name: "worker-in-the-basement".into(),
+            api: "http://127.0.0.1:4750".into(),
+            agent: Some("3ba38d2b008cd1d999f7a47ce8f8d3e6".into()),
+            priority: 0,
+            class: None,
+            region: None,
+        }],
+        quota: Default::default(),
+        admins: Vec::new(),
+    });
+    let (addr, _) = serve_with(Some(hosting)).await;
+    let page = reqwest::get(format!("http://{addr}/")).await.unwrap().text().await.unwrap();
+    assert!(page.contains("sven-coop") && page.contains("<td>1</td>"), "{page}");
+    assert!(!page.contains("<script>"), "operator text reached the page as markup");
+    assert!(page.contains("&lt;script&gt;"));
+    assert!(!page.contains("worker-in-the-basement") && !page.contains("3ba38d2b"), "a worker was named");
+}
+
+/// Nothing the index answers may be framed, sniffed or made to run script: the
+/// status page is the only HTML it serves, and it has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_answer_says_it_may_not_be_framed_or_run_script() {
+    let (addr, _) = serve().await;
+    for path in ["/", "/health", "/servers"] {
+        let res = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        let csp = res.headers()["content-security-policy"].to_str().unwrap().to_string();
+        assert!(csp.contains("frame-ancestors 'none'") && csp.contains("default-src 'none'") && !csp.contains("script-src"), "{path}: {csp}");
+        assert_eq!(res.headers()["x-frame-options"], "DENY", "{path}");
+        assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{path}");
+    }
+}
+
+/// Erasing needs the identity typed back, ends every session the account holds,
+/// and is refused (503) with sessions left alone while a worker that may hold
+/// its servers cannot be asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn erasing_an_account_ends_its_sessions_and_a_silent_worker_refuses_it() {
+    let user = key(7);
+    let identity = hex::encode(user.identity_hash().as_bytes());
+    let client = reqwest::Client::new();
+
+    let (addr, index_key) = serve().await;
+    let first = token_for(addr, &index_key, &user).await;
+    let second = token_for(addr, &index_key, &user).await;
+    let wrong = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&first)
+        .json(&serde_json::json!({ "confirm": "00".repeat(16) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 400);
+    let done: serde_json::Value = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&first)
+        .json(&serde_json::json!({ "confirm": identity }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(done["sessions_ended"], serde_json::json!(2));
+    for token in [&first, &second] {
+        let me = client.get(format!("http://{addr}/me")).bearer_auth(token).send().await.unwrap();
+        assert_eq!(me.status(), 401);
+    }
+
+    let (addr, index_key) = serve_with(Some(platform_index::hosting::Hosting::new(hosting_config()))).await;
+    let token = token_for(addr, &index_key, &user).await;
+    let refused = client
+        .delete(format!("http://{addr}/me"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "confirm": identity }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    let me = client.get(format!("http://{addr}/me")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(me.status(), 200);
 }

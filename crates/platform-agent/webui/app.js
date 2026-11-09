@@ -28,6 +28,11 @@ const MAP_NAME_RE = /^[A-Za-z0-9_.\/-]+$/;
 
 const state = {
   token: null,
+  controllerOn: false,   // this page places servers through a controller (controller.rs)
+  regions: [],           // the controller's regions, offered on the create form
+  hostedGames: [],       // the games the controller hosts: what can be started through it
+  isAdmin: false,        // this node's identity may decide region requests on the controller
+  role: "admin",         // this page's role here: the token and an admin account are "admin" (accounts.rs)
   capacity: null,        // {max_instances, running, port_range_start, port_range_end}
   games: [],             // array of game defs
   instances: [],         // array of instance objects
@@ -176,7 +181,82 @@ function setToken(t) {
 
 // ---------- api ----------
 
+// With a controller, the server actions the controller carries go through it,
+// and the list shows every worker's servers. This mirrors controller::allowed_path
+// on the node, so a request the node would refuse is refused here first, with
+// the same words, and nothing is sent. Anything else on a server stays local.
+const CONTROLLER_ROUTES = [
+  [/^\/instances$/, ["GET", "POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}$/, ["GET", "DELETE"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/(stop|start|relocate)$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/logs(\?lines=\d{1,4})?$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/map$/, ["POST"]],
+  [/^\/games\/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}\/maps$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/backups$/, ["GET", "POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+$/, ["DELETE"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/backups\/[A-Za-z0-9._-]+\/restore$/, ["POST"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/move-targets$/, ["GET"]],
+  [/^\/instances\/[a-z0-9-]{1,64}\/region-request$/, ["POST"]],
+];
+
+// The URL a request really goes to: through the controller when this page has
+// one and the controller carries the request; the node's own path otherwise.
+function routeFor(method, path) {
+  // A game's maps come from a worker that hosts it: the controller's own
+  // machine has no game files.
+  const games = /^\/games\/[^/]+\/maps$/.test(path);
+  if (!state.controllerOn || !(path.startsWith("/instances") || games)) return path;
+  const allowed = CONTROLLER_ROUTES.some(([re, methods]) => re.test(path) && methods.includes(method));
+  if (!allowed) {
+    throw { error: "Not available through the controller yet. This server's own page keeps it.", status: 404 };
+  }
+  return "/controller" + path;
+}
+
+async function loadControllerStatus() {
+  try {
+    const s = await api("GET", "/controller/status");
+    state.controllerOn = !!(s && s.enabled);
+    const note = $("controller-note");
+    if (note) {
+      note.hidden = !state.controllerOn;
+      // A loopback address tells nobody anything; a remote one is worth naming.
+      const local = /^https?:\/\/(127\.|localhost|\[::1\])/.test(String(s.url || ""));
+      note.textContent = state.controllerOn ? "Servers are placed through the controller" + (local ? "" : " at " + s.url) + ", across every worker it drives." : "";
+    }
+    // On a controller, Installed and Mesh describe its own machine, not the
+    // workers that run the servers: the page says so there.
+    for (const n of document.querySelectorAll(".controller-host-note")) n.hidden = !state.controllerOn;
+    state.regions = [];
+    state.hostedGames = [];
+    state.isAdmin = false;
+    if (state.controllerOn) {
+      const h = await api("GET", "/controller/hosting").catch(() => null);
+      if (h && Array.isArray(h.regions)) state.regions = h.regions.filter(r => typeof r === "string");
+      if (h && Array.isArray(h.games)) state.hostedGames = h.games.filter(g => typeof g === "string");
+      // The index says who is admin: its list answers only an admin.
+      state.isAdmin = await api("GET", "/controller/admin/region-requests").then(() => true, () => false);
+    }
+  } catch (_) {
+    state.controllerOn = false;
+    state.regions = [];
+    state.hostedGames = [];
+    state.isAdmin = false;
+  }
+  showRequestsTab();
+}
+
+// Region requests exist only through a controller, and a user has nothing to
+// ask for while the controller has one region (a move stays in its region).
+function showRequestsTab() {
+  const reqTab = $("tab-requests");
+  if (!reqTab) return;
+  reqTab.hidden = !state.controllerOn || (state.role === "user" && state.regions.length < 2);
+  if (reqTab.hidden && state.activeTab === "requests") setActiveTab("servers");
+}
+
 async function api(method, path, body) {
+  const url = routeFor(method, path);
   const opts = { method, headers: { "Authorization": "Bearer " + (state.token || "") } };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
@@ -184,7 +264,7 @@ async function api(method, path, body) {
   }
   let resp;
   try {
-    resp = await fetch(path, opts);
+    resp = await fetch(url, opts);
   } catch (e) {
     throw { __network: true, error: "Could not reach the node. " + (e && e.message ? e.message : "") };
   }
@@ -208,9 +288,10 @@ async function api(method, path, body) {
 
 // The same as api(), for an endpoint that answers plain text (a server log).
 async function apiText(path) {
+  const url = routeFor("GET", path);
   let resp;
   try {
-    resp = await fetch(path, { headers: { "Authorization": "Bearer " + (state.token || "") } });
+    resp = await fetch(url, { headers: { "Authorization": "Bearer " + (state.token || "") } });
   } catch (e) {
     throw { __network: true, error: "Could not reach the node. " + (e && e.message ? e.message : "") };
   }
@@ -294,12 +375,92 @@ function toast(msg) {
 
 // ---------- screen switching ----------
 
-function showTokenScreen() {
+// How this node lets a person in (accounts.rs): sign in with an account, make
+// the first account with the API token, or paste the token. A node with no
+// token is loopback-only and open, so it just connects.
+let loginMode = "account";
+let authState = null;
+let autoConnected = false;
+
+async function showTokenScreen() {
   stopPolling();
   $("token-screen").classList.remove("hidden");
   $("main-ui").classList.add("hidden");
-  $("token-input").value = "";
-  $("token-input").focus();
+  for (const id of ["token-input", "login-user", "login-pass", "login-code", "setup-token", "setup-user", "setup-pass", "setup-pass2"]) {
+    const e = $(id);
+    if (e) e.value = "";
+  }
+  $("login-code-wrap").hidden = true;
+  try { authState = await (await fetch("/auth/state")).json(); } catch (_) { authState = null; }
+  if (authState && !authState.token_required && !autoConnected) {
+    autoConnected = true;
+    tryConnect(null);
+    return;
+  }
+  loginMode = !authState || !authState.accounts ? "token" : (authState.has_accounts ? "account" : "setup");
+  renderLoginMode();
+}
+
+function renderLoginMode() {
+  $("login-form").hidden = loginMode !== "account";
+  $("setup-form").hidden = loginMode !== "setup";
+  $("token-form").hidden = loginMode !== "token";
+  $("login-help").textContent = loginMode === "account" ? "Sign in to this node."
+    : loginMode === "setup" ? "Make the account you will sign in with from now on. The API token proves this is your node: it is in the file named by api_token_file in the agent's config. You need it only this once."
+    : "Paste this node's API token, from the file named by api_token_file in the agent's config.";
+  const sw = $("login-switch");
+  const canAccounts = authState && authState.accounts;
+  sw.parentElement.hidden = !canAccounts;
+  sw.textContent = loginMode === "token" ? (authState && authState.has_accounts ? "Sign in with an account instead" : "Make an account instead")
+    : "Use the API token instead";
+  const first = { account: "login-user", setup: "setup-token", token: "token-input" }[loginMode];
+  $(first)?.focus();
+}
+
+async function onLoginSubmit(e) {
+  e.preventDefault();
+  const err = $("token-error");
+  err.textContent = "";
+  const body = { username: $("login-user").value.trim(), password: $("login-pass").value };
+  const code = $("login-code").value.trim();
+  if (code) body.code = code;
+  let resp, out = {};
+  try {
+    resp = await fetch("/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    out = await resp.json().catch(() => ({}));
+  } catch (_) { err.textContent = "Could not reach this node."; return; }
+  if (resp.ok && out.session) {
+    state.signedInAs = out.username;
+    tryConnect(out.session);
+    return;
+  }
+  if (out.needs_code) {
+    $("login-code-wrap").hidden = false;
+    $("login-code").focus();
+  }
+  err.textContent = out.error || "Could not sign in.";
+}
+
+async function onSetupSubmit(e) {
+  e.preventDefault();
+  const err = $("token-error");
+  err.textContent = "";
+  const username = $("setup-user").value.trim();
+  const password = $("setup-pass").value;
+  if (password !== $("setup-pass2").value) { err.textContent = "The two passwords are not the same."; return; }
+  let resp, out = {};
+  try {
+    resp = await fetch("/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: $("setup-token").value.trim(), username, password }) });
+    out = await resp.json().catch(() => ({}));
+  } catch (_) { err.textContent = "Could not reach this node."; return; }
+  if (!resp.ok) { err.textContent = out.error || "The account was not made."; return; }
+  // Made: sign straight in with it.
+  $("login-user").value = username;
+  $("login-pass").value = password;
+  loginMode = "account";
+  renderLoginMode();
+  $("login-form").requestSubmit();
 }
 function showMainUI() {
   $("token-screen").classList.add("hidden");
@@ -359,8 +520,9 @@ function renderStorage() {
   const line = $("disk-line");
   if (!line) return;
   const s = state.storage;
-  line.classList.toggle("hidden", !s);
-  if (!s) return;
+  // This node's disk holds no server's files when a controller places them.
+  line.classList.toggle("hidden", !s || state.controllerOn);
+  if (!s || state.controllerOn) return;
   const low = s.free_bytes < LOW_DISK_BYTES;
   line.classList.toggle("low", low);
   $("disk-text").textContent = formatBytes(s.free_bytes) + " free";
@@ -587,6 +749,14 @@ async function tryConnect(token) {
     const games = await api("GET", "/games");
     state.games = Array.isArray(games) ? games : [];
     state.capacity = await api("GET", "/capacity");
+    await loadControllerStatus();
+    // The Account tab exists where this node has accounts.
+    const acct = $("tab-account");
+    if (acct) acct.hidden = !(authState ? authState.accounts : !!token);
+    // A user runs servers; an admin also manages the node (api::user_may).
+    const me = await api("GET", "/auth/me").catch(() => ({ role: "admin" }));
+    state.role = me && me.role === "user" ? "user" : "admin";
+    applyRole();
     const insts = await api("GET", "/instances");
     state.instances = Array.isArray(insts) ? insts : [];
     clearError();
@@ -611,8 +781,11 @@ function renderBuildVersion(version) {
 
 function renderStatusPill() {
   const cap = state.capacity || {};
-  const running = cap.running != null ? cap.running : 0;
-  const max = cap.max_instances != null ? cap.max_instances : null;
+  // Through a controller the list is every worker's servers, so count those;
+  // this node's own slots say nothing about the cluster.
+  const running = state.controllerOn ? state.instances.filter(i => i.state === "running").length
+    : (cap.running != null ? cap.running : 0);
+  const max = state.controllerOn ? null : (cap.max_instances != null ? cap.max_instances : null);
   $("status-pill").textContent = running + (max != null ? " of " + max : "") + " running";
   const bar = $("capacity-bar");
   if (bar) bar.style.width = max ? Math.min(100, Math.round(100 * running / max)) + "%" : "0";
@@ -672,6 +845,9 @@ function stateTitle(inst, ending) {
   return parts.join(" ");
 }
 
+// Said on whatever a controller does not carry (controller::allowed_path).
+const NOT_THROUGH_CONTROLLER = "Not through the controller. The worker's own page has it.";
+
 function instById(id) { return state.instances.find(i => i.instance_id === id) || null; }
 
 // What a server can be asked to do right now, and why not when it cannot. One
@@ -685,6 +861,13 @@ function capabilities(inst) {
   return {
     running,
     canStop: !(inst.state === "stopped" || inst.state === "missing"),
+    // Through a controller there is start but no restart. A map change goes
+    // through it: a validated name, never a console line.
+    canRestart: state.controllerOn ? inst.state === "stopped" : true,
+    restartLabel: state.controllerOn ? "Start" : "Restart",
+    restartWhy: !state.controllerOn ? "Restart"
+      : inst.state === "stopped" ? "Start this server on its worker."
+      : "Restart is not carried through the controller: stop it, then start it.",
     canMap: running && speaks && !oneWorld,
     mapWhy: oneWorld ? "A Minecraft server has one world. Upload a different one with Upload a world."
       : !running ? "The server has to be running to be told anything."
@@ -757,7 +940,8 @@ function renderInstances() {
     // Cells are updated in place; the row node is never replaced, which is what
     // keeps this list from stealing focus or scroll on a poll.
     row.querySelector(".cell-name").textContent = inst.name || inst.instance_id;
-    row.querySelector(".cell-game").textContent = gameName(inst.game_id);
+    row.querySelector(".cell-game").textContent = gameName(inst.game_id)
+      + (state.controllerOn && inst.node ? " · on " + inst.node + (inst.region ? " (" + inst.region + ")" : "") : "");
     const pill = row.querySelector(".state-pill");
     const ending = exitWords(inst.last_exit);
     const crashed = inst.state === "stopped" && ending && ending.crash;
@@ -810,6 +994,14 @@ function renderInstances() {
       meshCell.textContent = inst.mesh_destination.slice(0, 10) + "…";
       meshCell.classList.remove("muted-em");
       makeCopyable(meshCell, inst.mesh_destination);
+    } else if (state.controllerOn) {
+      // A worker's server has an address while it runs; this node's [mesh]
+      // has nothing to do with it.
+      meshCell.textContent = inst.state === "running" ? "LAN only" : "—";
+      meshCell.title = inst.state === "running" ? "Its worker announces it on no mesh." : "No address while it is stopped.";
+      meshCell.classList.add("muted-em");
+      meshCell.classList.remove("copyable");
+      meshCell.onclick = null;
     } else {
       meshCell.textContent = "LAN only";
       meshCell.title = "Not announced on the mesh. Add a [mesh] section to this node's config.";
@@ -825,6 +1017,10 @@ function renderInstances() {
     mapBtn.disabled = !cap.canMap;
     mapBtn.title = cap.mapWhy;
     row.querySelector(".stop-btn").disabled = !cap.canStop;
+    const restartBtn = row.querySelector(".restart-btn");
+    restartBtn.disabled = !cap.canRestart;
+    restartBtn.title = cap.restartWhy;
+    restartBtn.setAttribute("aria-label", cap.restartLabel);
   }
 
   for (const [id, row] of state.rows) {
@@ -878,7 +1074,8 @@ function openInstanceMenu(id, x, y) {
       title: cap.canBots ? "Add or remove bots without restarting." : "The server has to be running.",
       action: () => onBots(id, inst.game_id) });
   }
-  items.push({ label: "Restart", icon: "restart", action: () => onRestart(id) });
+  items.push({ label: cap.restartLabel, icon: "restart", disabled: !cap.canRestart,
+    title: state.controllerOn ? cap.restartWhy : undefined, action: () => onRestart(id) });
   items.push({ label: "Stop", icon: "stop", disabled: !cap.canStop, action: () => onStop(id) });
   items.push("sep");
   items.push({ label: "Announce now", icon: "megaphone", disabled: !cap.canAnnounce,
@@ -890,7 +1087,7 @@ function openInstanceMenu(id, x, y) {
     action: () => copyValue(inviteLink(inst)) });
   items.push({ label: "Copy mesh address", icon: "copy", disabled: !inst.mesh_destination, action: () => copyValue(inst.mesh_destination) });
   const hasConsole = state.games.some(g => g.id === inst.game_id && g.console);
-  items.push({ label: hasConsole ? "Log and console" : "Show log", icon: "log", action: () => onShowLog(id) });
+  items.push({ label: hasConsole && !state.controllerOn ? "Log and console" : "Show log", icon: "log", action: () => onShowLog(id) });
   items.push({ label: "Players…", icon: "users", disabled: !cap.running,
     title: cap.running ? "Who is on this server, as the game reports it." : "The server has to be running.",
     action: () => onShowPlayers(id) });
@@ -919,53 +1116,103 @@ function openInstanceMenu(id, x, y) {
     title: inst.mesh_destination ? "Talk with the players who joined through Lanthorn, and turn this server's chat on or off."
       : "Only a server on the mesh has chat.",
     action: () => onChat(id) });
+  if (state.controllerOn) {
+    items.push({ label: "Move to another worker…", icon: "restart",
+      title: "Copy its files to the worker with the most room while it runs, then switch over. It keeps its mesh address.",
+      action: () => onRelocate(id, inst.name) });
+  }
   items.push("sep");
   items.push({ label: "Remove server…", icon: "trash", danger: true, action: () => onRemove(id, inst.name) });
+  // Through a controller, only what it carries is live; the rest says where it is.
+  if (state.controllerOn) {
+    const carried = new Set(["Start", "Stop", "Copy invite link", "Copy mesh address", "Show log", "Log and console",
+      "Backups…", "Move to another worker…", "Remove server…"]);
+    for (const it of items) {
+      if (typeof it === "object" && it.label && !carried.has(it.label)) {
+        it.disabled = true;
+        it.title = NOT_THROUGH_CONTROLLER;
+      }
+    }
+  }
   showMenu(x, y, items);
 }
 
 // ---------- rendering: games ----------
 
+// Whether a game can be started from this page, and why not. Through a
+// controller the index's workers host it, so this node's own setup (its
+// runtimes, its installed files) says nothing: what the controller hosts does.
+function startable(g) {
+  if (state.controllerOn) {
+    return state.hostedGames.includes(g.id)
+      ? { ok: true, reason: "" }
+      : { ok: false, reason: "the controller does not host this game." };
+  }
+  return g.runnable ? { ok: true, reason: "" } : { ok: false, reason: g.reason || "unavailable on this node." };
+}
+
 function renderGames() {
   const grid = $("games-grid");
   const n = $("nav-games-count");
-  if (n) n.textContent = state.games.length ? String(state.games.length) : "";
-  const sig = state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
+  // A user through a controller sees what it can start: the rest is the
+  // node's packs, not something they can use here.
+  const onlyStartable = state.controllerOn && state.role === "user";
+  const shown = onlyStartable ? state.games.filter(g => startable(g).ok) : state.games;
+  if (n) n.textContent = shown.length ? String(shown.length) : "";
+  const sig = state.role + ";" + (state.controllerOn ? "c:" + state.hostedGames.join(",") + ";" : "") + state.games.map(g => g.id + "|" + (g.runnable ? "1" : "0") + "|" + (g.reason || "") + "|" + (g.trust || "")
     + "|" + (g.content ? (g.content.installed ? "i" : "-") + g.content.missing.join(",") : "")).join(";");
   if (grid.dataset.sig !== sig) {
     grid.dataset.sig = sig;
     grid.textContent = "";
-    const sorted = [...state.games].sort((a, b) => (b.runnable - a.runnable) || a.display_name.localeCompare(b.display_name));
-    for (const g of sorted) grid.appendChild(buildGameCard(g));
+    const sorted = [...shown].sort((a, b) => (startable(b).ok - startable(a).ok) || a.display_name.localeCompare(b.display_name));
+    // Through a controller, the games it does not host fold away under the
+    // ones that can start, so the page leads with what can be used.
+    const folded = state.controllerOn ? sorted.filter(g => !startable(g).ok) : [];
+    for (const g of sorted) if (!folded.includes(g)) grid.appendChild(buildGameCard(g));
+    if (folded.length) {
+      const more = el("details", "games-folded");
+      more.open = !!state.foldedOpen;
+      more.addEventListener("toggle", () => { state.foldedOpen = more.open; });
+      more.appendChild(el("summary", null, folded.length + (folded.length === 1 ? " game" : " games") + " the controller does not host"));
+      const inner = el("div", "games-grid");
+      for (const g of folded) inner.appendChild(buildGameCard(g));
+      more.appendChild(inner);
+      grid.appendChild(more);
+    }
+    if (onlyStartable && !shown.length) grid.appendChild(el("p", "muted", "No games can be started here right now."));
   }
-  for (const g of state.games) refreshCardDynamic(g);
+  for (const g of shown) refreshCardDynamic(g);
 }
 
 function buildGameCard(g) {
-  const card = el("article", "game-card" + (g.runnable ? "" : " unrunnable"));
+  const can = startable(g);
+  const card = el("article", "game-card" + (can.ok ? "" : " unrunnable"));
   card.dataset.gameId = g.id;
   card.appendChild(art(g.id));
   const body = el("div", "card-body");
   body.appendChild(el("h3", "card-title", g.display_name));
   const meta = el("div", "card-meta");
-  meta.appendChild(el("span", "chip", (g.transport || "—").toUpperCase() + " " + g.default_port));
-  if (g.extra_ports) meta.appendChild(el("span", "chip", "+" + g.extra_ports + (g.extra_ports === 1 ? " port" : " ports")));
+  // Ports and whose word a pack is are the node's business, not a user's.
+  const plumbing = state.role !== "user";
+  if (plumbing) meta.appendChild(el("span", "chip", (g.transport || "—").toUpperCase() + " " + g.default_port));
+  if (plumbing && g.extra_ports) meta.appendChild(el("span", "chip", "+" + g.extra_ports + (g.extra_ports === 1 ? " port" : " ports")));
   if (g.console) meta.appendChild(el("span", "chip", "Live map change"));
   if (g.bots) meta.appendChild(el("span", "chip", "Bots"));
   // Whose word the pack is, under this node's [pack_trust] (§11.4's words).
-  if (g.trust && g.trust !== "built in") {
+  if (plumbing && g.trust && g.trust !== "built in") {
     const t = el("span", "chip" + (g.signer ? "" : " chip-muted"), g.trust);
     t.title = g.signer ? "Signed by " + g.signer : "Nobody signed this pack; it is trusted only as far as whoever wrote it.";
     meta.appendChild(t);
   }
   body.appendChild(meta);
-  if (!g.runnable) body.appendChild(el("p", "card-reason", "Cannot start here: " + (g.reason || "unavailable on this node.")));
-  const manualMissing = renderContentHelp(body, g);
+  if (!can.ok) body.appendChild(el("p", "card-reason", "Cannot start here: " + can.reason));
+  // Through a controller the files live on the workers, which fetch them.
+  const manualMissing = state.controllerOn ? false : renderContentHelp(body, g);
   body.appendChild(el("p", "install-status hidden"));
   const actions = el("div", "card-actions");
   const startBtn = el("button", "btn btn-primary start-btn", "Start server");
   startBtn.type = "button";
-  if (!g.runnable) { startBtn.disabled = true; startBtn.title = g.reason || "not runnable"; }
+  if (!can.ok) { startBtn.disabled = true; startBtn.title = can.reason; }
   startBtn.addEventListener("click", () => openStartDialog(g.id));
   const installBtn = el("button", "btn install-btn");
   installBtn.type = "button";
@@ -988,9 +1235,14 @@ function buildGameCard(g) {
   removeBtn.setAttribute("aria-label", "Remove " + g.display_name);
   removeBtn.appendChild(icon("trash"));
   removeBtn.addEventListener("click", () => onRemovePack(g));
-  actions.append(startBtn, installBtn);
+  actions.append(startBtn);
+  // Game files and packs are an admin's (api::user_may); through a controller
+  // the workers fetch them.
+  const manages = state.role === "admin";
+  if (!state.controllerOn && manages) actions.append(installBtn);
   body.appendChild(actions);
-  card.append(removeBtn, body);
+  if (manages) card.appendChild(removeBtn);
+  card.appendChild(body);
   return card;
 }
 
@@ -1262,6 +1514,8 @@ function refreshCardDynamic(g) {
   const card = $("games-grid").querySelector('.game-card[data-game-id="' + CSS.escape(g.id) + '"]');
   if (!card) return;
   const installBtn = card.querySelector(".install-btn");
+  // Through a controller a card has no Install: the workers fetch the files.
+  if (!installBtn) return;
   const label = installBtn.querySelector("span");
   const status = card.querySelector(".install-status");
   status.classList.remove("ok", "err");
@@ -1301,17 +1555,52 @@ async function ensureMaps(gameId, onLoaded) {
   if (onLoaded) onLoaded(state.maps.get(gameId));
 }
 
-// A <datalist> rather than a <select>: the node lists what it has, and an
-// operator can still type a map it does not know about.
-function mapDatalist(id, gameId) {
-  const dl = el("datalist");
-  dl.id = id;
-  (state.maps.get(gameId) || []).forEach(m => {
-    const o = el("option");
-    o.value = m;
-    dl.appendChild(o);
-  });
-  return dl;
+// A map picked from a menu of what is installed, with "Another map…" for a
+// name the list does not have. Before the list arrives, and when there is
+// none, the box takes a typed name. `blank` is the menu's first entry and
+// means "no map" (the game's default); without it a map must be chosen.
+function mapPicker(parent, id, label, gameId, blank) {
+  const OTHER = "\u0000other";
+  const l = el("label", null, label);
+  l.htmlFor = id;
+  const sel = el("select", "field");
+  sel.id = id;
+  const typed = el("input", "field");
+  typed.type = "text";
+  typed.id = id + "-name";
+  typed.placeholder = "map name";
+  typed.setAttribute("aria-label", label);
+  typed.spellcheck = false;
+  const hint = el("p", "muted small", "Reading the maps installed…");
+  parent.append(l, sel, typed, hint);
+  const show = () => { typed.hidden = sel.value !== OTHER; l.htmlFor = sel.hidden ? typed.id : id; };
+  const fill = (maps) => {
+    sel.textContent = "";
+    const opt = (v, t) => { const o = el("option", null, t); o.value = v; sel.appendChild(o); };
+    if (blank) opt("", blank);
+    else opt("", "Choose a map");
+    (maps || []).forEach(m => opt(m, m));
+    opt(OTHER, "Another map…");
+    if (maps && maps.length) {
+      sel.hidden = false;
+      hint.textContent = maps.length + " maps installed. Pick one, or Another map… to type a name.";
+    } else {
+      // Nothing to pick from: the box is the whole control.
+      sel.hidden = true;
+      sel.value = OTHER;
+      hint.textContent = blank ? "No map list for this game here. Type a name, or leave it blank for the game's default."
+        : "No map list for this game here. Type the map's name.";
+    }
+    show();
+  };
+  sel.addEventListener("change", () => { show(); if (!typed.hidden) typed.focus(); });
+  sel.hidden = true;
+  typed.hidden = false;
+  ensureMaps(gameId, fill);
+  return {
+    value: () => (sel.hidden || sel.value === OTHER ? typed.value : sel.value).trim(),
+    focus: () => (sel.hidden ? typed : sel).focus(),
+  };
 }
 
 // ---------- dialogs ----------
@@ -1360,15 +1649,7 @@ function openStartDialog(gameId) {
     form.autocomplete = "off";
     const name = field(form, "sf-name", "Server name", { type: "text", required: true, placeholder: "My Server" });
     const mp = field(form, "sf-mp", "Max players", { type: "number", min: "1", max: "64", step: "1", value: "16", required: true });
-    const map = field(form, "sf-map", "Starting map", { type: "text", placeholder: "the game's default" });
-    map.setAttribute("list", "sf-maplist");
-    const hint = el("p", "muted small", "The map name as the game knows it — svencoop1, de_dust2, cp_dustbowl.");
-    form.append(mapDatalist("sf-maplist", gameId), hint);
-    ensureMaps(gameId, (maps) => {
-      const dl = $("sf-maplist");
-      if (dl) dl.replaceWith(mapDatalist("sf-maplist", gameId));
-      if (maps && maps.length) hint.textContent = maps.length + " maps installed here — click the field to pick one, or type any name.";
-    });
+    const map = mapPicker(form, "sf-map", "Starting map", gameId, "The game's default");
     // Bots, and only for a game that has them: a disabled field would be
     // furniture, since nothing an operator does here could make it work.
     let bots = null;
@@ -1403,6 +1684,13 @@ function openStartDialog(gameId) {
         if (seed.value.trim()) out.seed = seed.value.trim();
         return out;
       };
+    }
+    // Through a controller with workers in named regions: where to put it.
+    // A wish the controller keeps when a worker there has room.
+    let region = null;
+    if (state.controllerOn && state.regions.length > 1) {
+      region = selectField(form, "sf-region", "Region",
+        [["", "Any: the worker with the most room"]].concat(state.regions.map(r => [r, r])), "");
     }
     const adv = el("details");
     adv.appendChild(el("summary", "muted", "Advanced"));
@@ -1447,9 +1735,10 @@ function openStartDialog(gameId) {
       e.preventDefault();
       if (go.disabled) return;
       onStartSubmit(gameId, {
-        name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value,
+        name: name.value, maxPlayers: parseInt(mp.value, 10), map: map.value(),
         bots: bots ? bots.value : "", fixedPort: port.value, restartOnCrash: crash.checked,
         eula: !!(eulaBox && eulaBox.checked), world: world ? world() : null,
+        region: region ? region.value : "",
       }, go, close);
     });
     body.appendChild(form);
@@ -1494,10 +1783,12 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
       bots = n;
     }
   }
-  if (!game.runnable) { showError("This game cannot start here: " + (game.reason || "")); return; }
+  const can = startable(game);
+  if (!can.ok) { showError("This game cannot start here: " + can.reason); return; }
 
-  // Starting a game that is not installed yet downloads it first.
-  if (!roomForDownload()) return;
+  // Starting a game that is not installed yet downloads it first, here; through
+  // a controller a worker does that, on its own disk.
+  if (!state.controllerOn && !roomForDownload()) return;
 
   const instance_id = randomInstanceId(gameId);
   if (!/^[a-z0-9._-]{1,64}$/.test(instance_id)) { showError("Could not make a valid id for this server."); return; }
@@ -1508,6 +1799,7 @@ async function onStartSubmit(gameId, f, submitBtn, close) {
     restart_on_crash: !!f.restartOnCrash,
   };
   if (f.eula) body.eula_accepted_at = Math.floor(Date.now() / 1000);
+  if (f.region) body.region = f.region;
   if (f.world) {
     if (f.world.seed && !/^[A-Za-z0-9-]{1,32}$/.test(f.world.seed)) { showError("A seed may only hold letters, digits and '-', up to 32."); return; }
     body.minecraft = f.world;
@@ -1935,7 +2227,7 @@ async function onMinecraftSubmit(gameId, f, go, close) {
   if (!name) { showError("A server needs a name."); return; }
   if (!(f.slots >= 1 && f.slots <= 255)) { showError("Player slots must be between 1 and 255."); return; }
   if (f.seed && !/^[A-Za-z0-9-]{1,32}$/.test(f.seed)) { showError("A seed may only hold letters, digits and '-', up to 32."); return; }
-  if (!roomForDownload()) return;
+  if (!state.controllerOn && !roomForDownload()) return;
   const instance_id = randomInstanceId(gameId);
   const settings = Object.assign({}, f.settings);
   if (f.seed) settings.seed = f.seed;
@@ -2225,7 +2517,8 @@ function onShowLog(instanceId) {
     const pre = el("pre", "log-text", "Reading the log…");
     pre.tabIndex = 0;
     const game = inst && state.games.find(g => g.id === inst.game_id);
-    const canType = !!(game && game.console && inst.state === "running");
+    // Never through a controller: it carries no console (controller::allowed_path).
+    const canType = !state.controllerOn && !!(game && game.console && inst.state === "running");
     const footText = canType ? "Updates every 2 s while open. A line you send shows here with the game's answer."
       : "Updates every 2 s while open. Read-only.";
     const foot = el("div", "muted small log-foot", footText);
@@ -2270,7 +2563,17 @@ function onShowLog(instanceId) {
       if (state.logTimer) { clearTimeout(state.logTimer); state.logTimer = null; }
       if (!$("log-dialog")) return;
       try {
-        const text = await apiText("/instances/" + encodeURIComponent(instanceId) + "/logs?lines=" + lines);
+        let text = await apiText("/instances/" + encodeURIComponent(instanceId) + "/logs?lines=" + lines);
+        // Through a controller the index answers `{text, truncated}` (one
+        // uplink packet's worth, newest kept); the node's own route is plain text.
+        if (state.controllerOn) {
+          try {
+            const j = JSON.parse(text);
+            if (j && typeof j.text === "string") {
+              text = (j.truncated ? "(older lines left out: the newest that fit one reply)\n" : "") + j.text;
+            }
+          } catch (_) { /* a plain-text answer stays as it is */ }
+        }
         if (!$("log-dialog")) return;
         // Follow the end only for a reader who is already there; someone
         // scrolled up to read is left where they are.
@@ -2896,6 +3199,13 @@ async function rowAction(instanceId, cls, busyText, request, failText, doneText)
 // Off and on again, keeping its ports and its mesh destination, so a player's
 // saved address still works — which is why this is not remove-and-recreate.
 function onRestart(id) {
+  // Through a controller a stopped server is started (`/start`); restart is not
+  // carried, and the button is off for a running one.
+  if (state.controllerOn) {
+    return rowAction(id, ".restart-btn", "…",
+      () => api("POST", "/instances/" + encodeURIComponent(id) + "/start"),
+      "The server did not start.", "Starting.");
+  }
   return rowAction(id, ".restart-btn", "…",
     () => api("POST", "/instances/" + encodeURIComponent(id) + "/restart"),
     "The server did not restart.", "Restarting.");
@@ -2913,6 +3223,509 @@ async function onRemove(id, name) {
   return rowAction(id, null, null,
     () => api("DELETE", "/instances/" + encodeURIComponent(id)),
     "The server was not removed.", "Removed.");
+}
+
+// Through the controller only. The owner picks a worker in the server's region
+// (its home), or asks an admin for another region (regions.rs on the index):
+// an approved request moves it there and makes that region its home.
+function onRelocate(id, name) {
+  openModal("move-dialog", null, async (body, close) => {
+    body.appendChild(el("h3", null, "Move \u201c" + (name || id) + "\u201d"));
+    const status = el("p", "muted small", "Asking the controller where it could go\u2026");
+    body.appendChild(status);
+    const actions = el("div", "form-actions");
+    const closeBtn = el("button", "btn", "Close");
+    closeBtn.type = "button";
+    closeBtn.onclick = close;
+    let t, mine;
+    try {
+      [t, mine] = await Promise.all([
+        api("GET", "/instances/" + encodeURIComponent(id) + "/move-targets"),
+        api("GET", "/controller/region-requests").catch(() => []),
+      ]);
+    } catch (e) {
+      status.textContent = (e && e.error) || "Could not ask the controller.";
+      actions.appendChild(closeBtn);
+      body.appendChild(actions);
+      return;
+    }
+    status.textContent = "On " + t.worker + (t.region ? ", in region " + t.region : ", in no region") +
+      ". Its files are copied while it runs; then it switches over, dropping players for a moment, and keeps its mesh address.";
+
+    body.appendChild(el("h4", null, t.region ? "Another worker in " + t.region : "Another worker"));
+    if (!t.workers.length) {
+      body.appendChild(el("p", "muted small", "No other worker is in this server's region."));
+    } else {
+      const roomy = t.workers.filter(w => w.room === "room");
+      const pick = selectField(body, "mv-worker", "Worker",
+        [["", "Any: the one with the most room"]].concat(t.workers.map(w =>
+          [w.name, w.name + (w.room === "room" ? "" : w.room === "full" ? " (full)" : " (not answering)")])), "");
+      for (const o of pick.options) {
+        const w = t.workers.find(x => x.name === o.value);
+        if (w && w.room !== "room") o.disabled = true;
+      }
+      const go = el("button", "btn btn-primary", "Move");
+      go.type = "button";
+      go.disabled = !roomy.length;
+      if (!roomy.length) go.title = "No worker in this region has room.";
+      go.onclick = async () => {
+        go.disabled = true;
+        go.textContent = "Moving\u2026";
+        try {
+          await withInFlight(api("POST", "/instances/" + encodeURIComponent(id) + "/relocate",
+            pick.value ? { node: pick.value } : {}));
+          close();
+          clearError();
+          toast("Moved.");
+          poll();
+        } catch (e) {
+          if (e && e.__auth) return;
+          showError((e && e.error) || "The server was not moved.");
+          go.disabled = false;
+          go.textContent = "Move";
+        }
+      };
+      const row = el("div", "form-actions");
+      row.style.justifyContent = "flex-start";
+      row.appendChild(go);
+      body.appendChild(row);
+    }
+
+    if (t.regions.length) {
+      body.appendChild(el("h4", null, "Another region"));
+      body.appendChild(el("p", "muted small",
+        "An admin of the controller decides. Once approved, the server moves to a worker in that region, " +
+        "and that region becomes its home: coming back is another request."));
+      const pending = (Array.isArray(mine) ? mine : []).find(r => r.instance_id === id && r.state === "pending");
+      if (pending) {
+        body.appendChild(el("p", null, "Waiting for an admin: move to " + pending.to_region + "." +
+          (pending.note ? " Last try: " + pending.note : "")));
+        const cancel = el("button", "btn", "Take the request back");
+        cancel.type = "button";
+        cancel.onclick = async () => {
+          try {
+            await withInFlight(api("DELETE", "/controller/region-requests/" + encodeURIComponent(pending.id)));
+            close();
+            toast("Request taken back.");
+          } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not taken back."); }
+        };
+        const row = el("div", "form-actions");
+        row.style.justifyContent = "flex-start";
+        row.appendChild(cancel);
+        body.appendChild(row);
+      } else {
+        const region = selectField(body, "mv-region", "Region", t.regions.map(r => [r, r]), t.regions[0]);
+        const ask = el("button", "btn", "Ask an admin");
+        ask.type = "button";
+        ask.onclick = async () => {
+          ask.disabled = true;
+          try {
+            await withInFlight(api("POST", "/instances/" + encodeURIComponent(id) + "/region-request", { region: region.value }));
+            close();
+            toast("Asked. An admin of the controller will decide.");
+            if (state.activeTab === "requests") loadRequests();
+          } catch (e) {
+            if (!(e && e.__auth)) showError((e && e.error) || "The request was not made.");
+            ask.disabled = false;
+          }
+        };
+        const row = el("div", "form-actions");
+        row.style.justifyContent = "flex-start";
+        row.appendChild(ask);
+        body.appendChild(row);
+      }
+    }
+    actions.appendChild(closeBtn);
+    body.appendChild(actions);
+  });
+}
+
+// ---------- roles and the Admin tab ----------
+
+// What this page shows for its role. The node refuses a user's admin request
+// anyway (api::user_may); this only stops offering what would be refused.
+function applyRole() {
+  const admin = state.role === "admin";
+  for (const id of ["tab-admin", "tab-installed", "tab-interfaces"]) {
+    const t = $(id);
+    if (!t) continue;
+    if (id === "tab-admin") t.hidden = !admin || !(authState ? authState.accounts || state.controllerOn : true);
+    else t.hidden = !admin;
+  }
+  if (!admin && ["admin", "installed", "interfaces"].includes(state.activeTab)) setActiveTab("servers");
+  // The node's packs, its official-pack switch and the announce of this
+  // node's own servers are an admin's (api::user_may).
+  document.body.classList.toggle("role-user", !admin);
+  const lead = document.querySelector("#tab-panel-games .page-lead");
+  if (lead) lead.textContent = admin ? "Games this node has a pack for. A game this node cannot run says why."
+    : "Pick a game and start your server. It runs here, not on your computer.";
+  showRequestsTab();
+  $("games-grid").dataset.sig = "";
+  renderGames();
+}
+
+// Built off the page and swapped in whole, so a refresh never shows half a
+// tab and two overlapping loads never write into the same one.
+let adminLoads = 0;
+async function loadAdmin() {
+  const target = $("admin-body");
+  if (!target) return;
+  const run = ++adminLoads;
+  const root = el("div");
+  let pending = 0;
+
+  // This node's accounts and their roles.
+  if (authState && authState.accounts) {
+    const box = section(root, "Accounts on this node");
+    let users = [];
+    try { users = await api("GET", "/auth/users"); } catch (e) { box.appendChild(el("p", "muted small", (e && e.error) || "Could not read the accounts.")); }
+    const me = await api("GET", "/auth/me").catch(() => ({}));
+    for (const u of users) {
+      const line = el("div", "req-head");
+      line.style.marginTop = "8px";
+      const asked = u.admin_requested_unix ? " \u00b7 asked to become an admin" : "";
+      line.appendChild(el("span", "req-line", u.username + " \u00b7 " + u.role + (u.totp_enabled ? " \u00b7 codes on" : "") + asked));
+      const acts = el("span");
+      const btn = (label, fn, primary) => {
+        const b = el("button", "btn" + (primary ? " btn-primary" : ""), label);
+        b.type = "button";
+        b.style.marginLeft = "6px";
+        b.onclick = async () => {
+          try { await withInFlight(fn()); clearError(); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That did not work."); }
+        };
+        acts.appendChild(b);
+      };
+      const path = "/auth/users/" + encodeURIComponent(u.username);
+      if (u.admin_requested_unix) {
+        pending++;
+        btn("Approve", () => api("POST", path + "/role", { role: "admin" }), true);
+        btn("Deny", () => api("POST", path + "/deny-admin"));
+      } else if (u.role === "user") {
+        btn("Make admin", () => api("POST", path + "/role", { role: "admin" }));
+      } else if (u.username !== me.username) {
+        btn("Make user", () => api("POST", path + "/role", { role: "user" }));
+      }
+      if (u.username !== me.username) {
+        btn("Remove", () => confirm("Remove the account " + u.username + "? It is signed out everywhere.")
+          ? api("DELETE", path) : Promise.reject({ error: "Not removed." }));
+      }
+      line.appendChild(acts);
+      box.appendChild(line);
+    }
+    const nu = field(box, "adm-add-user", "New username", { type: "text", autocapitalize: "none", spellcheck: false });
+    const np = field(box, "adm-add-pass", "Its password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
+    const nr = selectField(box, "adm-add-role", "Role", [["user", "User: runs servers"], ["admin", "Admin: also manages this node"]], "user");
+    const add = el("button", "btn", "Add account");
+    add.type = "button";
+    add.onclick = async () => {
+      try { await withInFlight(api("POST", "/auth/users", { username: nu.value.trim(), password: np.value, role: nr.value })); toast("Account added."); loadAdmin(); }
+      catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The account was not added."); }
+    };
+    const r = el("div", "form-actions"); r.style.justifyContent = "flex-start"; r.appendChild(add); box.appendChild(r);
+  }
+
+  // The controller: this node's standing there, and an admin's work.
+  if (state.controllerOn) {
+    const box = section(root, "The controller");
+    const me = await api("GET", "/controller/me").catch(() => null);
+    if (!me) {
+      box.appendChild(el("p", "muted small", "The controller did not answer."));
+    } else if (!me.admin) {
+      box.appendChild(el("p", "muted small", "This node is not an admin of the controller. An admin there decides region moves and who else is one."));
+      const r = me.admin_request;
+      if (r && r.state === "pending") {
+        box.appendChild(el("p", null, "Asked to become an admin; waiting for one to decide."));
+      } else {
+        if (r && r.state === "denied") box.appendChild(el("p", "muted small", "The last request was turned down" + (r.reason ? ": " + r.reason : ".")));
+        const note = field(box, "adm-ask-note", "A note for the admins (optional)", { type: "text", maxLength: 300 });
+        const ask = el("button", "btn btn-primary", "Ask to become an admin");
+        ask.type = "button";
+        ask.onclick = async () => {
+          try { await withInFlight(api("POST", "/controller/admin-requests", note.value.trim() ? { note: note.value.trim() } : {})); toast("Asked."); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not made."); }
+        };
+        const rr = el("div", "form-actions"); rr.style.justifyContent = "flex-start"; rr.appendChild(ask); box.appendChild(rr);
+      }
+    } else {
+      box.appendChild(el("p", "muted small", "This node is an admin of the controller."));
+      const [moves, asks, admins, workers] = await Promise.all([
+        api("GET", "/controller/admin/region-requests").catch(() => []),
+        api("GET", "/controller/admin/admin-requests").catch(() => []),
+        api("GET", "/controller/admin/admins").catch(() => []),
+        api("GET", "/controller/admin/workers").catch(() => []),
+      ]);
+      const waitingMoves = moves.filter(r => r.state === "pending");
+      pending += waitingMoves.length;
+      box.appendChild(el("h4", null, "Region moves to decide"));
+      if (!waitingMoves.length) box.appendChild(el("p", "muted small", "Nothing waiting."));
+      for (const r of waitingMoves) box.appendChild(requestCard(r, true));
+
+      const waitingAdmins = asks.filter(r => r.state === "pending");
+      pending += waitingAdmins.length;
+      box.appendChild(el("h4", null, "Asking to become admins"));
+      if (!waitingAdmins.length) box.appendChild(el("p", "muted small", "Nothing waiting."));
+      for (const r of waitingAdmins) {
+        const card = el("div", "req-card");
+        card.appendChild(el("span", "req-line", r.identity.slice(0, 12) + "\u2026 \u00b7 asked " + new Date(r.created_unix * 1000).toLocaleString()));
+        if (r.note) card.appendChild(el("p", "muted small", "\u201c" + r.note + "\u201d"));
+        const row = el("div", "form-actions"); row.style.justifyContent = "flex-start";
+        const ok = el("button", "btn btn-primary", "Make admin");
+        ok.type = "button";
+        ok.onclick = async () => {
+          try { await withInFlight(api("POST", "/controller/admin/admin-requests/" + r.id + "/approve")); toast("Made an admin."); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not approved."); }
+        };
+        const no = el("button", "btn", "Turn down");
+        no.type = "button";
+        no.onclick = async () => {
+          const why = prompt("Why? They see this (optional).", "");
+          if (why === null) return;
+          try { await withInFlight(api("POST", "/controller/admin/admin-requests/" + r.id + "/deny", why ? { note: why } : {})); loadAdmin(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not turned down."); }
+        };
+        row.append(ok, no);
+        card.appendChild(row);
+        box.appendChild(card);
+      }
+
+      box.appendChild(el("h4", null, "Admins"));
+      for (const a of admins) {
+        const line = el("div", "req-head");
+        line.appendChild(el("span", "req-line", a.identity.slice(0, 12) + "\u2026" + (a.identity === me.identity ? " (this node)" : "") +
+          (a.source === "file" ? " \u00b7 in the hosting file" : " \u00b7 granted")));
+        if (a.source === "granted") {
+          const rv = el("button", "btn", "Revoke");
+          rv.type = "button";
+          rv.onclick = async () => {
+            if (!confirm("Stop " + a.identity.slice(0, 12) + "\u2026 being an admin of the controller?")) return;
+            try { await withInFlight(api("DELETE", "/controller/admin/admins/" + a.identity)); loadAdmin(); }
+            catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Not revoked."); }
+          };
+          line.appendChild(rv);
+        }
+        box.appendChild(line);
+      }
+
+      box.appendChild(el("h4", null, "Workers"));
+      const table = el("table", "admin-workers");
+      const head = el("tr");
+      for (const h of ["Worker", "Region", "Class", "Answers", "Servers", "Running", "Free memory", "Free disk"]) head.appendChild(el("th", null, h));
+      table.appendChild(head);
+      for (const w of workers) {
+        const c = w.capacity || {};
+        const tr = el("tr");
+        for (const v of [w.name, w.region || "\u2014", w.class || "\u2014", w.answered ? "yes" : "no", String(w.servers),
+          c.max_instances != null ? c.running + " of " + c.max_instances : "\u2014",
+          c.memory_available_bytes != null ? formatBytes(c.memory_available_bytes) : "\u2014",
+          c.disk_free_bytes != null ? formatBytes(c.disk_free_bytes) : "\u2014"]) tr.appendChild(el("td", null, v));
+        table.appendChild(tr);
+      }
+      const wrap = el("div", "table-wrap");
+      wrap.appendChild(table);
+      box.appendChild(wrap);
+    }
+  }
+  for (const input of root.querySelectorAll("input")) input.classList.add("field");
+  if (run !== adminLoads) return;
+  target.replaceChildren(...root.childNodes);
+  const n = $("nav-admin-count");
+  if (n) n.textContent = pending ? String(pending) : "";
+}
+
+// ---------- account (accounts.rs) ----------
+
+function section(parent, title) {
+  const box = el("div", "req-card");
+  box.appendChild(el("h3", null, title));
+  parent.appendChild(box);
+  return box;
+}
+
+async function loadAccount() {
+  const root = $("account-body");
+  if (!root) return;
+  root.textContent = "";
+  let me = { via: "token" };
+  try {
+    me = await api("GET", "/auth/me");
+  } catch (e) {
+    if (!(e && e.__auth)) root.appendChild(el("p", "muted small", (e && e.error) || "Could not read the accounts."));
+    return;
+  }
+  const isAccount = me.via === "account";
+  root.appendChild(el("p", "muted small", isAccount ? "Signed in as " + me.username + "."
+    : "Signed in with the API token. Make an account below and sign in with it to change a password or turn on codes."));
+
+  if (isAccount) {
+    const pw = section(root, "Password");
+    const cur = field(pw, "acct-cur", "Current password", { type: "password", autocomplete: "current-password" });
+    const nw = field(pw, "acct-new", "New password (at least 10 characters)", { type: "password", autocomplete: "new-password" });
+    const nw2 = field(pw, "acct-new2", "The new password again", { type: "password", autocomplete: "new-password" });
+    const save = el("button", "btn btn-primary", "Change password");
+    save.type = "button";
+    save.onclick = async () => {
+      if (nw.value !== nw2.value) { showError("The two new passwords are not the same."); return; }
+      try {
+        await withInFlight(api("POST", "/auth/password", { current: cur.value, new: nw.value }));
+        cur.value = nw.value = nw2.value = "";
+        clearError();
+        toast("Password changed. Other sign-ins of this account were ended.");
+      } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The password was not changed."); }
+    };
+    const r = el("div", "form-actions"); r.style.justifyContent = "flex-start"; r.appendChild(save); pw.appendChild(r);
+
+    const tf = section(root, "Codes from an authenticator app");
+    if (me.totp_enabled) {
+      tf.appendChild(el("p", "muted small", "On. Signing in asks for a code. If the phone is lost, the API token still lets you in."));
+      const code = field(tf, "acct-off-code", "A current code", { type: "text", inputMode: "numeric", maxLength: 8 });
+      const off = el("button", "btn", "Turn codes off");
+      off.type = "button";
+      off.onclick = async () => {
+        try { await withInFlight(api("POST", "/auth/totp/disable", { code: code.value.trim() })); toast("Codes are off."); loadAccount(); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Codes were not turned off."); }
+      };
+      const r2 = el("div", "form-actions"); r2.style.justifyContent = "flex-start"; r2.appendChild(off); tf.appendChild(r2);
+    } else {
+      tf.appendChild(el("p", "muted small", "Off. Turn them on to ask for a code from an app (such as Aegis, Google Authenticator or 1Password) at every sign-in."));
+      const begin = el("button", "btn btn-primary", "Turn codes on");
+      begin.type = "button";
+      begin.onclick = async () => {
+        let t;
+        try { t = await withInFlight(api("POST", "/auth/totp/begin")); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "Could not start."); return; }
+        begin.remove();
+        tf.appendChild(el("p", "muted small", "Scan this with your authenticator app, or type the key into it. Then enter the code it shows."));
+        const img = el("img", "totp-qr");
+        img.alt = "QR code for your authenticator app";
+        img.src = "data:image/svg+xml;base64," + btoa(t.qr_svg);
+        tf.appendChild(img);
+        const key = el("p", "mono small", t.secret.replace(/(.{4})/g, "$1 ").trim());
+        tf.appendChild(key);
+        const code = field(tf, "acct-on-code", "The code it shows", { type: "text", inputMode: "numeric", maxLength: 8 });
+        code.classList.add("field");
+        const confirmBtn = el("button", "btn btn-primary", "Confirm");
+        confirmBtn.type = "button";
+        confirmBtn.onclick = async () => {
+          try { await withInFlight(api("POST", "/auth/totp/enable", { code: code.value.trim() })); toast("Codes are on."); loadAccount(); }
+          catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "That code was not accepted."); }
+        };
+        const r3 = el("div", "form-actions"); r3.style.justifyContent = "flex-start"; r3.appendChild(confirmBtn); tf.appendChild(r3);
+        code.focus();
+      };
+      const r4 = el("div", "form-actions"); r4.style.justifyContent = "flex-start"; r4.appendChild(begin); tf.appendChild(r4);
+    }
+  }
+
+  if (isAccount && me.role === "user") {
+    const ad = section(root, "Becoming an admin");
+    if (me.admin_requested_unix) {
+      ad.appendChild(el("p", "muted small", "You asked to become an admin of this node; an admin will decide."));
+    } else {
+      ad.appendChild(el("p", "muted small", "You run servers here. An admin also manages accounts, game files and the mesh. Ask, and an admin decides."));
+      const ask = el("button", "btn", "Ask to become an admin");
+      ask.type = "button";
+      ask.onclick = async () => {
+        try { await withInFlight(api("POST", "/auth/admin-request")); toast("Asked. An admin will decide."); loadAccount(); }
+        catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not made."); }
+      };
+      const r6 = el("div", "form-actions"); r6.style.justifyContent = "flex-start"; r6.appendChild(ask); ad.appendChild(r6);
+    }
+  } else if (me.role !== "user") {
+    root.appendChild(el("p", "muted small", "Accounts on this node, and who is an admin, are on the Admin tab."));
+  }
+  for (const input of root.querySelectorAll("input")) input.classList.add("field");
+}
+
+// ---------- region requests ----------
+
+function requestLine(r) {
+  const when = r.created_unix ? new Date(r.created_unix * 1000).toLocaleString() : "";
+  return (r.name || r.instance_id) + " \u00b7 " + (r.from_region || "no region") + " \u2192 " + r.to_region +
+    (when ? " \u00b7 asked " + when : "");
+}
+
+function requestCard(r, admin) {
+  const card = el("div", "req-card");
+  const head = el("div", "req-head");
+  head.appendChild(el("span", "req-line", requestLine(r)));
+  head.appendChild(el("span", "chip req-" + r.state, r.state));
+  card.appendChild(head);
+  if (admin) card.appendChild(el("p", "muted small", "Owner " + String(r.owner || "").slice(0, 12) + "\u2026"));
+  if (r.note) card.appendChild(el("p", "muted small", (r.state === "pending" ? "Last try: " : "Note: ") + r.note));
+  if (r.state === "pending") {
+    const row = el("div", "form-actions");
+    row.style.justifyContent = "flex-start";
+    if (admin) {
+      const approve = el("button", "btn btn-primary", "Approve and move");
+      approve.type = "button";
+      approve.onclick = async () => {
+        approve.disabled = true;
+        approve.textContent = "Moving\u2026";
+        try {
+          await withInFlight(api("POST", "/controller/admin/region-requests/" + encodeURIComponent(r.id) + "/approve"));
+          toast("Approved. The server moved to " + r.to_region + ".");
+          poll();
+        } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not approved."); }
+        loadRequests();
+      };
+      const deny = el("button", "btn", "Deny");
+      deny.type = "button";
+      deny.onclick = async () => {
+        const note = prompt("Why? The owner sees this (optional).", "");
+        if (note === null) return;
+        try {
+          await withInFlight(api("POST", "/controller/admin/region-requests/" + encodeURIComponent(r.id) + "/deny", note ? { note } : {}));
+          toast("Denied.");
+        } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not denied."); }
+        loadRequests();
+      };
+      row.append(approve, deny);
+    } else {
+      const cancel = el("button", "btn", "Take back");
+      cancel.type = "button";
+      cancel.onclick = async () => {
+        try {
+          await withInFlight(api("DELETE", "/controller/region-requests/" + encodeURIComponent(r.id)));
+          toast("Request taken back.");
+        } catch (e) { if (!(e && e.__auth)) showError((e && e.error) || "The request was not taken back."); }
+        loadRequests();
+      };
+      row.appendChild(cancel);
+    }
+    card.appendChild(row);
+  }
+  return card;
+}
+
+async function loadRequests() {
+  const adminBox = $("requests-admin");
+  const mineBox = $("requests-mine");
+  if (!adminBox || !mineBox) return;
+  const [all, mine] = await Promise.all([
+    // Deciding is on the Admin tab; this tab is the account's own requests.
+    Promise.resolve(null),
+    api("GET", "/controller/region-requests").catch(() => []),
+  ]);
+  adminBox.textContent = "";
+  mineBox.textContent = "";
+  if (Array.isArray(all)) {
+    adminBox.appendChild(el("h3", null, "To decide"));
+    const pending = all.filter(r => r.state === "pending");
+    if (!pending.length) adminBox.appendChild(el("p", "muted small", "Nothing waiting."));
+    for (const r of pending) adminBox.appendChild(requestCard(r, true));
+    const decided = all.filter(r => r.state !== "pending").slice(0, 20);
+    if (decided.length) {
+      adminBox.appendChild(el("h3", null, "Decided"));
+      for (const r of decided) adminBox.appendChild(requestCard(r, true));
+    }
+    const n = $("nav-requests-count");
+    if (n) n.textContent = pending.length ? String(pending.length) : "";
+  }
+  mineBox.appendChild(el("h3", null, "Your requests"));
+  const own = Array.isArray(mine) ? mine : [];
+  if (!own.length) mineBox.appendChild(el("p", "muted small", "None yet. Ask from a server's menu: Move to another worker\u2026"));
+  for (const r of own) mineBox.appendChild(requestCard(r, false));
 }
 
 // Announce now, rather than at each announcer's next tick. Each announcer keeps
@@ -2974,34 +3787,8 @@ function onChangeMap(instanceId, gameId) {
   if (!gameId) return;
   openModal("map-dialog", gameId, (body, close) => {
     body.appendChild(el("h3", null, "Change map"));
-    const note = el("p", "muted small", "Reading the maps installed on this node…");
-    body.appendChild(note);
-    const input = field(body, "map-dialog-input", "Map", { type: "text", placeholder: "map name" });
-    input.setAttribute("list", "map-dialog-list");
-    const holder = el("div");
-    body.appendChild(holder);
-    const fill = (maps) => {
-      holder.textContent = "";
-      holder.appendChild(mapDatalist("map-dialog-list", gameId));
-      note.textContent = maps && maps.length
-        ? maps.length + " maps installed. Players stay connected while the level changes."
-        : "This node lists no maps for this game. Type a name; players stay connected.";
-      if (maps && maps.length) {
-        const list = el("div", "map-list");
-        maps.forEach(m => {
-          const b = el("button", "map-choice", m);
-          b.type = "button";
-          b.addEventListener("click", () => {
-            input.value = m;
-            list.querySelectorAll(".map-choice").forEach(x => x.classList.remove("chosen"));
-            b.classList.add("chosen");
-          });
-          list.appendChild(b);
-        });
-        holder.appendChild(list);
-      }
-    };
-    ensureMaps(gameId, fill);
+    const input = mapPicker(body, "map-dialog-input", "Map", gameId, null);
+    body.appendChild(el("p", "muted small", "Players stay connected while the level changes."));
     const actions = el("div", "form-actions");
     const cancel = el("button", "btn", "Cancel");
     cancel.type = "button";
@@ -3009,7 +3796,7 @@ function onChangeMap(instanceId, gameId) {
     const go = el("button", "btn btn-primary", "Change map");
     go.type = "button";
     go.addEventListener("click", async () => {
-      const trimmed = (input.value || "").trim();
+      const trimmed = input.value();
       if (trimmed === "") { input.focus(); return; }
       if (!MAP_NAME_RE.test(trimmed)) {
         showError("A map name may only contain letters, digits, '_', '-', '.' and '/'.");
@@ -4086,8 +4873,8 @@ async function onDeleteUnused() {
 
 // ---------- tabs ----------
 
-const TABS = ["servers", "games", "installed", "interfaces"];
-const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh" };
+const TABS = ["servers", "games", "installed", "interfaces", "requests", "admin", "account"];
+const TITLES = { servers: "Servers", games: "Games", installed: "Installed", interfaces: "Mesh", requests: "Region requests", admin: "Admin", account: "Account" };
 
 function setActiveTab(name) {
   if (!TABS.includes(name)) name = "servers";
@@ -4097,6 +4884,8 @@ function setActiveTab(name) {
     const on = t === name;
     btn.classList.toggle("active", on);
     btn.setAttribute("aria-selected", String(on));
+    // Roving tab stop: Tab reaches the open tab only; the arrow keys move between them.
+    btn.tabIndex = on ? 0 : -1;
     $("tab-panel-" + t).classList.toggle("hidden", !on);
   }
   $("page-title").textContent = TITLES[name];
@@ -4106,6 +4895,9 @@ function setActiveTab(name) {
   if (name === "games") { renderGames(); loadOfficial(); }
   if (name === "servers") pollUsage();
   if (name === "installed") pollInstalled();
+  if (name === "requests") loadRequests();
+  if (name === "account") loadAccount();
+  if (name === "admin") loadAdmin();
 }
 
 function renderAll() {
@@ -4119,6 +4911,15 @@ function renderAll() {
 document.addEventListener("DOMContentLoaded", () => {
   $("error-dismiss").addEventListener("click", clearError);
 
+  $("login-form").addEventListener("submit", onLoginSubmit);
+  $("setup-form").addEventListener("submit", onSetupSubmit);
+  $("login-switch").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("token-error").textContent = "";
+    loginMode = loginMode === "token" ? (authState && authState.has_accounts ? "account" : "setup") : "token";
+    renderLoginMode();
+  });
+
   $("token-form").addEventListener("submit", (e) => {
     e.preventDefault();
     const v = $("token-input").value;
@@ -4128,6 +4929,11 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("disconnect-btn").addEventListener("click", () => {
+    // End the session on the node too, so it is not left live; the token has
+    // nothing to end.
+    const t = getToken();
+    if (t && t.startsWith("s.")) fetch("/auth/logout", { method: "POST", headers: { "Authorization": "Bearer " + t } }).catch(() => {});
+    state.signedInAs = null;
     setToken(null);
     state.capacity = null;
     state.instances = [];
@@ -4162,6 +4968,22 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   for (const t of TABS) $("tab-" + t).addEventListener("click", () => setActiveTab(t));
+  // The tab pattern: arrows, Home and End move between the visible tabs.
+  $("tab-servers").parentElement.addEventListener("keydown", (e) => {
+    const shown = TABS.filter((t) => !$("tab-" + t).hidden);
+    const at = shown.indexOf(state.activeTab);
+    let to = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") to = shown[(at + 1) % shown.length];
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") to = shown[(at - 1 + shown.length) % shown.length];
+    else if (e.key === "Home") to = shown[0];
+    else if (e.key === "End") to = shown[shown.length - 1];
+    if (!to) return;
+    e.preventDefault();
+    setActiveTab(to);
+    $("tab-" + to).focus();
+  });
+  $("requests-refresh")?.addEventListener("click", loadRequests);
+  $("admin-refresh")?.addEventListener("click", loadAdmin);
   $("empty-goto-games").addEventListener("click", () => setActiveTab("games"));
   $("add-game-btn").addEventListener("click", openAddGameDialog);
   $("new-server-btn").addEventListener("click", () => setActiveTab("games"));

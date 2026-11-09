@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::AgentConfig;
 use crate::content::{ProvisionError, Provisioned, Provisioner};
 use crate::docker::{DockerRuntime, PublishedPort};
-use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus};
+use crate::instance::{InstancePort, InstanceSpec, InstanceState, InstanceStatus, LastExit};
 use crate::ports::PortAllocator;
 use crate::store::{ContentRef, InstancePlan, StoreLayout};
 use crate::uplink_wire::CapacityResp;
@@ -93,6 +93,10 @@ fn human_bytes(n: u64) -> String {
 
 /// How long a backup waits for a running world to finish saving.
 const WORLD_SAVE_WAIT: Duration = Duration::from_secs(30);
+
+/// An upload over the uplink that has not grown for this long is abandoned,
+/// and deleted when the next one starts for the same server.
+const STALE_UPLOAD: Duration = Duration::from_secs(6 * 3600);
 /// A console-read `(online, max)` and when it was read.
 type CountedAt = (Instant, (u32, u32));
 /// How long a console's answer to a player-count line is waited for.
@@ -118,6 +122,9 @@ pub struct Storage {
 
 pub struct Agent {
     config: AgentConfig,
+    /// This node's page places servers through this index, when configured
+    /// (`controller.rs`). `None` keeps the page on this node alone.
+    controller: Option<Arc<crate::controller::Controller>>,
     layout: StoreLayout,
     content: Provisioner,
     docker: DockerRuntime,
@@ -132,6 +139,9 @@ pub struct Agent {
     /// authority on what is *running*; this only remembers the display name and
     /// requested size, which Docker has no place to keep.
     specs: Mutex<BTreeMap<String, InstanceSpec>>,
+    /// Instances whose spec could not be read back off their container
+    /// (`recall_specs`), so the list does not inspect them on every call.
+    unrecalled: Mutex<HashSet<String>>,
     /// One mesh bridge per running instance. Empty and inert on a node with no
     /// `[mesh]` section, which is the LAN-only behaviour that came before.
     mesh: Arc<crate::mesh::MeshBridges>,
@@ -167,6 +177,8 @@ pub struct Agent {
     restart_waits: std::sync::Mutex<BTreeMap<String, String>>,
     /// Minecraft builds the publishers list, cached (`minecraft.rs`).
     minecraft: crate::minecraft::Catalog,
+    /// Told what happens on this node (`events.rs`); nothing by default.
+    events: Arc<dyn crate::events::NodeEvents>,
 }
 
 /// A server being moved, and both its copies: neither is deleted while the
@@ -537,14 +549,23 @@ impl Agent {
             config.data_root.join("mesh-interfaces.json"),
         );
         let config_data_root = config.data_root.clone();
+        let controller = match (&config.controller, &config.uplink) {
+            (Some(c), Some(u)) => Some(Arc::new(
+                crate::controller::Controller::new(c, &u.identity_secret_path)
+                    .context("starting the controller client")?,
+            )),
+            _ => None,
+        };
         Ok(Self {
             config,
+            controller,
             layout,
             content,
             docker,
             ports: Mutex::new(ports),
             packs,
             specs: Mutex::new(BTreeMap::new()),
+            unrecalled: Mutex::new(HashSet::new()),
             mesh,
             crashes: Mutex::new(CrashWatch::default()),
             console_counts: Mutex::new(HashMap::new()),
@@ -560,7 +581,19 @@ impl Agent {
             move_timing: std::sync::Mutex::new(MoveTiming::default()),
             restart_waits: std::sync::Mutex::new(BTreeMap::new()),
             minecraft: crate::minecraft::Catalog::default(),
+            events: crate::events::none(),
         })
+    }
+
+    /// Tell `events` about what happens on this node (`events.rs`). Set before
+    /// the agent is shared; the default listens to nothing.
+    pub fn set_events(&mut self, events: Arc<dyn crate::events::NodeEvents>) {
+        self.events = events;
+    }
+
+    /// The listener for this node's events.
+    pub fn events(&self) -> Arc<dyn crate::events::NodeEvents> {
+        self.events.clone()
     }
 
     /// The official pack repository on this node.
@@ -711,6 +744,11 @@ impl Agent {
 
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// The controller this page places servers through, when one is configured.
+    pub fn controller(&self) -> Option<&Arc<crate::controller::Controller>> {
+        self.controller.as_ref()
     }
 
     /// Plan an instance's layout and refuse early if the shared content copy
@@ -1192,6 +1230,7 @@ impl Agent {
             players_now: None,
             max_players_now: None,
             last_exit: None,
+            stopped_secs: None,
             restart_on_crash: None,
             crash_restarts: None,
             map_now: None,
@@ -1679,6 +1718,13 @@ impl Agent {
             match self.stop(&instance.instance_id).await {
                 Ok(()) => {
                     tracing::warn!(instance = %instance.instance_id, "{reason}; stopped");
+                    let server = crate::events::ServerEvent {
+                        instance_id: instance.instance_id.clone(),
+                        game_id: Some(instance.game_id.clone()),
+                        name: Some(instance.name.clone()),
+                        owner: instance.owner.clone(),
+                    };
+                    self.events.server_stopped_by_host(&server, &reason);
                     stopped.push(instance.instance_id.clone());
                 }
                 Err(e) => tracing::warn!(instance = %instance.instance_id, error = %format!("{e:#}"), "over its disk limit, and could not be stopped"),
@@ -1785,6 +1831,17 @@ impl Agent {
         self.docker.remove(instance_id).await?;
         self.ports.lock().await.release_all(&held);
         self.specs.lock().await.remove(instance_id);
+        self.unrecalled.lock().await.remove(instance_id);
+        // The folder stays (a world or a backup may be wanted; only the
+        // operator deletes it), but the identity is the server's address and
+        // nothing can use it once the server is gone. A move leaves it on the
+        // old worker otherwise, beside a copy that is now live elsewhere.
+        let identity = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        if let Err(e) = std::fs::remove_file(&identity) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(instance = instance_id, "could not delete a removed server's identity: {e}");
+            }
+        }
         // The server may have been the last one holding an old copy the
         // operator asked to remove after an update.
         self.sweep_old_copies().await;
@@ -1810,6 +1867,7 @@ impl Agent {
             })
             .unwrap_or(0);
         let memory = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| parse_meminfo(&m));
+        let disk = self.reserve();
         CapacityResp {
             max_instances: self.config.max_instances,
             running,
@@ -1818,11 +1876,42 @@ impl Agent {
             memory_total_bytes: memory.map(|(total, _)| total),
             memory_available_bytes: memory.map(|(_, available)| available),
             cpus: std::thread::available_parallelism().ok().and_then(|n| u32::try_from(n.get()).ok()),
+            disk_free_bytes: disk.as_ref().map(|(storage, _)| storage.free_bytes),
+            disk_reserve_bytes: disk.map(|(_, reserve)| reserve),
+        }
+    }
+
+    /// Fill in the spec of every container this run did not create, read back
+    /// off the container (`DockerRuntime::spec_of`). Without it a restarted
+    /// agent showed, and announced, every server by its instance id instead of
+    /// the name its owner gave it. Once per container per run: a container
+    /// that cannot be read keeps the id and is not inspected again.
+    async fn recall_specs(&self, containers: &[crate::docker::ManagedContainer]) {
+        let missing: Vec<String> = {
+            let specs = self.specs.lock().await;
+            let unrecalled = self.unrecalled.lock().await;
+            containers
+                .iter()
+                .map(|c| &c.instance_id)
+                .filter(|id| !specs.contains_key(*id) && !unrecalled.contains(*id))
+                .cloned()
+                .collect()
+        };
+        for id in missing {
+            match self.docker.spec_of(&id).await {
+                Ok(spec) => {
+                    self.specs.lock().await.entry(id).or_insert(spec);
+                }
+                Err(_) => {
+                    self.unrecalled.lock().await.insert(id);
+                }
+            }
         }
     }
 
     pub async fn list(&self) -> Result<Vec<InstanceStatus>> {
         let containers = self.docker.list_managed().await?;
+        self.recall_specs(&containers).await;
         let specs = self.specs.lock().await;
         Ok(containers
             .into_iter()
@@ -1862,6 +1951,7 @@ impl Agent {
                     players_now: None,
                     max_players_now: None,
                     last_exit: None,
+                    stopped_secs: None,
                     restart_on_crash: None,
                     crash_restarts: None,
                     map_now: None,
@@ -1921,10 +2011,15 @@ impl Agent {
         }
         drop(crashes);
         // Only a stopped server has an ending worth showing, and there are few.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
         for instance in instances.iter_mut().filter(|i| i.state == InstanceState::Stopped) {
             if let Some(cid) = instance.container_id.as_deref() {
                 instance.last_exit = self.docker.last_exit(cid).await.ok().flatten();
             }
+            instance.stopped_secs = match (instance.last_exit.as_ref().and_then(LastExit::ended_unix), now) {
+                (Some(ended), Some(now)) => Some(now.saturating_sub(ended)),
+                _ => None,
+            };
         }
         Ok(instances)
     }
@@ -2223,6 +2318,17 @@ impl Agent {
     /// game may be writing a file at that moment, which the page says. Held
     /// to the disk reserve like a download, by the files' full size.
     pub async fn create_backup(&self, instance_id: &str) -> Result<crate::backups::Backup> {
+        self.make_backup(instance_id, None).await
+    }
+
+    /// What changed in a server's files since `since` (unix seconds on this
+    /// node's clock), as an archive for `merge_backup` (`backups::create_since`).
+    /// Made the same way as a backup, so a running world is held still too.
+    pub async fn create_delta(&self, instance_id: &str, since: i64) -> Result<crate::backups::Backup> {
+        self.make_backup(instance_id, Some(since)).await
+    }
+
+    async fn make_backup(&self, instance_id: &str, since: Option<i64>) -> Result<crate::backups::Backup> {
         let c = self.ensure_instance(instance_id).await?;
         let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
         let dir = self.backups_dir(instance_id)?;
@@ -2241,7 +2347,11 @@ impl Agent {
             self.hold_world(instance_id, console).await;
         }
         let name = crate::backups::new_name(&dir, now_unix());
-        let made = tokio::task::spawn_blocking(move || crate::backups::create(&writable, &dir, &name)).await;
+        let made = tokio::task::spawn_blocking(move || match since {
+            Some(since) => crate::backups::create_since(&writable, &dir, &name, since),
+            None => crate::backups::create(&writable, &dir, &name),
+        })
+        .await;
         if let Some(console) = console {
             for line in console.after_backup() {
                 if let Err(e) = self.docker.send_console_line(instance_id, line).await {
@@ -2307,6 +2417,75 @@ impl Agent {
         Ok(())
     }
 
+    /// Lay a delta (`create_delta`) over a stopped server's files, then delete
+    /// the delta: it is not a backup and restoring it later would drop files.
+    pub async fn merge_backup(&self, instance_id: &str, name: &str) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: its files cannot be changed while it runs"));
+        }
+        if self.is_moving(instance_id) {
+            return Err(anyhow!("this server is being moved to a new copy; try again when that is done"));
+        }
+        let archive = crate::backups::path_of(&self.backups_dir(instance_id)?, name)
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("{instance_id} has no backup {name:?}"))?;
+        let writable = self.layout.instance_dir(instance_id).map_err(|e| anyhow!("{e:?}"))?.join("writable");
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).map_err(|e| anyhow!("no randomness for a staging name: {e}"))?;
+        let staging = self.config.data_root.join("staging").join(format!("merge-{}", hex::encode(seed)));
+        let from = archive.clone();
+        tokio::task::spawn_blocking(move || crate::backups::merge(&from, &writable, &staging))
+            .await?
+            .map_err(|e| anyhow!("{e}"))?;
+        let _ = std::fs::remove_file(&archive);
+        tracing::info!(instance = %instance_id, backup = %name, "merged a delta into a server's files");
+        Ok(())
+    }
+
+    /// The server's mesh identity, which is its address. `None` for a node
+    /// with no mesh. Read only so a move can carry the address with the
+    /// files; it never leaves the node except to an index on `trusted_indexes`.
+    pub async fn identity(&self, instance_id: &str) -> Result<Option<Vec<u8>>> {
+        self.ensure_instance(instance_id).await?;
+        let path = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace a **stopped** server's mesh identity with `bytes`, so it
+    /// comes back at another server's address. Exactly the 64 bytes an
+    /// identity file holds, written beside and renamed, mode 0600.
+    pub async fn set_identity(&self, instance_id: &str, bytes: &[u8]) -> Result<()> {
+        let c = self.ensure_instance(instance_id).await?;
+        if c.state != InstanceState::Stopped {
+            return Err(anyhow!("stop the server first: it announces under its identity while it runs"));
+        }
+        if bytes.len() != 64 {
+            return Err(anyhow!("that is not a mesh identity"));
+        }
+        let path = crate::mesh::identity_path(&self.config.data_root, instance_id);
+        let partial = path.with_extension("identity.partial");
+        {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // Owner-only from the first byte. Windows has no mode bits; the
+            // file inherits the data directory's ACL there.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&partial)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&partial, &path)?;
+        tracing::info!(instance = %instance_id, "gave a server another mesh identity");
+        Ok(())
+    }
+
     /// Delete one backup. The server need not exist any more: a removed
     /// server's backups stay until deleted. The id is still checked as an
     /// instance id and the name against the agent's own shape.
@@ -2367,7 +2546,100 @@ impl Agent {
         }
         let bytes = std::fs::metadata(dir.join(&name))?.len();
         tracing::info!(instance = %instance_id, backup = %name, bytes, "imported a backup");
-        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()) })
+        Ok(crate::backups::Backup { name, bytes, created_unix: Some(now_unix()), started_unix: None })
+    }
+
+    /// What this server would be created from again on another node: its
+    /// spec read back off the container (`DockerRuntime::spec_of`) with the
+    /// restart-on-crash choice kept beside it. Ports come back as this node
+    /// holds them; another node picks its own.
+    pub async fn spec(&self, instance_id: &str) -> Result<InstanceSpec> {
+        self.ensure_instance(instance_id).await?;
+        let mut spec = self.docker.spec_of(instance_id).await?;
+        spec.restart_on_crash = self.restart_on_crash(instance_id);
+        Ok(spec)
+    }
+
+    /// Up to `max` bytes of a named backup's file from `offset`, and the
+    /// file's whole length, so a caller can fetch it piece by piece over a
+    /// link that carries one bounded reply at a time. Like download, the
+    /// server need not exist any more.
+    pub async fn backup_chunk(&self, instance_id: &str, name: &str, offset: u64, max: usize) -> Result<(u64, Vec<u8>)> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let path = self.backup_file(instance_id, name).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        let total = file.metadata().await?.len();
+        if offset > total {
+            return Err(anyhow!("{name} is {total} bytes; there is nothing at {offset}"));
+        }
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut buf = Vec::with_capacity(max.min((total - offset) as usize));
+        file.take(max as u64).read_to_end(&mut buf).await?;
+        Ok((total, buf))
+    }
+
+    /// Add one piece to a backup arriving over the uplink. The first piece
+    /// (`upload` absent, `offset` 0) is held to `backups::MAX_IMPORT_BYTES` and
+    /// the disk reserve by the whole `total`, and gets an agent-made upload id;
+    /// every later piece must start exactly where the file ends, so a repeated
+    /// or skipped piece is refused rather than written twice or left as a
+    /// hole. The piece that completes it is checked and kept as a backup
+    /// (`import_backup`), exactly like an uploaded file.
+    pub async fn backup_upload_chunk(
+        &self,
+        instance_id: &str,
+        upload: Option<&str>,
+        offset: u64,
+        total: u64,
+        data: &[u8],
+    ) -> Result<crate::backups::UploadProgress> {
+        use tokio::io::AsyncWriteExt;
+        let (id, path) = match upload {
+            None => {
+                if offset != 0 {
+                    return Err(anyhow!("an upload starts at 0"));
+                }
+                if total > crate::backups::MAX_IMPORT_BYTES {
+                    return Err(anyhow!("a backup is at most 4 GB"));
+                }
+                // A sender that stopped halfway never comes back; its piece
+                // holds disk until here.
+                crate::backups::sweep_stale_uploads(&self.backups_dir(instance_id)?, STALE_UPLOAD);
+                let path = self.backup_upload_path(instance_id, Some(total)).await?;
+                let id = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix(".upload-"))
+                    .and_then(|n| n.strip_suffix(".partial"))
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("an upload path the agent cannot name"))?;
+                (id, path)
+            }
+            Some(id) => {
+                let path = crate::backups::upload_path(&self.backups_dir(instance_id)?, id)
+                    .filter(|p| p.is_file())
+                    .ok_or_else(|| anyhow!("no upload {id:?} is arriving for {instance_id}"))?;
+                (id.to_string(), path)
+            }
+        };
+        let have = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        if have != offset {
+            return Err(anyhow!("this upload has {have} bytes; a piece at {offset} does not follow on"));
+        }
+        let received = offset + data.len() as u64;
+        if received > total {
+            let _ = std::fs::remove_file(&path);
+            return Err(anyhow!("the upload is longer than it said"));
+        }
+        let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        drop(file);
+        if received < total {
+            return Ok(crate::backups::UploadProgress { upload: id, received, backup: None });
+        }
+        let backup = self.import_backup(instance_id, &path).await?;
+        Ok(crate::backups::UploadProgress { upload: id, received, backup: Some(backup) })
     }
 
     async fn server_exists(&self, instance_id: &str) -> Result<bool> {
@@ -2598,6 +2870,7 @@ impl Agent {
             Err(_) => return,
         };
         let mut due = Vec::new();
+        let mut crashed = Vec::new();
         {
             let mut watch = self.crashes.lock().await;
             for c in containers.iter().filter(|c| c.state == InstanceState::Stopped) {
@@ -2611,11 +2884,21 @@ impl Agent {
                     continue;
                 }
                 watch.seen.insert(c.instance_id.clone(), key);
-                if !watch.seeded
-                    || watch.stopped_here.contains(&c.instance_id)
-                    || !exit.is_crash()
-                    || !self.restart_on_crash(&c.instance_id)
-                {
+                if !watch.seeded || watch.stopped_here.contains(&c.instance_id) || !exit.is_crash() {
+                    continue;
+                }
+                // Heard whether or not it is restarted: a server left stopped
+                // after a crash is still one its owner should hear about.
+                crashed.push((
+                    crate::events::ServerEvent {
+                        instance_id: c.instance_id.clone(),
+                        game_id: c.game_id.clone(),
+                        name: None,
+                        owner: c.owner.clone(),
+                    },
+                    exit.clone(),
+                ));
+                if !self.restart_on_crash(&c.instance_id) {
                     continue;
                 }
                 if watch.recent(&c.instance_id) >= MAX_CRASH_RESTARTS_PER_HOUR {
@@ -2627,6 +2910,9 @@ impl Agent {
                 due.push((c.instance_id.clone(), exit));
             }
             watch.seeded = true;
+        }
+        for (server, exit) in &crashed {
+            self.events.server_crashed(server, exit);
         }
         for (id, exit) in due {
             tracing::warn!(instance = %id, code = exit.code, oom_killed = exit.oom_killed, "server crashed; starting it again");

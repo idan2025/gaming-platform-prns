@@ -22,6 +22,8 @@ Sizes are rough: **S** is a day or two, **M** about a week, **L** more.
 | 10 | Controller and big-screen mode | Steam Deck, couch | M | **built**: big screen, gamepad navigation, Linux gamepads read by the launcher itself |
 | 11 | Node: installed games and downloads | node operators | M | **built**: Installed page, delete, cancel, update (v0.2.36); remove a pack, verify |
 | 12 | Node: update checks, storage-safe downloads, moving servers | node operators | M–L | **built**: checks, reserve, queue (v0.2.37); automatic download, moving servers, settings |
+| 13 | Cluster: one controller, many worker nodes | operators with more than one machine | L | **planned** (§13) |
+| 14 | QR codes on invite links | players, phones | S | **planned** (§14) |
 | — | Rebrand | the project | S–M | **done: Lanthorn** (v0.2.31) |
 
 ## Not working — check needed
@@ -759,6 +761,128 @@ in-game warning; the reserve defaults to the larger of 10% of the disk and
   copy is not swept meanwhile.
 
 ---
+
+## 13. Cluster: one controller, many worker nodes
+
+**Status (2026-10-24): items 1–7 built, and a move tested between two real
+workers** (LXC on a Proxmox host, through a real index and hub). Map change and
+the console stay unbuilt on purpose (below). Nothing here is money, tiers or billing, and none of it may become a
+dependency: a single node with no index must keep working exactly as today.
+
+**What.** An operator runs one **controller** (an index, `platform-index`) and
+any number of **workers** (ordinary agents). Someone starts a server in the
+web UI and never learns which machine runs it: the controller places it on the
+worker with the most room, then drives it from then on. Players find it on the
+mesh the same way, because each server announces itself from whichever worker
+holds it.
+
+**Already built** (do not rebuild): placement by the operator's `priority`,
+then free memory, then free slots, with a silent node ranked last
+(`hosting::rank_node`, `Agent::capacity`); the agent's control surface over
+Reticulum (`uplink.rs`) so a worker needs no inbound port; the index's
+`agent_client.rs`; `trusted_indexes` re-checked on every op; create, stop,
+start, remove and list over the uplink; the hosting file re-read every 10 s;
+the owner stamped from the user's identity.
+
+**To build, public repo** (each is a general feature for any operator):
+1. **Setup guide** in `HOSTING.md`: run an index beside a node, add a second
+   machine as a worker, test placement. No code.
+2. **Disk in placement** (built). Free disk joins the capacity report
+   (`disk_free_bytes`, `disk_reserve_bytes`) and the ranking, under the same
+   disk reserve a node already keeps. A node under its reserve is full; among
+   equals, more room above the reserve wins, after priority and memory. An
+   older agent reports none, and counts as none, like memory
+   (`a_node_under_its_disk_reserve_is_full_and_one_that_did_not_say_is_not`).
+3. **Node classes** (built). A worker carries an operator-chosen label in the
+   hosting file (`class = "…"`), and a create may require one. The index only
+   matches the label; **what a class is for is the operator's business**, and
+   the public code assigns it no meaning. Two rules fall out of "matches":
+   a classed node takes only creates naming its class, and a create naming
+   none takes only unclassed nodes. And an account may ask for a class only if
+   its hosting-file entry lists it (`[quota.accounts.<hash>] classes`); an
+   account listing none may ask for none, and a refusal says the same words
+   whether or not the class exists. Without that, naming a class would be
+   self-service. Caught by `a_classed_node_takes_only_creates_naming_its_class`
+   and `an_account_that_was_not_given_a_class_cannot_ask_for_it`.
+4. **One-command worker setup** (built, `scripts/setup-worker.sh`, `HOSTING.md`
+   "Adding a worker"). Writes the worker's config trusting the index, makes its
+   identity, points it at a hub, and prints the hosting-file block. The block's
+   `agent` hash comes from `platform-agent --control-address`, which derives the
+   same destination `uplink::start` serves
+   (`tests/control_address.rs`). Does not install Docker or the agent binary.
+5. **The node's own web UI creates through a configured controller** (built,
+   `controller.rs`, `HOSTING.md` "Placing servers through a controller"). With
+   a `[controller]` section the page lists every worker's servers, creates
+   through the index, and sends stop, start, remove, logs and backups to the
+   node that holds the server. The node logs in with its uplink identity,
+   pinned to the index's identity, and forwards only what
+   `controller::allowed_path` names, map change included (2026-11-02). Not
+   carried yet: console, bots, chat, players, restart, world upload and backup
+   download, which stay on the node's own page. Caught by `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
+   and `a_login_is_refused_by_an_index_the_node_is_not_pinned_to`.
+   **Backup cap per account** (built 2026-10-24, `max_backups_per_account`):
+   counted across the account's workers when a backup is asked for.
+6. **The missing uplink operations** (built: logs, backups list, create,
+   restore and delete, `OP_LOGS` to `OP_BACKUP_DELETE`). Replies are capped to
+   one packet: logs keep their newest text, and backup lists keep the newest
+   backups; both say when they were cut. **Map change** (built 2026-11-02, the
+   owner's call): `OP_MAP` carries a map name, validated at the index and
+   again on the node, where `console.rs` picks the words; `OP_MAPS` lists a
+   game's installed maps in pages that fit a packet. The console itself
+   (free text) still never crosses the uplink (`CLAUDE.md`).
+7. **Moving a server between workers** (built, `Hosting::relocate`,
+   `POST /instances/:id/relocate`, `HOSTING.md` "Moving a server to another
+   worker"). Create the same server on the new worker held stopped, copy its
+   files while the old one runs (a full copy, then deltas of what changed,
+   `OP_BACKUP_*`, `OP_DELTA_CREATE`, `OP_DELTA_MERGE`, riding Reticulum
+   resources), stop the old one for the last delta, carry its identity
+   (`OP_IDENTITY_READ`, `OP_IDENTITY_SET`) so the address does not change,
+   start the new one, and remove the old one last. The old server is not
+   touched until that final pass. Caught by
+   `a_server_moves_with_its_files_and_the_old_one_goes_last`,
+   `a_move_that_fails_while_copying_never_stops_the_old_server`,
+   `a_move_that_fails_after_the_stop_starts_the_old_server_again` and, live,
+   `a_backup_is_carried_in_pieces_from_one_server_to_another_over_the_uplink`
+   and `a_delta_and_an_identity_cross_the_uplink`. Measured between two
+   LXC workers on a Proxmox host over the LAN, through a real index and hub
+   (300 MiB of server files and a log written to while it ran): the move took
+   18 s and the index logged `downtime_ms=478`. The first run logged 10275: a game
+   that is PID 1 ignores SIGTERM and Docker waited out 10 s. Game containers now
+   run under Docker's init, so the stop ends on the signal. With the real Sven
+   Co-op server the move took 22 s and players lost it for 1.4 s, measured by
+   A2S from the LAN (boot included).
+
+**A decision, not a default.** The uplink must never gain a console route
+(`CLAUDE.md`: an index must not type at a node's servers). Moderation and the
+console on a worker, driven from a controller the same operator owns, is a
+different trust case; widening the rule is the project owner's call and gets
+its own entry here before any code.
+
+**Not here, on purpose.** Starting new machines when every worker is full
+(auto-scaling) needs a provider's API and is optional; it is not part of the
+public roadmap. Payment, quotas by plan and which class a customer gets are
+private (the private repo `idan2025/lanthorn-hosted`).
+
+**Rules this has to respect.** Decentralized by default: no index, no
+controller, no account must always still work. Game traffic never transits the
+controller. A worker is trusted per request, never per session. A pack still
+cannot name what runs.
+
+### Build order
+
+2 and 3 first (small, testable with the existing two-node round-trip test),
+then 4, 5 and 6 together, then 7. Item 1 is written alongside the first
+real second machine.
+
+## 14. QR codes on invite links
+
+**Status (2026-10-21): built** (#81, `invite_qr` in `launcher/src-tauri`,
+Android preview 12). Copy invite already produced the web form
+link (`invite::WEB_PAGE`, `site/join/`, the invite in the fragment); the
+launcher shows it as a QR code, desktop and Android, so a phone joins by scanning.
+The code is drawn locally and sent nowhere. The page the code opens applies
+the same validation as `invite::parse`: a scan selects a server and never joins
+one.
 
 ## Rebrand
 

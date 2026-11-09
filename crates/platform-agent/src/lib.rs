@@ -4,14 +4,17 @@
 //! layout and its security boundary; `config` holds the split between what a
 //! game pack describes and what a node's operator decides.
 
+pub mod accounts;
 pub mod active;
 pub mod agent;
 pub mod backups;
 pub mod bans;
 pub mod api;
 pub mod config;
+pub mod controller;
 pub mod content;
 pub mod docker;
+pub mod events;
 pub mod install;
 pub mod instance;
 pub mod interfaces;

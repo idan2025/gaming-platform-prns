@@ -68,8 +68,22 @@ const ANNOUNCE_INTERVAL_SECS: u64 = 30;
 pub const AGENT_APP_NAME: &str = "platform-agent";
 pub const AGENT_ASPECT: &str = "control";
 
+/// What the control destination announces. **Never empty and never printable:**
+/// a launcher cannot tell an announce's aspect, and an empty or text payload
+/// decodes as a legacy server, so this node's control address showed up in
+/// every browser as an unnamed "older server". `0xFE` is neither the server
+/// record's version nor valid UTF-8, so every build's `announce::decode`
+/// refuses it and no browser lists it (the same rule as a repository seed's
+/// announce, `game_bridge::repo_mesh`). The announce is not part of the
+/// destination hash, so the address does not change.
+pub const AGENT_ANNOUNCE: [u8; 4] = [0xFE, b'L', b'A', b'C'];
+
 /// The single request endpoint every op rides on. One endpoint, op byte inside.
 pub const CONTROL_ENDPOINT_ID: &str = "/platform-agent/control/1";
+
+/// The largest request this destination reads: one `OP_BACKUP_WRITE` piece
+/// and room for its header and the envelope.
+const MAX_REQUEST_BYTES: u64 = (TRANSFER_CHUNK + 4 * 1024) as u64;
 
 /// State the request endpoint handler sees.
 struct UplinkState {
@@ -184,7 +198,13 @@ impl RequestEndpoint<Arc<UplinkState>> for ControlEndpoint {
         };
 
         let resp = dispatch(cx.state, op, body, now).await;
-        let _ = cx.respond(resp);
+        // Only a file piece or a spec outgrows a packet; every other reply is
+        // capped to one by its encoder, and goes exactly as it always did.
+        if resp.len() > MAX_BODY_LEN + 3 {
+            let _ = cx.respond_resource(resp);
+        } else {
+            let _ = cx.respond(resp);
+        }
         Ok(())
     }
 }
@@ -265,6 +285,110 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_LOGS => {
+            let req: LogsReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_LOGS, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_LOGS, &msg);
+            }
+            match state.agent.logs(&req.instance_id, req.lines as usize).await {
+                Ok(text) => encode_logs_resp(&text),
+                Err(e) => encode_err(OP_LOGS, &format!("{e:#}")),
+            }
+        }
+
+        OP_MAPS => {
+            let req: MapsReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_MAPS, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_MAPS, &msg);
+            }
+            match state.agent.available_maps(&req.game_id).await {
+                Ok(maps) => encode_maps_resp(&maps, req.offset),
+                Err(e) => encode_err(OP_MAPS, &format!("{e:#}")),
+            }
+        }
+
+        OP_MAP => {
+            let req: MapReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_MAP, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_MAP, &msg);
+            }
+            // `change_map` validates the name and picks the words; nothing
+            // from the request becomes a console line unchecked.
+            match state.agent.change_map(&req.instance_id, &req.map).await {
+                Ok(_) => encode_ok(OP_MAP, &[]),
+                Err(e) => encode_err(OP_MAP, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUPS => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUPS, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUPS, &msg);
+            }
+            match state.agent.backups(&req.instance_id).await {
+                Ok(list) => encode_backups_resp(&list),
+                Err(e) => encode_err(OP_BACKUPS, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_CREATE => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_CREATE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_CREATE, &msg);
+            }
+            match state.agent.create_backup(&req.instance_id).await {
+                Ok(made) => match payload_bytes(&made) {
+                    Ok(bytes) if fits(bytes.len()).is_ok() => encode_ok(OP_BACKUP_CREATE, &bytes),
+                    Ok(bytes) => encode_err(OP_BACKUP_CREATE, &WireError::TooLarge(bytes.len()).to_string()),
+                    Err(e) => encode_err(OP_BACKUP_CREATE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_BACKUP_CREATE, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_RESTORE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_RESTORE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_RESTORE, &msg);
+            }
+            match state.agent.restore_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_BACKUP_RESTORE, &[]),
+                Err(e) => encode_err(OP_BACKUP_RESTORE, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_DELETE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_DELETE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_DELETE, &msg);
+            }
+            match state.agent.delete_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_BACKUP_DELETE, &[]),
+                Err(e) => encode_err(OP_BACKUP_DELETE, &format!("{e:#}")),
+            }
+        }
+
         OP_REMOVE => {
             let req: InstanceReq = match parse_payload(body) {
                 Ok(r) => r,
@@ -313,6 +437,124 @@ async fn dispatch(state: &Arc<UplinkState>, op: u8, body: &[u8], now: SystemTime
             }
         }
 
+        OP_SPEC => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_SPEC, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_SPEC, &msg);
+            }
+            match state.agent.spec(&req.instance_id).await {
+                Ok(spec) => match payload_bytes(&spec) {
+                    Ok(bytes) => encode_ok(OP_SPEC, &bytes),
+                    Err(e) => encode_err(OP_SPEC, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_SPEC, &format!("{e:#}")),
+            }
+        }
+
+        OP_DELTA_CREATE => {
+            let req: DeltaReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_DELTA_CREATE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_DELTA_CREATE, &msg);
+            }
+            match state.agent.create_delta(&req.instance_id, req.since).await {
+                Ok(made) => match payload_bytes(&made) {
+                    Ok(bytes) if fits(bytes.len()).is_ok() => encode_ok(OP_DELTA_CREATE, &bytes),
+                    Ok(bytes) => encode_err(OP_DELTA_CREATE, &WireError::TooLarge(bytes.len()).to_string()),
+                    Err(e) => encode_err(OP_DELTA_CREATE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_DELTA_CREATE, &format!("{e:#}")),
+            }
+        }
+
+        OP_DELTA_MERGE => {
+            let req: BackupReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_DELTA_MERGE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_DELTA_MERGE, &msg);
+            }
+            match state.agent.merge_backup(&req.instance_id, &req.name).await {
+                Ok(()) => encode_ok(OP_DELTA_MERGE, &[]),
+                Err(e) => encode_err(OP_DELTA_MERGE, &format!("{e:#}")),
+            }
+        }
+
+        OP_IDENTITY_READ => {
+            let req: InstanceReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_IDENTITY_READ, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_IDENTITY_READ, &msg);
+            }
+            match state.agent.identity(&req.instance_id).await {
+                Ok(found) => match payload_bytes(&IdentityResp { identity: found.map(hex::encode) }) {
+                    Ok(bytes) => encode_ok(OP_IDENTITY_READ, &bytes),
+                    Err(e) => encode_err(OP_IDENTITY_READ, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_IDENTITY_READ, &format!("{e:#}")),
+            }
+        }
+
+        OP_IDENTITY_SET => {
+            let req: IdentitySetReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_IDENTITY_SET, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_IDENTITY_SET, &msg);
+            }
+            let Ok(bytes) = hex::decode(&req.identity) else {
+                return encode_err(OP_IDENTITY_SET, "that is not a mesh identity");
+            };
+            match state.agent.set_identity(&req.instance_id, &bytes).await {
+                Ok(()) => encode_ok(OP_IDENTITY_SET, &[]),
+                Err(e) => encode_err(OP_IDENTITY_SET, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_READ => {
+            let req: BackupReadReq = match parse_payload(body) {
+                Ok(r) => r,
+                Err(e) => return encode_err(OP_BACKUP_READ, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_READ, &msg);
+            }
+            match state.agent.backup_chunk(&req.instance_id, &req.name, req.offset, TRANSFER_CHUNK).await {
+                Ok((total, data)) => encode_ok(OP_BACKUP_READ, &encode_chunk(total, &data)),
+                Err(e) => encode_err(OP_BACKUP_READ, &format!("{e:#}")),
+            }
+        }
+
+        OP_BACKUP_WRITE => {
+            let (req, data) = match decode_write_body(body) {
+                Ok(v) => v,
+                Err(e) => return encode_err(OP_BACKUP_WRITE, &e.to_string()),
+            };
+            if let Err(msg) = authorize(&state.auth, &state.trusted, &req.token, now).await {
+                return encode_err(OP_BACKUP_WRITE, &msg);
+            }
+            match state
+                .agent
+                .backup_upload_chunk(&req.instance_id, req.upload.as_deref(), req.offset, req.total, data)
+                .await
+            {
+                Ok(progress) => match payload_bytes(&progress) {
+                    Ok(bytes) => encode_ok(OP_BACKUP_WRITE, &bytes),
+                    Err(e) => encode_err(OP_BACKUP_WRITE, &e.to_string()),
+                },
+                Err(e) => encode_err(OP_BACKUP_WRITE, &format!("{e:#}")),
+            }
+        }
+
         other => encode_err(other, "unknown op"),
     }
 }
@@ -334,12 +576,43 @@ fn parse_identity_hash(hex_str: &str) -> Result<IdentityHash> {
 /// `identity_secret_path` is loaded (or created on first run, like the bridge)
 /// from `UplinkConfig`. The same key is the announce identity, the auth
 /// audience, and the transport identity — one key, consistent.
+/// The addresses an agent with this identity secret is reached at: its
+/// identity hash, and the control destination an index names in its hosting
+/// file. Derived from the secret alone, so `platform-agent --control-address`
+/// prints exactly what `start` will serve, without starting anything.
+pub fn addresses_of(secret: &[u8; 64]) -> Result<(IdentityHash, DestinationHash)> {
+    let identity = PrivateIdentityMaterial::from_slice(&secret[..])
+        .map_err(|e| anyhow!("agent identity key: {e:?}"))?;
+    let destination = PreConfiguredDestination::Single {
+        app_name: AGENT_APP_NAME,
+        aspects: &[AGENT_ASPECT],
+        identity: Zeroizing::new(*secret),
+        announce_app_data: &AGENT_ANNOUNCE,
+        proof: ProofStrategy::ProveAll,
+        link_requests: LinkRequestPolicy::AcceptAll,
+        ratchet: RatchetPolicy::NoRatchets,
+        resource_strategy: ResourceStrategy::AcceptNone,
+        maximum_request_bytes: Default::default(),
+        request_endpoints: ServeMyRequestEndpoints::Yes,
+    }
+    .destination_hash()
+    .map_err(|e| anyhow!("invalid agent destination: {e:?}"))?;
+    Ok((identity.identity_hash(), destination))
+}
+
+/// The addresses of the agent whose identity lives at `config`'s path, creating
+/// the identity on first use exactly as `start` does. Reads nothing else, so it
+/// needs no Docker and no network.
+pub fn control_address_of(config: &UplinkConfig) -> Result<(IdentityHash, DestinationHash)> {
+    let secret = load_or_create_identity_secret(&config.identity_secret_path)
+        .map_err(|e| anyhow!("loading agent identity: {e}"))?;
+    addresses_of(&secret)
+}
+
 pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplinkNode> {
     let secret = load_or_create_identity_secret(&config.identity_secret_path)
         .map_err(|e| anyhow!("loading agent identity: {e}"))?;
-    let identity = PrivateIdentityMaterial::from_slice(&secret[..])
-        .map_err(|e| anyhow!("agent identity key: {e:?}"))?;
-    let identity_hash = identity.identity_hash();
+    let (identity_hash, destination_hash) = addresses_of(&secret)?;
 
     let trusted: Vec<IdentityHash> = config
         .trusted_indexes
@@ -352,21 +625,6 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
         auth: Mutex::new(Authenticator::new(identity_hash)),
         trusted,
     });
-
-    let destination_hash = PreConfiguredDestination::Single {
-        app_name: AGENT_APP_NAME,
-        aspects: &[AGENT_ASPECT],
-        identity: secret.clone(),
-        announce_app_data: b"",
-        proof: ProofStrategy::ProveAll,
-        link_requests: LinkRequestPolicy::AcceptAll,
-        ratchet: RatchetPolicy::NoRatchets,
-        resource_strategy: ResourceStrategy::AcceptNone,
-        maximum_request_bytes: Default::default(),
-        request_endpoints: ServeMyRequestEndpoints::Yes,
-    }
-    .destination_hash()
-    .map_err(|e| anyhow!("invalid agent destination: {e:?}"))?;
 
     // The init handshake carries the node handle out of the dedicated uplink
     // thread as well as the stop channel, so the local API can drive interfaces
@@ -396,12 +654,16 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
                     app_name: AGENT_APP_NAME,
                     aspects: &[AGENT_ASPECT],
                     identity: secret.clone(),
-                    announce_app_data: b"",
+                    announce_app_data: &AGENT_ANNOUNCE,
                     proof: ProofStrategy::ProveAll,
                     link_requests: LinkRequestPolicy::AcceptAll,
                     ratchet: RatchetPolicy::NoRatchets,
                     resource_strategy: ResourceStrategy::AcceptNone,
-                    maximum_request_bytes: Default::default(),
+                    // A request is read whole before anyone is asked who sent
+                    // it, so the biggest is bounded here: one file piece and
+                    // its header. Unlimited, anyone who could reach this
+                    // destination could make the node hold any size.
+                    maximum_request_bytes: prns_core::units::ByteLimit::Maximum(MAX_REQUEST_BYTES),
                     request_endpoints: ServeMyRequestEndpoints::Yes,
                 };
 
@@ -481,6 +743,14 @@ pub async fn start(agent: Arc<Agent>, config: UplinkConfig) -> Result<AgentUplin
 
 #[cfg(test)]
 mod tests {
+    /// The control destination's announce must never decode as a server.
+    #[test]
+    fn the_control_announce_is_never_a_server_row() {
+        assert!(game_bridge::announce::decode(&AGENT_ANNOUNCE).is_err(), "a browser would list it as a server");
+        let bytes: &[u8] = std::hint::black_box(&AGENT_ANNOUNCE);
+        assert!(std::str::from_utf8(bytes).is_err());
+    }
+
     use super::*;
     use platform_auth::answer_challenge;
     use prns_core::identity::PrivateIdentityMaterial;

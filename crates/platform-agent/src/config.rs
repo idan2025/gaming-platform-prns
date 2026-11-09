@@ -120,6 +120,10 @@ pub struct AgentConfig {
     /// working either way.
     #[serde(default)]
     pub uplink: Option<UplinkConfig>,
+    /// An index this node's own page places servers through (`ROADMAP.md`
+    /// §13.5). Absent, the page manages this node only, as it always did.
+    #[serde(default)]
+    pub controller: Option<ControllerConfig>,
     /// Which pack signers this node trusts, and whether it deploys a pack
     /// nobody vouched for (`PLAN.md` §11.3, §11.4).
     ///
@@ -229,6 +233,44 @@ fn default_max_instances() -> usize {
     8
 }
 
+/// A controller, from this node's side. The node logs in to it with its uplink
+/// identity, so the operator's servers on that index belong to this node's
+/// identity, and the quotas that index keeps apply to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerConfig {
+    /// The index's front door: `https://…`, or `http://` to loopback only. The
+    /// login and every server request travel over it, so a plain address off
+    /// this machine is refused.
+    pub url: String,
+    /// The index's identity hash. The login's signature is bound to it, so a
+    /// server that is not this index cannot use this node's login.
+    pub identity: String,
+}
+
+/// Whether `url` may carry this node's login: https anywhere, or http to this
+/// machine only. Anything else would send a session token in the clear.
+pub fn controller_url_is_acceptable(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !authority_host(rest).is_empty();
+    }
+    match url.strip_prefix("http://") {
+        Some(rest) => matches!(authority_host(rest), "127.0.0.1" | "localhost" | "[::1]"),
+        None => false,
+    }
+}
+
+/// The host of `authority/path`, without userinfo or port. An IPv6 host keeps
+/// its brackets, so it can be compared as written.
+fn authority_host(rest: &str) -> &str {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host_port.starts_with('[') {
+        return host_port.split_once(']').map_or("", |(h, _)| &host_port[..h.len() + 1]);
+    }
+    host_port.split(':').next().unwrap_or_default()
+}
+
 /// How one game runs on this node. Operator-chosen, never pack-supplied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -328,6 +370,9 @@ pub enum ConfigError {
     BadTrustedIndex(String),
     /// The uplink identity secret path was relative, not absolute.
     RelativeUplinkIdentityPath(PathBuf),
+    /// A `[controller]` section that cannot be used: no `[uplink]` to log in
+    /// with, a plain-http address off this machine, or a bad identity.
+    BadController(String),
     /// A `pack_trust` key was not a 32-char hex identity hash.
     BadPackTrustKey(String),
 }
@@ -370,6 +415,7 @@ impl core::fmt::Display for ConfigError {
                 "set api_token or api_token_file, not both: two sources for one secret \
                  is a way to authenticate against the one you did not mean to change"
             ),
+            Self::BadController(why) => write!(f, "[controller]: {why}"),
             Self::BadTrustedIndex(s) => write!(
                 f,
                 "trusted_indexes entry {s:?} is not a 32-character hex identity hash"
@@ -429,6 +475,25 @@ impl AgentConfig {
         // it with a random value on first run.
         if !self.api_bind.ip().is_loopback() && !self.api_is_authenticated() {
             return Err(ConfigError::NonLoopbackApiBind(self.api_bind));
+        }
+        if let Some(c) = &self.controller {
+            if self.uplink.is_none() {
+                return Err(ConfigError::BadController(
+                    "needs an [uplink] section: the node logs in with its identity".into(),
+                ));
+            }
+            if !controller_url_is_acceptable(&c.url) {
+                return Err(ConfigError::BadController(format!(
+                    "url {:?} must be https, or http to 127.0.0.1, localhost or [::1]",
+                    c.url
+                )));
+            }
+            if !is_identity_hash_hex(&c.identity) {
+                return Err(ConfigError::BadController(format!(
+                    "identity {:?} is not a 32-character hex identity hash",
+                    c.identity
+                )));
+            }
         }
         if let Some(uplink) = &self.uplink {
             if !uplink.identity_secret_path.is_absolute() {
@@ -911,5 +976,50 @@ cpus = 1.5
         assert!(r.contains(27100) && r.contains(27101));
         assert!(!r.contains(27099) && !r.contains(27102));
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn a_controller_url_never_sends_a_login_in_the_clear_off_this_machine() {
+        for good in [
+            "https://index.example.org",
+            "https://index.example.org:4760/",
+            "http://127.0.0.1:4760",
+            "http://localhost:4760/api",
+            "http://[::1]:4760",
+        ] {
+            assert!(controller_url_is_acceptable(good), "{good}");
+        }
+        for bad in [
+            "http://index.example.org",
+            "http://192.168.1.5:4760",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "ftp://127.0.0.1",
+            "index.example.org",
+            "https://",
+            "http://user@192.168.1.5",
+        ] {
+            assert!(!controller_url_is_acceptable(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_controller_needs_an_uplink_identity_and_a_good_address() {
+        let base = "[port_range]\nstart = 27100\nend = 27199\n";
+        let without_uplink = format!(
+            "data_root = \"/var/lib/x\"\n{base}[controller]\nurl = \"https://idx.example.org\"\nidentity = \"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6\"\n"
+        );
+        assert!(AgentConfig::parse(&without_uplink).is_err(), "no [uplink] to log in with");
+
+        let with_uplink = |url: &str, identity: &str| {
+            format!(
+                "data_root = \"/var/lib/x\"\n{base}[uplink]\nidentity_secret_path = \"/var/lib/x/id\"\ntrusted_indexes = []\n\
+                 [controller]\nurl = \"{url}\"\nidentity = \"{identity}\"\n"
+            )
+        };
+        let id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+        assert!(AgentConfig::parse(&with_uplink("https://idx.example.org", id)).is_ok());
+        assert!(AgentConfig::parse(&with_uplink("http://idx.example.org", id)).is_err());
+        assert!(AgentConfig::parse(&with_uplink("https://idx.example.org", "NOT-HEX")).is_err());
     }
 }

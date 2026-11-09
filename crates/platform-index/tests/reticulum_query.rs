@@ -75,7 +75,7 @@ async fn a_launcher_queries_an_index_over_the_mesh_with_no_internet() {
     let mut index = platform_index::node::start(
         state,
         secret,
-        Some(format!("0.0.0.0:{tcp_port}")),
+        vec![format!("0.0.0.0:{tcp_port}")],
         false,
     )
     .await

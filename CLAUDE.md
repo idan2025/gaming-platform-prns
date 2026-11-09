@@ -45,6 +45,69 @@ stylistic, and both have tests against a real Docker daemon:
 The agent's Docker tests skip themselves where there is no daemon, and they
 build a tiny local image from busybox rather than pulling anything.
 
+**The node page signs in with accounts** (2026-10-24, `accounts.rs`, `/auth/*`
+in `api.rs`). The API token stays valid on every route and is what makes the
+first account (`/auth/setup`, refused once any account exists) and the way back
+in; accounts exist only where a token is configured. Rules a later change could
+quietly break:
+- **Passwords are Argon2id hashes; the file is owner-only and written beside
+  and renamed.** A file that does not parse turns accounts off, never into
+  "no accounts", which would let the next token holder make one.
+- **A wrong username and a wrong password read the same**, and a missing name
+  is still checked against a decoy hash, so neither the words nor the time say
+  which accounts exist (`the_page_signs_in_with_an_account_made_once_with_the_token`).
+- **Sign-in is throttled per name** (5 failures in 15 minutes lock it for 5),
+  whatever is sent; a wrong code counts, "code needed" does not.
+- **A code is good once**: the step of the last code accepted is kept and a
+  code for it or an older step is refused; codes are on only after one from the
+  new secret was typed back. HMAC-SHA1 and Base32 are written here and pinned
+  to RFC 6238, 2202 and 4648 vectors.
+- **Sessions are memory only** (12 h), end at sign-out, with a password change
+  (every other session of the account) and when an account is removed; the
+  last account cannot be removed. The token is no account: it changes no
+  password and turns on no codes (403).
+- **A user account runs servers; everything else is an admin's** (2026-10-25,
+  `accounts::Role`, `api::user_may`, checked in `require_token`). A route
+  `user_may` does not name is refused to a user, so a new route is an admin's
+  until someone decides otherwise; a server's identity, a move's plumbing,
+  the account list and acting as the node at its controller are refused by
+  name. An account file from before roles reads as admins (the safe
+  direction for the people who already ran the node), and the last admin can
+  be neither demoted nor removed. Caught by
+  `a_user_runs_servers_only_until_an_admin_makes_them_one` and
+  `a_route_nobody_listed_is_an_admins`.
+- **Each user account is its own identity at the controller** (2026-10-25,
+  `controller::Acting`, `account_secret`). An account with the user role signs
+  in to the index as an identity derived (HMAC-SHA256) from the node's key, its
+  name and a random per-account `key_salt`; admins and the token act as the
+  node. So the index's owner check keeps accounts' servers apart and its quotas
+  count each one. Before this every account was the node there and any user
+  could stop or remove another's server. A name taken again gets a new salt,
+  never the old account's servers. Removing a user account first has the index
+  erase that identity (`DELETE /me`: its servers and backups, refused while a
+  worker is silent); if the index cannot, the account stays. Lists are cached
+  per identity. Caught by
+  `each_user_account_is_its_own_identity_at_the_controller`.
+- **Sign-in state is bounded** (`platform-auth`: 10,000 challenges, 100,000
+  sessions, 8 per identity, then `Busy`/503), and **the node refuses browser
+  requests from other sites** (`api::browser_guard`: `Sec-Fetch-Site`,
+  `Origin`, and on a tokenless node a non-loopback `Host`, against CSRF and DNS
+  rebinding) and sends a CSP with no inline script or style and
+  `frame-ancestors 'none'`; the index sends the same kind of headers. Inline
+  `style=` in the page is refused by it. The page's prose must not use the
+  class `help` (the `?` tooltip). Caught by
+  `another_site_cannot_drive_a_loopback_node_through_a_browser`.
+- **`cargo audit` runs on both lockfiles** (`.github/workflows/audit.yml`, daily
+  and on lockfile changes). The launcher's zip 4, inside the Tauri updater, is
+  ignored with its reason in the workflow: it extracts only an update whose
+  signature has verified.
+- **An index admin is the hosting file's or granted by an admin**
+  (`platform-index/src/admins.rs`, `index-admins.json` beside the hosting
+  file). Asking grants nothing; only an identity that is already an admin
+  approves, a grant can be revoked and a file admin cannot (edit the file).
+  A store that does not parse is an error, never an empty list. Caught by
+  `an_account_becomes_an_index_admin_only_by_an_admin`.
+
 **The agent handles SIGTERM itself** (2026-09-23). As PID 1 in a container it
 gets no default action for a signal it has no handler for, so without one every
 `docker stop` sat out the 10 s timeout and ended in SIGKILL (exit 137). On a
@@ -94,7 +157,11 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   `priority`, then free memory (`MemAvailable`, reported by the node;
   unreported counts as none), then free slots, and a node under
   `MIN_FREE_MEMORY_BYTES` free is full. Priority never lifts a silent node
-  (`placement_follows_priority_then_memory_and_silence_still_loses`).
+  (`placement_follows_priority_then_memory_and_silence_still_loses`). A
+  create's `region` (2026-10-24) sits right after "answered" and before
+  priority: a node in it that answered wins, a silent one there still loses
+  to every node that answered, and a region nobody has is a wish that changes
+  nothing (`a_create_lands_in_its_region_when_a_node_there_answered`).
 - **The owner stamped over the uplink is the end-user's identity, not the
   index's.** The create request carries the user's identity hash; the agent sets
   `spec.owner` from it and stamps `OWNER_LABEL` unchanged. The authenticated
@@ -102,6 +169,16 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   caller's identity. Pinned by
   `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
 
+- **A limit is checked against every worker, and silence is not zero**
+  (2026-10-24, `max_backups_per_account`, `[quota.accounts.<hash>] max_backups`,
+  `Hosting::backups_held`). The cap is off until written, 0 is refused at
+  load, and an account's own number replaces the shared one either way. The
+  count asks each worker itself and refuses when one cannot answer:
+  `all_instances` deliberately skips a silent worker so a listing survives an
+  outage, and counting through it would let a worker's outage lift the limit.
+  A backup a node's own schedule makes counts toward it but is not stopped by
+  it (the schedule has its own `keep`). Caught by
+  `a_backup_is_refused_at_the_accounts_cap_across_its_workers_and_never_counts_a_strangers`.
 - **The hosting file is re-read without a restart** (`Hosting::reload_from`,
   checked every 10 s by modification time). The config is swapped whole and
   each operation takes one snapshot, so a reload never changes the rules
@@ -115,6 +192,59 @@ Two rules in phase 4's index and uplink that a later change could quietly break:
   players. Starting takes no quota, because a stopped server already counts.
   An agent too old for `OP_START` is named as such. Pinned by
   `an_index_creates_lists_stops_starts_and_removes_on_a_remote_agent`.
+
+**A server moves between workers through the index** (2026-10-23,
+`Hosting::relocate`, ROADMAP §13 item 7; copies while running and keeps its
+address, 2026-10-24). Rules a later change could quietly break:
+- **A move stays in the server's region; only an approved request leaves it**
+  (2026-10-24, `hosting::MoveTarget`, `regions.rs`). A server's region is its
+  worker's, so its creation region is its home. `Auto` and a picked `Worker`
+  are refused outside it, and the automatic choice no longer drifts to another
+  region (it used to prefer its own, then took any). `Region` is reached only
+  from `approve_region_request`, by an identity in the hosting file's
+  `admins`, and the owner can never approve their own unless listed there.
+  An approval that finds no room keeps the request pending with the reason; a
+  move retargets a pending request to the server's new id; the store refuses
+  a second pending request per server and a second decision, and a file that
+  does not parse is an error, never an empty list. Moves pick only workers
+  that answered. Caught by
+  `a_move_goes_to_the_chosen_worker_and_never_leaves_its_region_unasked` and
+  `a_region_move_needs_an_admin_and_its_new_region_becomes_home`.
+- **The old server is removed last, and is not touched at all until the final
+  pass.** The new server is made and held stopped, the files are copied while
+  the old one still serves (a full copy, then up to three deltas of what
+  changed since the previous one), and only then is the old one stopped for
+  one last delta. A failure before the stop removes only the new copy; after
+  it, the new copy is removed and the old one started again. A move that
+  fails never loses a server. Caught by
+  `a_move_that_fails_while_copying_never_stops_the_old_server` and
+  `a_move_that_fails_after_the_stop_starts_the_old_server_again`.
+- **A delta is `since` the time the previous archive was *started*, on the
+  source's clock** (`Backup.started_unix`), never when it finished: a file
+  written while the archive was being made must be sent again. A delta
+  carries `backups::DELTA_INDEX`, the list of every path the server has, so
+  `backups::merge` can delete what is gone; it refuses a plain backup, which
+  would delete every file it lacks. Merge only onto a stopped server and
+  consumes the delta. Caught by `a_delta_laid_over_an_earlier_copy_gives_the_later_state`
+  and `a_backup_that_is_not_a_delta_is_never_merged`.
+- **The uplink reads a request whole before it knows who sent it**, so the
+  control destination caps requests at one file piece
+  (`uplink::MAX_REQUEST_BYTES`). Leaving it `Unlimited` lets anyone who can
+  reach the destination make a node hold any size.
+- **An upload piece must start where the file ends**, and the first is held
+  to `backups::MAX_IMPORT_BYTES` and the disk reserve by its declared total;
+  the finished file goes through `import_backup`'s check like any upload.
+- **The server's identity travels, through the index, in memory only**
+  (`OP_IDENTITY_READ` / `OP_IDENTITY_SET`, `Hosting::identity_on`): the
+  address is the identity, so a move that keeps it must carry the 64 secret
+  bytes, and two nodes reach each other only through the index. An index on a
+  node's `trusted_indexes` can already create, stop and remove there; this
+  adds impersonating that one server, and the old node's copy goes when the old
+  server is removed (`Agent::remove` deletes `mesh.identity`; the folder stays).
+  Caught by `a_removed_servers_identity_goes_and_its_folder_stays`. It is read and set per request under the same allowlist check as
+  every op, set only on a **stopped** server and only if exactly 64 bytes,
+  written beside and renamed at mode 0600. Never log it or write it on the
+  index. Caught by `a_delta_and_an_identity_cross_the_uplink`.
 
 **`StreamRelay` is built** (2026-08-31, `crates/game-bridge/src/stream.rs`): a
 pack declaring `transport = "tcp"` runs. It rides the link's **channel**, not
@@ -594,6 +724,15 @@ under all of it). Rules a later change could quietly break:
   network and under host networking. Extra channels go through
   `ServerArgs::extra_game_ports`, since the node publishes them on its own
   numbers.
+- **Every game container runs under Docker's init** (`HostConfig.init`).
+  A dedicated server is PID 1 otherwise, gets no default action for a
+  SIGTERM it has no handler for, and Sven Co-op's DS has none: every stop
+  waited out the 10 s and ended in SIGKILL (137), and that wait was a server
+  move's whole downtime. Under init it ends on the signal (143, 0.25 s).
+  Sven's image also runs `svends_i686`, never the `svends_run` restart loop,
+  which ran the DS as its child even with `-norestart` and restarted crashes
+  behind the agent's crash watch. Caught by
+  `a_game_without_a_signal_handler_stops_on_the_signal_not_the_timeout`.
 - **A `gpp-games` network that lets containers talk is refused, never used**
   (`only_a_games_network_that_keeps_containers_apart_is_used`).
 - **A server's own files are held to `writable_limit_bytes`**
@@ -681,6 +820,12 @@ pack declares a console, every line is logged, and **only the loopback API
 has the route**: the uplink must never gain one, or an index could type at a
 node's servers. Caught by
 `an_operators_line_reaches_the_console_and_a_second_line_never_does`.
+**A map change does cross the uplink and the controller** (2026-11-02, the
+owner's call, `OP_MAP`, `OP_MAPS`): it carries a map name, never a line,
+validated by `validate_map_name` at the index and again in
+`Agent::change_map`, and the words are `console.rs`'s. Do not widen it into
+a free-text route. `nothing_that_types_at_a_server_or_moves_its_files_is_reachable`
+still pins console, bots and chat off the controller.
 
 **A server can restart daily in a window** (2026-10-14, `schedule.rs`,
 `Agent::scheduled_restarts`, "Daily restart…" in a server's menu). Once a

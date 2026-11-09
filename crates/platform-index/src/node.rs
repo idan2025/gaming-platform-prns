@@ -31,7 +31,7 @@ use tracing::{debug, info};
 
 use crate::http::IndexState;
 use crate::wire::{
-    encode_result, IndexQuery, INDEX_APP_NAME, INDEX_ASPECT, QUERY_ENDPOINT_ID,
+    encode_result, IndexQuery, INDEX_ANNOUNCE, INDEX_APP_NAME, INDEX_ASPECT, QUERY_ENDPOINT_ID,
 };
 
 /// How often the index re-announces itself.
@@ -65,7 +65,10 @@ impl RequestEndpoint<Arc<IndexState>> for QueryEndpoint {
         };
 
         let registry = cx.state.registry.lock().await;
-        let matched = registry.query(&browse, Instant::now());
+        let mut matched = registry.query(&browse, Instant::now());
+        if let Some(hosting) = &cx.state.hosting {
+            matched.retain(|s| hosting.listed(s.destination_hash.as_bytes()));
+        }
         let body = encode_result(&matched, matched.len());
         drop(registry);
 
@@ -116,14 +119,14 @@ impl IndexNode {
 pub async fn start(
     state: Arc<IndexState>,
     identity: Zeroizing<[u8; IDENTITY_SECRET_KEY_LEN]>,
-    tcp: Option<String>,
+    tcp: Vec<String>,
     auto: bool,
 ) -> Result<IndexNode> {
     let destination_hash = PreConfiguredDestination::Single {
         app_name: INDEX_APP_NAME,
         aspects: &[INDEX_ASPECT],
         identity: identity.clone(),
-        announce_app_data: b"",
+        announce_app_data: INDEX_ANNOUNCE,
         proof: ProofStrategy::ProveAll,
         link_requests: LinkRequestPolicy::AcceptAll,
         ratchet: RatchetPolicy::NoRatchets,
@@ -156,7 +159,7 @@ pub async fn start(
                     app_name: INDEX_APP_NAME,
                     aspects: &[INDEX_ASPECT],
                     identity: identity.clone(),
-                    announce_app_data: b"",
+                    announce_app_data: INDEX_ANNOUNCE,
                     proof: ProofStrategy::ProveAll,
                     link_requests: LinkRequestPolicy::AcceptAll,
                     ratchet: RatchetPolicy::NoRatchets,
@@ -178,8 +181,15 @@ pub async fn start(
                     storage: GrowableHeap,
                     request_endpoints: request_endpoints![QueryEndpoint],
                     on_event: |_event, _state| {},
+                    // Every hub, so a remote agent stays reachable through
+                    // whichever is up; auto-discovery once.
                     interfaces: |node: &PrnsNodeHandle| {
-                        game_bridge::relay::attach_interfaces(node, tcp.as_deref(), auto);
+                        if tcp.is_empty() {
+                            game_bridge::relay::attach_interfaces(node, None, auto);
+                        }
+                        for (i, hub) in tcp.iter().enumerate() {
+                            game_bridge::relay::attach_interfaces(node, Some(hub), auto && i == 0);
+                        }
                     },
                     persistence: NoPersistence,
                 });

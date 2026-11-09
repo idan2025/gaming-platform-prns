@@ -985,6 +985,11 @@ function renderDetail() {
   inv.title = 'Copy a link that opens this ' + (room ? 'room' : 'server') + ' in a friend\u2019s Lanthorn';
   inv.prepend(icon('link'));
   inv.onclick = () => copyInvite(a);
+  const qr = el('button', 'btn', 'QR code');
+  qr.id = 'detail-invite-qr';
+  qr.type = 'button';
+  qr.title = 'Show a QR code a phone can scan to open this invite';
+  qr.onclick = () => showRowInviteQr(a);
   const starred = state.favSet.has(d.hash);
   const fav = el('button', 'btn btn-fav' + (starred ? ' on' : ''), starred ? 'Starred' : 'Star');
   fav.id = 'detail-fav';
@@ -995,6 +1000,7 @@ function renderDetail() {
   // Ahead of the join message, which spans the whole row.
   const msg = actions.querySelector('.join-msg');
   actions.insertBefore(inv, msg);
+  actions.insertBefore(qr, msg);
   actions.insertBefore(fav, msg);
   pane.appendChild(actions);
 
@@ -3442,6 +3448,41 @@ async function copyInvite(row) {
   }
 }
 
+// The invite as a QR code, for a phone to scan. Drawn by the core from the
+// same link Copy invite gives; the page only shows what it is handed.
+async function showInviteQr(link) {
+  try {
+    const svg = await invoke('invite_qr', { invite: link });
+    closePopovers();
+    showMenu(window.innerWidth / 2 - 150, 70, [{ head: 'Scan to open this invite' }]);
+    const m = $('ctx-menu');
+    const box = el('div', 'invite-qr');
+    box.id = 'invite-qr';
+    const img = el('img');
+    img.alt = 'QR code for the invite link';
+    img.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    box.appendChild(img);
+    m.appendChild(box);
+  } catch (err) {
+    showError('Could not make the QR code: ' + errText(err));
+  }
+}
+
+async function showRowInviteQr(row) {
+  if (!row) return;
+  try {
+    const link = await invoke('invite_link', {
+      destinationHash: row.destination_hash,
+      gameId: row.game_id || null,
+      name: row.name || null,
+      room: isRoom(row),
+    });
+    await showInviteQr(link);
+  } catch (err) {
+    showError('Could not make the QR code: ' + errText(err));
+  }
+}
+
 // Show the server an invite names: its row if it is listed, else a pane built
 // from the invite until its announce arrives — which can be never, for a
 // server too far away to have reached this launcher yet. Joining works
@@ -4105,6 +4146,11 @@ function renderHostCard(body) {
         catch (_) { showError('Could not copy. The link is ' + h.invite); }
       };
       actions.appendChild(copy);
+      const qr = el('button', 'btn', 'QR code');
+      qr.type = 'button';
+      qr.id = 'host-invite-qr';
+      qr.onclick = () => showInviteQr(h.invite);
+      actions.appendChild(qr);
     }
     const stop = el('button', 'btn btn-danger', 'Stop hosting');
     stop.type = 'button';

@@ -1,0 +1,51 @@
+name: audit
+
+# Checks both lockfiles (the workspace and the launcher, which is outside it)
+# against the RustSec advisory database: on a pull request that changes a
+# lockfile or a manifest, on main, and daily, because an advisory published
+# today applies to code that has not changed in months.
+#
+# An advisory is ignored here only with the reason written beside it, and only
+# when the vulnerable code cannot be reached. Unmaintained and unsound notices
+# are reported and do not fail the job.
+
+on:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Workspace
+        run: cargo audit
+      - name: Launcher
+        working-directory: launcher/src-tauri
+        # zip 4.x, pulled in by tauri-plugin-updater: RUSTSEC-2026-0367,
+        # -0368 and -0369 are in `ZipArchive::extract` and
+        # `ZipStreamReader::extract`, which the updater runs only on an update
+        # whose minisign signature has already verified against the key in
+        # `tauri.conf.json`. Drop these once the updater moves to zip 9.
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2026-0367
+          --ignore RUSTSEC-2026-0368
+          --ignore RUSTSEC-2026-0369

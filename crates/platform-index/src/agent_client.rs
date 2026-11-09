@@ -37,11 +37,19 @@ use tracing::debug;
 
 use platform_agent::instance::{InstanceSpec, InstanceStatus};
 use platform_agent::uplink::CONTROL_ENDPOINT_ID;
+use platform_agent::backups::Backup;
+use platform_agent::backups::UploadProgress;
 use platform_agent::uplink_wire::{
-    decode_response, encode_request, parse_payload, payload_bytes, CapacityResp, CreateReq,
-    InstanceReq, ListResp, TokenReq, OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_LIST, OP_REMOVE,
-    OP_START, OP_STOP, OP_VERIFY,
+    decode_chunk, decode_response, encode_request, encode_write_body, parse_payload, payload_bytes,
+    BackupReadReq, BackupReq, BackupWriteReq, BackupsResp, CapacityResp, CreateReq, DeltaReq,
+    IdentityResp, IdentitySetReq, InstanceReq, ListResp, LogsReq, LogsResp, MapReq, MapsReq,
+    MapsResp, TokenReq, OP_BACKUPS, OP_BACKUP_CREATE, OP_BACKUP_DELETE, OP_BACKUP_READ,
+    OP_BACKUP_RESTORE, OP_BACKUP_WRITE, OP_CAPACITY, OP_CHALLENGE, OP_CREATE, OP_DELTA_CREATE,
+    OP_DELTA_MERGE, OP_IDENTITY_READ, OP_IDENTITY_SET, OP_LIST, OP_LOGS, OP_MAP, OP_MAPS, OP_REMOVE,
+    OP_SPEC, OP_START, OP_STOP, OP_VERIFY,
 };
+use prns_core::engine::RequestResponseTimeout;
+use prns_core::units::DurationMillis;
 use platform_auth::{answer_challenge, Challenge, ChallengeResponse, Session};
 
 /// The endpoint path hash, computed once.
@@ -117,6 +125,146 @@ impl AgentClient {
         Ok(resp.instances)
     }
 
+    /// The newest lines a server wrote, as the node could fit in one reply.
+    pub async fn logs(&self, agent: DestinationHash, instance_id: &str, lines: u32) -> Result<LogsResp> {
+        let req = LogsReq { token: String::new(), instance_id: instance_id.to_string(), lines };
+        let body = self.signed_op(agent, OP_LOGS, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_LOGS)
+    }
+
+    /// Every map the node has installed for one game, page by page.
+    pub async fn maps(&self, agent: DestinationHash, game_id: &str) -> Result<Vec<String>> {
+        let mut maps = Vec::new();
+        let mut offset = 0;
+        loop {
+            let req = MapsReq { token: String::new(), game_id: game_id.to_string(), offset };
+            let body = self.signed_op(agent, OP_MAPS, &payload_bytes(&req)?).await?;
+            let page: MapsResp = parse_ok(&body, OP_MAPS)?;
+            maps.extend(page.maps);
+            match page.next {
+                // A page that does not move forward would loop for ever.
+                Some(next) if next > offset => offset = next,
+                _ => return Ok(maps),
+            }
+        }
+    }
+
+    pub async fn change_map(&self, agent: DestinationHash, instance_id: &str, map: &str) -> Result<()> {
+        let req = MapReq { token: String::new(), instance_id: instance_id.to_string(), map: map.to_string() };
+        let body = self.signed_op(agent, OP_MAP, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_MAP)
+    }
+
+    pub async fn backups(&self, agent: DestinationHash, instance_id: &str) -> Result<BackupsResp> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_BACKUPS, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_BACKUPS)
+    }
+
+    pub async fn backup_create(&self, agent: DestinationHash, instance_id: &str) -> Result<Backup> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_BACKUP_CREATE, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_BACKUP_CREATE)
+    }
+
+    pub async fn backup_restore(&self, agent: DestinationHash, instance_id: &str, name: &str) -> Result<()> {
+        let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
+        let body = self.signed_op(agent, OP_BACKUP_RESTORE, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_BACKUP_RESTORE)
+    }
+
+    pub async fn backup_delete(&self, agent: DestinationHash, instance_id: &str, name: &str) -> Result<()> {
+        let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
+        let body = self.signed_op(agent, OP_BACKUP_DELETE, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_BACKUP_DELETE)
+    }
+
+    /// What changed in a server's files since `since` (the node's own clock).
+    pub async fn delta_create(&self, agent: DestinationHash, instance_id: &str, since: i64) -> Result<Backup> {
+        let req = DeltaReq { token: String::new(), instance_id: instance_id.to_string(), since };
+        let body = self.signed_op(agent, OP_DELTA_CREATE, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_DELTA_CREATE)
+    }
+
+    /// Lay a delta over a stopped server's files; the node deletes the delta.
+    pub async fn delta_merge(&self, agent: DestinationHash, instance_id: &str, name: &str) -> Result<()> {
+        let req = BackupReq { token: String::new(), instance_id: instance_id.to_string(), name: name.to_string() };
+        let body = self.signed_op(agent, OP_DELTA_MERGE, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_DELTA_MERGE)
+    }
+
+    /// A server's mesh identity (64 bytes), or none on a node with no mesh.
+    pub async fn identity_read(&self, agent: DestinationHash, instance_id: &str) -> Result<Option<Vec<u8>>> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_IDENTITY_READ, &payload_bytes(&req)?).await?;
+        let reply: IdentityResp = parse_ok(&body, OP_IDENTITY_READ)?;
+        reply.identity.map(|h| hex::decode(h).map_err(|_| anyhow!("the node sent an identity we cannot read"))).transpose()
+    }
+
+    pub async fn identity_set(&self, agent: DestinationHash, instance_id: &str, identity: &[u8]) -> Result<()> {
+        let req = IdentitySetReq { token: String::new(), instance_id: instance_id.to_string(), identity: hex::encode(identity) };
+        let body = self.signed_op(agent, OP_IDENTITY_SET, &payload_bytes(&req)?).await?;
+        expect_empty(&body, OP_IDENTITY_SET)
+    }
+
+    /// What a server would be created from on another node.
+    pub async fn spec(&self, agent: DestinationHash, instance_id: &str) -> Result<InstanceSpec> {
+        let req = InstanceReq { token: String::new(), instance_id: instance_id.to_string() };
+        let body = self.signed_op(agent, OP_SPEC, &payload_bytes(&req)?).await?;
+        parse_ok(&body, OP_SPEC)
+    }
+
+    /// One piece of a backup's file from `offset`, and the file's whole length.
+    pub async fn backup_read(
+        &self,
+        agent: DestinationHash,
+        instance_id: &str,
+        name: &str,
+        offset: u64,
+    ) -> Result<(u64, Vec<u8>)> {
+        let req = BackupReadReq {
+            token: String::new(),
+            instance_id: instance_id.to_string(),
+            name: name.to_string(),
+            offset,
+        };
+        let body = payload_bytes(&req)?;
+        let raw = self
+            .signed_with(agent, OP_BACKUP_READ, TRANSFER_TIMEOUT, |token| inject_token(OP_BACKUP_READ, &body, token))
+            .await?;
+        let chunk = ok_body(&raw, OP_BACKUP_READ)?;
+        let (total, data) = decode_chunk(chunk).map_err(|e| anyhow!("agent sent a piece we cannot read: {e}"))?;
+        Ok((total, data.to_vec()))
+    }
+
+    /// Send one piece of a backup's file to a node. The first piece has no
+    /// `upload`; the reply names it for the rest.
+    pub async fn backup_write(
+        &self,
+        agent: DestinationHash,
+        instance_id: &str,
+        upload: Option<&str>,
+        offset: u64,
+        total: u64,
+        data: &[u8],
+    ) -> Result<UploadProgress> {
+        let header = BackupWriteReq {
+            token: String::new(),
+            instance_id: instance_id.to_string(),
+            upload: upload.map(str::to_string),
+            offset,
+            total,
+        };
+        let raw = self
+            .signed_with(agent, OP_BACKUP_WRITE, TRANSFER_TIMEOUT, |token| {
+                let mut h = header.clone();
+                h.token = token.to_string();
+                encode_write_body(&h, data).map_err(|e| anyhow!("{e}"))
+            })
+            .await?;
+        parse_ok(&raw, OP_BACKUP_WRITE)
+    }
+
     pub async fn capacity(&self, agent: DestinationHash) -> Result<CapacityResp> {
         let req = TokenReq { token: String::new() };
         let body = self.signed_op(agent, OP_CAPACITY, &payload_bytes(&req)?).await?;
@@ -136,16 +284,30 @@ impl AgentClient {
         // The body's `token` field was empty; resolve a real token, then re-emit
         // the request with the token filled. Re-encoding keeps the wire path
         // uniform — there is no special "unauthed" request shape.
+        self.signed_with(agent, op, RequestResponseTimeout::LinkDefault, |token| {
+            inject_token(op, body_without_token, token)
+        })
+        .await
+    }
+
+    /// `signed_op` for a body built around the token by the caller, with a
+    /// chosen reply timeout: a file piece rides a resource, which takes longer
+    /// than one packet's round trip.
+    async fn signed_with(
+        &self,
+        agent: DestinationHash,
+        op: u8,
+        timeout: RequestResponseTimeout,
+        build: impl Fn(&str) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
         let token = self.resolve_token(agent).await?;
-        let body = inject_token(op, body_without_token, &token)?;
-        let raw = self.call(agent, op, &body).await?;
+        let raw = self.call(agent, op, &build(&token)?, timeout).await?;
         // An auth failure means the cached token is stale or revoked: drop it
         // and retry once with a fresh session.
         if is_auth_error(&raw) {
             self.sessions.lock().await.remove(&agent_bytes(agent));
             let token = self.resolve_token(agent).await?;
-            let body = inject_token(op, body_without_token, &token)?;
-            return self.call(agent, op, &body).await;
+            return self.call(agent, op, &build(&token)?, timeout).await;
         }
         Ok(raw)
     }
@@ -238,11 +400,11 @@ impl AgentClient {
 
     /// Send one op request over a fresh Link and return the response body bytes
     /// (the bytes after the envelope: status + payload).
-    async fn call(&self, agent: DestinationHash, op: u8, body: &[u8]) -> Result<Vec<u8>> {
+    async fn call(&self, agent: DestinationHash, op: u8, body: &[u8], timeout: RequestResponseTimeout) -> Result<Vec<u8>> {
         let link = self.link_to(agent).await?;
         let raw = self
             .handle
-            .request(link, endpoint_hash(), &encode_request(op, body))
+            .request_with_response_timeout(link, endpoint_hash(), &encode_request(op, body), timeout)
             .await
             .map_err(|e| anyhow!("agent {op} request failed: {e:?}"))?
             .0;
@@ -268,13 +430,53 @@ fn inject_token(op: u8, body: &[u8], token: &str) -> Result<Vec<u8>> {
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
-        OP_STOP | OP_START | OP_REMOVE => {
+        OP_STOP | OP_START | OP_REMOVE | OP_SPEC | OP_IDENTITY_READ => {
             let mut r: InstanceReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
         OP_LIST | OP_CAPACITY => {
             let mut r: TokenReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_LOGS => {
+            let mut r: LogsReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_MAPS => {
+            let mut r: MapsReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_MAP => {
+            let mut r: MapReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_BACKUPS | OP_BACKUP_CREATE => {
+            let mut r: InstanceReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_BACKUP_RESTORE | OP_BACKUP_DELETE | OP_DELTA_MERGE => {
+            let mut r: BackupReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_DELTA_CREATE => {
+            let mut r: DeltaReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_IDENTITY_SET => {
+            let mut r: IdentitySetReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
+            r.token = token.to_string();
+            payload_bytes(&r).map_err(|e| anyhow!("{e}"))
+        }
+        OP_BACKUP_READ => {
+            let mut r: BackupReadReq = parse_payload(body).map_err(|e| anyhow!("{e}"))?;
             r.token = token.to_string();
             payload_bytes(&r).map_err(|e| anyhow!("{e}"))
         }
@@ -296,6 +498,23 @@ fn is_auth_error(raw: &[u8]) -> bool {
     msg.contains("untrusted identity")
         || msg.contains("no such session")
         || msg.contains("session expired")
+}
+
+/// How long one file piece may take to arrive. A piece is `TRANSFER_CHUNK`;
+/// this allows a slow link about 4 KiB/s.
+const TRANSFER_TIMEOUT: RequestResponseTimeout = RequestResponseTimeout::Exact(DurationMillis(60_000));
+
+/// Decode a response envelope, require ok, and hand back the raw body.
+fn ok_body(raw: &[u8], op: u8) -> Result<&[u8]> {
+    let (resp_op, ok, body) =
+        decode_response(raw).map_err(|e| anyhow!("agent reply we cannot read: {e}"))?;
+    if resp_op != op {
+        return Err(anyhow!("agent replied with op {resp_op}, expected {op}"));
+    }
+    if !ok {
+        return Err(anyhow!("the agent refused: {}", String::from_utf8_lossy(body)));
+    }
+    Ok(body)
 }
 
 /// Decode a response envelope, require ok, and parse the payload.

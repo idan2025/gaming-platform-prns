@@ -167,6 +167,9 @@ function makeInvoke(scenario) {
         return { destination_hash: args.text.slice(16, 48), game_id: null, name: null, room: false };
       case 'invite_link':
         return `lanthorn://join/${args.destinationHash}${args.room ? '?room=1' : ''}`;
+      case 'invite_qr':
+        if (!/^lanthorn:\/\/join\//.test(args.invite)) throw new Error('not an invite');
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"></svg>';
       case 'auto_update':
         return scenario.autoUpdate ?? false;
       case 'set_auto_update':
@@ -1874,6 +1877,24 @@ await run('a room row copies a room invite', {
   check('invite_link is asked for a room link', lastArgs.get('invite_link')?.room === true && lastArgs.get('invite_link')?.destinationHash === roomRow.destination_hash);
 });
 
+await run('an invite can be shown as a QR code for a phone to scan', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  rows: () => [roomRow],
+}, async (win, doc) => {
+  doc.querySelector('#list .row').click();
+  await settle();
+  const btn = doc.querySelector('#detail-invite-qr');
+  check('the detail pane has a QR code button', !!btn);
+  btn.click();
+  await settle();
+  const asked = lastArgs.get('invite_qr');
+  check('the core is asked for the same room link', !!asked && asked.invite === `lanthorn://join/${roomRow.destination_hash}?room=1`);
+  const img = doc.querySelector('#invite-qr img');
+  check('the code is shown as an image', !!img && img.src.startsWith('data:image/svg+xml'));
+});
+
 await run('an update that installs itself is offered once found', {
   status: running,
   rows: () => [row()],
@@ -2228,6 +2249,87 @@ await run('on Android a joined server can be left from the detail pane', {
   check('the Bedrock create carries the acceptance and the settings',
     sent && Number.isInteger(sent.body.eula_accepted_at) && sent.body.minecraft.gamemode === 'creative' && !sent.body.memory,
     JSON.stringify(sent && sent.body));
+  w.close();
+}
+
+// Lanthorn Host through a controller: maps are picked from a menu of what a
+// worker has, a running server's map changes through the controller, and the
+// log reads as text, not as the index's JSON.
+{
+  const WEBUI = new URL('../../crates/platform-agent/webui/', import.meta.url).pathname;
+  const nodeHtml = fs.readFileSync(`${WEBUI}index.html`, 'utf8').replace('<script src="app.js"></script>', '');
+  const nodeJs = fs.readFileSync(`${WEBUI}app.js`, 'utf8');
+  const posts = [];
+  const routes = {
+    '/health': { ok: true, version: 'test' }, '/capacity': { max_instances: 4, running: 0 },
+    '/storage': { path: '/x', free_bytes: 1e12, total_bytes: 2e12 }, '/usage': [],
+    '/orphans/summary': { count: 0, bytes: 0, skipped_recent: 0 }, '/content': { copies: [], downloads: [] },
+    '/games': [{ id: 'sven-coop', display_name: 'Sven Co-op', runnable: true, transport: 'udp', default_port: 27015, extra_ports: 0, console: true }],
+    '/controller/status': { enabled: true, url: 'https://index.test' },
+    '/controller/hosting': { games: ['sven-coop'], regions: [] },
+    '/controller/instances': [{ instance_id: 's1', node: 'w1', game_id: 'sven-coop', name: 'Coop', state: 'running', port: 27100, ports: [], players_now: 2, map_now: 'svencoop1' }],
+    '/controller/games/sven-coop/maps': { game_id: 'sven-coop', maps: ['hl_c01_a1', 'svencoop1'] },
+    '/controller/instances/s1/logs': { text: 'first line\nsecond line\n', truncated: true },
+  };
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => consoleErrors.push('node webui: ' + e.message));
+  const dom = new JSDOM(nodeHtml, { runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://node.test/', virtualConsole: vc });
+  const w = dom.window;
+  w.localStorage.setItem('agent_token', 'x');
+  w.CSS = { escape: v => String(v).replace(/[^A-Za-z0-9_-]/g, c => '\\' + c) };
+  w.fetch = async (path, opts = {}) => {
+    const route = String(path).split('?')[0];
+    if ((opts.method || 'GET') !== 'GET') {
+      posts.push({ path: route, body: opts.body ? JSON.parse(opts.body) : null });
+      return { ok: true, status: 200, statusText: '', headers: { get: () => 'application/json' }, json: async () => ({ instance_id: 'x', state: 'running' }), text: async () => '{}' };
+    }
+    const body = routes[route];
+    return { ok: body !== undefined, status: body !== undefined ? 200 : 404, statusText: '',
+      headers: { get: () => 'application/json' }, json: async () => body ?? { error: 'no route' }, text: async () => JSON.stringify(body ?? {}) };
+  };
+  w.eval(nodeJs + '\n;window.__start = openStartDialog; window.__nodePoll = poll; window.__map = onChangeMap; window.__log = onShowLog;');
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await settle();
+  const d = w.document;
+
+  w.__start('sven-coop');
+  await settle();
+  const pick = d.getElementById('sf-map');
+  const opts = pick ? [...pick.options].map(o => o.textContent) : [];
+  check('the start form offers the worker\'s maps in a menu',
+    pick && !pick.hidden && opts[0] === "The game's default" && opts.includes('svencoop1') && opts[opts.length - 1] === 'Another map…', JSON.stringify(opts));
+  pick.value = 'svencoop1';
+  pick.dispatchEvent(new w.Event('change'));
+  d.getElementById('sf-name').value = 'Picked';
+  d.getElementById('sf-start').closest('form').dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  const sent = posts.find(p => p.path === '/controller/instances');
+  check('the create carries the picked map', sent && sent.body.map === 'svencoop1', JSON.stringify(sent && sent.body));
+
+  await w.__nodePoll();
+  await settle();
+  const btn = d.querySelector('.inst[data-id="s1"] .map-btn');
+  check('a running server\'s map can be changed through the controller', btn && !btn.disabled, btn && btn.title);
+  const shown = d.querySelector('.inst[data-id="s1"] .cell-map');
+  check('the row shows which map the server is on, through the controller', shown && shown.textContent === 'svencoop1', shown && shown.textContent);
+  posts.length = 0;
+  w.__map('s1', 'sven-coop');
+  await settle();
+  const dlg = d.getElementById('map-dialog');
+  const sel = d.getElementById('map-dialog-input');
+  sel.value = 'hl_c01_a1';
+  sel.dispatchEvent(new w.Event('change'));
+  [...dlg.querySelectorAll('button')].find(b => b.textContent === 'Change map').click();
+  await settle();
+  const change = posts.find(p => p.path === '/controller/instances/s1/map');
+  check('Change map sends the picked name through the controller', change && change.body.map === 'hl_c01_a1', JSON.stringify(posts));
+
+  w.__log('s1');
+  await settle();
+  const log = d.querySelector('#log-dialog .log-text');
+  check('the log through a controller reads as its lines, not JSON',
+    log && /first line\nsecond line/.test(log.textContent) && !/"truncated"/.test(log.textContent) && /older lines left out/.test(log.textContent),
+    log && log.textContent);
   w.close();
 }
 

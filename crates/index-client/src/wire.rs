@@ -40,6 +40,12 @@ pub const INDEX_ASPECT: &str = "query";
 
 pub const QUERY_SCHEMA: u8 = 1;
 
+/// What an index announces. Not a server row: its first byte is `0xFE`, which
+/// is not a record version and not UTF-8, so a launcher's browse refuses it
+/// instead of listing an index as a "legacy server". An empty payload read as
+/// one, which is what the index sent before this.
+pub const INDEX_ANNOUNCE: &[u8] = &[0xFE, b'L', b'P', b'I'];
+
 /// Keep a response inside one link packet.
 pub const MAX_RESPONSE_LEN: usize = 1800;
 
@@ -273,6 +279,17 @@ pub fn decode_result(buf: &[u8]) -> Result<QueryResult, WireError> {
 /// Re-exported so a caller can build a row without depending on game-bridge's
 /// internals directly.
 pub type Record = AnnounceRecord;
+
+#[cfg(test)]
+mod index_announce_tests {
+    use super::INDEX_ANNOUNCE;
+
+    #[test]
+    fn an_index_announce_is_never_a_server_row() {
+        assert!(game_bridge::announce::decode(INDEX_ANNOUNCE).is_err(), "a browser would list the index as a server");
+        assert_eq!(game_bridge::announce::decode(b"").unwrap(), game_bridge::announce::AnnounceInfo::Legacy { name: None }, "the empty payload is what a legacy row looks like");
+    }
+}
 
 #[cfg(test)]
 mod tests {
