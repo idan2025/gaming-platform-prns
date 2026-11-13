@@ -577,15 +577,34 @@ pub async fn check_room(
     policy: &LanPolicy,
     adapter: &str,
 ) -> Result<CheckReport> {
+    check_room_skipping(session, policy, adapter, &[]).await
+}
+
+/// [`check_room`], leaving out the seats at `skip`: a room seat that runs no
+/// game (a Lanthorn Host) cannot answer a broadcast or accept a game port, so
+/// probing it would report a failure that is not one. Nothing else is skipped,
+/// and the caller decides which seats those are.
+pub async fn check_room_skipping(
+    session: &LanSession,
+    policy: &LanPolicy,
+    adapter: &str,
+    skip: &[Ipv4Addr],
+) -> Result<CheckReport> {
     // `0.0.0.0`, as a game binds: what is under test is where the operating
     // system sends a broadcast from a socket that did not pick an interface.
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_broadcast(true)?;
     socket.set_nonblocking(true)?;
     let firewall = crate::lan_firewall::detect();
-    let mut report =
-        check_room_with(session, policy, UdpSocket::from_std(socket)?, TcpSocket::new_v4, DEFAULT_WAIT)
-            .await?;
+    let mut report = check_room_with_skipping(
+        session,
+        policy,
+        UdpSocket::from_std(socket)?,
+        TcpSocket::new_v4,
+        DEFAULT_WAIT,
+        skip,
+    )
+    .await?;
     if !report.dropped_here.is_empty() {
         report.firewall_advice = Some(crate::lan_firewall::advice_line(firewall, adapter));
     }
@@ -602,6 +621,17 @@ pub async fn check_room_with(
     new_tcp: impl Fn() -> std::io::Result<TcpSocket>,
     wait: Duration,
 ) -> Result<CheckReport> {
+    check_room_with_skipping(session, policy, socket, new_tcp, wait, &[]).await
+}
+
+pub async fn check_room_with_skipping(
+    session: &LanSession,
+    policy: &LanPolicy,
+    socket: UdpSocket,
+    new_tcp: impl Fn() -> std::io::Result<TcpSocket>,
+    wait: Duration,
+    skip: &[Ipv4Addr],
+) -> Result<CheckReport> {
     let port = probe_port(policy).ok_or_else(|| {
         anyhow!("this game uses no UDP on its LAN, and the room check is a UDP broadcast")
     })?;
@@ -610,7 +640,7 @@ pub async fn check_room_with(
         .own_address
         .ok_or_else(|| anyhow!("not seated in the room yet, so there is nothing to check"))?;
     let others: Vec<Ipv4Addr> =
-        view.members.iter().map(|m| m.address).filter(|a| *a != address).collect();
+        view.members.iter().map(|m| m.address).filter(|a| *a != address && !skip.contains(a)).collect();
     let subnet_broadcast = view.subnet.broadcast();
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -749,10 +779,13 @@ pub async fn check_room_with(
     for m in &mut members {
         m.tcp.sort_by_key(|t| t.port);
     }
+    // A skipped seat's attempts at this machine are not this check's business
+    // either: a Lanthorn Host never connects to a member's game ports.
     let dropped_here = session
         .connect_watch()
         .dropped(Instant::now())
         .into_iter()
+        .filter(|d| !skip.contains(&d.from))
         .map(|d| (d.port, d.from))
         .collect();
     let route_hijacks = route_hijacks(

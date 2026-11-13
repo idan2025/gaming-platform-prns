@@ -99,6 +99,10 @@ pub struct LanHelperView {
 pub struct RoomMemberView {
     pub address: String,
     pub is_self: bool,
+    /// The seat the room was opened at: the first member the host seated,
+    /// which is the host itself. A room on Lanthorn has no player there, only
+    /// a seat that runs no game.
+    pub is_host: bool,
     /// The name the member gave, if it gave one. Data from another player:
     /// shown, never used to tell members apart.
     pub name: Option<String>,
@@ -983,7 +987,10 @@ impl Launcher {
     /// Check the room from this machine: a real broadcast on the game's own
     /// port, which every member's launcher answers (`game_bridge::lan_check`).
     /// Takes a few seconds; the room stays usable meanwhile.
-    pub async fn check_room(&self) -> Result<RoomCheckView> {
+    /// Check the room. `skip_host` leaves the host's seat out of the probes:
+    /// a seat that runs no game cannot answer them, and a Lanthorn room's host
+    /// is one (the caller says so; the room does not know).
+    pub async fn check_room(&self, skip_host: bool) -> Result<RoomCheckView> {
         let (session, policy) = {
             let inner = self.inner.lock().await;
             let room = inner.room.as_ref().ok_or_else(|| anyhow!("not in a LAN room"))?;
@@ -998,7 +1005,13 @@ impl Launcher {
             }
             (room.session.clone(), policy)
         };
-        let report = game_bridge::lan_check::check_room(&session, &policy, ADAPTER_NAME).await?;
+        let skip: Vec<std::net::Ipv4Addr> = if skip_host {
+            session.view().members.first().map(|h| h.address).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let report =
+            game_bridge::lan_check::check_room_skipping(&session, &policy, ADAPTER_NAME, &skip).await?;
         Ok(report.into())
     }
 
@@ -1033,6 +1046,7 @@ impl Launcher {
                 .map(|m| RoomMemberView {
                     address: m.address.to_string(),
                     is_self: m.identity == view.own_identity,
+                    is_host: view.members.first().is_some_and(|h| h.identity == m.identity),
                     name: view.name_of(&m.identity).map(str::to_string),
                 })
                 .collect(),
@@ -1288,10 +1302,12 @@ mod tests {
         let m = serde_json::to_value(RoomMemberView {
             address: "198.19.0.1".into(),
             is_self: true,
+            is_host: true,
             name: Some("Ada".into()),
         })
         .unwrap();
-        assert_eq!(keys(&m), ["address", "is_self", "name"]);
+        assert_eq!(keys(&m), ["address", "is_host", "is_self", "name"]);
+        assert_eq!(m["is_host"], true);
         let c = serde_json::to_value(RoomChatLineView {
             seq: 1,
             name: None,
@@ -1453,7 +1469,7 @@ mod tests {
     #[tokio::test]
     async fn checking_outside_a_room_says_so() {
         let launcher = Launcher::new(shipped_packs());
-        let err = launcher.check_room().await.unwrap_err().to_string();
+        let err = launcher.check_room(false).await.unwrap_err().to_string();
         assert!(err.contains("not in a LAN room"), "{err}");
     }
 

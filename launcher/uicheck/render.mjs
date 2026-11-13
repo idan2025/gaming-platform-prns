@@ -1849,6 +1849,31 @@ await run('Announce asks for saved servers, and announces a hosted room', {
 });
 
 
+// The room's host seat is labelled as the host, and the check is run as the
+// room's own (no skip) unless a page says the host is a service.
+await run('the host seat of a room is labelled, and the check does not skip it', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: readyHelper,
+  room: { ...noRoom, active: true, role: 'member', game_id: 'openttd', name: 'Friday', room_hash: 'ab'.repeat(16), address: '198.19.0.2', adapter: 'up',
+    members: [{ address: '198.19.0.1', is_self: false, is_host: true, name: 'Ada' }, { address: '198.19.0.2', is_self: true, is_host: false, name: null }] },
+  roomCheck: { ok: true, address: '198.19.0.2', port: 3979, findings: [], members: [] },
+  rows: () => [],
+}, async (win, doc) => {
+  await settle();
+  const items = [...doc.querySelectorAll('#room-body li')].map((li) => li.textContent);
+  check('the host seat says it is the host', items.some((t) => t.includes('Ada') && t.includes('(host)')), items.join(' | '));
+  const host = doc.querySelector('#room-body li.host');
+  check('and is marked as the host', !!host && host.textContent.includes('(host)'));
+  check('the check does not skip the host unless a page says it is a service', lastArgs.get('check_room')?.skipHost === false, JSON.stringify(lastArgs.get('check_room')));
+  win.roomHostLabelFor = () => 'Lanthorn Host';
+  // No forced redraw: the room panel's own two-second poll must pick it up.
+  await new Promise((r) => setTimeout(r, 2300));
+  await settle();
+  const svc = [...doc.querySelectorAll('#room-body li')].map((li) => li.textContent).find((t) => t.includes('Ada'));
+  check('a page that knows the room is run by a service says so, on the next draw', svc && svc.includes('(Lanthorn Host)'), svc);
+});
+
 // A room the player is in can be sent on: a link and a QR code for it, from
 // the room's own card, as a room (`room=1`) so the friend gets Join room.
 for (const role of ['host', 'member']) {

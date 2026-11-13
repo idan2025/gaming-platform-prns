@@ -482,6 +482,22 @@ async fn one_pack(pack: GamePack) {
         let findings = report.findings().join("\n");
         assert!(findings.contains(&format!("{m1_addr} did not answer a connection to TCP")), "{findings}");
         assert!(findings.contains("firewall on that machine"), "{findings}");
+        // A seat that runs no game is left out of the probes, so the room
+        // reads as fine from m1 once the host (which here cannot be reached
+        // from m1) is skipped, and nothing is probed at it.
+        let skipped = lan_check::check_room_with_skipping(
+            &m1,
+            &policy,
+            nss[1].udp(0),
+            nss[1].tcp_sockets(),
+            Duration::from_secs(2),
+            &[host_addr],
+        )
+        .await
+        .unwrap();
+        assert!(skipped.ok(), "{}: the skipped host still failed the check: {}", pack.id, skipped.findings().join(" / "));
+        assert!(skipped.members.iter().all(|m| m.address != host_addr), "{}: {skipped:?}", pack.id);
+        assert_eq!(skipped.members.len(), 1, "{}: {skipped:?}", pack.id);
         // And m1 knows it is the one, without running a check of its own —
         // for every port the host tried. Each crosses its grace on its own
         // clock, a few milliseconds apart, so wait for the whole set rather

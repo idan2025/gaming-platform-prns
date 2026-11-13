@@ -1061,8 +1061,8 @@ async fn mute_in_hosted_chat(
 }
 
 #[tauri::command]
-async fn check_room(state: tauri::State<'_, AppState>) -> Result<RoomCheckView, String> {
-    state.launcher.check_room().await.map_err(fmt_err)
+async fn check_room(state: tauri::State<'_, AppState>, skip_host: Option<bool>) -> Result<RoomCheckView, String> {
+    state.launcher.check_room(skip_host == Some(true)).await.map_err(fmt_err)
 }
 
 #[tauri::command]
