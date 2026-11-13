@@ -2532,9 +2532,20 @@ async function pollRoom() {
 // every change, and a chat box rebuilt under someone typing loses their line.
 // Every name and line is another player's text, so it only ever goes in as
 // textContent.
-function memberLabel(m) {
+function memberLabel(m, r) {
   const who = m.name ? m.name + ' · ' + m.address : m.address;
-  return who + (m.is_self ? ' (you)' : '');
+  const role = m.is_host ? ' (' + roomHostLabel(r) + ')' : '';
+  return who + (m.is_self ? ' (you)' : '') + role;
+}
+// What the room's host seat is called. The public launcher calls it the host;
+// a page that knows the room is run by a service says so (`roomHostLabel` in
+// the Lanthorn Hosted page). Dynamic: it is read each time the room is drawn.
+function roomHostLabel(r) {
+  return (window.roomHostLabelFor && window.roomHostLabelFor(r)) || 'host';
+}
+// A room's host seat that runs no game is not probed by the room check.
+function roomHostIsService(r) {
+  return !!(window.roomHostLabelFor && window.roomHostLabelFor(r));
 }
 function ensureChat() {
   let box = $('room-chat');
@@ -3226,7 +3237,7 @@ async function checkRoom() {
   state.roomCheck = { busy: true, result: null, error: null, hash: r.room_hash };
   renderRoomPanel(true);
   try {
-    state.roomCheck.result = await invoke('check_room');
+    state.roomCheck.result = await invoke('check_room', { skipHost: roomHostIsService(r) });
   } catch (err) {
     state.roomCheck.error = errText(err);
   }
@@ -3317,7 +3328,7 @@ function renderRoomPanel(force) {
   const body = $('room-body');
   if (!panel || !body) return;
   panel.hidden = !state.roomsAvailable;
-  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, state.firewallAction, state.portsAction, lanGames().map(g => g.id)]);
+  const sig = JSON.stringify([state.room, state.lanHelper, state.roomBusy, state.roomCheck, state.firewallAction, state.portsAction, lanGames().map(g => g.id), state.room && state.room.active ? roomHostLabel(state.room) : null]);
   if (!force && sig === state.roomPanelSig) return;
   state.roomPanelSig = sig;
 
@@ -3336,7 +3347,7 @@ function renderRoomPanel(force) {
     renderRoomVerdict(card, r);
     const ul = el('ul', 'member-list player-list');
     r.members.forEach(m => {
-      const li = el('li', m.is_self ? 'self' : '', memberLabel(m));
+      const li = el('li', (m.is_self ? 'self' : '') + (m.is_host ? ' host' : ''), memberLabel(m, r));
       ul.appendChild(li);
     });
     card.appendChild(ul);
