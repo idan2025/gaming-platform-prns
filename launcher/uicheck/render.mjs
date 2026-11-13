@@ -1849,6 +1849,47 @@ await run('Announce asks for saved servers, and announces a hosted room', {
 });
 
 
+// A room the player is in can be sent on: a link and a QR code for it, from
+// the room's own card, as a room (`room=1`) so the friend gets Join room.
+for (const role of ['host', 'member']) {
+  await run(`a ${role} of a room can copy its invite and show its QR code`, {
+    status: running,
+    games: [svenGame, lanGame()],
+    lanHelper: { supported: true, path: '/x', ready: true, mode: 'granted', can_grant: false, can_revoke: false, detail: 'Ready.' },
+    room: { ...noRoom, active: true, role, game_id: 'openttd', name: 'Friday night', room_hash: 'ab'.repeat(16), address: '198.19.0.1', members: [{ address: '198.19.0.1', is_self: true }], adapter: 'up' },
+    rows: () => [],
+  }, async (win, doc) => {
+    await settle();
+    const copy = doc.querySelector('#room-invite');
+    check('the room card offers Copy invite link', !!copy && copy.textContent === 'Copy invite link');
+    let copied = null;
+    Object.defineProperty(win.navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { copied = t; } } });
+    lastArgs.delete('invite_link');
+    copy.click();
+    await settle();
+    check('the link is what lands on the clipboard', copied === `lanthorn://join/${'ab'.repeat(16)}?room=1`, String(copied));
+    const asked = lastArgs.get('invite_link');
+    check('the link is asked for as a room', asked?.room === true && asked?.destinationHash === 'ab'.repeat(16) && asked?.gameId === 'openttd' && asked?.name === 'Friday night', JSON.stringify(asked));
+    const qr = doc.querySelector('#room-invite-qr');
+    check('and a QR code button', !!qr);
+    qr.click();
+    await settle();
+    check('the QR is made from the same room link', lastArgs.get('invite_qr')?.invite === `lanthorn://join/${'ab'.repeat(16)}?room=1`);
+    check('and drawn as an image', !!doc.querySelector('#invite-qr img'));
+  });
+}
+
+await run('a room card with no address yet offers no invite', {
+  status: running,
+  games: [svenGame, lanGame()],
+  lanHelper: { supported: true, path: '/x', ready: true, mode: 'granted', can_grant: false, can_revoke: false, detail: 'Ready.' },
+  room: { ...noRoom, active: true, role: 'member', game_id: 'openttd', room_hash: null, members: [], adapter: 'waiting' },
+  rows: () => [],
+}, async (win, doc) => {
+  await settle();
+  check('no invite buttons without a room address', !doc.querySelector('#room-invite') && !doc.querySelector('#room-invite-qr'));
+});
+
 // An invite link opens the server it names — listed or not — and never joins.
 await run('an invite opens its server and waits for a click', {
   status: running,

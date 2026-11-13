@@ -3342,7 +3342,7 @@ function renderRoomPanel(force) {
     card.appendChild(ul);
     if (r.room_hash) {
       const code = el('code', 'room-hash', r.room_hash);
-      code.title = 'This room’s address. Others find it in their server list.';
+      code.title = 'This room’s address. Others find it in their server list, or open the invite link.';
       card.appendChild(code);
     }
     const actions = el('div', 'room-actions');
@@ -3350,6 +3350,22 @@ function renderRoomPanel(force) {
     const results = el('div');
     card.appendChild(results);
     renderRoomCheck(actions, results, r);
+    if (r.room_hash) {
+      // Anyone can send the room on: the link names the room, and whoever
+      // opens it presses Join themselves (see invites, below).
+      const inv = el('button', 'btn', 'Copy invite link');
+      inv.type = 'button';
+      inv.id = 'room-invite';
+      inv.title = 'Copy a link that opens this room on a friend’s Lanthorn. A friend without Lanthorn gets a page to download it.';
+      inv.onclick = () => copyRoomInvite(r);
+      actions.appendChild(inv);
+      const qr = el('button', 'btn', 'QR code');
+      qr.type = 'button';
+      qr.id = 'room-invite-qr';
+      qr.title = 'Show a QR code a phone can scan to open this invite';
+      qr.onclick = () => showRoomInviteQr(r);
+      actions.appendChild(qr);
+    }
     if (r.role === 'host') {
       const ann = el('button', 'btn', 'Announce now');
       ann.type = 'button';
@@ -3385,8 +3401,9 @@ function renderRoomPanel(force) {
     return;
   }
   card.appendChild(el('p', 'card-text',
-    'Open a room for a game and the others join it from their server list. To join someone '
-    + 'else’s room, find it in Servers — rooms carry a LAN room badge.'));
+    'Open a room for a game and the others join it from their server list, or from the invite '
+    + 'link you copy once it is open. To join someone else’s room, find it in Servers — rooms '
+    + 'carry a LAN room badge — or open their invite with Join by invite.'));
   if (!state.hostDraft.game_id || !gameById(state.hostDraft.game_id)?.lan) {
     state.hostDraft.game_id = games[0].id;
   }
@@ -3445,6 +3462,38 @@ async function copyInvite(row) {
     toast('Invite link copied. Lanthorn opens it on this ' + what + '; a friend without Lanthorn gets a page to download it.');
   } catch (err) {
     showError('Could not copy the invite: ' + errText(err));
+  }
+}
+
+// The room this launcher is in, as an invite: the same link a room's row
+// gives, so a friend opens it the same way (`room=1` picks the Join room
+// button until the room's own announce is heard).
+async function roomInviteLink(r) {
+  return invoke('invite_link', {
+    destinationHash: r.room_hash,
+    gameId: r.game_id || null,
+    name: r.name || null,
+    room: true,
+  });
+}
+
+async function copyRoomInvite(r) {
+  if (!r || !r.room_hash) return;
+  try {
+    const link = await roomInviteLink(r);
+    await navigator.clipboard.writeText(link);
+    toast('Invite link copied. Lanthorn opens it on this room; a friend without Lanthorn gets a page to download it.');
+  } catch (err) {
+    showError('Could not copy the invite: ' + errText(err));
+  }
+}
+
+async function showRoomInviteQr(r) {
+  if (!r || !r.room_hash) return;
+  try {
+    await showInviteQr(await roomInviteLink(r));
+  } catch (err) {
+    showError('Could not make the QR code: ' + errText(err));
   }
 }
 
